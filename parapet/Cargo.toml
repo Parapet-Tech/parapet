@@ -2,6 +2,7 @@
 name = "parapet"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 description = "LLM proxy firewall — protective wall at the edge of a fortification"
 
 [[bin]]
