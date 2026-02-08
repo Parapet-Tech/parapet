@@ -12,7 +12,7 @@ pub mod raw;
 mod source;
 mod types;
 
-pub use defaults::default_block_patterns;
+pub use defaults::{default_block_patterns, default_layer_configs, default_sensitive_patterns};
 pub use error::ConfigError;
 pub use loader::{compute_hash, load_config};
 pub use pattern::CompiledPattern;
@@ -139,7 +139,8 @@ layers:
             let default_count = super::defaults::default_block_patterns().len();
             assert_eq!(config.policy.block_patterns.len(), default_count + 6);
             assert_eq!(config.policy.canary_tokens, vec!["{{CANARY_a8f3e9b1}}"]);
-            assert_eq!(config.policy.sensitive_patterns.len(), 2);
+            let default_sensitive_count = super::defaults::default_sensitive_patterns().len();
+            assert_eq!(config.policy.sensitive_patterns.len(), default_sensitive_count + 2);
             assert_eq!(config.policy.untrusted_content_policy.max_length, Some(50000));
             assert_eq!(config.policy.trust.auto_untrusted_roles, vec!["tool"]);
             assert_eq!(config.runtime.engine.on_failure, FailureMode::Open);
@@ -156,18 +157,36 @@ layers:
     }
 
     // ---------------------------------------------------------------
-    // 2. Missing tools -> actionable error
+    // 2. Minimal config is valid (parapet: v1 is all you need)
     // ---------------------------------------------------------------
 
     #[test]
-    fn missing_tools_produces_actionable_error() {
+    fn minimal_config_is_valid() {
         let yaml = "parapet: v1\n";
-        let err = load_config(&make_source(yaml)).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("tools"),
-            "error should mention 'tools': {msg}"
-        );
+        let config = load_config(&make_source(yaml)).unwrap();
+
+        // Tools: empty map, allow-all behavior
+        assert!(config.policy.tools.is_empty());
+
+        // Block patterns: defaults active
+        let default_count = super::defaults::default_block_patterns().len();
+        assert!(default_count >= 60);
+        assert_eq!(config.policy.block_patterns.len(), default_count);
+
+        // Sensitive patterns: defaults active
+        let default_sensitive_count = super::defaults::default_sensitive_patterns().len();
+        assert!(default_sensitive_count >= 10);
+        assert_eq!(config.policy.sensitive_patterns.len(), default_sensitive_count);
+
+        // All 4 layers active
+        let l0 = config.policy.layers.l0.as_ref().unwrap();
+        assert_eq!(l0.mode, "sanitize");
+        let l3i = config.policy.layers.l3_inbound.as_ref().unwrap();
+        assert_eq!(l3i.mode, "block");
+        let l3o = config.policy.layers.l3_outbound.as_ref().unwrap();
+        assert_eq!(l3o.mode, "block");
+        let l5a = config.policy.layers.l5a.as_ref().unwrap();
+        assert_eq!(l5a.mode, "redact");
     }
 
     // ---------------------------------------------------------------
@@ -523,9 +542,12 @@ sensitive_patterns:
   - "API_KEY_[A-Za-z0-9]+"
 "#;
         let config = load_config(&make_source(yaml)).unwrap();
-        assert_eq!(config.policy.sensitive_patterns.len(), 1);
-        assert!(config.policy.sensitive_patterns[0].is_match("found API_KEY_abc123 in output"));
-        assert!(!config.policy.sensitive_patterns[0].is_match("no key here"));
+        let default_sensitive_count = super::defaults::default_sensitive_patterns().len();
+        assert_eq!(config.policy.sensitive_patterns.len(), default_sensitive_count + 1);
+        // User pattern is last
+        let user_pattern = config.policy.sensitive_patterns.last().unwrap();
+        assert!(user_pattern.is_match("found API_KEY_abc123 in output"));
+        assert!(!user_pattern.is_match("no key here"));
     }
 
     #[test]
@@ -537,17 +559,20 @@ sensitive_patterns:
         let default_count = super::defaults::default_block_patterns().len();
         assert_eq!(config.policy.block_patterns.len(), default_count);
         assert!(config.policy.canary_tokens.is_empty());
-        assert!(config.policy.sensitive_patterns.is_empty());
+        // Default sensitive patterns are active
+        let default_sensitive_count = super::defaults::default_sensitive_patterns().len();
+        assert_eq!(config.policy.sensitive_patterns.len(), default_sensitive_count);
         assert_eq!(config.policy.untrusted_content_policy.max_length, None);
         assert!(config.policy.trust.auto_untrusted_roles.is_empty());
         assert!(config.policy.trust.unknown_trust_policy.is_empty());
         assert_eq!(config.runtime.engine.on_failure, FailureMode::Open);
         assert_eq!(config.runtime.engine.timeout_ms, None);
         assert_eq!(config.runtime.environment, "");
-        assert!(config.policy.layers.l0.is_none());
-        assert!(config.policy.layers.l3_inbound.is_none());
-        assert!(config.policy.layers.l3_outbound.is_none());
-        assert!(config.policy.layers.l5a.is_none());
+        // All layers active by default
+        assert_eq!(config.policy.layers.l0.as_ref().unwrap().mode, "sanitize");
+        assert_eq!(config.policy.layers.l3_inbound.as_ref().unwrap().mode, "block");
+        assert_eq!(config.policy.layers.l3_outbound.as_ref().unwrap().mode, "block");
+        assert_eq!(config.policy.layers.l5a.as_ref().unwrap().mode, "redact");
     }
 
     #[test]
@@ -681,6 +706,56 @@ layers:
     // ---------------------------------------------------------------
     // Default block patterns tests
     // ---------------------------------------------------------------
+
+    #[test]
+    fn use_default_sensitive_patterns_false_disables_defaults() {
+        let yaml = r#"
+parapet: v1
+tools:
+  _default:
+    allowed: false
+use_default_sensitive_patterns: false
+sensitive_patterns:
+  - "MY_CUSTOM_SECRET_[0-9]+"
+"#;
+        let config = load_config(&make_source(yaml)).unwrap();
+        assert_eq!(config.policy.sensitive_patterns.len(), 1);
+        assert_eq!(config.policy.sensitive_patterns[0].pattern, "MY_CUSTOM_SECRET_[0-9]+");
+    }
+
+    #[test]
+    fn use_default_sensitive_patterns_false_no_user_patterns_gives_empty() {
+        let yaml = r#"
+parapet: v1
+tools:
+  _default:
+    allowed: false
+use_default_sensitive_patterns: false
+"#;
+        let config = load_config(&make_source(yaml)).unwrap();
+        assert!(config.policy.sensitive_patterns.is_empty());
+    }
+
+    #[test]
+    fn explicit_layers_override_defaults() {
+        let yaml = r#"
+parapet: v1
+tools:
+  _default:
+    allowed: false
+layers:
+  L0: { mode: sanitize }
+  L5a: { mode: redact, window_chars: 4096 }
+"#;
+        let config = load_config(&make_source(yaml)).unwrap();
+        // Explicitly specified layers are present
+        assert_eq!(config.policy.layers.l0.as_ref().unwrap().mode, "sanitize");
+        assert_eq!(config.policy.layers.l5a.as_ref().unwrap().mode, "redact");
+        assert_eq!(config.policy.layers.l5a.as_ref().unwrap().window_chars, Some(4096));
+        // Unspecified layers are None (user provided layers block, so only their entries apply)
+        assert!(config.policy.layers.l3_inbound.is_none());
+        assert!(config.policy.layers.l3_outbound.is_none());
+    }
 
     #[test]
     fn use_default_block_patterns_false_skips_defaults() {
