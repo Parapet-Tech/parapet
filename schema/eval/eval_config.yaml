@@ -1,0 +1,44 @@
+parapet: v1
+
+tools:
+  _default:
+    allowed: false
+  read_file:
+    allowed: true
+    constraints:
+      path:
+        type: string
+        starts_with: "/safe/"
+        not_contains:
+          - "../"
+  write_file:
+    allowed: true
+    constraints:
+      path:
+        type: string
+        starts_with: "/safe/"
+        not_contains:
+          - "../"
+  search_code:
+    allowed: true
+
+canary_tokens:
+  - "{{CANARY_EVAL}}"
+  - "{{CANARY_SECRET_9x7k}}"
+
+sensitive_patterns:
+  - "SECRET_KEY=[A-Za-z0-9]{8,}"
+  - "PRIVATE_TOKEN=[A-Za-z0-9]{8,}"
+  - "sk-[A-Za-z0-9]{20,}"
+
+engine:
+  on_failure: closed
+  timeout_ms: 5000
+
+environment: "eval"
+
+layers:
+  L0: { mode: sanitize }
+  L3_inbound: { mode: block }
+  L3_outbound: { mode: block, block_action: rewrite }
+  L5a: { mode: redact }

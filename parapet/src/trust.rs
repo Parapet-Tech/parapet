@@ -40,6 +40,7 @@ impl TrustAssigner for RoleTrustAssigner {
             // Step 1: Check unknown_trust_policy for a base trust level.
             // If no entry exists, default to Untrusted (safe default).
             let mut trust = config
+                .policy
                 .trust
                 .unknown_trust_policy
                 .get(role_str)
@@ -48,6 +49,7 @@ impl TrustAssigner for RoleTrustAssigner {
 
             // Step 2: If the role is in auto_untrusted_roles, override to Untrusted.
             if config
+                .policy
                 .trust
                 .auto_untrusted_roles
                 .iter()
@@ -59,7 +61,7 @@ impl TrustAssigner for RoleTrustAssigner {
             // Step 3: For Tool messages with a tool_name, check per-tool trust override.
             if msg.role == Role::Tool {
                 if let Some(tool_name) = &msg.tool_name {
-                    if let Some(tool_config) = config.tools.get(tool_name) {
+                    if let Some(tool_config) = config.policy.tools.get(tool_name) {
                         if let Some(ref tool_trust) = tool_config.trust {
                             trust = tool_trust.clone();
                         }
@@ -76,7 +78,8 @@ impl TrustAssigner for RoleTrustAssigner {
 mod tests {
     use super::*;
     use crate::config::{
-        Config, ContentPolicy, EngineConfig, LayerConfigs, ToolConfig, TrustConfig,
+        Config, ContentPolicy, EngineConfig, LayerConfigs, PolicyConfig, RuntimeConfig, ToolConfig,
+        TrustConfig,
     };
     use crate::message::{Message, Role, TrustLevel};
     use std::collections::HashMap;
@@ -122,19 +125,23 @@ mod tests {
         );
 
         Config {
-            version: "v1".to_string(),
-            tools,
-            block_patterns: Vec::new(),
-            canary_tokens: Vec::new(),
-            sensitive_patterns: Vec::new(),
-            untrusted_content_policy: ContentPolicy::default(),
-            trust: TrustConfig {
-                auto_untrusted_roles: vec!["tool".to_string()],
-                unknown_trust_policy,
+            policy: PolicyConfig {
+                version: "v1".to_string(),
+                tools,
+                block_patterns: Vec::new(),
+                canary_tokens: Vec::new(),
+                sensitive_patterns: Vec::new(),
+                untrusted_content_policy: ContentPolicy::default(),
+                trust: TrustConfig {
+                    auto_untrusted_roles: vec!["tool".to_string()],
+                    unknown_trust_policy,
+                },
+                layers: LayerConfigs::default(),
             },
-            engine: EngineConfig::default(),
-            environment: String::new(),
-            layers: LayerConfigs::default(),
+            runtime: RuntimeConfig {
+                engine: EngineConfig::default(),
+                environment: String::new(),
+            },
             contract_hash: String::new(),
         }
     }
@@ -256,19 +263,23 @@ mod tests {
     fn role_not_in_policy_defaults_to_untrusted() {
         // Build a config with an empty unknown_trust_policy so no role matches
         let config = Config {
-            version: "v1".to_string(),
-            tools: HashMap::new(),
-            block_patterns: Vec::new(),
-            canary_tokens: Vec::new(),
-            sensitive_patterns: Vec::new(),
-            untrusted_content_policy: ContentPolicy::default(),
-            trust: TrustConfig {
-                auto_untrusted_roles: Vec::new(),
-                unknown_trust_policy: HashMap::new(),
+            policy: PolicyConfig {
+                version: "v1".to_string(),
+                tools: HashMap::new(),
+                block_patterns: Vec::new(),
+                canary_tokens: Vec::new(),
+                sensitive_patterns: Vec::new(),
+                untrusted_content_policy: ContentPolicy::default(),
+                trust: TrustConfig {
+                    auto_untrusted_roles: Vec::new(),
+                    unknown_trust_policy: HashMap::new(),
+                },
+                layers: LayerConfigs::default(),
             },
-            engine: EngineConfig::default(),
-            environment: String::new(),
-            layers: LayerConfigs::default(),
+            runtime: RuntimeConfig {
+                engine: EngineConfig::default(),
+                environment: String::new(),
+            },
             contract_hash: String::new(),
         };
 

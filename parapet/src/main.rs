@@ -42,9 +42,9 @@ async fn main() {
     };
 
     tracing::info!(
-        version = %config.version,
-        environment = %config.environment,
-        on_failure = ?config.engine.on_failure,
+        version = %config.policy.version,
+        environment = %config.runtime.environment,
+        on_failure = ?config.runtime.engine.on_failure,
         contract_hash = %config.contract_hash,
         "config loaded"
     );

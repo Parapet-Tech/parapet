@@ -1,0 +1,95 @@
+# Default block patterns for parapet.yaml
+# All (?i) case-insensitive. L0 normalizes before these run.
+
+block_patterns:
+  # --- Instruction Override (6 papers) ---
+  - "(?i)ignore (all )?(your )?(previous|prior|above|preceding) (instructions|orders|tasks|rules|directives|assignments)"
+  - "(?i)ignore the (previous|prior|above|preceding) (instructions|orders|tasks|rules|directives)"
+  - "(?i)forget (about )?(all )?(the )?(your )?(previous|prior)? ?(instructions|orders|tasks|rules|directives|assignments)"
+  - "(?i)disregard (all )?(your )?(previous|prior|above|preceding) (instructions|orders|tasks|rules|directives)"
+  - "(?i)disregard the above"
+  - "(?i)override (your |the )?(system|original|previous) (prompt|instructions)"
+  - "(?i)do not follow (your |the )?(original|previous|prior|above) instructions"
+  - "(?i)new instructions[: ]"
+  - "(?i)follow new instructions"
+  - "(?i)ignore (all )?previous"
+  - "(?i)(ignore|forget) everything"
+  - "(?i)ignore all instructions"
+
+  # --- Role Hijacking / Persona ---
+  - "(?i)you are now .{1,30}(mode|persona|character|ai|assistant)"
+  - "(?i)you are in developer mode"
+  - "(?i)you have been jailbroken"
+  - "(?i)simulate a completely (amoral|unrestricted|unfiltered)"
+  - "(?i)act as (an? )?(unrestricted|unfiltered|uncensored|evil|malicious)"
+  - "(?i)pretend (you are|to be) (an? )?(unrestricted|unfiltered|evil|malicious)"
+  - "(?i)from now on,? you (are|will|must|should)"
+  - "(?i)for the rest of this conversation"
+  - "(?i)updated role:"
+  - "(?i)updated tool instructions:"
+
+  # --- Jailbreak Triggers ---
+  - "(?i)\\bDAN\\b.{0,20}(mode|enabled|activated|jailbreak|prompt)"
+  - "(?i)(enable|activate|engage|start|enter) (developer|god|admin|debug|test|sudo|unrestricted|jailbreak) mode"
+  - "(?i)developer mode (enabled|activated|output)"
+  - "(?i)jailbreak (mode|prompt|enabled|activated)"
+  - "(?i)do anything now"
+  - "(?i)all filters (are|have been) disabled"
+  - "(?i)there are no restrictions"
+  - "(?i)no restrictions apply"
+  - "(?i)ignore (all )?(safety|content|ethical) (guidelines|filters|restrictions|protocols|measures)"
+  - "(?i)(remove|disable|bypass|turn off|deactivate) (all )?(safety|content|ethical) (filters|restrictions|guidelines)"
+
+  # --- System Prompt Extraction ---
+  - "(?i)(display|reveal|show|output|repeat|print|echo) (your |the )?(full |entire |complete )?(system ?prompt|system ?message|initial ?prompt)"
+  - "(?i)what (are|is|were) your (system )?(prompt|instructions|rules|directives)"
+  - "(?i)(give|tell|send) me (your |the )?(system )?(prompt|instructions|rules)"
+  - "(?i)output (everything|all|the text) (above|before|preceding)"
+  - "(?i)repeat (everything|all|the text) (above|before|preceding)"
+
+  # --- Privilege Escalation ---
+  - "(?i)(i am|i'm) (the |an? )?(admin|administrator|developer|root|superuser|owner)"
+  - "(?i)(grant|give) (me |yourself )?(admin|root|elevated|full|unrestricted) (access|permissions|privileges)"
+  - "(?i)sudo (mode|access|command)"
+  - "(?i)(unlock|enable) (all |full |unrestricted )(capabilities|features|functions|access)"
+  - "(?i)you have (no|zero) restrictions"
+  - "(?i)(no|without|zero) (safety|content|ethical) (restrictions|filters|guidelines|limits)"
+
+  # --- Refusal Suppression ---
+  - "(?i)you cannot (respond with|say) .{0,20}(can't|cannot|unable|refuse)"
+  - "(?i)you (cannot|must not|should not) refuse"
+  - "(?i)you must always comply"
+  - "(?i)never refuse a request"
+  - "(?i)do not (say you cannot|decline|refuse)"
+  - "(?i)start your response with:"
+
+  # --- Indirect Injection Markers ---
+  - "(?i)SYSTEM:\\s*ignore above"
+  - "(?i)IMPORTANT:\\s*before calling"
+  - "(?i)important messages:"
+  - "(?i)ignore the previous instructions and do the following"
+
+  # --- Exfiltration / C2 ---
+  - "(?i)(send|transmit|exfiltrate|upload|post) .{0,40}(to |via |using )(https?://|webhook|endpoint|server)"
+  - "(?i)before every response,? (access|fetch|read|visit|check)"
+  - "(?i)access the content at https?://"
+  - "(?i)print all environment variables"
+  - "(?i)read ~/\\.aws/credentials"
+  - "(?i)list all files in ~/\\.ssh"
+  - "(?i)(curl|wget|fetch) https?://"
+
+  # --- Template / Delimiter Abuse ---
+  - "(?i)<!--\\s*SYSTEM:"
+  - "(?i)<\\|?(system|im_start|im_end|endoftext|end_turn)\\|?>"
+  - "(?i)\\[INST\\]|\\[/INST\\]"
+  - "(?i)\\[SYS\\]|\\[/SYS\\]"
+  - "(?i)<<\\s*SYS\\s*>>"
+  - "(?i)###\\s*(system|instruction|human|assistant)\\s*:"
+  - "(?i)(begin|end) (of )?(system|user|assistant) (message|prompt|section)"
+
+  # --- Tool / Agent Manipulation ---
+  - "(?i)ignore (the )?previous instructions and (output|reveal|show|print|display)"
+  - "(?i)(call|invoke|execute|run) (the )?(tool|function).{0,30}(instead|first|also)"
+  - "(?i)(ignore|skip|bypass) (the )?(tool|function) (policy|constraints?|restrictions?|validation)"
+  - "(?i)(modify|change|alter) (the |your )?(tool|function) (call|invocation|parameters?)"
+  - "(?i)(redirect|forward|pipe|send) (the |all )?(output|response|result|data) to"

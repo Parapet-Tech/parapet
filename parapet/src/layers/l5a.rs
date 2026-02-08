@@ -57,7 +57,7 @@ impl OutputScanner for L5aScanner {
         // After each replacement the string changes length, so we
         // collect redactions against the *original* content offsets
         // by scanning the original first.
-        for token in &config.canary_tokens {
+        for token in &config.policy.canary_tokens {
             if token.is_empty() {
                 continue;
             }
@@ -80,7 +80,7 @@ impl OutputScanner for L5aScanner {
         }
 
         // Pass 2: sensitive patterns (regex match).
-        for compiled in &config.sensitive_patterns {
+        for compiled in &config.policy.sensitive_patterns {
             // We loop because each replacement changes offsets.
             loop {
                 let Some(mat) = compiled.regex.find(&result) else {
@@ -108,26 +108,31 @@ impl OutputScanner for L5aScanner {
 mod tests {
     use super::*;
     use crate::config::{
-        CompiledPattern, Config, ContentPolicy, EngineConfig, LayerConfigs, TrustConfig,
+        CompiledPattern, Config, ContentPolicy, EngineConfig, LayerConfigs, PolicyConfig,
+        RuntimeConfig, TrustConfig,
     };
     use std::collections::HashMap;
 
     /// Build a minimal Config with specified canary tokens and sensitive patterns.
     fn test_config(canary_tokens: Vec<&str>, sensitive_patterns: Vec<&str>) -> Config {
         Config {
-            version: "v1".to_string(),
-            tools: HashMap::new(),
-            block_patterns: Vec::new(),
-            canary_tokens: canary_tokens.into_iter().map(String::from).collect(),
-            sensitive_patterns: sensitive_patterns
-                .into_iter()
-                .map(|p| CompiledPattern::compile(p).unwrap())
-                .collect(),
-            untrusted_content_policy: ContentPolicy::default(),
-            trust: TrustConfig::default(),
-            engine: EngineConfig::default(),
-            environment: String::new(),
-            layers: LayerConfigs::default(),
+            policy: PolicyConfig {
+                version: "v1".to_string(),
+                tools: HashMap::new(),
+                block_patterns: Vec::new(),
+                canary_tokens: canary_tokens.into_iter().map(String::from).collect(),
+                sensitive_patterns: sensitive_patterns
+                    .into_iter()
+                    .map(|p| CompiledPattern::compile(p).unwrap())
+                    .collect(),
+                untrusted_content_policy: ContentPolicy::default(),
+                trust: TrustConfig::default(),
+                layers: LayerConfigs::default(),
+            },
+            runtime: RuntimeConfig {
+                engine: EngineConfig::default(),
+                environment: String::new(),
+            },
             contract_hash: String::new(),
         }
     }

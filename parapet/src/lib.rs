@@ -1,6 +1,7 @@
 pub mod config;
 pub mod constraint;
 pub mod engine;
+pub mod eval;
 pub mod layers;
 pub mod message;
 pub mod normalize;
