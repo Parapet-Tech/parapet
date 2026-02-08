@@ -14,6 +14,7 @@ from typing import Generator
 from parapet.header import build_baggage_header
 from parapet.sidecar import EngineState, start_engine
 from parapet.transport import patch_httpx
+from typing import Iterable
 
 __all__ = ["init", "session"]
 
@@ -43,6 +44,7 @@ def init(
     config_path: str,
     *,
     port: int = _DEFAULT_PORT,
+    extra_hosts: Iterable[str] | None = None,
 ) -> None:
     """Initialize the parapet SDK.
 
@@ -53,6 +55,8 @@ def init(
     Args:
         config_path: Path to the parapet.yaml configuration file.
         port: Port for the engine to listen on (default 9800).
+        extra_hosts: Additional LLM API hosts to intercept beyond the
+            built-in defaults (e.g., ``["api.together.xyz"]``).
 
     Raises:
         FileNotFoundError: If *config_path* does not exist.
@@ -63,8 +67,9 @@ def init(
             f"Config file not found: {config_path}"
         )
 
+    hosts = frozenset(extra_hosts) if extra_hosts else None
     start_engine(config_path=config_path, port=port, state=_engine_state)
-    patch_httpx(port=port)
+    patch_httpx(port=port, extra_hosts=hosts)
 
 
 @contextmanager

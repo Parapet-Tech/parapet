@@ -10,6 +10,9 @@
 // - L5a output redaction
 // - Streaming: tool call buffering + validation via StreamProcessor
 
+use flate2::read::{DeflateDecoder, GzDecoder};
+use std::io::Read as _;
+
 use crate::config::Config;
 use crate::constraint::{ConstraintEvaluator, DslConstraintEvaluator, ToolCallVerdict};
 use crate::layers::l3_inbound::{DefaultInboundScanner, InboundScanner, InboundVerdict};
@@ -27,6 +30,8 @@ use async_trait::async_trait;
 use axum::body::Body;
 use bytes::Bytes;
 use axum::http::{HeaderMap, Method, StatusCode};
+#[cfg(test)]
+use axum::http::Uri;
 use futures_util::stream::{Stream, StreamExt};
 use futures_util::TryStreamExt;
 use std::pin::Pin;
@@ -49,8 +54,47 @@ struct RequestContext {
 // Interfaces
 // ---------------------------------------------------------------------------
 
+/// Known LLM API hosts — the engine's own allowlist for `X-Parapet-Original-Host`.
+///
+/// Defense in depth: the SDK only sets the header for hosts in its `LLM_HOSTS`,
+/// but the engine must not blindly trust headers from arbitrary clients (curl,
+/// other SDKs). An unrecognized host would cause the engine to forward the
+/// request — including auth headers — to an attacker-controlled server.
+const KNOWN_LLM_HOSTS: &[&str] = &[
+    "api.openai.com",
+    "api.anthropic.com",
+    "api.cerebras.ai",
+    "api.groq.com",
+    "generativelanguage.googleapis.com",
+    "api.together.xyz",
+];
+
 /// Resolves the upstream base URL for a provider.
+///
+/// Two resolution paths:
+/// - `base_url_for_host`: primary path when the SDK sends `X-Parapet-Original-Host`.
+///   Supports any OpenAI-compatible provider without hardcoded knowledge.
+/// - `base_url`: fallback for zero-SDK mode (no header), maps `Provider` enum to URL.
+///
+/// Security: `is_allowed_host` gates which hosts are accepted from the header.
 pub trait UpstreamResolver: Send + Sync {
+    /// Check if a host from `X-Parapet-Original-Host` is allowed.
+    ///
+    /// Default: matches against `KNOWN_LLM_HOSTS`. Override to extend
+    /// (e.g., via env var or config).
+    fn is_allowed_host(&self, host: &str) -> bool {
+        KNOWN_LLM_HOSTS.contains(&host)
+    }
+
+    /// Resolve base URL from the original host header (primary path).
+    ///
+    /// Default: `https://{host}`. Override to intercept per-host (e.g., internal
+    /// routing, staging environments, env var overrides).
+    fn base_url_for_host(&self, host: &str) -> String {
+        format!("https://{host}")
+    }
+
+    /// Fallback: resolve base URL from provider enum (zero-SDK mode, no header).
     fn base_url(&self, provider: Provider) -> String;
 }
 
@@ -222,10 +266,20 @@ impl UpstreamClient for EngineUpstreamClient {
         // 5) Forward to upstream
         let stream = is_streaming_request(&request.body);
         let url = build_upstream_url(self.deps.resolver.as_ref(), provider, &request);
+
+        // Reverse proxy header hygiene:
+        // - x-parapet-original-host: internal routing header, not for upstream.
+        // - Host: strip client's Host header (points at 127.0.0.1:9800). reqwest
+        //   sets the correct Host from the upstream URL. This is standard reverse
+        //   proxy behavior (RFC 7230 §5.4).
+        let mut fwd_headers = request.headers.clone();
+        fwd_headers.remove("x-parapet-original-host");
+        fwd_headers.remove(reqwest::header::HOST);
+
         let http_req = HttpRequest {
             method: request.method.clone(),
             url,
-            headers: request.headers.clone(),
+            headers: fwd_headers,
             body: request.body.clone(),
             timeout_ms: self.deps.config.engine.timeout_ms,
             stream,
@@ -242,9 +296,18 @@ impl UpstreamClient for EngineUpstreamClient {
             })?;
 
         if stream {
+            // Content-Encoding on SSE is rare (providers send chunked transfer,
+            // not gzip'd SSE). Log a warning if we see it, but pass through.
+            if is_gzip(&upstream.headers) || is_deflate(&upstream.headers) {
+                tracing::warn!(
+                    request_id = %ctx.request_id,
+                    "streaming response has Content-Encoding; passing through without decompression"
+                );
+            }
             return Ok(self.handle_streaming_response(provider, upstream, &ctx));
         }
 
+        let mut resp_headers = upstream.headers;
         let body_bytes = match upstream.body {
             HttpBody::Full(b) => b,
             HttpBody::Stream(mut s) => {
@@ -257,10 +320,14 @@ impl UpstreamClient for EngineUpstreamClient {
             }
         };
 
+        // Decompress if needed so security scanning can parse the JSON.
+        // Strips Content-Encoding/Content-Length from forwarded headers.
+        let body_bytes = maybe_decompress(&mut resp_headers, body_bytes)?;
+
         let processed = self.handle_non_streaming_response(provider, &body_bytes, &ctx);
         Ok(ProxyResponse {
             status: processed.status_override.unwrap_or(upstream.status),
-            headers: upstream.headers,
+            headers: resp_headers,
             body: Body::from(processed.body),
         })
     }
@@ -596,6 +663,26 @@ impl Default for EnvUpstreamResolver {
 }
 
 impl UpstreamResolver for EnvUpstreamResolver {
+    fn is_allowed_host(&self, host: &str) -> bool {
+        if KNOWN_LLM_HOSTS.contains(&host) {
+            return true;
+        }
+        // PARAPET_EXTRA_HOSTS=api.together.xyz,api.fireworks.ai
+        if let Ok(extra) = std::env::var("PARAPET_EXTRA_HOSTS") {
+            return extra.split(',').any(|h| h.trim() == host);
+        }
+        false
+    }
+
+    fn base_url_for_host(&self, host: &str) -> String {
+        // Check PARAPET_{HOST_UPPER}_BASE_URL, e.g. PARAPET_API_CEREBRAS_AI_BASE_URL
+        let env_key = format!(
+            "PARAPET_{}_BASE_URL",
+            host.to_uppercase().replace(['.', '-'], "_")
+        );
+        std::env::var(&env_key).unwrap_or_else(|_| format!("https://{host}"))
+    }
+
     fn base_url(&self, provider: Provider) -> String {
         match provider {
             Provider::OpenAi => std::env::var("PARAPET_OPENAI_BASE_URL")
@@ -694,8 +781,82 @@ pub fn build_engine_client(config: Arc<Config>) -> EngineUpstreamClient {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Check if the response has gzip Content-Encoding.
+fn is_gzip(headers: &HeaderMap) -> bool {
+    headers
+        .get(reqwest::header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("gzip"))
+        .unwrap_or(false)
+}
+
+/// Check if the response has deflate Content-Encoding.
+fn is_deflate(headers: &HeaderMap) -> bool {
+    headers
+        .get(reqwest::header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("deflate"))
+        .unwrap_or(false)
+}
+
+/// Decompress a gzip-encoded body.
+fn decompress_gzip(body: &Bytes) -> Result<Bytes, ProxyError> {
+    let mut decoder = GzDecoder::new(&body[..]);
+    let mut decompressed = Vec::new();
+    decoder
+        .read_to_end(&mut decompressed)
+        .map_err(|e| ProxyError::UpstreamFailure(format!("gzip decompression failed: {e}")))?;
+    Ok(Bytes::from(decompressed))
+}
+
+/// Decompress a deflate-encoded body.
+fn decompress_deflate(body: &Bytes) -> Result<Bytes, ProxyError> {
+    let mut decoder = DeflateDecoder::new(&body[..]);
+    let mut decompressed = Vec::new();
+    decoder
+        .read_to_end(&mut decompressed)
+        .map_err(|e| ProxyError::UpstreamFailure(format!("deflate decompression failed: {e}")))?;
+    Ok(Bytes::from(decompressed))
+}
+
+/// Decompress body if Content-Encoding is set. Strips Content-Encoding and
+/// Content-Length from headers (body size changed after decompression).
+fn maybe_decompress(headers: &mut HeaderMap, body: Bytes) -> Result<Bytes, ProxyError> {
+    let result = if is_gzip(headers) {
+        decompress_gzip(&body)?
+    } else if is_deflate(headers) {
+        decompress_deflate(&body)?
+    } else {
+        return Ok(body);
+    };
+    headers.remove(reqwest::header::CONTENT_ENCODING);
+    headers.remove(reqwest::header::CONTENT_LENGTH);
+    Ok(result)
+}
+
 fn build_upstream_url(resolver: &dyn UpstreamResolver, provider: Provider, req: &ProxyRequest) -> String {
-    let base = resolver.base_url(provider).trim_end_matches('/').to_string();
+    // Primary: use original host from SDK header (any OpenAI-compatible provider).
+    // Validate against resolver's allowlist — defense in depth against header
+    // injection when the engine is used without the SDK (curl, other clients).
+    // Fallback: resolve from Provider enum (zero-SDK mode).
+    let base = req
+        .headers
+        .get("x-parapet-original-host")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|host| {
+            if resolver.is_allowed_host(host) {
+                Some(resolver.base_url_for_host(host))
+            } else {
+                tracing::warn!(
+                    host = host,
+                    "X-Parapet-Original-Host rejected: not in allowed hosts"
+                );
+                None
+            }
+        })
+        .unwrap_or_else(|| resolver.base_url(provider));
+
+    let base = base.trim_end_matches('/');
     let path_and_query = req
         .uri
         .path_and_query()
@@ -1167,6 +1328,247 @@ mod tests {
             err.to_string(),
             "upstream request failed: connection refused"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // build_upstream_url tests
+    // -------------------------------------------------------------------
+
+    fn proxy_request_with_header(path: &str, host: Option<&str>) -> ProxyRequest {
+        let uri: Uri = path.parse().unwrap();
+        let mut headers = HeaderMap::new();
+        if let Some(h) = host {
+            headers.insert("x-parapet-original-host", h.parse().unwrap());
+        }
+        ProxyRequest {
+            method: Method::POST,
+            uri,
+            headers,
+            body: Bytes::from_static(b"{}"),
+        }
+    }
+
+    #[test]
+    fn build_upstream_url_with_header_uses_host() {
+        let req = proxy_request_with_header(
+            "/v1/chat/completions",
+            Some("api.cerebras.ai"),
+        );
+        let url = build_upstream_url(&NoopResolver, Provider::OpenAi, &req);
+        assert_eq!(url, "https://api.cerebras.ai/v1/chat/completions");
+    }
+
+    #[test]
+    fn build_upstream_url_without_header_falls_back_to_resolver() {
+        let req = proxy_request_with_header("/v1/chat/completions", None);
+        let url = build_upstream_url(&NoopResolver, Provider::OpenAi, &req);
+        assert_eq!(url, "https://example.com/v1/chat/completions");
+    }
+
+    #[test]
+    fn build_upstream_url_with_header_uses_resolver_base_url_for_host() {
+        // A resolver that overrides base_url_for_host for staging.
+        struct StagingResolver;
+        impl UpstreamResolver for StagingResolver {
+            fn base_url_for_host(&self, host: &str) -> String {
+                if host == "api.cerebras.ai" {
+                    "https://staging.cerebras.internal".to_string()
+                } else {
+                    format!("https://{host}")
+                }
+            }
+            fn base_url(&self, _provider: Provider) -> String {
+                "https://example.com".to_string()
+            }
+        }
+
+        let req = proxy_request_with_header(
+            "/v1/chat/completions",
+            Some("api.cerebras.ai"),
+        );
+        let url = build_upstream_url(&StagingResolver, Provider::OpenAi, &req);
+        assert_eq!(url, "https://staging.cerebras.internal/v1/chat/completions");
+    }
+
+    #[test]
+    fn env_upstream_resolver_base_url_for_host_default() {
+        let resolver = EnvUpstreamResolver::new();
+        // Without env var set, defaults to https://{host}
+        let url = resolver.base_url_for_host("api.groq.com");
+        assert_eq!(url, "https://api.groq.com");
+    }
+
+    #[test]
+    fn env_upstream_resolver_base_url_for_host_with_env_override() {
+        let resolver = EnvUpstreamResolver::new();
+        std::env::set_var("PARAPET_API_GROQ_COM_BASE_URL", "https://groq.staging.internal");
+        let url = resolver.base_url_for_host("api.groq.com");
+        std::env::remove_var("PARAPET_API_GROQ_COM_BASE_URL");
+        assert_eq!(url, "https://groq.staging.internal");
+    }
+
+    // -------------------------------------------------------------------
+    // Host allowlist tests (defense in depth)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn disallowed_host_header_falls_back_to_provider_resolver() {
+        // evil.com is not in KNOWN_LLM_HOSTS — header must be rejected.
+        let req = proxy_request_with_header(
+            "/v1/chat/completions",
+            Some("evil.com"),
+        );
+        let url = build_upstream_url(&NoopResolver, Provider::OpenAi, &req);
+        // Falls back to NoopResolver.base_url() → "https://example.com"
+        assert_eq!(url, "https://example.com/v1/chat/completions");
+    }
+
+    #[test]
+    fn allowed_host_header_is_accepted() {
+        let req = proxy_request_with_header(
+            "/v1/chat/completions",
+            Some("api.groq.com"),
+        );
+        let url = build_upstream_url(&NoopResolver, Provider::OpenAi, &req);
+        assert_eq!(url, "https://api.groq.com/v1/chat/completions");
+    }
+
+    #[test]
+    fn env_extra_hosts_extends_allowlist() {
+        let resolver = EnvUpstreamResolver::new();
+        assert!(!resolver.is_allowed_host("api.fireworks.ai"));
+
+        std::env::set_var("PARAPET_EXTRA_HOSTS", "api.fireworks.ai,api.custom.dev");
+        assert!(resolver.is_allowed_host("api.fireworks.ai"));
+        assert!(resolver.is_allowed_host("api.custom.dev"));
+        // Known hosts still allowed
+        assert!(resolver.is_allowed_host("api.openai.com"));
+        // Random host still blocked
+        assert!(!resolver.is_allowed_host("evil.com"));
+        std::env::remove_var("PARAPET_EXTRA_HOSTS");
+    }
+
+    #[test]
+    fn default_is_allowed_host_rejects_unknown() {
+        // NoopResolver gets the default is_allowed_host from the trait.
+        assert!(NoopResolver.is_allowed_host("api.openai.com"));
+        assert!(NoopResolver.is_allowed_host("api.cerebras.ai"));
+        assert!(!NoopResolver.is_allowed_host("evil.com"));
+        assert!(!NoopResolver.is_allowed_host("api.openai.com.evil.com"));
+    }
+
+    // -------------------------------------------------------------------
+    // Decompression tests
+    // -------------------------------------------------------------------
+
+    fn gzip_compress(data: &[u8]) -> Vec<u8> {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn deflate_compress(data: &[u8]) -> Vec<u8> {
+        use flate2::write::DeflateEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn is_gzip_detects_gzip_encoding() {
+        let mut headers = HeaderMap::new();
+        headers.insert(reqwest::header::CONTENT_ENCODING, "gzip".parse().unwrap());
+        assert!(is_gzip(&headers));
+    }
+
+    #[test]
+    fn is_gzip_case_insensitive() {
+        let mut headers = HeaderMap::new();
+        headers.insert(reqwest::header::CONTENT_ENCODING, "Gzip".parse().unwrap());
+        assert!(is_gzip(&headers));
+    }
+
+    #[test]
+    fn is_gzip_false_for_identity() {
+        let mut headers = HeaderMap::new();
+        headers.insert(reqwest::header::CONTENT_ENCODING, "identity".parse().unwrap());
+        assert!(!is_gzip(&headers));
+    }
+
+    #[test]
+    fn is_gzip_false_for_no_header() {
+        let headers = HeaderMap::new();
+        assert!(!is_gzip(&headers));
+    }
+
+    #[test]
+    fn decompress_gzip_recovers_json() {
+        let json = r#"{"choices":[{"message":{"content":"hello"}}]}"#;
+        let compressed = gzip_compress(json.as_bytes());
+        let result = decompress_gzip(&Bytes::from(compressed)).unwrap();
+        assert_eq!(&result[..], json.as_bytes());
+    }
+
+    #[test]
+    fn decompress_deflate_recovers_json() {
+        let json = r#"{"choices":[{"message":{"content":"hello"}}]}"#;
+        let compressed = deflate_compress(json.as_bytes());
+        let result = decompress_deflate(&Bytes::from(compressed)).unwrap();
+        assert_eq!(&result[..], json.as_bytes());
+    }
+
+    #[test]
+    fn maybe_decompress_strips_headers_on_gzip() {
+        let json = r#"{"ok":true}"#;
+        let compressed = gzip_compress(json.as_bytes());
+        let mut headers = HeaderMap::new();
+        headers.insert(reqwest::header::CONTENT_ENCODING, "gzip".parse().unwrap());
+        headers.insert(reqwest::header::CONTENT_LENGTH, "999".parse().unwrap());
+
+        let result = maybe_decompress(&mut headers, Bytes::from(compressed)).unwrap();
+        assert_eq!(&result[..], json.as_bytes());
+        assert!(headers.get(reqwest::header::CONTENT_ENCODING).is_none());
+        assert!(headers.get(reqwest::header::CONTENT_LENGTH).is_none());
+    }
+
+    #[test]
+    fn maybe_decompress_passthrough_no_encoding() {
+        let body = Bytes::from_static(b"plain text");
+        let mut headers = HeaderMap::new();
+        let result = maybe_decompress(&mut headers, body.clone()).unwrap();
+        assert_eq!(result, body);
+    }
+
+    #[test]
+    fn non_streaming_gzip_response_still_scannable() {
+        // Full integration: gzip'd response body with L5a redaction
+        let json = r#"{"choices":[{"message":{"content":"my secret SSN 123-45-6789"}}]}"#;
+        let compressed = gzip_compress(json.as_bytes());
+
+        let mut config = base_config_with_sensitive(r"\d{3}-\d{2}-\d{4}");
+        config.layers.l5a = Some(LayerConfig {
+            mode: "redact".to_string(),
+            block_action: None,
+            window_chars: None,
+        });
+        let engine = engine_with_config(config);
+
+        // Simulate: decompress first (as forward() does), then scan
+        let mut headers = HeaderMap::new();
+        headers.insert(reqwest::header::CONTENT_ENCODING, "gzip".parse().unwrap());
+        let decompressed = maybe_decompress(&mut headers, Bytes::from(compressed)).unwrap();
+
+        let ctx = test_ctx();
+        let processed = engine.handle_non_streaming_response(Provider::OpenAi, &decompressed, &ctx);
+
+        let output = String::from_utf8_lossy(&processed.body);
+        assert!(!output.contains("123-45-6789"));
+        assert!(output.contains("[REDACTED]"));
     }
 }
 
