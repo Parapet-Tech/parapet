@@ -167,6 +167,12 @@ cargo run --bin parapet-eval -- \
 - **Engine down** (connection refused) -- failopen, request goes directly to provider, warning logged.
 - **Engine slow** (timeout) -- failclosed, error returned.
 
+> **SDK failopen risk**: When using the Python SDK in sidecar mode, if the engine process crashes or fails to start, the SDK falls back to sending requests directly to the LLM provider with **no scanning**. Monitor engine health in production. For maximum protection, use zero-SDK mode with network rules that force all LLM traffic through the proxy.
+
+## Known limitations
+
+- **Compressed streaming responses**: When an upstream provider returns a streaming response with `Content-Encoding: gzip` or `deflate`, individual SSE chunks cannot be decompressed in isolation. In this case, L5a redaction may not catch sensitive patterns that span chunk boundaries. Non-streaming responses and uncompressed streaming responses are fully scanned. Most LLM providers do not compress SSE streams.
+
 ## Building from source
 
 ```bash

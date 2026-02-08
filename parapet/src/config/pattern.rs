@@ -1,8 +1,12 @@
 use std::fmt;
 
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 
 use super::error::ConfigError;
+
+/// Maximum compiled regex size (1 MB). Prevents pathological patterns
+/// from consuming excessive memory at startup.
+const MAX_REGEX_SIZE: usize = 1024 * 1024;
 
 /// A pre-compiled regex pattern. Wraps `regex::Regex` with the original
 /// pattern string preserved for debugging/display.
@@ -15,10 +19,13 @@ pub struct CompiledPattern {
 impl CompiledPattern {
     /// Compile a regex pattern, returning `ConfigError::InvalidRegex` on failure.
     pub fn compile(pattern: &str) -> Result<Self, ConfigError> {
-        let regex = Regex::new(pattern).map_err(|e| ConfigError::InvalidRegex {
-            pattern: pattern.to_string(),
-            source: e,
-        })?;
+        let regex = RegexBuilder::new(pattern)
+            .size_limit(MAX_REGEX_SIZE)
+            .build()
+            .map_err(|e| ConfigError::InvalidRegex {
+                pattern: pattern.to_string(),
+                source: e,
+            })?;
         Ok(Self {
             pattern: pattern.to_string(),
             regex,

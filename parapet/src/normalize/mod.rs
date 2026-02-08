@@ -216,6 +216,14 @@ fn remove_invisible_chars(input: &str) -> String {
     input.chars().filter(|c| !is_invisible(*c)).collect()
 }
 
+/// Apply NFKC normalization and strip invisible characters (no HTML stripping).
+/// Used for security-critical string comparisons (e.g., constraint predicates)
+/// where Unicode tricks could bypass checks.
+pub fn normalize_for_comparison(input: &str) -> String {
+    let nfkc: String = input.nfkc().collect();
+    remove_invisible_chars(&nfkc)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
