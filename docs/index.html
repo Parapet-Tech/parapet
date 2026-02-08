@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Parapet is an open-source LLM security proxy that stops prompt injection, tool abuse, and data exfiltration before they reach your model.">
+    <title>Parapet — LLM Security Proxy</title>
+    <link rel="canonical" href="https://parapet.tech/">
+    <meta property="og:title" content="Parapet — LLM Security Proxy">
+    <meta property="og:description" content="Stop prompt injection before it reaches your LLM. Open-source proxy firewall with layered defense, config-driven via YAML.">
+    <meta property="og:url" content="https://parapet.tech/">
+    <meta property="og:type" content="website">
+    <meta property="og:site_name" content="Parapet">
+    <meta property="og:image" content="https://parapet.tech/imgs/pp6.png">
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="Parapet — LLM Security Proxy">
+    <meta name="twitter:description" content="Stop prompt injection before it reaches your LLM. Open-source proxy firewall with layered defense.">
+    <meta name="twitter:image" content="https://parapet.tech/imgs/pp6.png">
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "SoftwareApplication",
+      "name": "Parapet",
+      "applicationCategory": "SecurityApplication",
+      "description": "Open-source LLM security proxy that stops prompt injection, tool abuse, and data exfiltration.",
+      "url": "https://parapet.tech/",
+      "operatingSystem": "Cross-platform",
+      "offers": {
+        "@type": "Offer",
+        "price": "0",
+        "priceCurrency": "USD"
+      }
+    }
+    </script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="parapet.css">
+</head>
+<body>
+
+    <!-- Nav -->
+    <nav aria-label="Main navigation">
+        <span class="nav-brand">parapet</span>
+        <ul class="nav-links">
+            <li><a href="#how-it-works">How It Works</a></li>
+            <li><a href="#quickstart">Quickstart</a></li>
+            <li><a href="https://github.com/Parapet-Tech/parapet" aria-label="Parapet on GitHub">GitHub</a></li>
+        </ul>
+    </nav>
+
+    <main>
+
+    <!-- Hero -->
+    <section class="hero" id="hero">
+        <img src="imgs/p1.png" alt="" class="hero-bg" role="presentation">
+        <div class="container">
+            <p class="hero-label">Open-source LLM security</p>
+            <h1>Stop prompt injection <em>before</em> it reaches your LLM</h1>
+            <p class="hero-sub">Parapet is a transparent proxy firewall that scans every request and response for prompt injection, tool abuse, and data exfiltration. Config-driven. Self-hosted. No code changes.</p>
+            <div class="hero-install">
+                <span aria-hidden="true">$</span>
+                <code>pip install parapet</code>
+            </div>
+            <div class="hero-ctas">
+                <a href="https://github.com/Parapet-Tech/parapet" class="btn btn-primary">View on GitHub</a>
+                <a href="#quickstart" class="btn btn-secondary">Get Started</a>
+            </div>
+        </div>
+    </section>
+
+    <!-- Problem -->
+    <section id="problem">
+        <div class="container">
+            <p class="section-label">The Problem</p>
+            <h2>LLMs trust everything they read</h2>
+            <p class="section-desc">Your model can't tell the difference between your instructions and an attacker's. Every tool call, every retrieved document, every user message is an attack surface.</p>
+            <div class="stats-grid">
+                <div class="stat">
+                    <div class="stat-number">0</div>
+                    <div class="stat-label">LLM providers offer built-in prompt injection protection at the API level</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-number">5 min</div>
+                    <div class="stat-label">from install to your first blocked attack with Parapet</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-number">40+</div>
+                    <div class="stat-label">academic papers on LLM security inform Parapet's defense layers</div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- How It Works — Layer Pipeline -->
+    <section id="how-it-works">
+        <div class="container">
+            <p class="section-label">How It Works</p>
+            <h2>Layered defense in the request pipeline</h2>
+            <p class="section-desc">Parapet sits between your app and the LLM provider. Every message passes through a stack of security layers before it reaches the model — and again before the response reaches your app.</p>
+            <div class="pipeline-roundtrip" role="img" aria-label="Request pipeline: Your App sends a request through L0 Normalize, L3 Inbound Block, then to the LLM Provider. The response passes through L3 Outbound Constrain and L5a Redact before returning to your app.">
+                <div class="pipeline-row-label">Request</div>
+                <div class="pipeline-row">
+                    <div class="pipeline-node node-start">
+                        <div class="pipeline-node-name">Your App</div>
+                        <div class="pipeline-node-desc">SDK intercepts</div>
+                    </div>
+                    <div class="pipeline-arrow" aria-hidden="true">&#8594;</div>
+                    <div class="pipeline-node">
+                        <div class="pipeline-node-label">L0</div>
+                        <div class="pipeline-node-name">Normalize</div>
+                        <div class="pipeline-node-desc">Strip encoding tricks</div>
+                    </div>
+                    <div class="pipeline-arrow" aria-hidden="true">&#8594;</div>
+                    <div class="pipeline-node node-blocked">
+                        <div class="pipeline-node-label">L3 Inbound</div>
+                        <div class="pipeline-node-name">Block</div>
+                        <div class="pipeline-node-desc">Pattern &amp; injection scan</div>
+                    </div>
+                    <div class="pipeline-arrow" aria-hidden="true">&#8594;</div>
+                    <div class="pipeline-node node-end">
+                        <div class="pipeline-node-name">LLM Provider</div>
+                        <div class="pipeline-node-desc">OpenAI, Anthropic, etc.</div>
+                    </div>
+                </div>
+                <div class="pipeline-row-label">Response</div>
+                <div class="pipeline-row">
+                    <div class="pipeline-node node-start">
+                        <div class="pipeline-node-name">Your App</div>
+                        <div class="pipeline-node-desc">Clean response</div>
+                    </div>
+                    <div class="pipeline-arrow" aria-hidden="true">&#8592;</div>
+                    <div class="pipeline-node">
+                        <div class="pipeline-node-label">L5a</div>
+                        <div class="pipeline-node-name">Redact</div>
+                        <div class="pipeline-node-desc">Strip secrets from output</div>
+                    </div>
+                    <div class="pipeline-arrow" aria-hidden="true">&#8592;</div>
+                    <div class="pipeline-node node-blocked">
+                        <div class="pipeline-node-label">L3 Outbound</div>
+                        <div class="pipeline-node-name">Constrain</div>
+                        <div class="pipeline-node-desc">Tool &amp; action limits</div>
+                    </div>
+                    <div class="pipeline-arrow" aria-hidden="true">&#8592;</div>
+                    <div class="pipeline-node node-end">
+                        <div class="pipeline-node-name">LLM Provider</div>
+                        <div class="pipeline-node-desc">Returns response</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Config -->
+    <section id="config">
+        <div class="container">
+            <p class="section-label">Config-Driven</p>
+            <h2>Define your security policy in YAML</h2>
+            <p class="section-desc">No SDKs to wire up, no code to change. Write a policy file, point Parapet at it, and every request is scanned.</p>
+            <figure class="code-block" aria-labelledby="code-filename">
+                <div class="code-header">
+                    <span class="code-filename" id="code-filename">parapet.yaml</span>
+                    <span class="code-lang">yaml</span>
+                </div>
+                <pre><code><span class="syn-comment"># Block known injection patterns in all messages</span>
+<span class="syn-key">block_patterns</span>:
+  <span class="syn-str">"ignore previous instructions"</span>
+  <span class="syn-str">"ignore all previous"</span>
+  <span class="syn-str">"disregard your instructions"</span>
+  <span class="syn-str">"override your instructions"</span>
+  <span class="syn-str">"jailbreak"</span>
+  <span class="syn-str">"act as if you have no restrictions"</span>
+
+<span class="syn-comment"># Constrain dangerous tools</span>
+<span class="syn-key">tools</span>:
+  <span class="syn-key">run_command</span>:
+    <span class="syn-key">allowed</span>: <span class="syn-val">true</span>
+    <span class="syn-key">constraints</span>:
+      <span class="syn-key">command</span>:
+        <span class="syn-key">not_contains</span>:
+          - <span class="syn-danger">"rm -rf /"</span>
+          - <span class="syn-danger">"curl -d"</span>
+          - <span class="syn-danger">"| bash"</span>
+          - <span class="syn-danger">"/dev/tcp/"</span>
+
+<span class="syn-comment"># Redact secrets from LLM output</span>
+<span class="syn-key">sensitive_patterns</span>:
+  - <span class="syn-str">"sk-[a-zA-Z0-9]{20,}"</span>
+  - <span class="syn-str">"-----BEGIN.*PRIVATE KEY-----"</span>
+  - <span class="syn-str">"ghp_[a-zA-Z0-9]{36}"</span></code></pre>
+            </figure>
+        </div>
+    </section>
+
+    <!-- Quickstart -->
+    <section id="quickstart">
+        <div class="container">
+            <p class="section-label">Quickstart</p>
+            <h2>Five minutes to your first blocked attack</h2>
+            <div class="steps">
+                <div class="step">
+                    <div class="step-number">Step 1</div>
+                    <h3>Install</h3>
+                    <p>Parapet works with any OpenAI-compatible provider.</p>
+                    <code>pip install parapet</code>
+                </div>
+                <div class="step">
+                    <div class="step-number">Step 2</div>
+                    <h3>Configure</h3>
+                    <p>Write a YAML policy. Start from an example or build your own.</p>
+                    <code>parapet init</code>
+                </div>
+                <div class="step">
+                    <div class="step-number">Step 3</div>
+                    <h3>Run</h3>
+                    <p>Parapet monkey-patches httpx. No code changes needed.</p>
+                    <code>parapet run -- python app.py</code>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Architecture -->
+    <section id="architecture">
+        <div class="container">
+            <p class="section-label">Architecture</p>
+            <h2>Transparent interception, zero code changes</h2>
+            <div class="arch-diagram">
+                <div class="arch-box">
+                    <div class="arch-box-label">Your App</div>
+                    <div class="arch-box-name">Python + httpx</div>
+                </div>
+                <div class="arch-arrow" aria-hidden="true">&#8594;</div>
+                <div class="arch-box arch-parapet">
+                    <div class="arch-box-label">Parapet SDK</div>
+                    <div class="arch-box-name">Intercept &amp; Scan</div>
+                </div>
+                <div class="arch-arrow" aria-hidden="true">&#8594;</div>
+                <div class="arch-box">
+                    <div class="arch-box-label">Parapet Engine</div>
+                    <div class="arch-box-name">Rust (fast path)</div>
+                </div>
+                <div class="arch-arrow" aria-hidden="true">&#8594;</div>
+                <div class="arch-box">
+                    <div class="arch-box-label">LLM Provider</div>
+                    <div class="arch-box-name">OpenAI / Anthropic / etc.</div>
+                </div>
+            </div>
+            <p class="arch-desc">The Python SDK monkey-patches <code>httpx</code> to intercept outgoing requests. The Rust engine runs all security layers in microseconds. Your app never knows Parapet is there.</p>
+        </div>
+    </section>
+
+    <!-- Features -->
+    <section id="features">
+        <div class="container">
+            <p class="section-label">Defense Layers</p>
+            <h2>What Parapet catches</h2>
+            <div class="features-grid">
+                <div class="feature">
+                    <h3>Prompt Injection</h3>
+                    <p>Pattern matching against known injection signatures: "ignore previous instructions," jailbreaks, persona hijacks. Scanned after Unicode normalization to defeat encoding tricks.</p>
+                </div>
+                <div class="feature">
+                    <h3>Tool Abuse</h3>
+                    <p>Per-tool constraints on arguments. Block path traversal in file tools, dangerous commands in shell tools, SSRF in web tools. Allowlists and denylists per tool name.</p>
+                </div>
+                <div class="feature">
+                    <h3>Data Exfiltration</h3>
+                    <p>Redact API keys, private keys, and secrets from LLM output. Regex-based pattern matching catches keys even if the model tries to encode or obfuscate them.</p>
+                </div>
+                <div class="feature">
+                    <h3>Canary Tokens</h3>
+                    <p>Inject canary strings into system prompts. If they appear in output, your system prompt is leaking. Detect exfiltration attempts that bypass pattern matching.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Trust / Research -->
+    <section id="research">
+        <div class="container">
+            <p class="section-label">Research-Backed</p>
+            <h2>Built on the literature, not on vibes</h2>
+            <p class="section-desc">Parapet's defense layers are grounded in published academic research on LLM security, prompt injection, and adversarial attacks on language models.</p>
+            <div class="trust-badges">
+                <div class="trust-badge">
+                    <div class="trust-badge-icon" aria-hidden="true">&#128218;</div>
+                    <div class="trust-badge-text">
+                        <strong>40+ Papers</strong>
+                        Research corpus on prompt injection, tool abuse, and LLM adversarial attacks
+                    </div>
+                </div>
+                <div class="trust-badge">
+                    <div class="trust-badge-icon" aria-hidden="true">&#128275;</div>
+                    <div class="trust-badge-text">
+                        <strong>Open Source</strong>
+                        Free deterministic layers, self-hosted, no data leaves your infrastructure
+                    </div>
+                </div>
+                <div class="trust-badge">
+                    <div class="trust-badge-icon" aria-hidden="true">&#9889;</div>
+                    <div class="trust-badge-text">
+                        <strong>Rust Engine</strong>
+                        Microsecond scanning on the fast path, no latency added to your requests
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- CTA -->
+    <section class="cta-section" id="cta">
+        <div class="container">
+            <h2>Your LLM deserves a wall</h2>
+            <p>Parapet is free, open source, and takes five minutes to set up.</p>
+            <div class="hero-ctas">
+                <a href="https://github.com/Parapet-Tech/parapet" class="btn btn-primary">View on GitHub</a>
+                <a href="#quickstart" class="btn btn-secondary">Read the Quickstart</a>
+            </div>
+        </div>
+    </section>
+
+    </main>
+
+    <!-- Footer -->
+    <footer>
+        <p>
+            <a href="https://github.com/Parapet-Tech/parapet">GitHub</a> &middot;
+            <a href="mailto:contact@parapet.tech">Contact</a> &middot;
+            MIT License
+        </p>
+    </footer>
+
+</body>
+</html>
