@@ -7,5 +7,5 @@ pub mod message;
 pub mod normalize;
 pub mod provider;
 pub mod proxy;
-pub mod stream;
+pub(crate) mod stream;
 pub mod trust;

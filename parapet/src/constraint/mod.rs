@@ -218,12 +218,12 @@ fn check_predicates(
     // 6. max_length
     if let Some(max_len) = constraints.max_length {
         match string_value {
-            Some(s) if s.len() <= max_len => {}
+            Some(s) if s.chars().count() <= max_len => {}
             Some(s) => {
                 return Some(format!(
                     "argument \"{}\" length {} exceeds maximum {}",
                     arg_name,
-                    s.len(),
+                    s.chars().count(),
                     max_len
                 ));
             }

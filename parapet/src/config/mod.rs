@@ -8,7 +8,7 @@ mod error;
 mod interpolation;
 mod loader;
 mod pattern;
-pub mod raw;
+pub(crate) mod raw;
 mod source;
 mod types;
 
@@ -17,7 +17,10 @@ pub use error::ConfigError;
 pub use loader::{compute_hash, load_config};
 pub use pattern::CompiledPattern;
 pub use source::{ConfigSource, FileSource, StringSource};
-pub use types::*;
+pub use types::{
+    ArgumentConstraints, Config, ContentPolicy, EngineConfig, FailureMode, LayerConfig,
+    LayerConfigs, PolicyConfig, RuntimeConfig, ToolConfig, TrustConfig,
+};
 
 // ---------------------------------------------------------------------------
 // Tests

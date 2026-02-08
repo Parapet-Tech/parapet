@@ -315,6 +315,12 @@ impl UpstreamClient for EngineUpstreamClient {
                 while let Some(chunk) = s.next().await {
                     let bytes = chunk.map_err(|e| ProxyError::UpstreamFailure(e.to_string()))?;
                     collected.extend_from_slice(&bytes);
+                    if collected.len() as u64 > MAX_RESPONSE_BODY_BYTES {
+                        return Err(ProxyError::UpstreamFailure(format!(
+                            "response body exceeds {} byte limit",
+                            MAX_RESPONSE_BODY_BYTES
+                        )));
+                    }
                 }
                 Bytes::from(collected)
             }
@@ -799,23 +805,45 @@ fn is_deflate(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
+/// Maximum response body size for non-streaming collection (10 MB).
+/// Prevents unbounded memory growth from large upstream responses.
+const MAX_RESPONSE_BODY_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Maximum decompressed response body size (50 MB).
+/// Prevents decompression bombs from causing OOM.
+const MAX_DECOMPRESSED_BYTES: u64 = 50 * 1024 * 1024;
+
 /// Decompress a gzip-encoded body.
 fn decompress_gzip(body: &Bytes) -> Result<Bytes, ProxyError> {
-    let mut decoder = GzDecoder::new(&body[..]);
+    let decoder = GzDecoder::new(&body[..]);
+    let mut limited = decoder.take(MAX_DECOMPRESSED_BYTES + 1);
     let mut decompressed = Vec::new();
-    decoder
+    limited
         .read_to_end(&mut decompressed)
         .map_err(|e| ProxyError::UpstreamFailure(format!("gzip decompression failed: {e}")))?;
+    if decompressed.len() as u64 > MAX_DECOMPRESSED_BYTES {
+        return Err(ProxyError::UpstreamFailure(format!(
+            "decompressed body exceeds {} byte limit",
+            MAX_DECOMPRESSED_BYTES
+        )));
+    }
     Ok(Bytes::from(decompressed))
 }
 
 /// Decompress a deflate-encoded body.
 fn decompress_deflate(body: &Bytes) -> Result<Bytes, ProxyError> {
-    let mut decoder = DeflateDecoder::new(&body[..]);
+    let decoder = DeflateDecoder::new(&body[..]);
+    let mut limited = decoder.take(MAX_DECOMPRESSED_BYTES + 1);
     let mut decompressed = Vec::new();
-    decoder
+    limited
         .read_to_end(&mut decompressed)
         .map_err(|e| ProxyError::UpstreamFailure(format!("deflate decompression failed: {e}")))?;
+    if decompressed.len() as u64 > MAX_DECOMPRESSED_BYTES {
+        return Err(ProxyError::UpstreamFailure(format!(
+            "decompressed body exceeds {} byte limit",
+            MAX_DECOMPRESSED_BYTES
+        )));
+    }
     Ok(Bytes::from(decompressed))
 }
 
