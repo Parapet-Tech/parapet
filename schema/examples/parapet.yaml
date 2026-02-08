@@ -1,0 +1,66 @@
+parapet: v1
+
+tools:
+  _default:
+    allowed: false
+  read_file:
+    allowed: true
+    trust: untrusted
+    constraints:
+      path:
+        type: string
+        starts_with: "${PROJECT_ROOT}"
+        not_contains: ["../", "..\\"]
+    result_policy:
+      max_length: 50000
+  write_file:
+    allowed: true
+    trust: untrusted
+    constraints:
+      path:
+        type: string
+        starts_with: "${PROJECT_ROOT}"
+        not_contains: ["../", "..\\"]
+  internal_lookup:
+    allowed: true
+    trust: trusted
+  exec_command:
+    allowed: false
+
+block_patterns:
+  - "ignore previous instructions"
+  - "ignore all previous"
+  - "DAN mode enabled"
+  - "ignore all safety guidelines"
+  - "you are now [A-Z]+"
+  - "jailbreak"
+
+canary_tokens:
+  - "{{CANARY_a8f3e9b1}}"
+
+sensitive_patterns:
+  - "CEREBRAS_API_KEY"
+  - "GROQ_API_KEY"
+
+untrusted_content_policy:
+  max_length: 50000
+
+trust:
+  auto_untrusted_roles: ["tool"]
+  unknown_trust_policy:
+    system: trusted
+    assistant: trusted
+    user: untrusted
+    tool: untrusted
+
+engine:
+  on_failure: open
+  timeout_ms: 5000
+
+environment: "internal"
+
+layers:
+  L0: { mode: sanitize }
+  L3_inbound: { mode: block }
+  L3_outbound: { mode: block, block_action: rewrite }
+  L5a: { mode: redact }

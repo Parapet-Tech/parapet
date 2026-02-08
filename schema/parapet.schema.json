@@ -1,0 +1,235 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parapet.dev/schema/v1/parapet.schema.json",
+  "title": "Parapet Contract v1",
+  "description": "JSON Schema for parapet.yaml — the v1 contract file that defines tool policies, block patterns, trust rules, and layer configuration for the Parapet LLM proxy.",
+  "type": "object",
+  "required": ["parapet", "tools"],
+  "additionalProperties": false,
+  "properties": {
+    "parapet": {
+      "description": "Contract version. Must be \"v1\".",
+      "type": "string",
+      "const": "v1"
+    },
+    "tools": {
+      "description": "Tool policies. Each key is a tool name (or \"_default\" for the fallback policy). Values define whether the tool is allowed, its trust level, argument constraints, and result policies.",
+      "type": "object",
+      "propertyNames": {
+        "type": "string",
+        "minLength": 1
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/toolPolicy"
+      }
+    },
+    "block_patterns": {
+      "description": "Patterns (literal strings or regex) scanned against ALL messages regardless of trust level. Matches cause the request to be blocked.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "canary_tokens": {
+      "description": "Canary tokens to detect in LLM output. If found in a response, the token is redacted.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "sensitive_patterns": {
+      "description": "Patterns for sensitive data (API keys, PII) to detect and redact in LLM output.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "untrusted_content_policy": {
+      "description": "Policy applied to untrusted messages. Controls maximum content length per message.",
+      "$ref": "#/$defs/contentPolicy"
+    },
+    "trust": {
+      "description": "Trust assignment rules. Controls how messages are classified as trusted or untrusted based on their role.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "auto_untrusted_roles": {
+          "description": "Roles that are automatically assigned untrusted trust level.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "unknown_trust_policy": {
+          "description": "Mapping of role names to trust levels. Used as the base trust assignment before auto_untrusted_roles overrides.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "enum": ["trusted", "untrusted"]
+          }
+        }
+      }
+    },
+    "engine": {
+      "description": "Engine runtime configuration.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "on_failure": {
+          "description": "Behavior when the engine cannot be reached. \"open\" bypasses and logs (connection refused). \"closed\" returns an error.",
+          "type": "string",
+          "enum": ["open", "closed"]
+        },
+        "timeout_ms": {
+          "description": "Request timeout in milliseconds. Must be a positive integer.",
+          "type": "integer",
+          "exclusiveMinimum": 0
+        }
+      }
+    },
+    "environment": {
+      "description": "Environment label (e.g. \"internal\", \"production\"). Informational, included in logs.",
+      "type": "string"
+    },
+    "layers": {
+      "description": "Per-layer configuration. Keys are layer identifiers (L0, L3_inbound, L3_outbound, L5a).",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "L0": {
+          "$ref": "#/$defs/layerConfig"
+        },
+        "L3_inbound": {
+          "$ref": "#/$defs/layerConfig"
+        },
+        "L3_outbound": {
+          "$ref": "#/$defs/layerConfig"
+        },
+        "L5a": {
+          "$ref": "#/$defs/layerConfig"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "toolPolicy": {
+      "description": "Policy for a single tool (or the _default fallback).",
+      "type": "object",
+      "required": ["allowed"],
+      "additionalProperties": false,
+      "properties": {
+        "allowed": {
+          "description": "Whether this tool is permitted to be called.",
+          "type": "boolean"
+        },
+        "trust": {
+          "description": "Trust level override for this tool's result messages. Overrides role-based trust assignment.",
+          "type": "string",
+          "enum": ["trusted", "untrusted"]
+        },
+        "constraints": {
+          "description": "Per-argument constraints. Each key is an argument name; the value defines predicates that the argument must satisfy.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/argumentConstraints"
+          }
+        },
+        "result_policy": {
+          "description": "Policy applied to this tool's result content. Overrides the general untrusted_content_policy for this tool.",
+          "$ref": "#/$defs/contentPolicy"
+        }
+      }
+    },
+    "argumentConstraints": {
+      "description": "Predicate constraints for a single tool argument. All specified predicates must be satisfied (AND semantics).",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "description": "Expected type of the argument value.",
+          "type": "string",
+          "enum": ["string", "number", "boolean"]
+        },
+        "starts_with": {
+          "description": "The argument value must start with this prefix. Supports variable interpolation (e.g. \"${PROJECT_ROOT}\").",
+          "type": "string"
+        },
+        "not_contains": {
+          "description": "The argument value must not contain any of these substrings.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "matches": {
+          "description": "The argument value must match this regular expression.",
+          "type": "string"
+        },
+        "one_of": {
+          "description": "The argument value must be one of these allowed values.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "max_length": {
+          "description": "Maximum allowed length of the argument value (string length).",
+          "type": "integer",
+          "minimum": 0
+        },
+        "min": {
+          "description": "Minimum allowed numeric value for the argument.",
+          "type": "number"
+        },
+        "max": {
+          "description": "Maximum allowed numeric value for the argument.",
+          "type": "number"
+        },
+        "url_host": {
+          "description": "The argument value must be a URL whose host matches one of these allowed hosts. Subdomain matching is exact (\"a.com\" does not match \"a.com.evil.com\").",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "contentPolicy": {
+      "description": "Content policy controlling message size limits.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_length": {
+          "description": "Maximum allowed content length per message in characters.",
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "layerConfig": {
+      "description": "Configuration for a single processing layer.",
+      "type": "object",
+      "required": ["mode"],
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "description": "Processing mode for this layer (e.g. \"sanitize\", \"block\", \"redact\").",
+          "type": "string"
+        },
+        "block_action": {
+          "description": "Action to take when content is blocked (e.g. \"rewrite\", \"error\"). Only applicable to layers that can block.",
+          "type": "string"
+        },
+        "window_chars": {
+          "description": "Streaming redaction window size in characters (L5a only).",
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    }
+  }
+}
