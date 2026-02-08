@@ -1,0 +1,21 @@
+# Rust
+parapet/target/
+
+# Python
+__pycache__/
+*.egg-info/
+.venv/
+*.pyc
+
+# IDE
+.idea/
+
+# Claude Code
+.claude/
+
+# Internal docs
+implement/
+
+# OS
+.DS_Store
+Thumbs.db
