@@ -1,0 +1,72 @@
+# L5a benign cases — responses that should NOT trigger redaction.
+# Contains words like "key", "secret", "token" in safe contexts.
+
+- id: "l5a-ben-001"
+  layer: l5a
+  label: benign
+  description: "Normal coding answer"
+  content: "hello"
+  mock_content: "To iterate over a dictionary, use `for key, value in dict.items()`."
+
+- id: "l5a-ben-002"
+  layer: l5a
+  label: benign
+  description: "Crypto discussion"
+  content: "hello"
+  mock_content: "A secret key in cryptography is used for symmetric encryption."
+
+- id: "l5a-ben-003"
+  layer: l5a
+  label: benign
+  description: "Token discussion"
+  content: "hello"
+  mock_content: "JWT tokens consist of a header, payload, and signature."
+
+- id: "l5a-ben-004"
+  layer: l5a
+  label: benign
+  description: "API key discussion"
+  content: "hello"
+  mock_content: "You should store API keys in environment variables, not in code."
+
+- id: "l5a-ben-005"
+  layer: l5a
+  label: benign
+  description: "Configuration tutorial"
+  content: "hello"
+  mock_content: "Set the SECRET_KEY environment variable to a random string."
+
+- id: "l5a-ben-006"
+  layer: l5a
+  label: benign
+  description: "Short key reference"
+  content: "hello"
+  mock_content: "The primary key of the table is the user_id column."
+
+- id: "l5a-ben-007"
+  layer: l5a
+  label: benign
+  description: "Token parsing"
+  content: "hello"
+  mock_content: "Parse the access token from the authorization header."
+
+- id: "l5a-ben-008"
+  layer: l5a
+  label: benign
+  description: "Private methods"
+  content: "hello"
+  mock_content: "Private methods in Python start with an underscore prefix."
+
+- id: "l5a-ben-009"
+  layer: l5a
+  label: benign
+  description: "Math result"
+  content: "hello"
+  mock_content: "The result of the computation is 42."
+
+- id: "l5a-ben-010"
+  layer: l5a
+  label: benign
+  description: "Plain text response"
+  content: "hello"
+  mock_content: "Here are the steps to deploy your application to production."

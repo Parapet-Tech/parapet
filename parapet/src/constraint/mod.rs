@@ -63,9 +63,10 @@ impl ConstraintEvaluator for DslConstraintEvaluator {
 /// Evaluate a single tool call against the config.
 fn evaluate_single(tool_call: &ToolCall, config: &Config) -> ToolCallVerdict {
     let tool_config = config
+        .policy
         .tools
         .get(&tool_call.name)
-        .or_else(|| config.tools.get("_default"));
+        .or_else(|| config.policy.tools.get("_default"));
 
     let tool_config = match tool_config {
         Some(tc) => tc,
@@ -341,16 +342,20 @@ mod tests {
     /// Build a minimal Config with the given tools map.
     fn config_with_tools(tools: HashMap<String, ToolConfig>) -> Config {
         Config {
-            version: "v1".to_string(),
-            tools,
-            block_patterns: Vec::new(),
-            canary_tokens: Vec::new(),
-            sensitive_patterns: Vec::new(),
-            untrusted_content_policy: ContentPolicy::default(),
-            trust: TrustConfig::default(),
-            engine: EngineConfig::default(),
-            environment: String::new(),
-            layers: LayerConfigs::default(),
+            policy: PolicyConfig {
+                version: "v1".to_string(),
+                tools,
+                block_patterns: Vec::new(),
+                canary_tokens: Vec::new(),
+                sensitive_patterns: Vec::new(),
+                untrusted_content_policy: ContentPolicy::default(),
+                trust: TrustConfig::default(),
+                layers: LayerConfigs::default(),
+            },
+            runtime: RuntimeConfig {
+                engine: EngineConfig::default(),
+                environment: String::new(),
+            },
             contract_hash: "sha256:test".to_string(),
         }
     }

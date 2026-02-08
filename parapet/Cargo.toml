@@ -8,6 +8,10 @@ description = "LLM proxy firewall — protective wall at the edge of a fortifica
 name = "parapet-engine"
 path = "src/main.rs"
 
+[[bin]]
+name = "parapet-eval"
+path = "src/bin/parapet_eval.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
 axum = "0.8"

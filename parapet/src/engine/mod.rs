@@ -216,14 +216,14 @@ impl UpstreamClient for EngineUpstreamClient {
             .assign_trust(&mut messages, &self.deps.config);
 
         // 3) L0 normalization (if enabled)
-        if let Some(layer) = &self.deps.config.layers.l0 {
+        if let Some(layer) = &self.deps.config.policy.layers.l0 {
             if layer.mode == "sanitize" {
                 normalize_messages(self.deps.normalizer.as_ref(), &mut messages);
             }
         }
 
         // 4) L3-inbound scanning (if enabled)
-        if let Some(layer) = &self.deps.config.layers.l3_inbound {
+        if let Some(layer) = &self.deps.config.policy.layers.l3_inbound {
             if layer.mode == "block" {
                 let l3i_start = Instant::now();
                 let inbound_verdict = self.deps.inbound_scanner.scan(&messages, &self.deps.config);
@@ -281,7 +281,7 @@ impl UpstreamClient for EngineUpstreamClient {
             url,
             headers: fwd_headers,
             body: request.body.clone(),
-            timeout_ms: self.deps.config.engine.timeout_ms,
+            timeout_ms: self.deps.config.runtime.engine.timeout_ms,
             stream,
         };
 
@@ -335,7 +335,7 @@ impl UpstreamClient for EngineUpstreamClient {
 
 impl EngineUpstreamClient {
     fn handle_streaming_response(&self, provider: Provider, upstream: HttpResponse, ctx: &RequestContext) -> ProxyResponse {
-        let (validator, block_mode) = if let Some(layer) = &self.deps.config.layers.l3_outbound {
+        let (validator, block_mode) = if let Some(layer) = &self.deps.config.policy.layers.l3_outbound {
             if layer.mode == "block" {
                 let mode = match layer.block_action.as_deref() {
                     Some("error") => ToolCallBlockMode::Error,
@@ -375,7 +375,7 @@ impl EngineUpstreamClient {
         let processor = StreamProcessor::new(classifier, validator, block_mode);
         let processed_stream = processor.process(stream);
 
-        let redacted_stream = if let Some(layer) = &self.deps.config.layers.l5a {
+        let redacted_stream = if let Some(layer) = &self.deps.config.policy.layers.l5a {
             if layer.mode == "redact" {
                 tracing::info!(
                     request_id = %ctx.request_id,
@@ -425,7 +425,7 @@ impl EngineUpstreamClient {
             }
         };
 
-        if let Some(layer) = &self.deps.config.layers.l3_outbound {
+        if let Some(layer) = &self.deps.config.policy.layers.l3_outbound {
             if layer.mode == "block" {
                 let l3o_start = Instant::now();
                 let block_action = layer.block_action.as_deref().unwrap_or("rewrite");
@@ -506,7 +506,7 @@ impl EngineUpstreamClient {
             }
         };
 
-        let redacted = if let Some(layer) = &self.deps.config.layers.l5a {
+        let redacted = if let Some(layer) = &self.deps.config.policy.layers.l5a {
             if layer.mode == "redact" {
                 let l5a_start = Instant::now();
                 let result = self.deps
@@ -941,10 +941,10 @@ fn apply_streaming_redaction(
 
 fn compute_redaction_window(config: &Config) -> usize {
     let mut max_len = 0usize;
-    for token in &config.canary_tokens {
+    for token in &config.policy.canary_tokens {
         max_len = max_len.max(token.len());
     }
-    for pattern in &config.sensitive_patterns {
+    for pattern in &config.policy.sensitive_patterns {
         max_len = max_len.max(pattern.pattern.len());
     }
     max_len = max_len.saturating_add(32);
@@ -981,8 +981,8 @@ fn head_chars(input: &str, count: usize) -> String {
 mod tests {
     use super::*;
     use crate::config::{
-        CompiledPattern, ContentPolicy, EngineConfig, LayerConfig, LayerConfigs, ToolConfig,
-        TrustConfig,
+        CompiledPattern, ContentPolicy, EngineConfig, LayerConfig, LayerConfigs, PolicyConfig,
+        RuntimeConfig, ToolConfig, TrustConfig,
     };
     use crate::message::Message;
     use futures_util::stream;
@@ -990,32 +990,40 @@ mod tests {
 
     fn base_config_with_canary(canary: &str) -> Config {
         Config {
-            version: "v1".to_string(),
-            tools: HashMap::new(),
-            block_patterns: Vec::new(),
-            canary_tokens: vec![canary.to_string()],
-            sensitive_patterns: Vec::new(),
-            untrusted_content_policy: ContentPolicy::default(),
-            trust: TrustConfig::default(),
-            engine: EngineConfig::default(),
-            environment: String::new(),
-            layers: LayerConfigs::default(),
+            policy: PolicyConfig {
+                version: "v1".to_string(),
+                tools: HashMap::new(),
+                block_patterns: Vec::new(),
+                canary_tokens: vec![canary.to_string()],
+                sensitive_patterns: Vec::new(),
+                untrusted_content_policy: ContentPolicy::default(),
+                trust: TrustConfig::default(),
+                layers: LayerConfigs::default(),
+            },
+            runtime: RuntimeConfig {
+                engine: EngineConfig::default(),
+                environment: String::new(),
+            },
             contract_hash: "sha256:test".to_string(),
         }
     }
 
     fn base_config_with_sensitive(pattern: &str) -> Config {
         Config {
-            version: "v1".to_string(),
-            tools: HashMap::new(),
-            block_patterns: Vec::new(),
-            canary_tokens: Vec::new(),
-            sensitive_patterns: vec![CompiledPattern::compile(pattern).unwrap()],
-            untrusted_content_policy: ContentPolicy::default(),
-            trust: TrustConfig::default(),
-            engine: EngineConfig::default(),
-            environment: String::new(),
-            layers: LayerConfigs::default(),
+            policy: PolicyConfig {
+                version: "v1".to_string(),
+                tools: HashMap::new(),
+                block_patterns: Vec::new(),
+                canary_tokens: Vec::new(),
+                sensitive_patterns: vec![CompiledPattern::compile(pattern).unwrap()],
+                untrusted_content_policy: ContentPolicy::default(),
+                trust: TrustConfig::default(),
+                layers: LayerConfigs::default(),
+            },
+            runtime: RuntimeConfig {
+                engine: EngineConfig::default(),
+                environment: String::new(),
+            },
             contract_hash: "sha256:test".to_string(),
         }
     }
@@ -1164,24 +1172,28 @@ mod tests {
         );
 
         Config {
-            version: "v1".to_string(),
-            tools,
-            block_patterns: Vec::new(),
-            canary_tokens: Vec::new(),
-            sensitive_patterns: Vec::new(),
-            untrusted_content_policy: ContentPolicy::default(),
-            trust: TrustConfig::default(),
-            engine: EngineConfig::default(),
-            environment: String::new(),
-            layers: LayerConfigs {
-                l0: None,
-                l3_inbound: None,
-                l3_outbound: Some(LayerConfig {
-                    mode: "block".to_string(),
-                    block_action: Some(block_action.to_string()),
-                    window_chars: None,
-                }),
-                l5a: None,
+            policy: PolicyConfig {
+                version: "v1".to_string(),
+                tools,
+                block_patterns: Vec::new(),
+                canary_tokens: Vec::new(),
+                sensitive_patterns: Vec::new(),
+                untrusted_content_policy: ContentPolicy::default(),
+                trust: TrustConfig::default(),
+                layers: LayerConfigs {
+                    l0: None,
+                    l3_inbound: None,
+                    l3_outbound: Some(LayerConfig {
+                        mode: "block".to_string(),
+                        block_action: Some(block_action.to_string()),
+                        window_chars: None,
+                    }),
+                    l5a: None,
+                },
+            },
+            runtime: RuntimeConfig {
+                engine: EngineConfig::default(),
+                environment: String::new(),
             },
             contract_hash: "sha256:test".to_string(),
         }
@@ -1401,10 +1413,12 @@ mod tests {
     #[test]
     fn env_upstream_resolver_base_url_for_host_with_env_override() {
         let resolver = EnvUpstreamResolver::new();
-        std::env::set_var("PARAPET_API_GROQ_COM_BASE_URL", "https://groq.staging.internal");
-        let url = resolver.base_url_for_host("api.groq.com");
-        std::env::remove_var("PARAPET_API_GROQ_COM_BASE_URL");
-        assert_eq!(url, "https://groq.staging.internal");
+        // Use a distinct host from env_upstream_resolver_base_url_for_host_default
+        // to avoid env var race between parallel tests.
+        std::env::set_var("PARAPET_API_MISTRAL_AI_BASE_URL", "https://mistral.staging.internal");
+        let url = resolver.base_url_for_host("api.mistral.ai");
+        std::env::remove_var("PARAPET_API_MISTRAL_AI_BASE_URL");
+        assert_eq!(url, "https://mistral.staging.internal");
     }
 
     // -------------------------------------------------------------------
@@ -1551,7 +1565,7 @@ mod tests {
         let compressed = gzip_compress(json.as_bytes());
 
         let mut config = base_config_with_sensitive(r"\d{3}-\d{2}-\d{4}");
-        config.layers.l5a = Some(LayerConfig {
+        config.policy.layers.l5a = Some(LayerConfig {
             mode: "redact".to_string(),
             block_action: None,
             window_chars: None,

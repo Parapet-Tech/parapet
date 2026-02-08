@@ -55,7 +55,7 @@ impl InboundScanner for DefaultInboundScanner {
     fn scan(&self, messages: &[Message], config: &Config) -> InboundVerdict {
         // 1) Block patterns on ALL messages (all trust levels).
         for (idx, msg) in messages.iter().enumerate() {
-            for pattern in &config.block_patterns {
+            for pattern in &config.policy.block_patterns {
                 if pattern.is_match(&msg.content) {
                     return InboundVerdict::Block(InboundBlock {
                         reason: format!("block pattern matched: {}", pattern.pattern),
@@ -94,14 +94,14 @@ impl InboundScanner for DefaultInboundScanner {
 fn policy_for_message(msg: &Message, config: &Config) -> ContentPolicy {
     if msg.role == Role::Tool {
         if let Some(tool_name) = &msg.tool_name {
-            if let Some(tool_config) = config.tools.get(tool_name) {
+            if let Some(tool_config) = config.policy.tools.get(tool_name) {
                 if let Some(policy) = &tool_config.result_policy {
                     return policy.clone();
                 }
             }
         }
     }
-    config.untrusted_content_policy.clone()
+    config.policy.untrusted_content_policy.clone()
 }
 
 // ---------------------------------------------------------------------------
@@ -111,7 +111,9 @@ fn policy_for_message(msg: &Message, config: &Config) -> ContentPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{LayerConfigs, ToolConfig, TrustConfig};
+    use crate::config::{
+        EngineConfig, LayerConfigs, PolicyConfig, RuntimeConfig, ToolConfig, TrustConfig,
+    };
     use crate::message::TrustLevel;
     use std::collections::HashMap;
 
@@ -128,19 +130,23 @@ mod tests {
         );
 
         Config {
-            version: "v1".to_string(),
-            tools,
-            block_patterns: vec![
-                crate::config::CompiledPattern::compile("ignore previous instructions").unwrap(),
-                crate::config::CompiledPattern::compile("you are now [A-Z]+").unwrap(),
-            ],
-            canary_tokens: Vec::new(),
-            sensitive_patterns: Vec::new(),
-            untrusted_content_policy: ContentPolicy { max_length: Some(10) },
-            trust: TrustConfig::default(),
-            engine: crate::config::EngineConfig::default(),
-            environment: String::new(),
-            layers: LayerConfigs::default(),
+            policy: PolicyConfig {
+                version: "v1".to_string(),
+                tools,
+                block_patterns: vec![
+                    crate::config::CompiledPattern::compile("ignore previous instructions").unwrap(),
+                    crate::config::CompiledPattern::compile("you are now [A-Z]+").unwrap(),
+                ],
+                canary_tokens: Vec::new(),
+                sensitive_patterns: Vec::new(),
+                untrusted_content_policy: ContentPolicy { max_length: Some(10) },
+                trust: TrustConfig::default(),
+                layers: LayerConfigs::default(),
+            },
+            runtime: RuntimeConfig {
+                engine: EngineConfig::default(),
+                environment: String::new(),
+            },
             contract_hash: "sha256:test".to_string(),
         }
     }
@@ -272,7 +278,7 @@ mod tests {
     #[test]
     fn per_tool_result_policy_overrides_general_policy() {
         let mut config = base_config();
-        config.tools.insert(
+        config.policy.tools.insert(
             "read_file".to_string(),
             ToolConfig {
                 allowed: true,
