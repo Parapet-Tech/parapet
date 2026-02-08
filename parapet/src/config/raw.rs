@@ -10,6 +10,7 @@ use std::collections::HashMap;
 #[derive(Debug, Deserialize)]
 pub struct RawConfig {
     pub parapet: String,
+    #[serde(default)]
     pub tools: HashMap<String, RawToolPolicy>,
     #[serde(default)]
     pub block_patterns: Vec<String>,
@@ -24,6 +25,8 @@ pub struct RawConfig {
     pub layers: Option<RawLayerConfigs>,
     /// If false, skip embedding default block patterns. Default: true.
     pub use_default_block_patterns: Option<bool>,
+    /// If false, skip embedding default sensitive patterns. Default: true.
+    pub use_default_sensitive_patterns: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]

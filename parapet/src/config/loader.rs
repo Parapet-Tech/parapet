@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 
 use crate::message::TrustLevel;
 
-use super::defaults::default_block_patterns;
+use super::defaults::{default_block_patterns, default_layer_configs, default_sensitive_patterns};
 use super::error::ConfigError;
 use super::interpolation::resolve_variables;
 use super::pattern::CompiledPattern;
@@ -36,13 +36,6 @@ pub fn load_config(source: &dyn ConfigSource) -> Result<Config, ConfigError> {
         )));
     }
 
-    // Validate tools: must have at least one entry
-    if raw.tools.is_empty() {
-        return Err(ConfigError::Validation(
-            "\"tools\" must contain at least one tool policy".to_string(),
-        ));
-    }
-
     // Build tools
     let mut tools = HashMap::with_capacity(raw.tools.len());
     for (name, raw_tool) in raw.tools {
@@ -64,12 +57,18 @@ pub fn load_config(source: &dyn ConfigSource) -> Result<Config, ConfigError> {
         .collect::<Result<Vec<_>, _>>()?;
     block_patterns.extend(user_patterns);
 
-    // Compile sensitive_patterns
-    let sensitive_patterns = raw
+    // Compile sensitive_patterns: defaults first, then user patterns
+    let mut sensitive_patterns = if raw.use_default_sensitive_patterns != Some(false) {
+        default_sensitive_patterns()
+    } else {
+        Vec::new()
+    };
+    let user_sensitive = raw
         .sensitive_patterns
         .iter()
         .map(|p| CompiledPattern::compile(p))
         .collect::<Result<Vec<_>, _>>()?;
+    sensitive_patterns.extend(user_sensitive);
 
     // Content policy
     let untrusted_content_policy = raw
@@ -229,7 +228,7 @@ fn build_engine_config(raw: Option<raw::RawEngineConfig>) -> Result<EngineConfig
 fn build_layer_configs(raw: Option<raw::RawLayerConfigs>) -> LayerConfigs {
     let raw = match raw {
         Some(r) => r,
-        None => return LayerConfigs::default(),
+        None => return default_layer_configs(),
     };
 
     LayerConfigs {

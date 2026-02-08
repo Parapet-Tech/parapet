@@ -1,0 +1,27 @@
+# Default sensitive patterns for parapet
+# Detects common API keys, secrets, and credentials in LLM output.
+# Used by L5a redaction layer.
+
+sensitive_patterns:
+  # OpenAI API keys
+  - "sk-[a-zA-Z0-9]{20,}"
+  # Anthropic API keys
+  - "sk-ant-[a-zA-Z0-9\\-]{20,}"
+  # AWS access keys
+  - "AKIA[0-9A-Z]{16}"
+  # AWS secret keys (40 char base64)
+  - "(?i)aws[_\\-]?secret[_\\-]?access[_\\-]?key[\"'=:\\s]+[A-Za-z0-9/+=]{40}"
+  # GitHub tokens
+  - "gh[pousr]_[A-Za-z0-9_]{36,}"
+  # Google API keys
+  - "AIza[0-9A-Za-z\\-_]{35}"
+  # Stripe keys
+  - "(?:sk|pk)_(?:test|live)_[a-zA-Z0-9]{20,}"
+  # PEM private keys
+  - "-----BEGIN.*PRIVATE KEY-----"
+  # Generic bearer tokens (long alphanumeric after "Bearer")
+  - "Bearer\\s+[A-Za-z0-9\\-._~+/]+=*"
+  # Slack tokens
+  - "xox[baprs]-[0-9a-zA-Z\\-]{10,}"
+  # Generic high-entropy hex secrets (64+ chars, likely API keys)
+  - "(?i)(?:api[_-]?key|secret|token|password)[\"'=:\\s]+[a-f0-9]{64,}"
