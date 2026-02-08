@@ -7,6 +7,7 @@
 
 use crate::config::{ArgumentConstraints, Config, ToolConfig};
 use crate::message::ToolCall;
+use crate::normalize::normalize_for_comparison;
 
 // ---------------------------------------------------------------------------
 // Public interface
@@ -155,12 +156,13 @@ fn check_predicates(
         }
     }
 
-    // 3. not_contains
+    // 3. not_contains (NFKC-normalized to prevent Unicode bypass)
     if let Some(ref forbidden) = constraints.not_contains {
         match string_value {
             Some(s) => {
+                let normalized = normalize_for_comparison(s);
                 for substring in forbidden {
-                    if s.contains(substring.as_str()) {
+                    if normalized.contains(substring.as_str()) {
                         return Some(format!(
                             "argument \"{}\" contains forbidden substring \"{}\"",
                             arg_name, substring
@@ -1090,6 +1092,72 @@ mod tests {
                 assert!(reason.contains("missing"), "reason: {}", reason);
             }
             ToolCallVerdict::Allow => panic!("expected Block"),
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // not_contains blocks fullwidth Unicode bypass
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn not_contains_blocks_fullwidth_unicode_bypass() {
+        // "../" using fullwidth chars: U+FF0E U+FF0E U+FF0F
+        let fullwidth_dotdotslash = "\u{FF0E}\u{FF0E}\u{FF0F}";
+        let mut constraints = HashMap::new();
+        constraints.insert(
+            "path".to_string(),
+            ArgumentConstraints {
+                not_contains: Some(vec!["../".to_string()]),
+                ..Default::default()
+            },
+        );
+        let mut tools = HashMap::new();
+        tools.insert("read_file".to_string(), tool_allowed_with_constraints(constraints));
+        let config = config_with_tools(tools);
+
+        let calls = vec![make_tool_call(
+            "read_file",
+            json!({"path": format!("/home/user/{fullwidth_dotdotslash}etc/passwd")}),
+        )];
+        let verdicts = evaluator().evaluate_tool_calls(&calls, &config);
+
+        assert_eq!(verdicts.len(), 1);
+        match &verdicts[0] {
+            ToolCallVerdict::Block { reason, .. } => {
+                assert!(reason.contains("forbidden substring"), "reason: {}", reason);
+            }
+            ToolCallVerdict::Allow => panic!("expected Block -- fullwidth '../' should be caught"),
+        }
+    }
+
+    #[test]
+    fn not_contains_blocks_invisible_char_bypass() {
+        // "../" with zero-width spaces inserted: ".\u{200B}./\u{200B}"
+        let sneaky = ".\u{200B}./";
+        let mut constraints = HashMap::new();
+        constraints.insert(
+            "path".to_string(),
+            ArgumentConstraints {
+                not_contains: Some(vec!["../".to_string()]),
+                ..Default::default()
+            },
+        );
+        let mut tools = HashMap::new();
+        tools.insert("read_file".to_string(), tool_allowed_with_constraints(constraints));
+        let config = config_with_tools(tools);
+
+        let calls = vec![make_tool_call(
+            "read_file",
+            json!({"path": format!("/home/user/{sneaky}etc/passwd")}),
+        )];
+        let verdicts = evaluator().evaluate_tool_calls(&calls, &config);
+
+        assert_eq!(verdicts.len(), 1);
+        match &verdicts[0] {
+            ToolCallVerdict::Block { reason, .. } => {
+                assert!(reason.contains("forbidden substring"), "reason: {}", reason);
+            }
+            ToolCallVerdict::Allow => panic!("expected Block -- invisible char bypass should be caught"),
         }
     }
 

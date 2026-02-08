@@ -70,13 +70,25 @@ pub enum ProxyError {
 
 impl IntoResponse for ProxyError {
     fn into_response(self) -> axum::response::Response {
-        let status = match &self {
-            ProxyError::UpstreamFailure(_) => StatusCode::BAD_GATEWAY,
-            ProxyError::UpstreamTimeout(_) => StatusCode::GATEWAY_TIMEOUT,
-            ProxyError::MalformedJson(_) => StatusCode::BAD_REQUEST,
-            ProxyError::EmptyBody => StatusCode::BAD_REQUEST,
+        let (status, public_message) = match &self {
+            ProxyError::UpstreamFailure(_) => (
+                StatusCode::BAD_GATEWAY,
+                "upstream request failed".to_string(),
+            ),
+            ProxyError::UpstreamTimeout(_) => (
+                StatusCode::GATEWAY_TIMEOUT,
+                "upstream request timed out".to_string(),
+            ),
+            ProxyError::MalformedJson(_) => (
+                StatusCode::BAD_REQUEST,
+                "request body is not valid JSON".to_string(),
+            ),
+            ProxyError::EmptyBody => (
+                StatusCode::BAD_REQUEST,
+                "request body is empty".to_string(),
+            ),
         };
-        (status, self.to_string()).into_response()
+        (status, public_message).into_response()
     }
 }
 

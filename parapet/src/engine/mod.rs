@@ -686,17 +686,52 @@ impl UpstreamResolver for EnvUpstreamResolver {
             "PARAPET_{}_BASE_URL",
             host.to_uppercase().replace(['.', '-'], "_")
         );
-        std::env::var(&env_key).unwrap_or_else(|_| format!("https://{host}"))
+        match std::env::var(&env_key) {
+            Ok(url) if url.starts_with("https://") => url,
+            Ok(url) => {
+                tracing::warn!(
+                    env_key = %env_key,
+                    url = %url,
+                    "ignoring non-HTTPS base URL override, falling back to https://{}",
+                    host,
+                );
+                format!("https://{host}")
+            }
+            Err(_) => format!("https://{host}"),
+        }
     }
 
     fn base_url(&self, provider: Provider) -> String {
-        match provider {
-            Provider::OpenAi => std::env::var("PARAPET_OPENAI_BASE_URL")
-                .or_else(|_| std::env::var("OPENAI_BASE_URL"))
-                .unwrap_or_else(|_| "https://api.openai.com".to_string()),
-            Provider::Anthropic => std::env::var("PARAPET_ANTHROPIC_BASE_URL")
-                .or_else(|_| std::env::var("ANTHROPIC_BASE_URL"))
-                .unwrap_or_else(|_| "https://api.anthropic.com".to_string()),
+        let (primary_key, fallback_key, default_url) = match provider {
+            Provider::OpenAi => (
+                "PARAPET_OPENAI_BASE_URL",
+                Some("OPENAI_BASE_URL"),
+                "https://api.openai.com",
+            ),
+            Provider::Anthropic => (
+                "PARAPET_ANTHROPIC_BASE_URL",
+                Some("ANTHROPIC_BASE_URL"),
+                "https://api.anthropic.com",
+            ),
+        };
+
+        let url = std::env::var(primary_key)
+            .or_else(|_| {
+                fallback_key
+                    .map(std::env::var)
+                    .unwrap_or(Err(std::env::VarError::NotPresent))
+            })
+            .unwrap_or_else(|_| default_url.to_string());
+
+        if url.starts_with("https://") {
+            url
+        } else {
+            tracing::warn!(
+                url = %url,
+                "ignoring non-HTTPS base URL override for {:?}, using default",
+                provider,
+            );
+            default_url.to_string()
         }
     }
 }
@@ -913,7 +948,15 @@ fn is_streaming_request(body: &Bytes) -> bool {
 fn stream_body(
     stream: impl Stream<Item = Result<Bytes, HttpError>> + Send + 'static,
 ) -> Pin<Box<dyn Stream<Item = Bytes> + Send>> {
-    Box::pin(stream.filter_map(|item| async move { item.ok() }))
+    Box::pin(stream.filter_map(|item| async move {
+        match item {
+            Ok(bytes) => Some(bytes),
+            Err(e) => {
+                tracing::warn!(error = %e, "dropped error chunk from upstream stream");
+                None
+            }
+        }
+    }))
 }
 
 fn apply_streaming_redaction(
@@ -973,7 +1016,10 @@ fn compute_redaction_window(config: &Config) -> usize {
         max_len = max_len.max(token.len());
     }
     for pattern in &config.policy.sensitive_patterns {
-        max_len = max_len.max(pattern.pattern.len());
+        // Regex patterns can match strings much longer than the pattern
+        // string itself (e.g. `sk-[a-zA-Z0-9]{20,}` is 22 chars but
+        // matches 23+ char strings). Use 4x pattern length as heuristic.
+        max_len = max_len.max(pattern.pattern.len().saturating_mul(4));
     }
     max_len = max_len.saturating_add(32);
     max_len.max(1024)

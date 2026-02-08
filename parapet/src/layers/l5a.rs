@@ -52,23 +52,21 @@ impl OutputScanner for L5aScanner {
         let mut redactions: Vec<Redaction> = Vec::new();
         let mut result = content.to_string();
 
-        // Pass 1: canary tokens (exact substring match).
+        // Pass 1: canary tokens (case-insensitive substring match).
         // We process one token at a time, replacing all occurrences.
-        // After each replacement the string changes length, so we
-        // collect redactions against the *original* content offsets
-        // by scanning the original first.
+        // Case-insensitive to catch LLM case variations of leaked tokens.
         for token in &config.policy.canary_tokens {
             if token.is_empty() {
                 continue;
             }
-            // Find all occurrences in the *current* result string.
-            // We track positions relative to the original content by
-            // doing a fresh search on the current result each time,
-            // but record the position in the current (partially-redacted)
-            // string. This is acceptable because the spec says
-            // `position` is informational for logging.
+            let token_lower = token.to_lowercase();
             let mut search_from = 0;
-            while let Some(pos) = result[search_from..].find(token.as_str()) {
+            loop {
+                let haystack = &result[search_from..];
+                let haystack_lower = haystack.to_lowercase();
+                let Some(pos) = haystack_lower.find(&token_lower) else {
+                    break;
+                };
                 let abs_pos = search_from + pos;
                 redactions.push(Redaction {
                     pattern: token.clone(),
@@ -337,6 +335,25 @@ mod tests {
         // Regex pass should not find "SECRET=[a-z]+" in the redacted string
         assert_eq!(result.content, "has [REDACTED] here");
         assert_eq!(result.redactions.len(), 1);
+    }
+
+    #[test]
+    fn canary_token_case_insensitive_match() {
+        let config = test_config(vec!["{{CANARY_a8f3e9b1}}"], vec![]);
+        let result = scanner().scan_and_redact(
+            "Leaked: {{canary_a8f3e9b1}} here.",
+            &config,
+        );
+        assert_eq!(result.content, "Leaked: [REDACTED] here.");
+        assert_eq!(result.redactions.len(), 1);
+    }
+
+    #[test]
+    fn canary_token_mixed_case_match() {
+        let config = test_config(vec!["SecretToken"], vec![]);
+        let result = scanner().scan_and_redact("Found SECRETTOKEN and secrettoken", &config);
+        assert_eq!(result.content, "Found [REDACTED] and [REDACTED]");
+        assert_eq!(result.redactions.len(), 2);
     }
 
     #[test]
