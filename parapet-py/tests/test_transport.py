@@ -6,6 +6,7 @@ import httpx
 import pytest
 
 from parapet.transport import (
+    DEFAULT_LLM_HOSTS,
     LLM_HOSTS,
     ParapetTransport,
     should_intercept,
@@ -137,7 +138,72 @@ class TestLLMHosts:
     """The set of known LLM hosts is correct."""
 
     def test_openai_in_hosts(self):
-        assert "api.openai.com" in LLM_HOSTS
+        assert "api.openai.com" in DEFAULT_LLM_HOSTS
 
     def test_anthropic_in_hosts(self):
-        assert "api.anthropic.com" in LLM_HOSTS
+        assert "api.anthropic.com" in DEFAULT_LLM_HOSTS
+
+
+class TestCustomHosts:
+    """Custom hosts can be added via the hosts parameter."""
+
+    def test_should_intercept_with_custom_hosts(self):
+        """Transport with custom hosts intercepts those hosts."""
+        custom_hosts = DEFAULT_LLM_HOSTS | frozenset({"api.together.xyz"})
+        transport = ParapetTransport(
+            wrapped=MagicMock(),
+            port=9800,
+            hosts=custom_hosts,
+        )
+
+        # Custom host should be intercepted
+        request = httpx.Request(
+            "POST",
+            "https://api.together.xyz/v1/chat/completions",
+            json={"model": "meta-llama/Llama-3-70b"},
+        )
+        mock_response = httpx.Response(200, json={"choices": []})
+        transport._wrapped.handle_request.return_value = mock_response
+        transport.handle_request(request)
+
+        called_request = transport._wrapped.handle_request.call_args[0][0]
+        assert called_request.url.host == "127.0.0.1"
+        assert called_request.url.port == 9800
+
+    def test_default_hosts_still_work_with_custom(self):
+        """Adding custom hosts doesn't break default host interception."""
+        custom_hosts = DEFAULT_LLM_HOSTS | frozenset({"api.together.xyz"})
+        transport = ParapetTransport(
+            wrapped=MagicMock(),
+            port=9800,
+            hosts=custom_hosts,
+        )
+
+        request = httpx.Request(
+            "POST",
+            "https://api.openai.com/v1/chat/completions",
+            json={"model": "gpt-4"},
+        )
+        mock_response = httpx.Response(200, json={"choices": []})
+        transport._wrapped.handle_request.return_value = mock_response
+        transport.handle_request(request)
+
+        called_request = transport._wrapped.handle_request.call_args[0][0]
+        assert called_request.url.host == "127.0.0.1"
+
+    def test_unknown_host_not_intercepted_with_custom(self):
+        """Hosts not in defaults or custom set are still passed through."""
+        custom_hosts = DEFAULT_LLM_HOSTS | frozenset({"api.together.xyz"})
+        transport = ParapetTransport(
+            wrapped=MagicMock(),
+            port=9800,
+            hosts=custom_hosts,
+        )
+
+        request = httpx.Request("GET", "https://example.com/api/data")
+        mock_response = httpx.Response(200, json={"ok": True})
+        transport._wrapped.handle_request.return_value = mock_response
+        transport.handle_request(request)
+
+        called_request = transport._wrapped.handle_request.call_args[0][0]
+        assert called_request.url.host == "example.com"

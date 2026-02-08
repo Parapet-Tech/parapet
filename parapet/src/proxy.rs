@@ -22,7 +22,13 @@ use std::sync::Arc;
 // Domain types
 // ---------------------------------------------------------------------------
 
-/// LLM provider detected from the request path.
+/// Wire format detected from the request path.
+///
+/// This is **not** a vendor enum — it identifies the API wire format.
+/// `OpenAi` covers any provider using the OpenAI-compatible chat completions
+/// API (Cerebras, Groq, Together, etc.). `Anthropic` covers the Anthropic
+/// messages API. Routing to the correct upstream host is handled separately
+/// by `UpstreamResolver`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
     OpenAi,

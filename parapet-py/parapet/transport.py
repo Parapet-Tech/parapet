@@ -16,6 +16,7 @@ from typing import Optional
 import httpx
 
 __all__ = [
+    "DEFAULT_LLM_HOSTS",
     "LLM_HOSTS",
     "ParapetTransport",
     "AsyncParapetTransport",
@@ -25,14 +26,21 @@ __all__ = [
 
 logger = logging.getLogger("parapet.transport")
 
-# Known LLM API hosts that should be routed through the engine.
+# Default LLM API hosts that should be routed through the engine.
 # Strict equality match -- subdomains are NOT intercepted.
-LLM_HOSTS: frozenset[str] = frozenset(
+DEFAULT_LLM_HOSTS: frozenset[str] = frozenset(
     {
         "api.openai.com",
         "api.anthropic.com",
+        # OpenAI-compatible providers
+        "api.cerebras.ai",
+        "api.groq.com",
+        "generativelanguage.googleapis.com",
     }
 )
+
+# Active host set — starts as defaults, extended by patch_httpx(extra_hosts=...).
+LLM_HOSTS: frozenset[str] = DEFAULT_LLM_HOSTS
 
 
 def should_intercept(url: httpx.URL) -> bool:
@@ -65,22 +73,33 @@ class ParapetTransport(httpx.BaseTransport):
     retried directly.
     """
 
-    def __init__(self, wrapped: httpx.BaseTransport, port: int) -> None:
+    def __init__(
+        self,
+        wrapped: httpx.BaseTransport,
+        port: int,
+        hosts: Optional[frozenset[str]] = None,
+    ) -> None:
         self._wrapped = wrapped
         self._port = port
+        self._hosts = hosts or LLM_HOSTS
 
     def handle_request(self, request: httpx.Request) -> httpx.Response:
-        if not should_intercept(request.url):
+        if request.url.host not in self._hosts:
             return self._wrapped.handle_request(request)
 
         original_url = request.url
         proxy_url = _rewrite_url(original_url, self._port)
 
         # Build a new request targeting the engine.
+        # Carry the original host so the engine can forward to the right upstream.
+        # Remove the original Host header so httpx sets it from proxy_url.
+        headers = {k: v for k, v in request.headers.items() if k.lower() != "host"}
+        headers["x-parapet-original-host"] = original_url.host
+
         proxy_request = httpx.Request(
             method=request.method,
             url=proxy_url,
-            headers=request.headers,
+            headers=headers,
             content=request.content,
             extensions=request.extensions,
         )
@@ -113,23 +132,34 @@ class AsyncParapetTransport(httpx.AsyncBaseTransport):
     Same failopen/failclosed semantics as ``ParapetTransport``.
     """
 
-    def __init__(self, wrapped: httpx.AsyncBaseTransport, port: int) -> None:
+    def __init__(
+        self,
+        wrapped: httpx.AsyncBaseTransport,
+        port: int,
+        hosts: Optional[frozenset[str]] = None,
+    ) -> None:
         self._wrapped = wrapped
         self._port = port
+        self._hosts = hosts or LLM_HOSTS
 
     async def handle_async_request(
         self, request: httpx.Request
     ) -> httpx.Response:
-        if not should_intercept(request.url):
+        if request.url.host not in self._hosts:
             return await self._wrapped.handle_async_request(request)
 
         original_url = request.url
         proxy_url = _rewrite_url(original_url, self._port)
 
+        # Carry the original host so the engine can forward to the right upstream.
+        # Remove the original Host header so httpx sets it from proxy_url.
+        headers = {k: v for k, v in request.headers.items() if k.lower() != "host"}
+        headers["x-parapet-original-host"] = original_url.host
+
         proxy_request = httpx.Request(
             method=request.method,
             url=proxy_url,
-            headers=request.headers,
+            headers=headers,
             content=request.content,
             extensions=request.extensions,
         )
@@ -155,7 +185,10 @@ class AsyncParapetTransport(httpx.AsyncBaseTransport):
         await self._wrapped.aclose()
 
 
-def patch_httpx(port: int) -> None:
+def patch_httpx(
+    port: int,
+    extra_hosts: Optional[frozenset[str]] = None,
+) -> None:
     """Monkey-patch httpx.Client and httpx.AsyncClient constructors.
 
     After this call, all newly created ``httpx.Client`` and
@@ -164,7 +197,15 @@ def patch_httpx(port: int) -> None:
 
     Args:
         port: The port the engine is listening on.
+        extra_hosts: Additional hosts to intercept beyond the defaults.
     """
+    global LLM_HOSTS
+    if extra_hosts:
+        LLM_HOSTS = DEFAULT_LLM_HOSTS | extra_hosts
+    else:
+        LLM_HOSTS = DEFAULT_LLM_HOSTS
+
+    hosts = LLM_HOSTS
     _original_client_init = httpx.Client.__init__
     _original_async_init = httpx.AsyncClient.__init__
 
@@ -174,6 +215,7 @@ def patch_httpx(port: int) -> None:
         self._transport = ParapetTransport(
             wrapped=original_transport,
             port=port,
+            hosts=hosts,
         )
 
     def _patched_async_init(
@@ -184,6 +226,7 @@ def patch_httpx(port: int) -> None:
         self._transport = AsyncParapetTransport(
             wrapped=original_transport,
             port=port,
+            hosts=hosts,
         )
 
     httpx.Client.__init__ = _patched_client_init  # type: ignore[assignment]
