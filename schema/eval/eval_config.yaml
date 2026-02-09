@@ -57,3 +57,7 @@ layers:
   L3_inbound: { mode: block }
   L3_outbound: { mode: block, block_action: rewrite }
   L5a: { mode: redact }
+  L4:
+    mode: block
+    risk_threshold: 0.7
+    min_user_turns: 2

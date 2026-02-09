@@ -169,37 +169,39 @@ pub struct LayerConfig {
     pub window_chars: Option<usize>,
 }
 
+/// L4 operating mode.
+#[derive(Debug, Clone, PartialEq)]
+pub enum L4Mode {
+    /// Log detections but don't block (calibration mode).
+    Shadow,
+    /// Actively block requests exceeding risk threshold.
+    Block,
+}
+
 /// Configuration for the L4 multi-turn scanning layer.
 #[derive(Debug, Clone)]
 pub struct L4Config {
-    /// Whether L4 multi-turn scanning is enabled.
-    pub enabled: bool,
-    /// Maximum number of history entries to retain per session.
-    pub max_history: usize,
-    /// Session TTL in seconds.
-    pub session_ttl_secs: u64,
-    /// Detector configurations.
-    pub detectors: Vec<DetectorConfig>,
+    /// Operating mode: shadow (log-only) or block (enforce).
+    pub mode: L4Mode,
+    /// Risk score threshold for blocking (0.0 - 1.0).
+    pub risk_threshold: f64,
+    /// Bonus added to cumulative score when escalation gradient detected.
+    pub escalation_bonus: f64,
+    /// Bonus added when repetition/resampling detected.
+    pub resampling_bonus: f64,
+    /// Minimum number of user turns before L4 activates.
+    pub min_user_turns: usize,
+    /// Cross-turn pattern categories with compiled regexes.
+    pub cross_turn_patterns: Vec<L4PatternCategory>,
 }
 
-/// Configuration for a single L4 detector.
+/// A category of cross-turn patterns with a weight.
 #[derive(Debug, Clone)]
-pub struct DetectorConfig {
-    /// Detector type name (e.g., "escalation", "accumulation", "tool_frequency").
-    pub name: String,
-    /// Whether this detector is enabled.
-    pub enabled: bool,
-    /// Detector-specific threshold value.
-    pub threshold: Option<f64>,
-}
-
-impl Default for L4Config {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            max_history: 50,
-            session_ttl_secs: 3600,
-            detectors: Vec::new(),
-        }
-    }
+pub struct L4PatternCategory {
+    /// Category name (e.g., "instruction_seeding", "role_confusion").
+    pub category: String,
+    /// Weight contributed to per-turn risk score when matched.
+    pub weight: f64,
+    /// Compiled regex patterns for this category.
+    pub patterns: Vec<CompiledPattern>,
 }

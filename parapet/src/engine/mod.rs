@@ -17,7 +17,8 @@ use std::io::Read as _;
 use crate::config::Config;
 use crate::constraint::{ConstraintEvaluator, DslConstraintEvaluator, ToolCallVerdict};
 use crate::layers::l3_inbound::{DefaultInboundScanner, InboundScanner, InboundVerdict};
-use crate::layers::l4::{DefaultMultiTurnScanner, L4Action, MultiTurnScanner};
+use crate::config::L4Mode;
+use crate::layers::l4::{DefaultMultiTurnScanner, L4Verdict, MultiTurnScanner};
 use crate::layers::l5a::{L5aScanner, OutputScanner};
 use crate::message::ToolCall;
 use crate::normalize::{normalize_messages_with_spans, L0Normalizer, Normalizer};
@@ -271,31 +272,15 @@ impl UpstreamClient for EngineUpstreamClient {
         }
 
         // 5) L4 multi-turn scanning (if enabled)
-        let mut l4_warning: Option<String> = None;
-        let l4_session_id: Option<String> = if self.deps.session_store.is_some() {
-            Some(extract_session_id(&request.headers))
-        } else {
-            None
-        };
-        if let (Some(scanner), Some(store)) = (&self.deps.multi_turn_scanner, &self.deps.session_store) {
-            let session_id = l4_session_id.as_deref().unwrap();
-            let session = store.get(session_id).unwrap_or_else(|| {
-                crate::session::SessionState::new(session_id)
-            });
-
+        if let (Some(scanner), Some(l4_config)) = (&self.deps.multi_turn_scanner, &self.deps.config.policy.layers.l4) {
             let l4_start = Instant::now();
-            let l4_result = scanner.scan(&messages, &session, &self.deps.config);
+            let l4_result = scanner.scan(&messages, l4_config);
             let l4_ms = l4_start.elapsed().as_secs_f64() * 1000.0;
+            let categories: Vec<&str> = l4_result.matched_categories.iter()
+                .map(|c| c.category.as_str()).collect();
 
-            // Update session state with L4 flags
-            let mut updated_session = session.clone();
-            for flag in &l4_result.updated_flags {
-                updated_session.flags.insert(flag.clone());
-            }
-            store.update(updated_session);
-
-            match &l4_result.action {
-                L4Action::Block(reason) => {
+            match &l4_result.verdict {
+                L4Verdict::Block { reason } if l4_config.mode == L4Mode::Block => {
                     tracing::info!(
                         request_id = %ctx.request_id,
                         contract_hash = %ctx.contract_hash,
@@ -303,39 +288,41 @@ impl UpstreamClient for EngineUpstreamClient {
                         model = %ctx.model,
                         layer = "L4",
                         verdict = "block",
-                        reason = %reason,
-                        detections = l4_result.detections.len(),
+                        categories = ?categories,
+                        risk_score = l4_result.risk_score,
                         latency_ms = l4_ms,
-                        "L4 multi-turn blocked"
+                        "multi-turn attack blocked"
                     );
                     let body = adapter.serialize_error(reason, 403);
                     return Ok(ProxyResponse::from_bytes(StatusCode::FORBIDDEN, body));
                 }
-                L4Action::Warn(reason) => {
+                L4Verdict::Block { .. } => {
+                    // Shadow mode: log but don't block
                     tracing::info!(
                         request_id = %ctx.request_id,
                         contract_hash = %ctx.contract_hash,
                         provider = ctx.provider_str,
                         model = %ctx.model,
                         layer = "L4",
-                        verdict = "warn",
-                        reason = %reason,
-                        detections = l4_result.detections.len(),
+                        verdict = "shadow_block",
+                        categories = ?categories,
+                        risk_score = l4_result.risk_score,
                         latency_ms = l4_ms,
-                        "L4 multi-turn warning"
+                        "multi-turn attack detected (shadow)"
                     );
-                    l4_warning = Some(reason.clone());
                 }
-                L4Action::Allow => {
-                    tracing::info!(
+                L4Verdict::Allow => {
+                    tracing::debug!(
                         request_id = %ctx.request_id,
                         contract_hash = %ctx.contract_hash,
                         provider = ctx.provider_str,
                         model = %ctx.model,
                         layer = "L4",
                         verdict = "allow",
+                        categories = ?categories,
+                        risk_score = l4_result.risk_score,
                         latency_ms = l4_ms,
-                        "L4 multi-turn allowed"
+                        "multi-turn scan complete"
                     );
                 }
             }
@@ -382,38 +369,7 @@ impl UpstreamClient for EngineUpstreamClient {
                     "streaming response has Content-Encoding; passing through without decompression"
                 );
             }
-            let mut resp = self.handle_streaming_response(provider, upstream, &ctx);
-            if let Some(warning) = &l4_warning {
-                resp.headers.insert("x-guard-warning", warning.parse().unwrap_or_else(|_| axum::http::HeaderValue::from_static("l4-warning")));
-            }
-
-            // M11: Update session after stream completes.
-            // Chain a finalizer onto the body stream that updates session state.
-            if let (Some(session_id), Some(store)) = (l4_session_id, &self.deps.session_store) {
-                let store = store.clone();
-                let max_history = self.deps.config.policy.layers.l4
-                    .as_ref()
-                    .map(|c| c.max_history)
-                    .unwrap_or(50);
-
-                let body_stream = resp.body.into_data_stream();
-                let messages_clone = messages.clone();
-                let finalized_stream = body_stream.chain(
-                    futures_util::stream::once({
-                        let store = store.clone();
-                        let session_id = session_id.clone();
-                        let messages = messages_clone;
-                        async move {
-                            update_session_after_request(
-                                store.as_ref(), &session_id, &messages, max_history,
-                            );
-                            Ok::<Bytes, axum::Error>(Bytes::new())
-                        }
-                    }),
-                );
-
-                resp.body = Body::from_stream(finalized_stream);
-            }
+            let resp = self.handle_streaming_response(provider, upstream, &ctx);
 
             return Ok(resp);
         }
@@ -442,18 +398,6 @@ impl UpstreamClient for EngineUpstreamClient {
         let body_bytes = maybe_decompress(&mut resp_headers, body_bytes)?;
 
         let processed = self.handle_non_streaming_response(provider, &body_bytes, &ctx);
-        if let Some(warning) = &l4_warning {
-            resp_headers.insert("x-guard-warning", warning.parse().unwrap_or_else(|_| axum::http::HeaderValue::from_static("l4-warning")));
-        }
-
-        // M11: Update session state after response completes
-        if let (Some(session_id), Some(store)) = (&l4_session_id, &self.deps.session_store) {
-            let max_history = self.deps.config.policy.layers.l4
-                .as_ref()
-                .map(|c| c.max_history)
-                .unwrap_or(50);
-            update_session_after_request(store.as_ref(), session_id, &messages, max_history);
-        }
 
         Ok(ProxyResponse {
             status: processed.status_override.unwrap_or(upstream.status),
@@ -927,22 +871,10 @@ impl HttpSender for ReqwestHttpSender {
 // ---------------------------------------------------------------------------
 
 pub fn build_engine_client(config: Arc<Config>) -> EngineUpstreamClient {
-    let session_store: Option<Arc<dyn crate::session::SessionStore>> =
-        if config.policy.layers.l4.as_ref().map_or(false, |c| c.enabled) {
-            let ttl = config
-                .policy
-                .layers
-                .l4
-                .as_ref()
-                .map(|c| std::time::Duration::from_secs(c.session_ttl_secs))
-                .unwrap_or(std::time::Duration::from_secs(3600));
-            Some(Arc::new(crate::session::InMemorySessionStore::new(ttl)))
-        } else {
-            None
-        };
+    let session_store: Option<Arc<dyn crate::session::SessionStore>> = None; // Sprint 2
 
     let multi_turn_scanner: Option<Arc<dyn MultiTurnScanner>> =
-        if config.policy.layers.l4.as_ref().map_or(false, |c| c.enabled) {
+        if config.policy.layers.l4.is_some() {
             Some(Arc::new(DefaultMultiTurnScanner::new()))
         } else {
             None
@@ -1100,6 +1032,7 @@ fn is_streaming_request(body: &Bytes) -> bool {
 ///
 /// W3C Baggage format: `key1=value1,key2=value2`
 /// Values are percent-encoded per RFC 3986.
+#[allow(dead_code)] // Sprint 2: session identity
 fn extract_session_id(headers: &HeaderMap) -> String {
     if let Some(baggage) = headers.get("baggage").and_then(|v| v.to_str().ok()) {
         for pair in baggage.split(',') {
@@ -1120,6 +1053,7 @@ fn extract_session_id(headers: &HeaderMap) -> String {
 }
 
 /// Simple percent-decode (handles %XX sequences).
+#[allow(dead_code)] // Sprint 2: session identity
 fn percent_decode(input: &str) -> String {
     let mut result = String::with_capacity(input.len());
     let bytes = input.as_bytes();
@@ -1157,6 +1091,7 @@ fn stream_body(
 /// Each message becomes a `HistoryEntry` with a summary of the first 200 chars
 /// and tool call names. This keeps session state lightweight while providing
 /// enough context for L4 detectors.
+#[allow(dead_code)] // Sprint 2: session state
 fn compress_to_history(messages: &[crate::message::Message]) -> Vec<crate::session::HistoryEntry> {
     messages
         .iter()
@@ -1185,6 +1120,7 @@ fn compress_to_history(messages: &[crate::message::Message]) -> Vec<crate::sessi
 ///
 /// Adds compressed history entries for the current messages,
 /// merges any L4 flags, and stores back to the session store.
+#[allow(dead_code)] // Sprint 2: session state
 fn update_session_after_request(
     store: &dyn crate::session::SessionStore,
     session_id: &str,

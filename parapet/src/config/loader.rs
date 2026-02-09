@@ -4,7 +4,9 @@ use sha2::{Digest, Sha256};
 
 use crate::message::TrustLevel;
 
-use super::defaults::{default_block_patterns, default_layer_configs, default_sensitive_patterns};
+use super::defaults::{
+    default_block_patterns, default_l4_patterns, default_layer_configs, default_sensitive_patterns,
+};
 use super::error::ConfigError;
 use super::interpolation::resolve_variables;
 use super::pattern::CompiledPattern;
@@ -85,7 +87,7 @@ pub fn load_config(source: &dyn ConfigSource) -> Result<Config, ConfigError> {
     let engine = build_engine_config(raw.engine)?;
 
     // Layers
-    let layers = build_layer_configs(raw.layers);
+    let layers = build_layer_configs(raw.layers)?;
 
     Ok(Config {
         policy: PolicyConfig {
@@ -225,13 +227,53 @@ fn build_engine_config(raw: Option<raw::RawEngineConfig>) -> Result<EngineConfig
     })
 }
 
-fn build_layer_configs(raw: Option<raw::RawLayerConfigs>) -> LayerConfigs {
+fn build_layer_configs(raw: Option<raw::RawLayerConfigs>) -> Result<LayerConfigs, ConfigError> {
     let raw = match raw {
         Some(r) => r,
-        None => return default_layer_configs(),
+        None => return Ok(default_layer_configs()),
     };
 
-    LayerConfigs {
+    let l4 = raw
+        .l4
+        .map(|l4| {
+            let mode = match l4.mode.as_str() {
+                "shadow" => L4Mode::Shadow,
+                "block" => L4Mode::Block,
+                other => {
+                    return Err(ConfigError::Validation(format!(
+                        "unknown L4 mode \"{other}\", expected \"shadow\" or \"block\""
+                    )))
+                }
+            };
+            let mut patterns = if l4.use_default_l4_patterns != Some(false) {
+                default_l4_patterns()
+            } else {
+                Vec::new()
+            };
+            for raw_cat in l4.cross_turn_patterns {
+                let compiled = raw_cat
+                    .patterns
+                    .iter()
+                    .map(|p| CompiledPattern::compile(p))
+                    .collect::<Result<Vec<_>, _>>()?;
+                patterns.push(L4PatternCategory {
+                    category: raw_cat.category,
+                    weight: raw_cat.weight,
+                    patterns: compiled,
+                });
+            }
+            Ok(L4Config {
+                mode,
+                risk_threshold: l4.risk_threshold,
+                escalation_bonus: l4.escalation_bonus,
+                resampling_bonus: l4.resampling_bonus,
+                min_user_turns: l4.min_user_turns,
+                cross_turn_patterns: patterns,
+            })
+        })
+        .transpose()?;
+
+    Ok(LayerConfigs {
         l0: raw.l0.map(|l| LayerConfig {
             mode: l.mode,
             block_action: l.block_action,
@@ -252,19 +294,6 @@ fn build_layer_configs(raw: Option<raw::RawLayerConfigs>) -> LayerConfigs {
             block_action: l.block_action,
             window_chars: l.window_chars,
         }),
-        l4: raw.l4.map(|l4| L4Config {
-            enabled: l4.enabled,
-            max_history: l4.max_history,
-            session_ttl_secs: l4.session_ttl_secs,
-            detectors: l4
-                .detectors
-                .into_iter()
-                .map(|d| DetectorConfig {
-                    name: d.name,
-                    enabled: d.enabled,
-                    threshold: d.threshold,
-                })
-                .collect(),
-        }),
-    }
+        l4,
+    })
 }

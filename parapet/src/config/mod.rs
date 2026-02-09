@@ -12,14 +12,17 @@ pub(crate) mod raw;
 mod source;
 mod types;
 
-pub use defaults::{default_block_patterns, default_layer_configs, default_sensitive_patterns};
+pub use defaults::{
+    default_block_patterns, default_l4_patterns, default_layer_configs, default_sensitive_patterns,
+};
 pub use error::ConfigError;
 pub use loader::{compute_hash, load_config};
 pub use pattern::CompiledPattern;
 pub use source::{ConfigSource, FileSource, StringSource};
 pub use types::{
-    ArgumentConstraints, Config, ContentPolicy, DetectorConfig, EngineConfig, FailureMode,
-    L4Config, LayerConfig, LayerConfigs, PolicyConfig, RuntimeConfig, ToolConfig, TrustConfig,
+    ArgumentConstraints, Config, ContentPolicy, EngineConfig, FailureMode, L4Config,
+    L4Mode, L4PatternCategory, LayerConfig, LayerConfigs, PolicyConfig, RuntimeConfig, ToolConfig,
+    TrustConfig,
 };
 
 // ---------------------------------------------------------------------------
@@ -181,7 +184,7 @@ layers:
         assert!(default_sensitive_count >= 10);
         assert_eq!(config.policy.sensitive_patterns.len(), default_sensitive_count);
 
-        // All 4 layers active
+        // All 5 layers active
         let l0 = config.policy.layers.l0.as_ref().unwrap();
         assert_eq!(l0.mode, "sanitize");
         let l3i = config.policy.layers.l3_inbound.as_ref().unwrap();
@@ -190,6 +193,8 @@ layers:
         assert_eq!(l3o.mode, "block");
         let l5a = config.policy.layers.l5a.as_ref().unwrap();
         assert_eq!(l5a.mode, "redact");
+        let l4 = config.policy.layers.l4.as_ref().unwrap();
+        assert_eq!(l4.mode, L4Mode::Shadow);
     }
 
     // ---------------------------------------------------------------
@@ -576,6 +581,7 @@ sensitive_patterns:
         assert_eq!(config.policy.layers.l3_inbound.as_ref().unwrap().mode, "block");
         assert_eq!(config.policy.layers.l3_outbound.as_ref().unwrap().mode, "block");
         assert_eq!(config.policy.layers.l5a.as_ref().unwrap().mode, "redact");
+        assert_eq!(config.policy.layers.l4.as_ref().unwrap().mode, L4Mode::Shadow);
     }
 
     #[test]
