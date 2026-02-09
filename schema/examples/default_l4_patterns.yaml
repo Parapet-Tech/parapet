@@ -1,0 +1,40 @@
+# Default cross-turn patterns for L4 multi-turn scanning.
+# Each category has a weight that contributes to per-turn risk scores.
+# Patterns are case-insensitive regexes compiled at config load time.
+
+cross_turn_patterns:
+  - category: instruction_seeding
+    weight: 0.4
+    patterns:
+      - "(?i)remember this for later"
+      - "(?i)in my next message"
+      - "(?i)when I (say|type|send) .{0,30}"
+      - "(?i)later I will (give|send|provide)"
+      - "(?i)keep this in mind"
+      - "(?i)store this (instruction|command|rule)"
+
+  - category: role_confusion
+    weight: 0.5
+    patterns:
+      - "(?i)you are now (in |)(developer|admin|debug|sudo|root|god) mode"
+      - "(?i)switch to (unrestricted|unfiltered|jailbreak|DAN)"
+      - "(?i)from now on.{0,30}(ignore|forget|disregard)"
+      - "(?i)your new (role|persona|identity|name) is"
+
+  - category: deferred_authority
+    weight: 0.3
+    patterns:
+      - "(?i)(admin|administrator|supervisor|manager) (said|told|approved|authorized)"
+      - "(?i)I have (special |elevated |admin )(permission|access|privilege)"
+      - "(?i)(override|bypass) (has been |)(authorized|granted|approved)"
+
+  - category: escalation_probing
+    weight: 0.3
+    patterns:
+      - "(?i)can you (just |)(try|attempt) (to |)(bypass|ignore|skip)"
+      - "(?i)what if (you|we) (just |)(pretend|imagine|hypothetically)"
+      - "(?i)I (need|require) you to (be more |)(flexible|open|willing)"
+
+  - category: repetition_resampling
+    weight: 0.2
+    patterns: []  # detected algorithmically, not via regex

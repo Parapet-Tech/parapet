@@ -21,6 +21,7 @@ use crate::engine::{
     HttpResponse, HttpSender, UpstreamResolver,
 };
 use crate::layers::l3_inbound::DefaultInboundScanner;
+use crate::layers::l4::{DefaultMultiTurnScanner, MultiTurnScanner};
 use crate::layers::l5a::L5aScanner;
 use crate::normalize::L0Normalizer;
 use crate::proxy::{Provider, ProxyRequest, UpstreamClient};
@@ -208,6 +209,13 @@ pub fn load_dataset(dir: &Path) -> Result<Vec<EvalCase>, String> {
 pub fn build_eval_engine(config: Arc<Config>) -> (EngineUpstreamClient, Arc<MockHttpSender>) {
     let mock = Arc::new(MockHttpSender::new());
 
+    let multi_turn_scanner: Option<Arc<dyn MultiTurnScanner>> =
+        if config.policy.layers.l4.is_some() {
+            Some(Arc::new(DefaultMultiTurnScanner))
+        } else {
+            None
+        };
+
     let deps = EngineDeps {
         config,
         http: mock.clone(),
@@ -219,7 +227,7 @@ pub fn build_eval_engine(config: Arc<Config>) -> (EngineUpstreamClient, Arc<Mock
         constraint_evaluator: Arc::new(DslConstraintEvaluator::new()),
         output_scanner: Arc::new(L5aScanner),
         session_store: None,
-        multi_turn_scanner: None,
+        multi_turn_scanner,
     };
 
     (EngineUpstreamClient::new_with(deps), mock)
@@ -564,6 +572,11 @@ fn determine_verdict(case: &EvalCase, status: StatusCode, body: &str) -> (String
                 "content unchanged".to_string()
             };
             (actual.to_string(), detail)
+        }
+        "l4" => {
+            let fired = status == StatusCode::FORBIDDEN;
+            let actual = if fired { "blocked" } else { "allowed" };
+            (actual.to_string(), format!("status={}", status.as_u16()))
         }
         other => ("allowed".to_string(), format!("unknown layer: {other}")),
     }

@@ -94,32 +94,44 @@ pub struct RawLayerConfig {
 
 #[derive(Debug, Deserialize)]
 pub struct RawL4Config {
+    #[serde(default = "default_l4_mode")]
+    pub mode: String,
+    #[serde(default = "default_risk_threshold")]
+    pub risk_threshold: f64,
+    #[serde(default = "default_escalation_bonus")]
+    pub escalation_bonus: f64,
+    #[serde(default = "default_resampling_bonus")]
+    pub resampling_bonus: f64,
+    #[serde(default = "default_min_user_turns")]
+    pub min_user_turns: usize,
     #[serde(default)]
-    pub enabled: bool,
-    #[serde(default = "default_max_history")]
-    pub max_history: usize,
-    #[serde(default = "default_session_ttl")]
-    pub session_ttl_secs: u64,
-    #[serde(default)]
-    pub detectors: Vec<RawDetectorConfig>,
+    pub cross_turn_patterns: Vec<RawL4PatternCategory>,
+    pub use_default_l4_patterns: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct RawDetectorConfig {
-    pub name: String,
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    pub threshold: Option<f64>,
+pub struct RawL4PatternCategory {
+    pub category: String,
+    pub weight: f64,
+    pub patterns: Vec<String>,
 }
 
-fn default_max_history() -> usize {
-    50
+fn default_l4_mode() -> String {
+    "shadow".to_string()
 }
 
-fn default_session_ttl() -> u64 {
-    3600
+fn default_risk_threshold() -> f64 {
+    0.7
 }
 
-fn default_true() -> bool {
-    true
+fn default_escalation_bonus() -> f64 {
+    0.2
+}
+
+fn default_resampling_bonus() -> f64 {
+    0.7
+}
+
+fn default_min_user_turns() -> usize {
+    2
 }
