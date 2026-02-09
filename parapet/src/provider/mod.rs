@@ -221,6 +221,7 @@ impl ProviderAdapter for OpenAiAdapter {
                 tool_call_id,
                 tool_name,
                 trust: TrustLevel::Trusted,
+                trust_spans: Vec::new(),
             });
         }
 
@@ -470,6 +471,7 @@ impl ProviderAdapter for AnthropicAdapter {
                         tool_call_id: Some(tr.tool_use_id.clone()),
                         tool_name: None,
                         trust: TrustLevel::Trusted,
+                        trust_spans: Vec::new(),
                     });
                 }
                 // If there was also text content alongside tool_results, include it
@@ -481,6 +483,7 @@ impl ProviderAdapter for AnthropicAdapter {
                         tool_call_id: None,
                         tool_name: None,
                         trust: TrustLevel::Trusted,
+                        trust_spans: Vec::new(),
                     });
                 }
             } else {
@@ -491,6 +494,7 @@ impl ProviderAdapter for AnthropicAdapter {
                     tool_call_id: None,
                     tool_name: None,
                     trust: TrustLevel::Trusted,
+                    trust_spans: Vec::new(),
                 });
             }
         }

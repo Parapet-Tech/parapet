@@ -76,6 +76,7 @@ pub fn default_layer_configs() -> LayerConfigs {
             block_action: None,
             window_chars: None,
         }),
+        l4: None,
     }
 }
 

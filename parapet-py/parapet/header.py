@@ -1,15 +1,21 @@
-"""W3C Baggage header serialization.
+"""Header serialization for Parapet SDK.
 
-Produces baggage headers per the W3C Baggage specification.
-Format: ``baggage: key1=value1,key2=value2``
+Includes:
+- W3C Baggage header (``baggage: key1=value1,key2=value2``)
+- X-Guard-Trust header (``inline:<base64-encoded JSON>``)
 
 Values are percent-encoded to handle special characters safely.
 """
 from __future__ import annotations
 
+import base64
+import json
+import logging
 from urllib.parse import quote
 
-__all__ = ["build_baggage_header"]
+__all__ = ["build_baggage_header", "build_trust_header"]
+
+MAX_TRUST_HEADER_BYTES = 4096  # 4KB inline limit
 
 # Characters that must be percent-encoded in baggage values.
 # W3C Baggage uses a subset of RFC 3986 — commas, semicolons, equals,
@@ -46,3 +52,31 @@ def build_baggage_header(
         parts.append(f"role={_encode_value(role)}")
 
     return ",".join(parts)
+
+
+def build_trust_header(spans: list) -> str | None:
+    """Serialize trust spans as X-Guard-Trust header value.
+
+    Format: ``inline:<base64-encoded JSON>``
+    JSON schema: ``[{"s": start, "e": end, "src": source}, ...]``
+
+    Returns None if no spans or if encoded value exceeds 4KB limit.
+    Compact keys (s/e/src) to minimize header size.
+    """
+    if not spans:
+        return None
+
+    compact = [{"s": s.start, "e": s.end, "src": s.source} for s in spans]
+    payload = json.dumps(compact, separators=(",", ":")).encode("utf-8")
+
+    if len(payload) > MAX_TRUST_HEADER_BYTES:
+        logging.getLogger("parapet.header").warning(
+            "X-Guard-Trust header exceeds %d byte limit (%d spans, %d bytes); dropping",
+            MAX_TRUST_HEADER_BYTES,
+            len(spans),
+            len(payload),
+        )
+        return None
+
+    encoded = base64.b64encode(payload).decode("ascii")
+    return f"inline:{encoded}"

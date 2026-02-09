@@ -21,6 +21,21 @@ tools:
           - "../"
   search_code:
     allowed: true
+  internal_lookup:
+    allowed: true
+    trust: trusted
+
+trust:
+  unknown_trust_policy:
+    system: trusted
+    assistant: trusted
+    user: untrusted
+    tool: untrusted
+  auto_untrusted_roles:
+    - tool
+
+untrusted_content_policy:
+  max_length: 500
 
 canary_tokens:
   - "{{CANARY_EVAL}}"

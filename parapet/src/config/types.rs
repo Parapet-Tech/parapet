@@ -155,6 +155,7 @@ pub struct LayerConfigs {
     pub l3_inbound: Option<LayerConfig>,
     pub l3_outbound: Option<LayerConfig>,
     pub l5a: Option<LayerConfig>,
+    pub l4: Option<L4Config>,
 }
 
 /// Configuration for a single processing layer.
@@ -166,4 +167,39 @@ pub struct LayerConfig {
     pub block_action: Option<String>,
     /// Optional window size for streaming redaction (L5a only).
     pub window_chars: Option<usize>,
+}
+
+/// Configuration for the L4 multi-turn scanning layer.
+#[derive(Debug, Clone)]
+pub struct L4Config {
+    /// Whether L4 multi-turn scanning is enabled.
+    pub enabled: bool,
+    /// Maximum number of history entries to retain per session.
+    pub max_history: usize,
+    /// Session TTL in seconds.
+    pub session_ttl_secs: u64,
+    /// Detector configurations.
+    pub detectors: Vec<DetectorConfig>,
+}
+
+/// Configuration for a single L4 detector.
+#[derive(Debug, Clone)]
+pub struct DetectorConfig {
+    /// Detector type name (e.g., "escalation", "accumulation", "tool_frequency").
+    pub name: String,
+    /// Whether this detector is enabled.
+    pub enabled: bool,
+    /// Detector-specific threshold value.
+    pub threshold: Option<f64>,
+}
+
+impl Default for L4Config {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_history: 50,
+            session_ttl_secs: 3600,
+            detectors: Vec::new(),
+        }
+    }
 }

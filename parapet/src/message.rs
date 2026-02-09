@@ -5,6 +5,7 @@
 // bead (trust assignment, constraint evaluation, normalization,
 // streaming) consumes them.
 
+use crate::trust::TrustSpan;
 use serde::{Deserialize, Serialize};
 
 /// The role of a message participant.
@@ -53,6 +54,9 @@ pub struct Message {
     pub tool_name: Option<String>,
     /// Assigned by role-based trust (M1.7). Defaults to `Trusted`.
     pub trust: TrustLevel,
+    /// Byte-range trust annotations (v2). Empty = no per-span info (backwards compatible).
+    /// When non-empty, layers can apply stricter checks to untrusted spans.
+    pub trust_spans: Vec<TrustSpan>,
 }
 
 impl Message {
@@ -61,6 +65,7 @@ impl Message {
     /// - `trust` defaults to `TrustLevel::Trusted`
     /// - `tool_calls` defaults to empty
     /// - `tool_call_id` and `tool_name` default to `None`
+    /// - `trust_spans` defaults to empty (backwards compatible)
     pub fn new(role: Role, content: impl Into<String>) -> Self {
         Self {
             role,
@@ -69,7 +74,38 @@ impl Message {
             tool_call_id: None,
             tool_name: None,
             trust: TrustLevel::Trusted,
+            trust_spans: Vec::new(),
         }
+    }
+
+    /// Returns byte ranges that are explicitly marked as untrusted.
+    pub fn untrusted_ranges(&self) -> Vec<&TrustSpan> {
+        self.trust_spans
+            .iter()
+            .filter(|s| s.level == TrustLevel::Untrusted)
+            .collect()
+    }
+
+    /// Returns true if this message has no untrusted byte-range annotations.
+    ///
+    /// Note: this only checks `trust_spans`. The message-level `trust` field
+    /// is a separate concept (role-based trust vs. byte-range trust).
+    pub fn is_fully_trusted(&self) -> bool {
+        self.trust_spans
+            .iter()
+            .all(|s| s.level == TrustLevel::Trusted)
+    }
+
+    /// Returns true if any trust spans overlap each other.
+    pub fn has_overlapping_spans(&self) -> bool {
+        for i in 0..self.trust_spans.len() {
+            for j in (i + 1)..self.trust_spans.len() {
+                if self.trust_spans[i].overlaps(&self.trust_spans[j]) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 }
 
@@ -260,6 +296,7 @@ mod tests {
             tool_call_id: Some("call_abc".to_string()),
             tool_name: Some("read_file".to_string()),
             trust: TrustLevel::Untrusted,
+            trust_spans: Vec::new(),
         };
         assert_eq!(msg.role, Role::Tool);
         assert_eq!(msg.tool_call_id.as_deref(), Some("call_abc"));
@@ -298,6 +335,7 @@ mod tests {
             tool_call_id: None,
             tool_name: None,
             trust: TrustLevel::Trusted,
+            trust_spans: Vec::new(),
         };
         let mut cloned = original.clone();
         cloned.content = "modified".to_string();
