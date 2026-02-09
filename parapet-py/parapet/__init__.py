@@ -3,6 +3,7 @@
 # Public API:
 #   parapet.init(config_path)  — validate config, start engine sidecar, patch httpx
 #   parapet.session(...)       — context manager that sets W3C Baggage for the scope
+#   parapet.untrusted(content) — mark a string as untrusted content
 from __future__ import annotations
 
 import logging
@@ -14,9 +15,10 @@ from typing import Generator
 from parapet.header import build_baggage_header
 from parapet.sidecar import EngineState, start_engine
 from parapet.transport import patch_httpx
+from parapet.trust import _ensure_registry
 from typing import Iterable
 
-__all__ = ["init", "session"]
+__all__ = ["init", "session", "untrusted"]
 
 logger = logging.getLogger("parapet")
 
@@ -103,3 +105,24 @@ def session(
         yield SessionContext(baggage=baggage)
     finally:
         _active_baggage.reset(token)
+
+
+def untrusted(content: str, source: str = "unknown") -> str:
+    """Mark a string as untrusted content.
+
+    Registers the string in the per-context trust registry so the SDK
+    can locate it in serialized requests and emit byte-range trust spans.
+
+    The string is returned unchanged for inline use::
+
+        prompt = f"Context: {parapet.untrusted(rag_snippet, source='rag')}"
+
+    Args:
+        content: The untrusted content string.
+        source: Provenance label (e.g., "rag", "user_input", "web_search").
+
+    Returns:
+        The content string, unchanged.
+    """
+    registry = _ensure_registry()
+    return registry.register(content, source=source)

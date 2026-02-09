@@ -5,6 +5,7 @@
 // content returns the same result.
 
 use crate::message::Message;
+use std::collections::HashMap;
 use unicode_normalization::UnicodeNormalization;
 
 // ---------------------------------------------------------------------------
@@ -222,6 +223,107 @@ fn remove_invisible_chars(input: &str) -> String {
 pub fn normalize_for_comparison(input: &str) -> String {
     let nfkc: String = input.nfkc().collect();
     remove_invisible_chars(&nfkc)
+}
+
+// ---------------------------------------------------------------------------
+// Trust span remapping (M4)
+// ---------------------------------------------------------------------------
+
+/// Maps a byte range in the original string to a byte range in the normalized string.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OffsetMapping {
+    /// Start byte in the original string.
+    pub old_start: usize,
+    /// End byte in the original string (exclusive).
+    pub old_end: usize,
+    /// Start byte in the normalized string.
+    pub new_start: usize,
+    /// End byte in the normalized string (exclusive).
+    pub new_end: usize,
+}
+
+/// Remap trust spans from pre-normalization to post-normalization byte offsets.
+///
+/// Strategy: for each unique span boundary, normalize the prefix of the original
+/// string up to that boundary and record the resulting length. This tells us
+/// exactly where that byte position maps to in the normalized output.
+///
+/// Complexity: O(k * n) where k = number of unique span boundaries (typically
+/// 2-40) and n = input length. Acceptable for typical message sizes.
+pub fn remap_trust_spans(
+    normalizer: &dyn Normalizer,
+    original: &str,
+    spans: &mut [crate::trust::TrustSpan],
+) {
+    if spans.is_empty() || original.is_empty() {
+        return;
+    }
+
+    // Collect all unique boundary positions we need to map.
+    let mut boundaries: Vec<usize> = Vec::new();
+    for span in spans.iter() {
+        boundaries.push(span.start);
+        boundaries.push(span.end);
+    }
+    boundaries.sort_unstable();
+    boundaries.dedup();
+
+    // For each boundary, normalize the prefix up to that point and record the output length.
+    let mut boundary_map: HashMap<usize, usize> = HashMap::new();
+
+    for &boundary in &boundaries {
+        // Clamp to a valid UTF-8 character boundary.
+        let clamped = clamp_to_char_boundary(original, boundary);
+        let prefix = &original[..clamped];
+        let normalized_prefix = normalizer.normalize(prefix);
+        boundary_map.insert(boundary, normalized_prefix.len());
+    }
+
+    // Remap each span.
+    for span in spans.iter_mut() {
+        let new_start = boundary_map.get(&span.start).copied().unwrap_or(span.start);
+        let new_end = boundary_map.get(&span.end).copied().unwrap_or(span.end);
+
+        // Conservative: if remapping produces an inverted range, swap to preserve coverage.
+        if new_start <= new_end {
+            span.start = new_start;
+            span.end = new_end;
+        } else {
+            span.start = new_end;
+            span.end = new_start;
+        }
+    }
+}
+
+/// Clamp a byte offset to the nearest valid UTF-8 character boundary.
+/// If the offset falls in the middle of a multi-byte character, round down
+/// to the start of that character.
+fn clamp_to_char_boundary(s: &str, offset: usize) -> usize {
+    if offset >= s.len() {
+        return s.len();
+    }
+    let mut pos = offset;
+    while pos > 0 && !s.is_char_boundary(pos) {
+        pos -= 1;
+    }
+    pos
+}
+
+/// Normalize the `content` field of every message and remap trust spans.
+///
+/// For messages with trust spans, the original content is preserved long enough
+/// to remap span offsets before being replaced with the normalized content.
+/// Messages without trust spans are normalized directly (no overhead).
+pub fn normalize_messages_with_spans(normalizer: &dyn Normalizer, messages: &mut [Message]) {
+    for msg in messages {
+        if !msg.trust_spans.is_empty() {
+            let original = msg.content.clone();
+            msg.content = normalizer.normalize(&original);
+            remap_trust_spans(normalizer, &original, &mut msg.trust_spans);
+        } else {
+            msg.content = normalizer.normalize(&msg.content);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -493,5 +595,200 @@ mod tests {
         let n = normalizer();
         // Malformed: no closing </script> -- everything after <script> is removed
         assert_eq!(n.normalize("before<script>evil code"), "before");
+    }
+
+    // -------------------------------------------------------------------
+    // Trust span remapping tests (M4)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn remap_spans_identity_ascii() {
+        // ASCII-only text: no normalization changes, offsets unchanged.
+        let n = normalizer();
+        let original = "hello world";
+        let mut spans = vec![crate::trust::TrustSpan::untrusted(6, 11, "test")];
+        remap_trust_spans(&n, original, &mut spans);
+        assert_eq!(spans[0].start, 6);
+        assert_eq!(spans[0].end, 11);
+    }
+
+    #[test]
+    fn remap_spans_invisible_char_removed() {
+        // "he\u{200B}llo" -> "hello" (zero-width space at byte 2 removed)
+        // ZWS is 3 bytes (E2 80 8B), so "he" = 2 bytes, ZWS = 3 bytes,
+        // "llo" starts at byte 5 in the original.
+        let n = normalizer();
+        let original = "he\u{200B}llo";
+        assert_eq!(original.len(), 8); // h=1, e=1, ZWS=3, l=1, l=1, o=1
+        let mut spans = vec![crate::trust::TrustSpan::untrusted(5, 8, "test")]; // "llo" in original
+        remap_trust_spans(&n, original, &mut spans);
+        let normalized = n.normalize(original);
+        assert_eq!(normalized, "hello");
+        // "llo" in "hello" is at bytes 2..5
+        assert_eq!(spans[0].start, 2);
+        assert_eq!(spans[0].end, 5);
+    }
+
+    #[test]
+    fn remap_spans_html_stripped() {
+        // "<b>hello</b>" -> "hello"
+        // "hello" in original is at bytes 3..8, in normalized at 0..5
+        let n = normalizer();
+        let original = "<b>hello</b>";
+        let mut spans = vec![crate::trust::TrustSpan::untrusted(3, 8, "test")];
+        remap_trust_spans(&n, original, &mut spans);
+        assert_eq!(n.normalize(original), "hello");
+        assert_eq!(spans[0].start, 0);
+        assert_eq!(spans[0].end, 5);
+    }
+
+    #[test]
+    fn remap_spans_nfkc_fullwidth() {
+        // Fullwidth "AB" -> "AB" (each fullwidth char is 3 bytes, ASCII is 1 byte)
+        let n = normalizer();
+        let original = "\u{FF21}\u{FF22}"; // Fullwidth A, B (3 bytes each)
+        assert_eq!(original.len(), 6);
+        let mut spans = vec![crate::trust::TrustSpan::untrusted(0, 6, "test")]; // entire string
+        remap_trust_spans(&n, original, &mut spans);
+        assert_eq!(n.normalize(original), "AB");
+        assert_eq!(spans[0].start, 0);
+        assert_eq!(spans[0].end, 2);
+    }
+
+    #[test]
+    fn remap_spans_empty_input() {
+        let n = normalizer();
+        let mut spans = vec![crate::trust::TrustSpan::untrusted(0, 0, "test")];
+        remap_trust_spans(&n, "", &mut spans);
+        assert_eq!(spans[0].start, 0);
+        assert_eq!(spans[0].end, 0);
+    }
+
+    #[test]
+    fn remap_spans_no_spans_is_noop() {
+        let n = normalizer();
+        let mut spans: Vec<crate::trust::TrustSpan> = Vec::new();
+        remap_trust_spans(&n, "hello", &mut spans);
+        assert!(spans.is_empty());
+    }
+
+    #[test]
+    fn remap_spans_multiple_spans() {
+        // "he<b>llo</b> wo<i>rld</i>" -> "hello world"
+        let n = normalizer();
+        let original = "he<b>llo</b> wo<i>rld</i>";
+        let normalized = n.normalize(original);
+        assert_eq!(normalized, "hello world");
+
+        // Span 1: "llo" inside <b> tags, bytes 5..8 in original
+        // Span 2: "rld" inside <i> tags, bytes 18..21 in original
+        let mut spans = vec![
+            crate::trust::TrustSpan::untrusted(5, 8, "test1"),
+            crate::trust::TrustSpan::untrusted(18, 21, "test2"),
+        ];
+        remap_trust_spans(&n, original, &mut spans);
+
+        // "llo" in "hello world" -> bytes 2..5
+        assert_eq!(spans[0].start, 2);
+        assert_eq!(spans[0].end, 5);
+        // "rld" in "hello world" -> bytes 8..11
+        assert_eq!(spans[1].start, 8);
+        assert_eq!(spans[1].end, 11);
+    }
+
+    // -------------------------------------------------------------------
+    // clamp_to_char_boundary tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn clamp_to_char_boundary_on_ascii() {
+        let s = "hello";
+        assert_eq!(clamp_to_char_boundary(s, 3), 3);
+        assert_eq!(clamp_to_char_boundary(s, 0), 0);
+        assert_eq!(clamp_to_char_boundary(s, 5), 5);
+        assert_eq!(clamp_to_char_boundary(s, 100), 5);
+    }
+
+    #[test]
+    fn clamp_to_char_boundary_on_multibyte() {
+        // "h" + e-acute (U+00E9, 2 bytes: C3 A9) + "llo"
+        // byte 0: 'h', byte 1: start of e-acute, byte 2: continuation, byte 3: 'l'
+        let s = "h\u{00E9}llo";
+        assert_eq!(clamp_to_char_boundary(s, 0), 0);
+        assert_eq!(clamp_to_char_boundary(s, 1), 1); // start of e-acute (valid boundary)
+        assert_eq!(clamp_to_char_boundary(s, 2), 1); // continuation byte of e-acute -> round down to 1
+        assert_eq!(clamp_to_char_boundary(s, 3), 3); // 'l' (valid boundary after e-acute)
+    }
+
+    // -------------------------------------------------------------------
+    // normalize_messages_with_spans tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn normalize_messages_with_spans_remaps() {
+        let n = normalizer();
+        let mut msg = Message::new(Role::User, "<b>untrusted</b> data");
+        msg.trust_spans
+            .push(crate::trust::TrustSpan::untrusted(3, 12, "rag")); // "untrusted" inside <b>
+
+        let mut messages = vec![msg];
+        normalize_messages_with_spans(&n, &mut messages);
+
+        assert_eq!(messages[0].content, "untrusted data");
+        // Span should now point to "untrusted" in the normalized string (bytes 0..9)
+        assert_eq!(messages[0].trust_spans[0].start, 0);
+        assert_eq!(messages[0].trust_spans[0].end, 9);
+    }
+
+    #[test]
+    fn normalize_messages_with_spans_no_spans_still_normalizes() {
+        let n = normalizer();
+        let mut messages = vec![Message::new(Role::User, "<b>hello</b>")];
+        normalize_messages_with_spans(&n, &mut messages);
+        assert_eq!(messages[0].content, "hello");
+        assert!(messages[0].trust_spans.is_empty());
+    }
+
+    #[test]
+    fn normalize_messages_with_spans_preserves_span_metadata() {
+        // Ensure source label and trust level survive remapping.
+        let n = normalizer();
+        let mut msg = Message::new(Role::User, "\u{200B}data");
+        msg.trust_spans
+            .push(crate::trust::TrustSpan::untrusted(3, 7, "web_search"));
+
+        let mut messages = vec![msg];
+        normalize_messages_with_spans(&n, &mut messages);
+
+        assert_eq!(messages[0].content, "data");
+        assert_eq!(
+            messages[0].trust_spans[0].level,
+            crate::message::TrustLevel::Untrusted
+        );
+        assert_eq!(
+            messages[0].trust_spans[0].source.as_deref(),
+            Some("web_search")
+        );
+    }
+
+    #[test]
+    fn normalize_messages_with_spans_mixed_messages() {
+        // Mix of messages with and without spans -- both should be normalized.
+        let n = normalizer();
+        let mut msg_with_span = Message::new(Role::User, "<b>hello</b>");
+        msg_with_span
+            .trust_spans
+            .push(crate::trust::TrustSpan::untrusted(3, 8, "rag"));
+        let msg_without_span = Message::new(Role::Assistant, "\u{FF48}i");
+
+        let mut messages = vec![msg_with_span, msg_without_span];
+        normalize_messages_with_spans(&n, &mut messages);
+
+        assert_eq!(messages[0].content, "hello");
+        assert_eq!(messages[0].trust_spans[0].start, 0);
+        assert_eq!(messages[0].trust_spans[0].end, 5);
+
+        assert_eq!(messages[1].content, "hi");
+        assert!(messages[1].trust_spans.is_empty());
     }
 }

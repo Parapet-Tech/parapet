@@ -1,7 +1,11 @@
-"""Tests for parapet.header — W3C Baggage serialization."""
+"""Tests for parapet.header — W3C Baggage and X-Guard-Trust serialization."""
+import base64
+import json
+
 import pytest
 
-from parapet.header import build_baggage_header
+from parapet.header import build_baggage_header, build_trust_header
+from parapet.trust import TrustSpan
 
 
 class TestBuildBaggageHeader:
@@ -53,3 +57,52 @@ class TestBuildBaggageHeader:
         # Should be percent-encoded UTF-8 bytes
         assert "user_id=" in result
         assert "\u00e9" not in result  # Raw unicode should not appear
+
+
+class TestBuildTrustHeader:
+    """Tests for X-Guard-Trust header serialization."""
+
+    def test_empty_spans_returns_none(self):
+        """Empty span list returns None (no header needed)."""
+        assert build_trust_header([]) is None
+
+    def test_single_span_round_trip(self):
+        """Single span serializes and can be decoded back correctly."""
+        spans = [TrustSpan(start=10, end=20, source="rag")]
+        header = build_trust_header(spans)
+        assert header is not None
+        assert header.startswith("inline:")
+
+        # Decode and verify
+        encoded = header[len("inline:"):]
+        decoded = json.loads(base64.b64decode(encoded))
+        assert decoded == [{"s": 10, "e": 20, "src": "rag"}]
+
+    def test_multiple_spans(self):
+        """Multiple spans are all included in the header."""
+        spans = [
+            TrustSpan(start=0, end=10, source="rag"),
+            TrustSpan(start=20, end=30, source="user"),
+        ]
+        header = build_trust_header(spans)
+        assert header is not None
+        decoded = json.loads(base64.b64decode(header[len("inline:"):]))
+        assert len(decoded) == 2
+        assert decoded[0] == {"s": 0, "e": 10, "src": "rag"}
+        assert decoded[1] == {"s": 20, "e": 30, "src": "user"}
+
+    def test_oversized_header_returns_none(self):
+        """Header exceeding 4KB limit returns None (graceful degradation)."""
+        # Create enough spans to exceed 4KB
+        spans = [TrustSpan(start=i, end=i + 100, source=f"source_{i}") for i in range(200)]
+        header = build_trust_header(spans)
+        assert header is None
+
+    def test_compact_json_format(self):
+        """JSON payload uses compact separators (no extra spaces)."""
+        spans = [TrustSpan(start=5, end=15, source="web")]
+        header = build_trust_header(spans)
+        encoded = header[len("inline:"):]
+        raw_json = base64.b64decode(encoded).decode("utf-8")
+        # Should have no spaces in the JSON (compact separators)
+        assert " " not in raw_json

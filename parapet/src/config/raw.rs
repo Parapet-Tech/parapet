@@ -81,6 +81,8 @@ pub struct RawLayerConfigs {
     pub l3_outbound: Option<RawLayerConfig>,
     #[serde(rename = "L5a")]
     pub l5a: Option<RawLayerConfig>,
+    #[serde(rename = "L4")]
+    pub l4: Option<RawL4Config>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -88,4 +90,36 @@ pub struct RawLayerConfig {
     pub mode: String,
     pub block_action: Option<String>,
     pub window_chars: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RawL4Config {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_max_history")]
+    pub max_history: usize,
+    #[serde(default = "default_session_ttl")]
+    pub session_ttl_secs: u64,
+    #[serde(default)]
+    pub detectors: Vec<RawDetectorConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RawDetectorConfig {
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub threshold: Option<f64>,
+}
+
+fn default_max_history() -> usize {
+    50
+}
+
+fn default_session_ttl() -> u64 {
+    3600
+}
+
+fn default_true() -> bool {
+    true
 }

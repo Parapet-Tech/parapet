@@ -15,6 +15,9 @@ from typing import Optional
 
 import httpx
 
+from parapet.header import build_trust_header
+from parapet.trust import get_registry
+
 __all__ = [
     "DEFAULT_LLM_HOSTS",
     "LLM_HOSTS",
@@ -96,6 +99,14 @@ class ParapetTransport(httpx.BaseTransport):
         headers = {k: v for k, v in request.headers.items() if k.lower() != "host"}
         headers["x-parapet-original-host"] = original_url.host
 
+        # Inject trust spans if registry has entries
+        registry = get_registry()
+        if registry is not None:
+            spans = registry.find_spans(request.content)
+            trust_header = build_trust_header(spans)
+            if trust_header is not None:
+                headers["x-guard-trust"] = trust_header
+
         proxy_request = httpx.Request(
             method=request.method,
             url=proxy_url,
@@ -155,6 +166,14 @@ class AsyncParapetTransport(httpx.AsyncBaseTransport):
         # Remove the original Host header so httpx sets it from proxy_url.
         headers = {k: v for k, v in request.headers.items() if k.lower() != "host"}
         headers["x-parapet-original-host"] = original_url.host
+
+        # Inject trust spans if registry has entries
+        registry = get_registry()
+        if registry is not None:
+            spans = registry.find_spans(request.content)
+            trust_header = build_trust_header(spans)
+            if trust_header is not None:
+                headers["x-guard-trust"] = trust_header
 
         proxy_request = httpx.Request(
             method=request.method,

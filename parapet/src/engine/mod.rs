@@ -10,15 +10,17 @@
 // - L5a output redaction
 // - Streaming: tool call buffering + validation via StreamProcessor
 
+use base64::Engine as _;
 use flate2::read::{DeflateDecoder, GzDecoder};
 use std::io::Read as _;
 
 use crate::config::Config;
 use crate::constraint::{ConstraintEvaluator, DslConstraintEvaluator, ToolCallVerdict};
 use crate::layers::l3_inbound::{DefaultInboundScanner, InboundScanner, InboundVerdict};
+use crate::layers::l4::{DefaultMultiTurnScanner, L4Action, MultiTurnScanner};
 use crate::layers::l5a::{L5aScanner, OutputScanner};
 use crate::message::ToolCall;
-use crate::normalize::{normalize_messages, L0Normalizer, Normalizer};
+use crate::normalize::{normalize_messages_with_spans, L0Normalizer, Normalizer};
 use crate::provider::{adapter_for, ProviderAdapter, ProviderType};
 use crate::proxy::{ProxyError, ProxyRequest, ProxyResponse, Provider, UpstreamClient};
 use crate::stream::{
@@ -156,6 +158,8 @@ pub struct EngineDeps {
     pub inbound_scanner: Arc<dyn InboundScanner>,
     pub constraint_evaluator: Arc<dyn ConstraintEvaluator>,
     pub output_scanner: Arc<dyn OutputScanner>,
+    pub session_store: Option<Arc<dyn crate::session::SessionStore>>,
+    pub multi_turn_scanner: Option<Arc<dyn MultiTurnScanner>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -210,6 +214,9 @@ impl UpstreamClient for EngineUpstreamClient {
             }
         };
 
+        // 1.5) Parse trust header spans from SDK (X-Guard-Trust)
+        parse_trust_header(&request.headers, &request.body, &mut messages);
+
         // 2) Trust assignment
         self.deps
             .trust_assigner
@@ -218,7 +225,7 @@ impl UpstreamClient for EngineUpstreamClient {
         // 3) L0 normalization (if enabled)
         if let Some(layer) = &self.deps.config.policy.layers.l0 {
             if layer.mode == "sanitize" {
-                normalize_messages(self.deps.normalizer.as_ref(), &mut messages);
+                normalize_messages_with_spans(self.deps.normalizer.as_ref(), &mut messages);
             }
         }
 
@@ -263,7 +270,78 @@ impl UpstreamClient for EngineUpstreamClient {
             }
         }
 
-        // 5) Forward to upstream
+        // 5) L4 multi-turn scanning (if enabled)
+        let mut l4_warning: Option<String> = None;
+        let l4_session_id: Option<String> = if self.deps.session_store.is_some() {
+            Some(extract_session_id(&request.headers))
+        } else {
+            None
+        };
+        if let (Some(scanner), Some(store)) = (&self.deps.multi_turn_scanner, &self.deps.session_store) {
+            let session_id = l4_session_id.as_deref().unwrap();
+            let session = store.get(session_id).unwrap_or_else(|| {
+                crate::session::SessionState::new(session_id)
+            });
+
+            let l4_start = Instant::now();
+            let l4_result = scanner.scan(&messages, &session, &self.deps.config);
+            let l4_ms = l4_start.elapsed().as_secs_f64() * 1000.0;
+
+            // Update session state with L4 flags
+            let mut updated_session = session.clone();
+            for flag in &l4_result.updated_flags {
+                updated_session.flags.insert(flag.clone());
+            }
+            store.update(updated_session);
+
+            match &l4_result.action {
+                L4Action::Block(reason) => {
+                    tracing::info!(
+                        request_id = %ctx.request_id,
+                        contract_hash = %ctx.contract_hash,
+                        provider = ctx.provider_str,
+                        model = %ctx.model,
+                        layer = "L4",
+                        verdict = "block",
+                        reason = %reason,
+                        detections = l4_result.detections.len(),
+                        latency_ms = l4_ms,
+                        "L4 multi-turn blocked"
+                    );
+                    let body = adapter.serialize_error(reason, 403);
+                    return Ok(ProxyResponse::from_bytes(StatusCode::FORBIDDEN, body));
+                }
+                L4Action::Warn(reason) => {
+                    tracing::info!(
+                        request_id = %ctx.request_id,
+                        contract_hash = %ctx.contract_hash,
+                        provider = ctx.provider_str,
+                        model = %ctx.model,
+                        layer = "L4",
+                        verdict = "warn",
+                        reason = %reason,
+                        detections = l4_result.detections.len(),
+                        latency_ms = l4_ms,
+                        "L4 multi-turn warning"
+                    );
+                    l4_warning = Some(reason.clone());
+                }
+                L4Action::Allow => {
+                    tracing::info!(
+                        request_id = %ctx.request_id,
+                        contract_hash = %ctx.contract_hash,
+                        provider = ctx.provider_str,
+                        model = %ctx.model,
+                        layer = "L4",
+                        verdict = "allow",
+                        latency_ms = l4_ms,
+                        "L4 multi-turn allowed"
+                    );
+                }
+            }
+        }
+
+        // 6) Forward to upstream
         let stream = is_streaming_request(&request.body);
         let url = build_upstream_url(self.deps.resolver.as_ref(), provider, &request);
 
@@ -304,7 +382,40 @@ impl UpstreamClient for EngineUpstreamClient {
                     "streaming response has Content-Encoding; passing through without decompression"
                 );
             }
-            return Ok(self.handle_streaming_response(provider, upstream, &ctx));
+            let mut resp = self.handle_streaming_response(provider, upstream, &ctx);
+            if let Some(warning) = &l4_warning {
+                resp.headers.insert("x-guard-warning", warning.parse().unwrap_or_else(|_| axum::http::HeaderValue::from_static("l4-warning")));
+            }
+
+            // M11: Update session after stream completes.
+            // Chain a finalizer onto the body stream that updates session state.
+            if let (Some(session_id), Some(store)) = (l4_session_id, &self.deps.session_store) {
+                let store = store.clone();
+                let max_history = self.deps.config.policy.layers.l4
+                    .as_ref()
+                    .map(|c| c.max_history)
+                    .unwrap_or(50);
+
+                let body_stream = resp.body.into_data_stream();
+                let messages_clone = messages.clone();
+                let finalized_stream = body_stream.chain(
+                    futures_util::stream::once({
+                        let store = store.clone();
+                        let session_id = session_id.clone();
+                        let messages = messages_clone;
+                        async move {
+                            update_session_after_request(
+                                store.as_ref(), &session_id, &messages, max_history,
+                            );
+                            Ok::<Bytes, axum::Error>(Bytes::new())
+                        }
+                    }),
+                );
+
+                resp.body = Body::from_stream(finalized_stream);
+            }
+
+            return Ok(resp);
         }
 
         let mut resp_headers = upstream.headers;
@@ -331,6 +442,19 @@ impl UpstreamClient for EngineUpstreamClient {
         let body_bytes = maybe_decompress(&mut resp_headers, body_bytes)?;
 
         let processed = self.handle_non_streaming_response(provider, &body_bytes, &ctx);
+        if let Some(warning) = &l4_warning {
+            resp_headers.insert("x-guard-warning", warning.parse().unwrap_or_else(|_| axum::http::HeaderValue::from_static("l4-warning")));
+        }
+
+        // M11: Update session state after response completes
+        if let (Some(session_id), Some(store)) = (&l4_session_id, &self.deps.session_store) {
+            let max_history = self.deps.config.policy.layers.l4
+                .as_ref()
+                .map(|c| c.max_history)
+                .unwrap_or(50);
+            update_session_after_request(store.as_ref(), session_id, &messages, max_history);
+        }
+
         Ok(ProxyResponse {
             status: processed.status_override.unwrap_or(upstream.status),
             headers: resp_headers,
@@ -803,6 +927,27 @@ impl HttpSender for ReqwestHttpSender {
 // ---------------------------------------------------------------------------
 
 pub fn build_engine_client(config: Arc<Config>) -> EngineUpstreamClient {
+    let session_store: Option<Arc<dyn crate::session::SessionStore>> =
+        if config.policy.layers.l4.as_ref().map_or(false, |c| c.enabled) {
+            let ttl = config
+                .policy
+                .layers
+                .l4
+                .as_ref()
+                .map(|c| std::time::Duration::from_secs(c.session_ttl_secs))
+                .unwrap_or(std::time::Duration::from_secs(3600));
+            Some(Arc::new(crate::session::InMemorySessionStore::new(ttl)))
+        } else {
+            None
+        };
+
+    let multi_turn_scanner: Option<Arc<dyn MultiTurnScanner>> =
+        if config.policy.layers.l4.as_ref().map_or(false, |c| c.enabled) {
+            Some(Arc::new(DefaultMultiTurnScanner::new()))
+        } else {
+            None
+        };
+
     let deps = EngineDeps {
         config,
         http: Arc::new(ReqwestHttpSender::new(reqwest::Client::new())),
@@ -813,6 +958,8 @@ pub fn build_engine_client(config: Arc<Config>) -> EngineUpstreamClient {
         inbound_scanner: Arc::new(DefaultInboundScanner::new()),
         constraint_evaluator: Arc::new(DslConstraintEvaluator::new()),
         output_scanner: Arc::new(L5aScanner),
+        session_store,
+        multi_turn_scanner,
     };
 
     EngineUpstreamClient::new_with(deps)
@@ -945,6 +1092,52 @@ fn is_streaming_request(body: &Bytes) -> bool {
         .unwrap_or(false)
 }
 
+/// Extract session ID from W3C Baggage header.
+///
+/// The SDK sets `baggage: user_id=<value>,role=<value>`. We use `user_id` as
+/// the session identifier when present. If no user_id in baggage, generate an
+/// ephemeral session ID from a random UUID (best-effort grouping).
+///
+/// W3C Baggage format: `key1=value1,key2=value2`
+/// Values are percent-encoded per RFC 3986.
+fn extract_session_id(headers: &HeaderMap) -> String {
+    if let Some(baggage) = headers.get("baggage").and_then(|v| v.to_str().ok()) {
+        for pair in baggage.split(',') {
+            let pair = pair.trim();
+            if let Some((key, value)) = pair.split_once('=') {
+                if key.trim() == "user_id" {
+                    let decoded = percent_decode(value.trim());
+                    if !decoded.is_empty() {
+                        return format!("user:{decoded}");
+                    }
+                }
+            }
+        }
+    }
+
+    // No user_id in baggage -- generate ephemeral session ID
+    format!("ephemeral:{}", Uuid::new_v4())
+}
+
+/// Simple percent-decode (handles %XX sequences).
+fn percent_decode(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(byte) = u8::from_str_radix(&input[i + 1..i + 3], 16) {
+                result.push(byte as char);
+                i += 3;
+                continue;
+            }
+        }
+        result.push(bytes[i] as char);
+        i += 1;
+    }
+    result
+}
+
 fn stream_body(
     stream: impl Stream<Item = Result<Bytes, HttpError>> + Send + 'static,
 ) -> Pin<Box<dyn Stream<Item = Bytes> + Send>> {
@@ -957,6 +1150,56 @@ fn stream_body(
             }
         }
     }))
+}
+
+/// Compress current request messages into history entries for session state.
+///
+/// Each message becomes a `HistoryEntry` with a summary of the first 200 chars
+/// and tool call names. This keeps session state lightweight while providing
+/// enough context for L4 detectors.
+fn compress_to_history(messages: &[crate::message::Message]) -> Vec<crate::session::HistoryEntry> {
+    messages
+        .iter()
+        .map(|msg| {
+            let role = match &msg.role {
+                crate::message::Role::System => "system",
+                crate::message::Role::User => "user",
+                crate::message::Role::Assistant => "assistant",
+                crate::message::Role::Tool => "tool",
+            };
+            let summary: String = msg.content.chars().take(200).collect();
+            let tool_names: Vec<String> = msg.tool_calls.iter().map(|tc| tc.name.clone()).collect();
+
+            crate::session::HistoryEntry {
+                role: role.to_string(),
+                content_summary: summary,
+                timestamp: chrono::Utc::now(),
+                trust_level: msg.trust.clone(),
+                tool_calls_summary: tool_names,
+            }
+        })
+        .collect()
+}
+
+/// Update session state after a request completes.
+///
+/// Adds compressed history entries for the current messages,
+/// merges any L4 flags, and stores back to the session store.
+fn update_session_after_request(
+    store: &dyn crate::session::SessionStore,
+    session_id: &str,
+    messages: &[crate::message::Message],
+    max_history: usize,
+) {
+    let mut session = store
+        .get(session_id)
+        .unwrap_or_else(|| crate::session::SessionState::new(session_id));
+
+    for entry in compress_to_history(messages) {
+        session.push_history(entry, max_history);
+    }
+
+    store.update(session);
 }
 
 fn apply_streaming_redaction(
@@ -1058,7 +1301,8 @@ mod tests {
         CompiledPattern, ContentPolicy, EngineConfig, LayerConfig, LayerConfigs, PolicyConfig,
         RuntimeConfig, ToolConfig, TrustConfig,
     };
-    use crate::message::Message;
+    use crate::message::{Message, Role, TrustLevel};
+    use crate::session::SessionStore;
     use futures_util::stream;
     use std::collections::HashMap;
 
@@ -1211,6 +1455,8 @@ mod tests {
             inbound_scanner: Arc::new(NoopInboundScanner),
             constraint_evaluator: Arc::new(DslConstraintEvaluator::new()),
             output_scanner: Arc::new(L5aScanner),
+            session_store: None,
+            multi_turn_scanner: None,
         };
         EngineUpstreamClient::new_with(deps)
     }
@@ -1263,6 +1509,7 @@ mod tests {
                         window_chars: None,
                     }),
                     l5a: None,
+                    l4: None,
                 },
             },
             runtime: RuntimeConfig {
@@ -1657,6 +1904,458 @@ mod tests {
         let output = String::from_utf8_lossy(&processed.body);
         assert!(!output.contains("123-45-6789"));
         assert!(output.contains("[REDACTED]"));
+    }
+
+    // -------------------------------------------------------------------
+    // X-Guard-Trust header parsing tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn parse_trust_header_attaches_spans_to_messages() {
+        // Build a mock JSON body with a user message
+        let body = serde_json::json!({
+            "model": "gpt-4",
+            "messages": [
+                {"role": "user", "content": "Hello untrusted data here"}
+            ]
+        });
+        let body_bytes = serde_json::to_vec(&body).unwrap();
+
+        // Find where "untrusted data" appears in the body bytes
+        let body_str = std::str::from_utf8(&body_bytes).unwrap();
+        let content_in_body = body_str.find("untrusted data").unwrap();
+
+        // Create the trust header with a span covering "untrusted data"
+        let spans = serde_json::json!([
+            {"s": content_in_body, "e": content_in_body + "untrusted data".len(), "src": "rag"}
+        ]);
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_vec(&spans).unwrap());
+        let header_value = format!("inline:{encoded}");
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-guard-trust", header_value.parse().unwrap());
+
+        let mut messages = vec![Message::new(Role::User, "Hello untrusted data here")];
+
+        parse_trust_header(&headers, &body_bytes, &mut messages);
+
+        assert!(!messages[0].trust_spans.is_empty());
+        assert_eq!(messages[0].trust_spans[0].level, TrustLevel::Untrusted);
+        assert_eq!(messages[0].trust_spans[0].source.as_deref(), Some("rag"));
+    }
+
+    #[test]
+    fn parse_trust_header_missing_header_is_noop() {
+        let headers = HeaderMap::new();
+        let body = b"{}";
+        let mut messages = vec![Message::new(Role::User, "hello")];
+
+        parse_trust_header(&headers, body, &mut messages);
+
+        assert!(messages[0].trust_spans.is_empty());
+    }
+
+    #[test]
+    fn parse_trust_header_malformed_base64_warns_gracefully() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-guard-trust", "inline:not-valid-base64!!!".parse().unwrap());
+        let body = b"{}";
+        let mut messages = vec![Message::new(Role::User, "hello")];
+
+        parse_trust_header(&headers, body, &mut messages);
+
+        // Should not panic, messages unchanged
+        assert!(messages[0].trust_spans.is_empty());
+    }
+
+    #[test]
+    fn parse_trust_header_unknown_format_is_noop() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-guard-trust", "external:http://example.com".parse().unwrap());
+        let body = b"{}";
+        let mut messages = vec![Message::new(Role::User, "hello")];
+
+        parse_trust_header(&headers, body, &mut messages);
+
+        assert!(messages[0].trust_spans.is_empty());
+    }
+
+    #[test]
+    fn parse_trust_header_empty_spans_array_is_noop() {
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(b"[]");
+        let header_value = format!("inline:{encoded}");
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-guard-trust", header_value.parse().unwrap());
+
+        let body = b"{}";
+        let mut messages = vec![Message::new(Role::User, "hello")];
+
+        parse_trust_header(&headers, body, &mut messages);
+
+        assert!(messages[0].trust_spans.is_empty());
+    }
+
+    #[test]
+    fn parse_trust_header_span_without_src_defaults_to_unknown() {
+        let body = serde_json::json!({
+            "messages": [{"role": "user", "content": "test data"}]
+        });
+        let body_bytes = serde_json::to_vec(&body).unwrap();
+        let body_str = std::str::from_utf8(&body_bytes).unwrap();
+        let data_offset = body_str.find("test data").unwrap();
+
+        let spans = serde_json::json!([
+            {"s": data_offset, "e": data_offset + "test data".len()}
+        ]);
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_vec(&spans).unwrap());
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-guard-trust", format!("inline:{encoded}").parse().unwrap());
+
+        let mut messages = vec![Message::new(Role::User, "test data")];
+
+        parse_trust_header(&headers, &body_bytes, &mut messages);
+
+        assert_eq!(messages[0].trust_spans.len(), 1);
+        assert_eq!(messages[0].trust_spans[0].level, TrustLevel::Untrusted);
+        assert_eq!(messages[0].trust_spans[0].source.as_deref(), Some("unknown"));
+    }
+
+    // -------------------------------------------------------------------
+    // Session ID extraction from W3C Baggage header (M8)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn extract_session_id_from_baggage_user_id() {
+        let mut headers = HeaderMap::new();
+        headers.insert("baggage", "user_id=user_123,role=admin".parse().unwrap());
+        let id = extract_session_id(&headers);
+        assert_eq!(id, "user:user_123");
+    }
+
+    #[test]
+    fn extract_session_id_percent_encoded() {
+        let mut headers = HeaderMap::new();
+        headers.insert("baggage", "user_id=user%20with%20spaces".parse().unwrap());
+        let id = extract_session_id(&headers);
+        assert_eq!(id, "user:user with spaces");
+    }
+
+    #[test]
+    fn extract_session_id_no_baggage_generates_ephemeral() {
+        let headers = HeaderMap::new();
+        let id = extract_session_id(&headers);
+        assert!(id.starts_with("ephemeral:"));
+    }
+
+    #[test]
+    fn extract_session_id_baggage_without_user_id_generates_ephemeral() {
+        let mut headers = HeaderMap::new();
+        headers.insert("baggage", "role=admin".parse().unwrap());
+        let id = extract_session_id(&headers);
+        assert!(id.starts_with("ephemeral:"));
+    }
+
+    #[test]
+    fn extract_session_id_empty_user_id_generates_ephemeral() {
+        let mut headers = HeaderMap::new();
+        headers.insert("baggage", "user_id=".parse().unwrap());
+        let id = extract_session_id(&headers);
+        assert!(id.starts_with("ephemeral:"));
+    }
+
+    #[test]
+    fn percent_decode_basic() {
+        assert_eq!(percent_decode("hello%20world"), "hello world");
+        assert_eq!(percent_decode("no%20encoding%21"), "no encoding!");
+        assert_eq!(percent_decode("plain"), "plain");
+        assert_eq!(percent_decode(""), "");
+    }
+
+    // -----------------------------------------------------------------------
+    // M11: Session state update + history compression
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn compress_to_history_captures_role_and_summary() {
+        let messages = vec![
+            Message {
+                role: Role::User,
+                content: "Hello, world!".to_string(),
+                trust: TrustLevel::Trusted,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                tool_name: None,
+                trust_spans: Vec::new(),
+            },
+            Message {
+                role: Role::Assistant,
+                content: "Hi there! How can I help?".to_string(),
+                trust: TrustLevel::Trusted,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                tool_name: None,
+                trust_spans: Vec::new(),
+            },
+        ];
+
+        let entries = compress_to_history(&messages);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].role, "user");
+        assert_eq!(entries[0].content_summary, "Hello, world!");
+        assert_eq!(entries[1].role, "assistant");
+        assert_eq!(entries[1].content_summary, "Hi there! How can I help?");
+    }
+
+    #[test]
+    fn compress_to_history_truncates_at_200_chars() {
+        let long_content = "a".repeat(500);
+        let messages = vec![Message {
+            role: Role::User,
+            content: long_content,
+            trust: TrustLevel::Trusted,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+            trust_spans: Vec::new(),
+        }];
+
+        let entries = compress_to_history(&messages);
+        assert_eq!(entries[0].content_summary.len(), 200);
+    }
+
+    #[test]
+    fn compress_to_history_captures_tool_call_names() {
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: String::new(),
+            trust: TrustLevel::Trusted,
+            tool_calls: vec![
+                crate::message::ToolCall {
+                    id: "call_1".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({}),
+                },
+                crate::message::ToolCall {
+                    id: "call_2".to_string(),
+                    name: "exec_command".to_string(),
+                    arguments: serde_json::json!({}),
+                },
+            ],
+            tool_call_id: None,
+            tool_name: None,
+            trust_spans: Vec::new(),
+        }];
+
+        let entries = compress_to_history(&messages);
+        assert_eq!(entries[0].tool_calls_summary, vec!["read_file", "exec_command"]);
+    }
+
+    #[test]
+    fn update_session_after_request_creates_session_if_missing() {
+        let store = crate::session::InMemorySessionStore::new(std::time::Duration::from_secs(3600));
+        let messages = vec![Message {
+            role: Role::User,
+            content: "hello".to_string(),
+            trust: TrustLevel::Trusted,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+            trust_spans: Vec::new(),
+        }];
+
+        assert!(store.get("new_session").is_none());
+        update_session_after_request(&store, "new_session", &messages, 50);
+
+        let session = store.get("new_session").unwrap();
+        assert_eq!(session.turn_count, 1);
+        assert_eq!(session.history.len(), 1);
+        assert_eq!(session.history[0].role, "user");
+    }
+
+    #[test]
+    fn update_session_after_request_appends_to_existing() {
+        let store = crate::session::InMemorySessionStore::new(std::time::Duration::from_secs(3600));
+        let msg1 = vec![Message {
+            role: Role::User,
+            content: "turn 1".to_string(),
+            trust: TrustLevel::Trusted,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+            trust_spans: Vec::new(),
+        }];
+        update_session_after_request(&store, "sess", &msg1, 50);
+
+        let msg2 = vec![Message {
+            role: Role::Assistant,
+            content: "turn 2".to_string(),
+            trust: TrustLevel::Trusted,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+            trust_spans: Vec::new(),
+        }];
+        update_session_after_request(&store, "sess", &msg2, 50);
+
+        let session = store.get("sess").unwrap();
+        assert_eq!(session.turn_count, 2);
+        assert_eq!(session.history.len(), 2);
+    }
+
+    #[test]
+    fn update_session_respects_max_history() {
+        let store = crate::session::InMemorySessionStore::new(std::time::Duration::from_secs(3600));
+        for i in 0..10 {
+            let msg = vec![Message {
+                role: Role::User,
+                content: format!("turn {i}"),
+                trust: TrustLevel::Trusted,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                tool_name: None,
+                trust_spans: Vec::new(),
+            }];
+            update_session_after_request(&store, "sess", &msg, 5);
+        }
+
+        let session = store.get("sess").unwrap();
+        assert_eq!(session.turn_count, 10);
+        assert_eq!(session.history.len(), 5);
+        // Oldest remaining should be turn 5
+        assert_eq!(session.history[0].content_summary, "turn 5");
+    }
+
+    #[test]
+    fn compress_to_history_preserves_trust_level() {
+        let messages = vec![
+            Message {
+                role: Role::User,
+                content: "trusted".to_string(),
+                trust: TrustLevel::Trusted,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                tool_name: None,
+                trust_spans: Vec::new(),
+            },
+            Message {
+                role: Role::User,
+                content: "untrusted".to_string(),
+                trust: TrustLevel::Untrusted,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                tool_name: None,
+                trust_spans: Vec::new(),
+            },
+        ];
+
+        let entries = compress_to_history(&messages);
+        assert_eq!(entries[0].trust_level, TrustLevel::Trusted);
+        assert_eq!(entries[1].trust_level, TrustLevel::Untrusted);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// X-Guard-Trust header parsing (SDK -> Engine)
+// ---------------------------------------------------------------------------
+
+/// Compact span from the X-Guard-Trust header JSON.
+#[derive(serde::Deserialize)]
+struct RawTrustHeaderSpan {
+    s: usize,
+    e: usize,
+    src: Option<String>,
+}
+
+/// Parse X-Guard-Trust header and attach trust spans to messages.
+///
+/// Format: `inline:<base64-encoded JSON>`
+/// JSON: `[{"s": <start>, "e": <end>, "src": "<source>"}, ...]`
+///
+/// Byte offsets in the header reference positions in the SERIALIZED request body.
+/// Since we've already parsed messages, we need to map body-level offsets to
+/// per-message content offsets. We find each message's content string within
+/// the serialized body and adjust span offsets relative to the content start.
+///
+/// If parsing fails, logs a warning and returns (graceful degradation).
+fn parse_trust_header(headers: &HeaderMap, body: &[u8], messages: &mut [crate::message::Message]) {
+    let header_value = match headers.get("x-guard-trust").and_then(|v| v.to_str().ok()) {
+        Some(v) => v,
+        None => return,
+    };
+
+    let encoded = match header_value.strip_prefix("inline:") {
+        Some(e) => e,
+        None => {
+            tracing::warn!("X-Guard-Trust header has unknown format (expected 'inline:...')");
+            return;
+        }
+    };
+
+    let decoded = match base64::engine::general_purpose::STANDARD.decode(encoded) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(error = %e, "X-Guard-Trust header base64 decode failed");
+            return;
+        }
+    };
+
+    let spans: Vec<RawTrustHeaderSpan> = match serde_json::from_slice(&decoded) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "X-Guard-Trust header JSON parse failed");
+            return;
+        }
+    };
+
+    if spans.is_empty() {
+        return;
+    }
+
+    // The body is the full JSON request. Trust spans reference byte offsets within
+    // this body. For each message, find where its content appears in the body and
+    // compute per-message span offsets.
+    let body_str = match std::str::from_utf8(body) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+
+    for msg in messages.iter_mut() {
+        if msg.content.is_empty() {
+            continue;
+        }
+
+        // Find the JSON-escaped form of the content in the body.
+        // json.dumps adds quotes, so strip them to get the escaped interior.
+        let escaped_content = match serde_json::to_string(&msg.content) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let escaped_interior = &escaped_content[1..escaped_content.len() - 1];
+
+        // Find where this content appears in the body (byte offset)
+        if let Some(content_byte_offset) = body_str.find(escaped_interior) {
+            let content_byte_end = content_byte_offset + escaped_interior.len();
+
+            for span in &spans {
+                // Check if this span overlaps with this message's content in the body
+                if span.s < content_byte_end && span.e > content_byte_offset {
+                    // Compute message-relative offsets
+                    let rel_start = span.s.saturating_sub(content_byte_offset);
+                    let rel_end = span.e.min(content_byte_end) - content_byte_offset;
+
+                    msg.trust_spans.push(crate::trust::TrustSpan::untrusted(
+                        rel_start,
+                        rel_end,
+                        span.src.clone().unwrap_or_else(|| "unknown".to_string()),
+                    ));
+                }
+            }
+        }
     }
 }
 

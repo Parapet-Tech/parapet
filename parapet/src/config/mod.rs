@@ -18,8 +18,8 @@ pub use loader::{compute_hash, load_config};
 pub use pattern::CompiledPattern;
 pub use source::{ConfigSource, FileSource, StringSource};
 pub use types::{
-    ArgumentConstraints, Config, ContentPolicy, EngineConfig, FailureMode, LayerConfig,
-    LayerConfigs, PolicyConfig, RuntimeConfig, ToolConfig, TrustConfig,
+    ArgumentConstraints, Config, ContentPolicy, DetectorConfig, EngineConfig, FailureMode,
+    L4Config, LayerConfig, LayerConfigs, PolicyConfig, RuntimeConfig, ToolConfig, TrustConfig,
 };
 
 // ---------------------------------------------------------------------------

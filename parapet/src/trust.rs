@@ -5,9 +5,74 @@
 // 2. `auto_untrusted_roles`: override matching roles to Untrusted
 // 3. Per-tool `trust` config: override for specific tool messages
 // 4. Safe default: Untrusted if no policy matches
+//
+// Byte-range trust (v2): `TrustSpan` marks sub-regions of message content
+// as untrusted (e.g., RAG snippets, user input embedded in tool results).
 
 use crate::config::Config;
 use crate::message::{Message, Role, TrustLevel};
+use serde::{Deserialize, Serialize};
+
+// ---------------------------------------------------------------------------
+// TrustSpan: byte-range trust annotation
+// ---------------------------------------------------------------------------
+
+/// A byte range within a message's content that has a specific trust level.
+///
+/// SDK users call `parapet.untrusted(content, source)` to mark content.
+/// The SDK locates those strings in the serialized request and emits
+/// `TrustSpan`s via the `X-Guard-Trust` header.
+///
+/// Byte offsets reference the message content *before* L0 normalization.
+/// After L0, spans are remapped using `OffsetMapping` (see `normalize`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TrustSpan {
+    /// Start byte offset (inclusive) within the message content.
+    pub start: usize,
+    /// End byte offset (exclusive) within the message content.
+    pub end: usize,
+    /// Trust level for this span.
+    pub level: TrustLevel,
+    /// Optional provenance label (e.g., "rag", "user_input", "web_search").
+    pub source: Option<String>,
+}
+
+impl TrustSpan {
+    /// Create a new untrusted span with a source label.
+    pub fn untrusted(start: usize, end: usize, source: impl Into<String>) -> Self {
+        Self {
+            start,
+            end,
+            level: TrustLevel::Untrusted,
+            source: Some(source.into()),
+        }
+    }
+
+    /// Create a new untrusted span without a source label.
+    pub fn untrusted_anonymous(start: usize, end: usize) -> Self {
+        Self {
+            start,
+            end,
+            level: TrustLevel::Untrusted,
+            source: None,
+        }
+    }
+
+    /// Byte length of this span.
+    pub fn len(&self) -> usize {
+        self.end.saturating_sub(self.start)
+    }
+
+    /// Whether this span is empty (zero length).
+    pub fn is_empty(&self) -> bool {
+        self.end <= self.start
+    }
+
+    /// Whether this span overlaps with another.
+    pub fn overlaps(&self, other: &TrustSpan) -> bool {
+        self.start < other.end && other.start < self.end
+    }
+}
 
 /// Maps a `Role` enum variant to its lowercase config string.
 fn role_to_str(role: &Role) -> &'static str {
@@ -154,6 +219,7 @@ mod tests {
             tool_call_id: Some("call_1".to_string()),
             tool_name: Some(tool_name.to_string()),
             trust: TrustLevel::Trusted, // default; will be overridden
+            trust_spans: Vec::new(),
         }
     }
 
@@ -363,5 +429,149 @@ mod tests {
         assert_eq!(role_to_str(&Role::User), "user");
         assert_eq!(role_to_str(&Role::Assistant), "assistant");
         assert_eq!(role_to_str(&Role::Tool), "tool");
+    }
+
+    // ---------------------------------------------------------------
+    // TrustSpan tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn trust_span_untrusted_constructor() {
+        let span = TrustSpan::untrusted(10, 20, "rag");
+        assert_eq!(span.start, 10);
+        assert_eq!(span.end, 20);
+        assert_eq!(span.level, TrustLevel::Untrusted);
+        assert_eq!(span.source.as_deref(), Some("rag"));
+    }
+
+    #[test]
+    fn trust_span_untrusted_anonymous() {
+        let span = TrustSpan::untrusted_anonymous(5, 15);
+        assert_eq!(span.start, 5);
+        assert_eq!(span.end, 15);
+        assert_eq!(span.level, TrustLevel::Untrusted);
+        assert_eq!(span.source, None);
+    }
+
+    #[test]
+    fn trust_span_len() {
+        let span = TrustSpan::untrusted(10, 30, "test");
+        assert_eq!(span.len(), 20);
+    }
+
+    #[test]
+    fn trust_span_empty() {
+        let span = TrustSpan::untrusted(10, 10, "test");
+        assert!(span.is_empty());
+        assert_eq!(span.len(), 0);
+    }
+
+    #[test]
+    fn trust_span_overlap_detection() {
+        let a = TrustSpan::untrusted(10, 20, "a");
+        let b = TrustSpan::untrusted(15, 25, "b");
+        let c = TrustSpan::untrusted(20, 30, "c");
+        let d = TrustSpan::untrusted(5, 12, "d");
+
+        // a and b overlap (15..20)
+        assert!(a.overlaps(&b));
+        assert!(b.overlaps(&a));
+
+        // a and c are adjacent, not overlapping (a ends at 20, c starts at 20)
+        assert!(!a.overlaps(&c));
+        assert!(!c.overlaps(&a));
+
+        // a and d overlap (10..12)
+        assert!(a.overlaps(&d));
+        assert!(d.overlaps(&a));
+
+        // c and d do not overlap
+        assert!(!c.overlaps(&d));
+    }
+
+    #[test]
+    fn trust_span_serialization_roundtrip() {
+        let span = TrustSpan::untrusted(10, 50, "web_search");
+        let json = serde_json::to_string(&span).unwrap();
+        let deserialized: TrustSpan = serde_json::from_str(&json).unwrap();
+        assert_eq!(span, deserialized);
+    }
+
+    #[test]
+    fn trust_span_serialization_without_source() {
+        let span = TrustSpan::untrusted_anonymous(0, 100);
+        let json = serde_json::to_string(&span).unwrap();
+        let deserialized: TrustSpan = serde_json::from_str(&json).unwrap();
+        assert_eq!(span, deserialized);
+        assert_eq!(deserialized.source, None);
+    }
+
+    // ---------------------------------------------------------------
+    // Message trust_spans helper method tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn message_untrusted_ranges_returns_only_untrusted() {
+        let mut msg = Message::new(Role::User, "hello world of trust");
+        msg.trust_spans = vec![
+            TrustSpan::untrusted(0, 5, "user"),
+            TrustSpan {
+                start: 6,
+                end: 11,
+                level: TrustLevel::Trusted,
+                source: None,
+            },
+            TrustSpan::untrusted(12, 20, "rag"),
+        ];
+
+        let untrusted = msg.untrusted_ranges();
+        assert_eq!(untrusted.len(), 2);
+        assert_eq!(untrusted[0].start, 0);
+        assert_eq!(untrusted[1].start, 12);
+    }
+
+    #[test]
+    fn message_is_fully_trusted_with_no_spans() {
+        let msg = Message::new(Role::User, "hello");
+        assert!(msg.is_fully_trusted());
+    }
+
+    #[test]
+    fn message_is_fully_trusted_with_trusted_spans() {
+        let mut msg = Message::new(Role::User, "hello");
+        msg.trust_spans = vec![TrustSpan {
+            start: 0,
+            end: 5,
+            level: TrustLevel::Trusted,
+            source: None,
+        }];
+        assert!(msg.is_fully_trusted());
+    }
+
+    #[test]
+    fn message_is_not_fully_trusted_with_untrusted_span() {
+        let mut msg = Message::new(Role::User, "hello");
+        msg.trust_spans = vec![TrustSpan::untrusted(0, 5, "rag")];
+        assert!(!msg.is_fully_trusted());
+    }
+
+    #[test]
+    fn message_has_overlapping_spans_detects_overlap() {
+        let mut msg = Message::new(Role::User, "hello world");
+        msg.trust_spans = vec![
+            TrustSpan::untrusted(0, 7, "a"),
+            TrustSpan::untrusted(5, 11, "b"),
+        ];
+        assert!(msg.has_overlapping_spans());
+    }
+
+    #[test]
+    fn message_has_overlapping_spans_no_overlap() {
+        let mut msg = Message::new(Role::User, "hello world");
+        msg.trust_spans = vec![
+            TrustSpan::untrusted(0, 5, "a"),
+            TrustSpan::untrusted(5, 11, "b"),
+        ];
+        assert!(!msg.has_overlapping_spans());
     }
 }

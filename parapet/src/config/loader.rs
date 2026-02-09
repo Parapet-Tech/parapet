@@ -252,5 +252,19 @@ fn build_layer_configs(raw: Option<raw::RawLayerConfigs>) -> LayerConfigs {
             block_action: l.block_action,
             window_chars: l.window_chars,
         }),
+        l4: raw.l4.map(|l4| L4Config {
+            enabled: l4.enabled,
+            max_history: l4.max_history,
+            session_ttl_secs: l4.session_ttl_secs,
+            detectors: l4
+                .detectors
+                .into_iter()
+                .map(|d| DetectorConfig {
+                    name: d.name,
+                    enabled: d.enabled,
+                    threshold: d.threshold,
+                })
+                .collect(),
+        }),
     }
 }
