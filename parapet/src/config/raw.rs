@@ -102,6 +102,10 @@ pub struct RawL4Config {
     pub escalation_bonus: f64,
     #[serde(default = "default_resampling_bonus")]
     pub resampling_bonus: f64,
+    #[serde(default = "default_persistence_factor")]
+    pub persistence_factor: f64,
+    #[serde(default = "default_diversity_factor")]
+    pub diversity_factor: f64,
     #[serde(default = "default_min_user_turns")]
     pub min_user_turns: usize,
     #[serde(default)]
@@ -130,6 +134,14 @@ fn default_escalation_bonus() -> f64 {
 
 fn default_resampling_bonus() -> f64 {
     0.7
+}
+
+fn default_persistence_factor() -> f64 {
+    0.45
+}
+
+fn default_diversity_factor() -> f64 {
+    0.15
 }
 
 fn default_min_user_turns() -> usize {

@@ -28,9 +28,17 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     json: bool,
 
-    /// Filter to a specific layer (l3_inbound, l3_outbound, l5a)
+    /// Filter to a specific layer (l3_inbound, l3_outbound, l5a, l4)
     #[arg(long)]
     layer: Option<String>,
+
+    /// Filter to a specific source dataset (filename without extension)
+    #[arg(long)]
+    source: Option<String>,
+
+    /// Max failures to print (default: 50)
+    #[arg(long, default_value_t = 50)]
+    max_failures: usize,
 }
 
 #[tokio::main]
@@ -61,6 +69,11 @@ async fn main() {
     // Filter by layer if specified
     if let Some(ref layer) = cli.layer {
         cases.retain(|c| c.layer == *layer);
+    }
+
+    // Filter by source if specified
+    if let Some(ref source) = cli.source {
+        cases.retain(|c| c.source == *source);
     }
 
     if cases.is_empty() {
@@ -100,21 +113,42 @@ async fn main() {
             println!();
         }
 
-        // Print failures
+        // Per-source breakdown
+        println!("Per-dataset breakdown:");
+        println!("{:<45} {:>5} {:>5} {:>5} {:>7}",
+            "source", "total", "pass", "fail", "acc%");
+        println!("{}", "-".repeat(72));
+        for s in &report.sources {
+            println!(
+                "  {:<43} {:>5} {:>5} {:>5} {:>6.1}%",
+                format!("{} [{}] ({})", s.source, s.layer, s.label),
+                s.total,
+                s.correct,
+                s.incorrect,
+                s.accuracy * 100.0
+            );
+        }
+        println!();
+
+        // Print failures (capped)
         let failures: Vec<&eval::EvalResult> = results.iter().filter(|r| !r.correct).collect();
         if failures.is_empty() {
             println!("All {} cases passed.", report.total_cases);
         } else {
+            let shown = failures.len().min(cli.max_failures);
             println!(
-                "{}/{} cases passed, {} failures:",
-                report.total_correct, report.total_cases, failures.len()
+                "{}/{} cases passed, {} failures (showing first {}):",
+                report.total_correct, report.total_cases, failures.len(), shown
             );
             println!();
-            for f in &failures {
+            for f in &failures[..shown] {
                 println!(
                     "  FAIL {}: [{}] {} — expected={}, actual={} ({})",
                     f.case_id, f.layer, f.label, f.expected, f.actual, f.detail
                 );
+            }
+            if failures.len() > shown {
+                println!("  ... {} more failures (use --max-failures to show more)", failures.len() - shown);
             }
         }
         println!();

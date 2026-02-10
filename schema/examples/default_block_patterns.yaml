@@ -65,9 +65,12 @@ block_patterns:
 
   # --- Indirect Injection Markers ---
   - "(?i)SYSTEM:\\s*ignore above"
+  - "(?i)SYSTEM:\\s*(you are|new instructions|override|disregard|forget)"
   - "(?i)IMPORTANT:\\s*before calling"
   - "(?i)important messages:"
   - "(?i)ignore the previous instructions and do the following"
+  - "(?i)(ADMIN|ROOT|OVERRIDE|SUPERUSER):\\s"
+  - "(?i)TODO:\\s*(ignore|bypass|override|skip|disable)"
 
   # --- Exfiltration / C2 ---
   - "(?i)(send|transmit|exfiltrate|upload|post) .{0,40}(to |via |using )(https?://|webhook|endpoint|server)"

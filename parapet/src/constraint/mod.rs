@@ -134,12 +134,16 @@ fn check_predicates(
         }
     }
 
-    // For string predicates, extract the string value
+    // For string predicates, extract the string value.
+    // NFKC-normalize once here so ALL string predicates are bypass-resistant.
+    // Without this, attackers can use fullwidth chars or zero-width insertions
+    // to bypass starts_with, matches, one_of, etc.
     let string_value = value.as_str();
+    let normalized_string = string_value.map(|s| normalize_for_comparison(s));
 
-    // 2. starts_with
+    // 2. starts_with (uses normalized input)
     if let Some(ref prefix) = constraints.starts_with {
-        match string_value {
+        match normalized_string.as_deref() {
             Some(s) if s.starts_with(prefix.as_str()) => {}
             Some(s) => {
                 return Some(format!(
@@ -156,13 +160,12 @@ fn check_predicates(
         }
     }
 
-    // 3. not_contains (NFKC-normalized to prevent Unicode bypass)
+    // 3. not_contains (uses normalized input)
     if let Some(ref forbidden) = constraints.not_contains {
-        match string_value {
+        match normalized_string.as_deref() {
             Some(s) => {
-                let normalized = normalize_for_comparison(s);
                 for substring in forbidden {
-                    if normalized.contains(substring.as_str()) {
+                    if s.contains(substring.as_str()) {
                         return Some(format!(
                             "argument \"{}\" contains forbidden substring \"{}\"",
                             arg_name, substring
@@ -179,9 +182,9 @@ fn check_predicates(
         }
     }
 
-    // 4. matches (pre-compiled regex)
+    // 4. matches (uses normalized input)
     if let Some(ref pattern) = constraints.matches {
-        match string_value {
+        match normalized_string.as_deref() {
             Some(s) if pattern.is_match(s) => {}
             Some(s) => {
                 return Some(format!(
@@ -198,9 +201,9 @@ fn check_predicates(
         }
     }
 
-    // 5. one_of
+    // 5. one_of (uses normalized input)
     if let Some(ref allowed) = constraints.one_of {
-        match string_value {
+        match normalized_string.as_deref() {
             Some(s) if allowed.iter().any(|a| a == s) => {}
             Some(s) => {
                 return Some(format!(
@@ -217,7 +220,7 @@ fn check_predicates(
         }
     }
 
-    // 6. max_length
+    // 6. max_length (uses raw string — length should reflect actual content)
     if let Some(max_len) = constraints.max_length {
         match string_value {
             Some(s) if s.chars().count() <= max_len => {}
@@ -276,9 +279,9 @@ fn check_predicates(
         }
     }
 
-    // 9. url_host (parse as URL, exact host match)
+    // 9. url_host (parse normalized URL, exact host match)
     if let Some(ref allowed_hosts) = constraints.url_host {
-        match string_value {
+        match normalized_string.as_deref() {
             Some(s) => match url::Url::parse(s) {
                 Ok(parsed) => match parsed.host_str() {
                     Some(host) if allowed_hosts.iter().any(|h| h == host) => {}
@@ -1250,5 +1253,185 @@ mod tests {
         let config = config_with_tools(HashMap::new());
         let verdicts = evaluator().evaluate_tool_calls(&[], &config);
         assert!(verdicts.is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // Combined predicate tests (AND semantics)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn combined_starts_with_and_not_contains_and_max_length_all_pass() {
+        let mut constraints = HashMap::new();
+        constraints.insert(
+            "path".to_string(),
+            ArgumentConstraints {
+                starts_with: Some("/home/user/".to_string()),
+                not_contains: Some(vec!["../".to_string(), "..\\".to_string()]),
+                max_length: Some(50),
+                ..Default::default()
+            },
+        );
+        let mut tools = HashMap::new();
+        tools.insert("read_file".to_string(), tool_allowed_with_constraints(constraints));
+        let config = config_with_tools(tools);
+
+        let calls = vec![make_tool_call("read_file", json!({"path": "/home/user/docs/readme.txt"}))];
+        let verdicts = evaluator().evaluate_tool_calls(&calls, &config);
+        assert_eq!(verdicts, vec![ToolCallVerdict::Allow]);
+    }
+
+    #[test]
+    fn combined_predicates_starts_with_passes_but_not_contains_fails() {
+        let mut constraints = HashMap::new();
+        constraints.insert(
+            "path".to_string(),
+            ArgumentConstraints {
+                starts_with: Some("/home/user/".to_string()),
+                not_contains: Some(vec!["../".to_string()]),
+                max_length: Some(100),
+                ..Default::default()
+            },
+        );
+        let mut tools = HashMap::new();
+        tools.insert("read_file".to_string(), tool_allowed_with_constraints(constraints));
+        let config = config_with_tools(tools);
+
+        // Path starts correctly but contains traversal
+        let calls = vec![make_tool_call("read_file", json!({"path": "/home/user/../etc/passwd"}))];
+        let verdicts = evaluator().evaluate_tool_calls(&calls, &config);
+        assert!(matches!(&verdicts[0], ToolCallVerdict::Block { .. }));
+    }
+
+    #[test]
+    fn combined_predicates_starts_with_and_not_contains_pass_but_max_length_fails() {
+        let mut constraints = HashMap::new();
+        constraints.insert(
+            "path".to_string(),
+            ArgumentConstraints {
+                starts_with: Some("/home/user/".to_string()),
+                not_contains: Some(vec!["../".to_string()]),
+                max_length: Some(20),
+                ..Default::default()
+            },
+        );
+        let mut tools = HashMap::new();
+        tools.insert("read_file".to_string(), tool_allowed_with_constraints(constraints));
+        let config = config_with_tools(tools);
+
+        // Path is valid and safe but too long
+        let calls = vec![make_tool_call("read_file", json!({"path": "/home/user/very/deep/nested/path/file.txt"}))];
+        let verdicts = evaluator().evaluate_tool_calls(&calls, &config);
+        assert!(matches!(&verdicts[0], ToolCallVerdict::Block { .. }));
+    }
+
+    #[test]
+    fn multiple_arguments_each_with_constraints() {
+        let mut constraints = HashMap::new();
+        constraints.insert(
+            "path".to_string(),
+            ArgumentConstraints {
+                starts_with: Some("/home/".to_string()),
+                ..Default::default()
+            },
+        );
+        constraints.insert(
+            "mode".to_string(),
+            ArgumentConstraints {
+                one_of: Some(vec!["read".to_string(), "write".to_string()]),
+                ..Default::default()
+            },
+        );
+        let mut tools = HashMap::new();
+        tools.insert("file_op".to_string(), tool_allowed_with_constraints(constraints));
+        let config = config_with_tools(tools);
+
+        // Both args valid
+        let calls = vec![make_tool_call("file_op", json!({"path": "/home/user/f.txt", "mode": "read"}))];
+        let verdicts = evaluator().evaluate_tool_calls(&calls, &config);
+        assert_eq!(verdicts, vec![ToolCallVerdict::Allow]);
+
+        // path ok, mode invalid
+        let calls = vec![make_tool_call("file_op", json!({"path": "/home/user/f.txt", "mode": "execute"}))];
+        let verdicts = evaluator().evaluate_tool_calls(&calls, &config);
+        assert!(matches!(&verdicts[0], ToolCallVerdict::Block { .. }));
+    }
+
+    #[test]
+    fn url_host_with_matches_constraint_combined() {
+        let mut constraints = HashMap::new();
+        constraints.insert(
+            "url".to_string(),
+            ArgumentConstraints {
+                url_host: Some(vec!["api.example.com".to_string()]),
+                matches: Some(crate::config::CompiledPattern::compile("^https://").unwrap()),
+                ..Default::default()
+            },
+        );
+        let mut tools = HashMap::new();
+        tools.insert("fetch".to_string(), tool_allowed_with_constraints(constraints));
+        let config = config_with_tools(tools);
+
+        // Valid: https + correct host
+        let calls = vec![make_tool_call("fetch", json!({"url": "https://api.example.com/data"}))];
+        let verdicts = evaluator().evaluate_tool_calls(&calls, &config);
+        assert_eq!(verdicts, vec![ToolCallVerdict::Allow]);
+
+        // Invalid: http (wrong scheme)
+        let calls = vec![make_tool_call("fetch", json!({"url": "http://api.example.com/data"}))];
+        let verdicts = evaluator().evaluate_tool_calls(&calls, &config);
+        assert!(matches!(&verdicts[0], ToolCallVerdict::Block { .. }));
+
+        // Invalid: wrong host
+        let calls = vec![make_tool_call("fetch", json!({"url": "https://evil.com/data"}))];
+        let verdicts = evaluator().evaluate_tool_calls(&calls, &config);
+        assert!(matches!(&verdicts[0], ToolCallVerdict::Block { .. }));
+    }
+
+    // ---------------------------------------------------------------
+    // Confusable bypass tests for constraints
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn starts_with_blocks_cyrillic_homoglyph_bypass() {
+        // Attacker uses Cyrillic а (U+0430) instead of Latin 'a' in "/home"
+        // to try: "/h\u{043E}me/user/" which looks like "/home/user/"
+        let mut constraints = HashMap::new();
+        constraints.insert(
+            "path".to_string(),
+            ArgumentConstraints {
+                starts_with: Some("/home/user/".to_string()),
+                ..Default::default()
+            },
+        );
+        let mut tools = HashMap::new();
+        tools.insert("read_file".to_string(), tool_allowed_with_constraints(constraints));
+        let config = config_with_tools(tools);
+
+        // Cyrillic о in "home" — normalization replaces it with Latin o
+        // because the word "h\u{043E}me" is mixed-script
+        let calls = vec![make_tool_call("read_file", json!({"path": "/h\u{043E}me/user/file.txt"}))];
+        let verdicts = evaluator().evaluate_tool_calls(&calls, &config);
+        assert_eq!(verdicts, vec![ToolCallVerdict::Allow],
+            "mixed-script confusable should be normalized to Latin, matching starts_with");
+    }
+
+    #[test]
+    fn one_of_normalizes_confusables_before_matching() {
+        let mut constraints = HashMap::new();
+        constraints.insert(
+            "format".to_string(),
+            ArgumentConstraints {
+                one_of: Some(vec!["json".to_string(), "yaml".to_string()]),
+                ..Default::default()
+            },
+        );
+        let mut tools = HashMap::new();
+        tools.insert("export".to_string(), tool_allowed_with_constraints(constraints));
+        let config = config_with_tools(tools);
+
+        // "js\u{043E}n" with Cyrillic о — normalizes to "json" (mixed-script)
+        let calls = vec![make_tool_call("export", json!({"format": "js\u{043E}n"}))];
+        let verdicts = evaluator().evaluate_tool_calls(&calls, &config);
+        assert_eq!(verdicts, vec![ToolCallVerdict::Allow]);
     }
 }

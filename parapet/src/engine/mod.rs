@@ -252,7 +252,8 @@ impl UpstreamClient for EngineUpstreamClient {
                             latency_ms = l3i_ms,
                             "inbound blocked"
                         );
-                        let body = adapter.serialize_error(&block.reason, 403);
+                        // Generic message to client — don't leak pattern details
+                        let body = adapter.serialize_error("request blocked by content policy", 403);
                         return Ok(ProxyResponse::from_bytes(StatusCode::FORBIDDEN, body));
                     }
                     InboundVerdict::Allow => {
@@ -293,7 +294,8 @@ impl UpstreamClient for EngineUpstreamClient {
                         latency_ms = l4_ms,
                         "multi-turn attack blocked"
                     );
-                    let body = adapter.serialize_error(reason, 403);
+                    // Generic message to client — internal reason already logged above
+                    let body = adapter.serialize_error("request blocked by content policy", 403);
                     return Ok(ProxyResponse::from_bytes(StatusCode::FORBIDDEN, body));
                 }
                 L4Verdict::Block { .. } => {
@@ -533,7 +535,8 @@ impl EngineUpstreamClient {
                             latency_ms = l3o_ms,
                             "outbound blocked (error mode)"
                         );
-                        let body = adapter.serialize_error(reason, 403);
+                        // Generic message to client — internal reason already logged above
+                        let body = adapter.serialize_error("request blocked by content policy", 403);
                         return ProcessedResponse {
                             status_override: Some(StatusCode::FORBIDDEN),
                             body: Bytes::from(body),

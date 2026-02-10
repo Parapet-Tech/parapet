@@ -16,6 +16,16 @@ __pycache__/
 # Internal docs
 implement/
 
+# Eval datasets (reproducible via scripts/)
+schema/eval/opensource_*.yaml
+schema/eval/multiturn_*.yaml
+schema/eval/out_of_scope/
+
+# LaTeX build artifacts
+paper/*.aux
+paper/*.log
+paper/*.out
+
 # OS
 .DS_Store
 Thumbs.db

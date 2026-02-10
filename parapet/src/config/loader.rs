@@ -267,6 +267,8 @@ fn build_layer_configs(raw: Option<raw::RawLayerConfigs>) -> Result<LayerConfigs
                 risk_threshold: l4.risk_threshold,
                 escalation_bonus: l4.escalation_bonus,
                 resampling_bonus: l4.resampling_bonus,
+                persistence_factor: l4.persistence_factor,
+                diversity_factor: l4.diversity_factor,
                 min_user_turns: l4.min_user_turns,
                 cross_turn_patterns: patterns,
             })
