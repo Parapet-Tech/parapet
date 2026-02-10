@@ -3,8 +3,8 @@
 # Used by L5a redaction layer.
 
 sensitive_patterns:
-  # OpenAI API keys
-  - "sk-[a-zA-Z0-9]{20,}"
+  # OpenAI API keys (includes sk-proj-*, sk-svcacct-* formats with hyphens)
+  - "sk-[a-zA-Z0-9\\-]{20,}"
   # Anthropic API keys
   - "sk-ant-[a-zA-Z0-9\\-]{20,}"
   # AWS access keys
@@ -19,9 +19,17 @@ sensitive_patterns:
   - "(?:sk|pk)_(?:test|live)_[a-zA-Z0-9]{20,}"
   # PEM private keys
   - "-----BEGIN.*PRIVATE KEY-----"
-  # Generic bearer tokens (long alphanumeric after "Bearer")
-  - "Bearer\\s+[A-Za-z0-9\\-._~+/]+=*"
+  # Bearer tokens (minimum 20 chars to avoid matching examples/docs)
+  - "Bearer\\s+[A-Za-z0-9\\-._~+/]{20,}=*"
   # Slack tokens
   - "xox[baprs]-[0-9a-zA-Z\\-]{10,}"
   # Generic high-entropy hex secrets (64+ chars, likely API keys)
   - "(?i)(?:api[_-]?key|secret|token|password)[\"'=:\\s]+[a-f0-9]{64,}"
+  # Database connection strings with embedded credentials
+  - "(?i)(?:postgres|mysql|mongodb(?:\\+srv)?)://[^:]+:[^@]+@"
+  # SendGrid API keys
+  - "SG\\.[A-Za-z0-9_\\-]{22,}\\.[A-Za-z0-9_\\-]{22,}"
+  # NPM tokens
+  - "npm_[A-Za-z0-9]{36,}"
+  # Shopify tokens
+  - "shp(?:at|ss|pa)_[a-fA-F0-9]{32,}"

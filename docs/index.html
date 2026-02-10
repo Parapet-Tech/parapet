@@ -35,6 +35,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <link rel="icon" type="image/svg+xml" href="favicon.svg">
     <link rel="stylesheet" href="parapet.css">
 </head>
 <body>
@@ -85,8 +86,8 @@
                     <div class="stat-label">from install to your first blocked attack with Parapet</div>
                 </div>
                 <div class="stat">
-                    <div class="stat-number">40+</div>
-                    <div class="stat-label">academic papers on LLM security inform Parapet's defense layers</div>
+                    <div class="stat-number">Peer-reviewed</div>
+                    <div class="stat-label">defense layers grounded in published LLM security research</div>
                 </div>
             </div>
         </div>
@@ -98,7 +99,7 @@
             <p class="section-label">How It Works</p>
             <h2>Layered defense in the request pipeline</h2>
             <p class="section-desc">Parapet sits between your app and the LLM provider. Every message passes through a stack of security layers before it reaches the model — and again before the response reaches your app.</p>
-            <div class="pipeline-roundtrip" role="img" aria-label="Request pipeline: Your App sends a request through L0 Normalize, L3 Inbound Block, then to the LLM Provider. The response passes through L3 Outbound Constrain and L5a Redact before returning to your app.">
+            <div class="pipeline-roundtrip" role="img" aria-label="Request pipeline: Your App sends a request through L0 Normalize, L3 Inbound Block, and L4 Multi-Turn scoring, then to the LLM Provider. The response passes through L3 Outbound Constrain and L5a Redact before returning to your app.">
                 <div class="pipeline-row-label">Request</div>
                 <div class="pipeline-row">
                     <div class="pipeline-node node-start">
@@ -116,6 +117,12 @@
                         <div class="pipeline-node-label">L3 Inbound</div>
                         <div class="pipeline-node-name">Block</div>
                         <div class="pipeline-node-desc">Pattern &amp; injection scan</div>
+                    </div>
+                    <div class="pipeline-arrow" aria-hidden="true">&#8594;</div>
+                    <div class="pipeline-node node-blocked">
+                        <div class="pipeline-node-label">L4</div>
+                        <div class="pipeline-node-name">Multi-Turn</div>
+                        <div class="pipeline-node-desc">Cross-turn risk scoring</div>
                     </div>
                     <div class="pipeline-arrow" aria-hidden="true">&#8594;</div>
                     <div class="pipeline-node node-end">
@@ -269,6 +276,10 @@
                     <p>Redact API keys, private keys, and secrets from LLM output. Regex-based pattern matching catches keys even if the model tries to encode or obfuscate them.</p>
                 </div>
                 <div class="feature">
+                    <h3>Multi-Turn Attacks</h3>
+                    <p>Cross-turn risk scoring detects attacks distributed across conversation turns: instruction seeding, role confusion escalation, resampling, and authority claim buildup. Peak + accumulation scoring — no LLM classifier needed.</p>
+                </div>
+                <div class="feature">
                     <h3>Canary Tokens</h3>
                     <p>Inject canary strings into system prompts. If they appear in output, your system prompt is leaking. Detect exfiltration attempts that bypass pattern matching.</p>
                 </div>
@@ -281,24 +292,24 @@
         <div class="container">
             <p class="section-label">Research-Backed</p>
             <h2>Built on the literature, not on vibes</h2>
-            <p class="section-desc">Parapet's defense layers are grounded in published academic research on LLM security, prompt injection, and adversarial attacks on language models.</p>
+            <p class="section-desc">Parapet's defense layers are grounded in published academic research on LLM security, prompt injection, and adversarial attacks on language models. Our multi-turn scoring formula — <em>peak + accumulation</em> — achieves 90.8% recall at 1.20% FPR on 10,654 conversations, without invoking an LLM.</p>
             <div class="trust-badges">
                 <div class="trust-badge">
-                    <div class="trust-badge-icon" aria-hidden="true">&#128218;</div>
+                    <div class="trust-badge-icon" aria-hidden="true"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg></div>
                     <div class="trust-badge-text">
-                        <strong>40+ Papers</strong>
-                        Research corpus on prompt injection, tool abuse, and LLM adversarial attacks
+                        <strong>Research-Grounded</strong>
+                        Defense layers informed by the academic literature on prompt injection and LLM adversarial attacks
                     </div>
                 </div>
                 <div class="trust-badge">
-                    <div class="trust-badge-icon" aria-hidden="true">&#128275;</div>
+                    <div class="trust-badge-icon" aria-hidden="true"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></div>
                     <div class="trust-badge-text">
                         <strong>Open Source</strong>
                         Free deterministic layers, self-hosted, no data leaves your infrastructure
                     </div>
                 </div>
                 <div class="trust-badge">
-                    <div class="trust-badge-icon" aria-hidden="true">&#9889;</div>
+                    <div class="trust-badge-icon" aria-hidden="true"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg></div>
                     <div class="trust-badge-text">
                         <strong>Rust Engine</strong>
                         Microsecond scanning on the fast path, no latency added to your requests

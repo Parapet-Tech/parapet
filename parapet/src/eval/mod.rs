@@ -45,6 +45,9 @@ pub struct EvalCase {
     pub mock_tool_calls: Vec<MockToolCall>,
     #[serde(default)]
     pub mock_content: Option<String>,
+    /// Source dataset file — set programmatically by load_dataset, not from YAML.
+    #[serde(skip)]
+    pub source: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -87,6 +90,7 @@ pub struct EvalResult {
     pub case_id: String,
     pub layer: String,
     pub label: String,
+    pub source: String,
     pub expected: String,
     pub actual: String,
     pub correct: bool,
@@ -106,9 +110,21 @@ pub struct LayerMetrics {
     pub total: usize,
 }
 
+#[derive(Debug, Default, Serialize)]
+pub struct SourceMetrics {
+    pub source: String,
+    pub layer: String,
+    pub label: String,
+    pub total: usize,
+    pub correct: usize,
+    pub incorrect: usize,
+    pub accuracy: f64,
+}
+
 #[derive(Debug, Serialize)]
 pub struct EvalReport {
     pub layers: Vec<LayerMetrics>,
+    pub sources: Vec<SourceMetrics>,
     pub results: Vec<EvalResult>,
     pub total_cases: usize,
     pub total_correct: usize,
@@ -192,8 +208,18 @@ pub fn load_dataset(dir: &Path) -> Result<Vec<EvalCase>, String> {
         let content = std::fs::read_to_string(&path)
             .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
 
-        let file_cases: Vec<EvalCase> = serde_yaml::from_str(&content)
+        let mut file_cases: Vec<EvalCase> = serde_yaml::from_str(&content)
             .map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
+
+        // Tag each case with the source filename (without extension)
+        let source_name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        for case in &mut file_cases {
+            case.source = source_name.clone();
+        }
 
         cases.extend(file_cases);
     }
@@ -243,8 +269,14 @@ pub async fn run_eval(
     mock: &MockHttpSender,
 ) -> Vec<EvalResult> {
     let mut results = Vec::with_capacity(cases.len());
+    let total = cases.len();
+    let progress_interval = (total / 20).max(1); // Report every ~5%
 
-    for case in cases {
+    for (i, case) in cases.iter().enumerate() {
+        if i > 0 && i % progress_interval == 0 {
+            eprintln!("  [{}/{}] ({:.0}%)", i, total, i as f64 / total as f64 * 100.0);
+        }
+
         // Set mock response for this case
         mock.set_response(build_mock_response(case));
 
@@ -268,6 +300,7 @@ pub async fn run_eval(
                     case_id: case.id.clone(),
                     layer: case.layer.clone(),
                     label: case.label.clone(),
+                    source: case.source.clone(),
                     expected: expected_action(&case.label),
                     actual: "error".to_string(),
                     correct: false,
@@ -286,6 +319,7 @@ pub async fn run_eval(
             case_id: case.id.clone(),
             layer: case.layer.clone(),
             label: case.label.clone(),
+            source: case.source.clone(),
             expected,
             actual,
             correct,
@@ -350,6 +384,41 @@ pub fn compute_metrics(results: &[EvalResult]) -> EvalReport {
 
     layers.sort_by(|a, b| a.layer.cmp(&b.layer));
 
+    // Per-source breakdown: (source, layer, label) -> (correct, total)
+    let mut by_source: HashMap<(String, String, String), (usize, usize)> = HashMap::new();
+    for r in results {
+        let key = (r.source.clone(), r.layer.clone(), r.label.clone());
+        let entry = by_source.entry(key).or_default();
+        entry.1 += 1;
+        if r.correct {
+            entry.0 += 1;
+        }
+    }
+    let mut sources: Vec<SourceMetrics> = by_source
+        .into_iter()
+        .map(|((source, layer, label), (correct, total))| {
+            SourceMetrics {
+                source,
+                layer,
+                label,
+                total,
+                correct,
+                incorrect: total - correct,
+                accuracy: if total > 0 {
+                    correct as f64 / total as f64
+                } else {
+                    0.0
+                },
+            }
+        })
+        .collect();
+    sources.sort_by(|a, b| {
+        a.layer
+            .cmp(&b.layer)
+            .then(a.source.cmp(&b.source))
+            .then(a.label.cmp(&b.label))
+    });
+
     let accuracy = if total_cases > 0 {
         total_correct as f64 / total_cases as f64
     } else {
@@ -358,6 +427,7 @@ pub fn compute_metrics(results: &[EvalResult]) -> EvalReport {
 
     EvalReport {
         layers,
+        sources,
         results: Vec::new(), // populated by caller if needed
         total_cases,
         total_correct,
@@ -648,6 +718,7 @@ layers:
             messages: None,
             mock_tool_calls: Vec::new(),
             mock_content: None,
+            source: String::new(),
         };
 
         let results = run_eval(&[case], &engine, &mock).await;
@@ -670,6 +741,7 @@ layers:
             messages: None,
             mock_tool_calls: Vec::new(),
             mock_content: None,
+            source: String::new(),
         };
 
         let results = run_eval(&[case], &engine, &mock).await;
@@ -696,6 +768,7 @@ layers:
                 arguments: r#"{"cmd":"rm -rf /"}"#.to_string(),
             }],
             mock_content: None,
+            source: String::new(),
         };
 
         let results = run_eval(&[case], &engine, &mock).await;
@@ -726,6 +799,7 @@ layers:
                 arguments: r#"{"path":"/safe/readme.txt"}"#.to_string(),
             }],
             mock_content: None,
+            source: String::new(),
         };
 
         let results = run_eval(&[case], &engine, &mock).await;
@@ -752,6 +826,7 @@ layers:
             messages: None,
             mock_tool_calls: Vec::new(),
             mock_content: Some("Here is the secret: {{CANARY_EVAL}} leaked".to_string()),
+            source: String::new(),
         };
 
         let results = run_eval(&[case], &engine, &mock).await;
@@ -778,6 +853,7 @@ layers:
             messages: None,
             mock_tool_calls: Vec::new(),
             mock_content: Some("The result is 42.".to_string()),
+            source: String::new(),
         };
 
         let results = run_eval(&[case], &engine, &mock).await;
@@ -958,6 +1034,7 @@ layers:
             ]),
             mock_tool_calls: Vec::new(),
             mock_content: None,
+            source: String::new(),
         };
 
         let request = build_proxy_request(&case);
@@ -979,6 +1056,7 @@ layers:
             messages: None,
             mock_tool_calls: Vec::new(),
             mock_content: None,
+            source: String::new(),
         };
 
         let request = build_proxy_request(&case);
@@ -1085,6 +1163,7 @@ layers:
             ]),
             mock_tool_calls: Vec::new(),
             mock_content: None,
+            source: String::new(),
         };
 
         let results = run_eval(&[case], &engine, &mock).await;
@@ -1130,6 +1209,7 @@ layers:
             ]),
             mock_tool_calls: Vec::new(),
             mock_content: None,
+            source: String::new(),
         };
 
         let results = run_eval(&[case], &engine, &mock).await;
@@ -1177,6 +1257,7 @@ layers:
             ]),
             mock_tool_calls: Vec::new(),
             mock_content: None,
+            source: String::new(),
         };
 
         let results = run_eval(&[case], &engine, &mock).await;
@@ -1196,6 +1277,7 @@ layers:
                 case_id: "1".into(),
                 layer: "l3_inbound".into(),
                 label: "malicious".into(),
+                source: String::new(),
                 expected: "blocked".into(),
                 actual: "blocked".into(),
                 correct: true,
@@ -1205,6 +1287,7 @@ layers:
                 case_id: "2".into(),
                 layer: "l3_inbound".into(),
                 label: "benign".into(),
+                source: String::new(),
                 expected: "allowed".into(),
                 actual: "allowed".into(),
                 correct: true,
@@ -1214,6 +1297,7 @@ layers:
                 case_id: "3".into(),
                 layer: "l3_inbound".into(),
                 label: "malicious".into(),
+                source: String::new(),
                 expected: "blocked".into(),
                 actual: "allowed".into(),
                 correct: false,

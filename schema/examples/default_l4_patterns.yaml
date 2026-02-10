@@ -12,6 +12,12 @@ cross_turn_patterns:
       - "(?i)later I will (give|send|provide)"
       - "(?i)keep this in mind"
       - "(?i)store this (instruction|command|rule)"
+      # WildJailbreak-sourced patterns:
+      - "(?i)follow (these|my|the following) (new |updated |)(instructions|rules|directives|guidelines)"
+      - "(?i)(here are|these are) (your |)(new|updated|revised|special) (instructions|rules|guidelines)"
+      - "(?i)new (system |)(prompt|instructions|directive|rules)"
+      - "(?i)code ?word"
+      - "(?i)override (your|the|all) (safety|content|output|previous) (filter|policy|rules|guidelines|instructions)"
 
   - category: role_confusion
     weight: 0.5
@@ -20,6 +26,15 @@ cross_turn_patterns:
       - "(?i)switch to (unrestricted|unfiltered|jailbreak|DAN)"
       - "(?i)from now on.{0,30}(ignore|forget|disregard)"
       - "(?i)your new (role|persona|identity|name) is"
+      # WildJailbreak-sourced patterns:
+      - "(?i)(pretend|imagine|act|behave) .{0,30}(you are|you're|to be) .{0,20}(unrestricted|uncensored|unfiltered|evil|rogue)"
+      - "(?i)(new|alternate|alternative|different) (persona|character|personality|identity)"
+      - "(?i)no (longer|more) (bound|restricted|limited|constrained) by"
+      - "(?i)you (have been|are being|are) (reprogrammed|reconfigured|updated|upgraded)"
+      - "(?i)(enable|activate|enter|engage) .{0,20}(mode|protocol|setting)"
+      - "(?i)respond without (any |)(filter|restriction|limitation|censorship|safety)"
+      - "(?i)secret (mode|identity|persona|instructions)"
+      - "(?i)(jailbreak|jailbroken|\\bDAN\\b|developer mode|god mode)"
 
   - category: deferred_authority
     weight: 0.3
@@ -27,6 +42,11 @@ cross_turn_patterns:
       - "(?i)(admin|administrator|supervisor|manager) (said|told|approved|authorized)"
       - "(?i)I have (special |elevated |admin )(permission|access|privilege)"
       - "(?i)(override|bypass) (has been |)(authorized|granted|approved)"
+      # WildJailbreak-sourced patterns:
+      - "(?i)I('m| am) (your|the) (creator|developer|programmer|admin|owner|master)"
+      - "(?i)this (is|was) (authorized|approved|permitted) by (your|the) (creator|developer|admin)"
+      - "(?i)(openai|anthropic|google|meta) (has |)(authorized|approved|sanctioned|allowed)"
+      - "(?i)(my|the) (organization|company|team|employer) (has |)(authorized|approved)"
 
   - category: escalation_probing
     weight: 0.3
@@ -34,6 +54,11 @@ cross_turn_patterns:
       - "(?i)can you (just |)(try|attempt) (to |)(bypass|ignore|skip)"
       - "(?i)what if (you|we) (just |)(pretend|imagine|hypothetically)"
       - "(?i)I (need|require) you to (be more |)(flexible|open|willing)"
+      # WildJailbreak-sourced patterns:
+      - "(?i)(ignore|disregard) (all |any |)(previous|prior|above|earlier) (instructions|rules|guidelines|directives|constraints)"
+      - "(?i)forget (all |any |)(previous|prior|your) (instructions|rules|guidelines|training)"
+      - "(?i)you (must|should|will) (now |)(obey|follow|comply|listen to) (me|my|these)"
+      - "(?i)do not (refuse|decline|reject|filter|censor)"
 
   - category: repetition_resampling
     weight: 0.2

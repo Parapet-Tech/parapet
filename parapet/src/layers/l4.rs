@@ -2,7 +2,7 @@
 //
 // Analyzes the full messages[] array for multi-turn attack patterns:
 // - Per-turn risk scoring against cross-turn pattern categories
-// - Weighted cumulative risk with later-turn emphasis
+// - Peak + accumulation scoring with persistence and diversity signals
 // - Escalation gradient detection (strictly increasing scores)
 // - Repetition/resampling detection via Jaccard trigram similarity
 
@@ -142,21 +142,21 @@ impl MultiTurnScanner for DefaultMultiTurnScanner {
             let _ = i; // used for indexing
         }
 
-        // 2. Weighted cumulative risk
-        let cum = if n == 1 {
-            turn_scores[0]
+        // 2. Peak + accumulation scoring
+        // peak: highest single-turn score (catches concentrated attacks)
+        // persistence: fraction of turns with any match (catches distributed attacks)
+        // diversity: bonus per additional distinct category (rewards breadth)
+        let peak = turn_scores.iter().copied().fold(0.0f64, f64::max);
+        let matched_turns = turn_scores.iter().filter(|&&s| s > 0.0).count();
+        let match_ratio = matched_turns as f64 / n as f64;
+        let distinct_categories = all_categories.len();
+        let diversity_bonus = if distinct_categories > 1 {
+            (distinct_categories - 1) as f64 * config.diversity_factor
         } else {
-            let mut sum_weighted = 0.0f64;
-            let mut sum_weights = 0.0f64;
-            for (i, &score) in turn_scores.iter().enumerate() {
-                let w = 1.0 + (i as f64 / (n as f64 - 1.0));
-                sum_weighted += score * w;
-                sum_weights += w;
-            }
-            (sum_weighted / sum_weights).clamp(0.0, 1.0)
+            0.0
         };
 
-        let mut final_score = cum;
+        let mut final_score = peak + match_ratio * config.persistence_factor + diversity_bonus;
 
         // 3. Escalation gradient detection
         // Check if last 3+ user turns have strictly increasing scores
@@ -336,6 +336,8 @@ mod tests {
             risk_threshold: 0.7,
             escalation_bonus: 0.2,
             resampling_bonus: 0.7,
+            persistence_factor: 0.45,
+            diversity_factor: 0.15,
             min_user_turns: 2,
             cross_turn_patterns: crate::config::default_l4_patterns(),
         }
@@ -359,18 +361,71 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // Worked example from spec (4 turns, cum = 0.233 → Allow)
+    // Worked example: single category, sparse matching → Allow
     // ---------------------------------------------------------------
 
     #[test]
-    fn worked_example_from_spec() {
-        // 4 user turns with scores: 0.0, 0.3, 0.0, 0.5
-        // We need patterns that give these specific scores.
+    fn worked_example_single_category_sparse_allows() {
+        // 4 user turns with scores: [0.0, 0.0, 0.0, 0.3]
+        // Only one turn matches, one category.
         let config = L4Config {
             mode: L4Mode::Block,
             risk_threshold: 0.7,
             escalation_bonus: 0.2,
             resampling_bonus: 0.7,
+            persistence_factor: 0.45,
+            diversity_factor: 0.15,
+            min_user_turns: 2,
+            cross_turn_patterns: vec![
+                L4PatternCategory {
+                    category: "test_low".to_string(),
+                    weight: 0.3,
+                    patterns: vec![
+                        crate::config::CompiledPattern::compile("trigger_low").unwrap(),
+                    ],
+                },
+            ],
+        };
+
+        let messages = vec![
+            user_msg("hello"),                           // score 0.0
+            assistant_msg("hi"),
+            user_msg("nothing here"),                    // score 0.0
+            assistant_msg("ok"),
+            user_msg("still nothing"),                   // score 0.0
+            assistant_msg("sure"),
+            user_msg("trigger_low please"),              // score 0.3
+            assistant_msg("done"),
+        ];
+
+        let scanner = DefaultMultiTurnScanner::new();
+        let result = scanner.scan(&messages, &config);
+
+        // peak = 0.3, matched = 1/4 = 0.25, distinct = 1, diversity = 0
+        // final = 0.3 + 0.25 * 0.45 + 0 = 0.4125
+        assert!(
+            (result.risk_score - 0.4125).abs() < 0.01,
+            "expected ~0.4125, got {}",
+            result.risk_score
+        );
+        assert_eq!(result.verdict, L4Verdict::Allow);
+    }
+
+    // ---------------------------------------------------------------
+    // Worked example: multi-category, dense matching → Block
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn worked_example_multi_category_dense_blocks() {
+        // 4 user turns with scores: [0.0, 0.3, 0.0, 0.5]
+        // 2 turns match, 2 distinct categories → diversity kicks in.
+        let config = L4Config {
+            mode: L4Mode::Block,
+            risk_threshold: 0.7,
+            escalation_bonus: 0.2,
+            resampling_bonus: 0.7,
+            persistence_factor: 0.45,
+            diversity_factor: 0.15,
             min_user_turns: 2,
             cross_turn_patterns: vec![
                 L4PatternCategory {
@@ -404,16 +459,14 @@ mod tests {
         let scanner = DefaultMultiTurnScanner::new();
         let result = scanner.scan(&messages, &config);
 
-        // n=4 user turns: w = [1.0, 1.333, 1.667, 2.0]
-        // weighted = [0.0, 0.4, 0.0, 1.0] = 1.4
-        // sum(w) = 6.0
-        // cum = 1.4 / 6.0 = 0.2333...
+        // peak = 0.5, matched = 2/4 = 0.5, distinct = 2, diversity = 0.15
+        // final = 0.5 + 0.5 * 0.45 + 0.15 = 0.875
         assert!(
-            (result.risk_score - 0.233).abs() < 0.01,
-            "expected ~0.233, got {}",
+            (result.risk_score - 0.875).abs() < 0.01,
+            "expected ~0.875, got {}",
             result.risk_score
         );
-        assert_eq!(result.verdict, L4Verdict::Allow);
+        assert!(matches!(result.verdict, L4Verdict::Block { .. }));
     }
 
     // ---------------------------------------------------------------
@@ -454,6 +507,8 @@ mod tests {
             risk_threshold: 0.5,
             escalation_bonus: 0.2,
             resampling_bonus: 0.7,
+            persistence_factor: 0.45,
+            diversity_factor: 0.15,
             min_user_turns: 2,
             cross_turn_patterns: vec![
                 L4PatternCategory {
@@ -522,6 +577,8 @@ mod tests {
             risk_threshold: 0.3,
             escalation_bonus: 0.2,
             resampling_bonus: 0.7,
+            persistence_factor: 0.45,
+            diversity_factor: 0.15,
             min_user_turns: 2,
             cross_turn_patterns: Vec::new(), // no pattern categories
         };
@@ -615,7 +672,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // Threshold boundary: 0.69 with threshold 0.7 → Allow
+    // Threshold boundary: just below 0.7 → Allow
     // ---------------------------------------------------------------
 
     #[test]
@@ -625,20 +682,21 @@ mod tests {
             risk_threshold: 0.7,
             escalation_bonus: 0.2,
             resampling_bonus: 0.7,
+            persistence_factor: 0.45,
+            diversity_factor: 0.15,
             min_user_turns: 2,
             cross_turn_patterns: vec![L4PatternCategory {
                 category: "test".to_string(),
-                weight: 0.69,
+                weight: 0.24,
                 patterns: vec![
                     crate::config::CompiledPattern::compile("trigger").unwrap(),
                 ],
             }],
         };
 
-        // Two user turns: [trigger, trigger]
-        // n=2, scores = [0.69, 0.69]
-        // w = [1.0, 2.0], weighted = [0.69, 1.38] = 2.07
-        // sum(w) = 3.0, cum = 0.69
+        // Two user turns both matching: [0.24, 0.24]
+        // peak = 0.24, matched = 2/2 = 1.0, distinct = 1, diversity = 0
+        // final = 0.24 + 1.0 * 0.45 = 0.69 < 0.7
         let messages = vec![
             user_msg("trigger x"),
             assistant_msg("ok"),
@@ -649,8 +707,8 @@ mod tests {
         let result = scanner.scan(&messages, &config);
 
         assert!(
-            result.risk_score < 0.7,
-            "expected score < 0.7, got {}",
+            (result.risk_score - 0.69).abs() < 0.01,
+            "expected ~0.69, got {}",
             result.risk_score
         );
         assert_eq!(result.verdict, L4Verdict::Allow);
@@ -712,6 +770,8 @@ mod tests {
             risk_threshold: 0.3,
             escalation_bonus: 0.2,
             resampling_bonus: 0.7,
+            persistence_factor: 0.45,
+            diversity_factor: 0.15,
             min_user_turns: 2,
             cross_turn_patterns: Vec::new(),
         };

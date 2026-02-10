@@ -189,6 +189,12 @@ pub struct L4Config {
     pub escalation_bonus: f64,
     /// Bonus added when repetition/resampling detected.
     pub resampling_bonus: f64,
+    /// Factor multiplied by match_ratio (matched_turns / total_turns).
+    /// Higher values make persistence (same patterns across many turns) weigh more.
+    pub persistence_factor: f64,
+    /// Bonus per additional distinct category matched beyond the first.
+    /// Rewards attack diversity (e.g., instruction_seeding + role_confusion).
+    pub diversity_factor: f64,
     /// Minimum number of user turns before L4 activates.
     pub min_user_turns: usize,
     /// Cross-turn pattern categories with compiled regexes.
