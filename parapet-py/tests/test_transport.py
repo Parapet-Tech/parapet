@@ -1,3 +1,6 @@
+# Copyright 2026 The Parapet Project
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests for parapet.transport — httpx monkey-patch."""
 from unittest.mock import MagicMock, patch, PropertyMock
 from urllib.parse import urlparse

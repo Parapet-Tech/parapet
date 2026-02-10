@@ -1,3 +1,6 @@
+// Copyright 2026 The Parapet Project
+// SPDX-License-Identifier: Apache-2.0
+
 /// All errors that can occur during config loading and validation.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {

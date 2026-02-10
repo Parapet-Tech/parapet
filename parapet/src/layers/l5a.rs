@@ -1,3 +1,6 @@
+// Copyright 2026 The Parapet Project
+// SPDX-License-Identifier: Apache-2.0
+
 // L5a output pattern scanner -- defined in M1.10
 //
 // Scans LLM response content for canary tokens and sensitive patterns,

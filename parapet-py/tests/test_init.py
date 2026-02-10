@@ -1,3 +1,6 @@
+# Copyright 2026 The Parapet Project
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests for parapet.__init__ — main API (init, session)."""
 import os
 import tempfile

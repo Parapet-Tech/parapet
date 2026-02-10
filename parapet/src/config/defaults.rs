@@ -1,3 +1,6 @@
+// Copyright 2026 The Parapet Project
+// SPDX-License-Identifier: Apache-2.0
+
 use super::pattern::CompiledPattern;
 use super::types::{L4Config, L4Mode, L4PatternCategory, LayerConfig, LayerConfigs};
 

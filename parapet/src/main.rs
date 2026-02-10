@@ -1,3 +1,6 @@
+// Copyright 2026 The Parapet Project
+// SPDX-License-Identifier: Apache-2.0
+
 use clap::Parser;
 use parapet::config;
 use parapet::engine;

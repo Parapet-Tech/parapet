@@ -1,3 +1,6 @@
+# Copyright 2026 The Parapet Project
+# SPDX-License-Identifier: Apache-2.0
+
 """Byte-range trust registry for marking untrusted content.
 
 SDK users call ``parapet.untrusted(content, source)`` to register strings

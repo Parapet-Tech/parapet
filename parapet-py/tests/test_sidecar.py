@@ -1,3 +1,6 @@
+# Copyright 2026 The Parapet Project
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests for parapet.sidecar — Engine process lifecycle."""
 import os
 import tempfile

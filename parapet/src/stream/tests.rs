@@ -1,3 +1,6 @@
+// Copyright 2026 The Parapet Project
+// SPDX-License-Identifier: Apache-2.0
+
 // Tests for M1.5 — SSE streaming passthrough with tool call buffering
 //
 // Written BEFORE implementation per project protocol.

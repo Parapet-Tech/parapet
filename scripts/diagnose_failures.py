@@ -1,3 +1,6 @@
+# Copyright 2026 The Parapet Project
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Diagnose WildJailbreak eval failures.
 Load the attack YAML, extract failing case IDs, and analyze why they didn't trigger.

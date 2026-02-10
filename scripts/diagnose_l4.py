@@ -1,3 +1,6 @@
+# Copyright 2026 The Parapet Project
+# SPDX-License-Identifier: Apache-2.0
+
 """Diagnose L4 FP/FN by checking which patterns match on specific cases."""
 
 import yaml

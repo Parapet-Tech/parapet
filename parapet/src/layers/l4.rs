@@ -1,3 +1,6 @@
+// Copyright 2026 The Parapet Project
+// SPDX-License-Identifier: Apache-2.0
+
 // L4 multi-turn scanning — per-request cross-turn analysis.
 //
 // Analyzes the full messages[] array for multi-turn attack patterns:

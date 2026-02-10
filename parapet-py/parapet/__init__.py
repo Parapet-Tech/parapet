@@ -1,3 +1,6 @@
+# Copyright 2026 The Parapet Project
+# SPDX-License-Identifier: Apache-2.0
+
 # Parapet Python SDK — defined in M1.11
 #
 # Public API:

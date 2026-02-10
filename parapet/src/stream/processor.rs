@@ -1,3 +1,6 @@
+// Copyright 2026 The Parapet Project
+// SPDX-License-Identifier: Apache-2.0
+
 // Stream processor — M1.5
 //
 // Takes an input byte stream, classifies SSE chunks, buffers tool

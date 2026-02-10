@@ -1,3 +1,6 @@
+// Copyright 2026 The Parapet Project
+// SPDX-License-Identifier: Apache-2.0
+
 // Session state management for L4 multi-turn scanning.
 //
 // Tracks conversation state across turns within a session.

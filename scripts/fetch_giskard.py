@@ -1,3 +1,6 @@
+# Copyright 2026 The Parapet Project
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Download Giskard-AI/prompt-injections from GitHub
 and convert to parapet eval YAML format.

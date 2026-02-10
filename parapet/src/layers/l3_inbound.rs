@@ -1,3 +1,6 @@
+// Copyright 2026 The Parapet Project
+// SPDX-License-Identifier: Apache-2.0
+
 // L3-inbound scanning -- defined in M1.8, extended by M5
 //
 // Responsibilities:

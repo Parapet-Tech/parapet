@@ -1,3 +1,6 @@
+# Copyright 2026 The Parapet Project
+# SPDX-License-Identifier: Apache-2.0
+
 """Engine process lifecycle management.
 
 Manages spawning the Rust engine as a subprocess, PID file tracking,

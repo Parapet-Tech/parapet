@@ -1,3 +1,6 @@
+# Copyright 2026 The Parapet Project
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Explore allenai/wildjailbreak to find adversarial prompts that use
 injection-like tactics matching our L4 pattern categories.
