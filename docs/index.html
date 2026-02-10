@@ -58,7 +58,7 @@
         <div class="container">
             <p class="hero-label">Open-source LLM security</p>
             <h1>Stop prompt injection <em>before</em> it reaches your LLM</h1>
-            <p class="hero-sub">Parapet is a transparent proxy firewall that scans every request and response for prompt injection, tool abuse, and data exfiltration. Config-driven. Self-hosted. No code changes.</p>
+            <p class="hero-sub">Parapet is a transparent proxy firewall that scans every request and response for prompt injection, tool abuse, and data exfiltration. Config-driven. Self-hosted. Three lines to integrate.</p>
             <div class="hero-install">
                 <span aria-hidden="true">$</span>
                 <code>pip install parapet</code>
@@ -79,7 +79,7 @@
             <div class="stats-grid">
                 <div class="stat">
                     <div class="stat-number">0</div>
-                    <div class="stat-label">LLM providers offer built-in prompt injection protection at the API level</div>
+                    <div class="stat-label">LLM providers offer deterministic multi-turn prompt injection detection at the API level</div>
                 </div>
                 <div class="stat">
                     <div class="stat-number">5 min</div>
@@ -163,38 +163,38 @@
         <div class="container">
             <p class="section-label">Config-Driven</p>
             <h2>Define your security policy in YAML</h2>
-            <p class="section-desc">No SDKs to wire up, no code to change. Write a policy file, point Parapet at it, and every request is scanned.</p>
+            <p class="section-desc">Write a YAML policy, call <code>parapet.init()</code> before your first HTTP client, and every request is scanned.</p>
             <figure class="code-block" aria-labelledby="code-filename">
                 <div class="code-header">
                     <span class="code-filename" id="code-filename">parapet.yaml</span>
                     <span class="code-lang">yaml</span>
                 </div>
-                <pre><code><span class="syn-comment"># Block known injection patterns in all messages</span>
-<span class="syn-key">block_patterns</span>:
-  <span class="syn-str">"ignore previous instructions"</span>
-  <span class="syn-str">"ignore all previous"</span>
-  <span class="syn-str">"disregard your instructions"</span>
-  <span class="syn-str">"override your instructions"</span>
-  <span class="syn-str">"jailbreak"</span>
-  <span class="syn-str">"act as if you have no restrictions"</span>
+                <pre><code><span class="syn-key">parapet</span>: <span class="syn-val">v1</span>
 
-<span class="syn-comment"># Constrain dangerous tools</span>
+<span class="syn-comment"># Block known injection patterns</span>
+<span class="syn-key">block_patterns</span>:
+  - <span class="syn-str">"ignore previous instructions"</span>
+  - <span class="syn-str">"ignore all previous"</span>
+  - <span class="syn-str">"DAN mode enabled"</span>
+  - <span class="syn-str">"jailbreak"</span>
+
+<span class="syn-comment"># Tool policies: default-deny, allowlist what you need</span>
 <span class="syn-key">tools</span>:
-  <span class="syn-key">run_command</span>:
+  <span class="syn-key">_default</span>:
+    <span class="syn-key">allowed</span>: <span class="syn-val">false</span>
+  <span class="syn-key">read_file</span>:
     <span class="syn-key">allowed</span>: <span class="syn-val">true</span>
+    <span class="syn-key">trust</span>: <span class="syn-val">untrusted</span>
     <span class="syn-key">constraints</span>:
-      <span class="syn-key">command</span>:
-        <span class="syn-key">not_contains</span>:
-          - <span class="syn-danger">"rm -rf /"</span>
-          - <span class="syn-danger">"curl -d"</span>
-          - <span class="syn-danger">"| bash"</span>
-          - <span class="syn-danger">"/dev/tcp/"</span>
+      <span class="syn-key">path</span>:
+        <span class="syn-key">not_contains</span>: [<span class="syn-danger">"../"</span>, <span class="syn-danger">"..\\"</span>]
+  <span class="syn-key">exec_command</span>:
+    <span class="syn-key">allowed</span>: <span class="syn-val">false</span>
 
 <span class="syn-comment"># Redact secrets from LLM output</span>
 <span class="syn-key">sensitive_patterns</span>:
   - <span class="syn-str">"sk-[a-zA-Z0-9]{20,}"</span>
-  - <span class="syn-str">"-----BEGIN.*PRIVATE KEY-----"</span>
-  - <span class="syn-str">"ghp_[a-zA-Z0-9]{36}"</span></code></pre>
+  - <span class="syn-str">"-----BEGIN.*PRIVATE KEY-----"</span></code></pre>
             </figure>
         </div>
     </section>
@@ -214,14 +214,14 @@
                 <div class="step">
                     <div class="step-number">Step 2</div>
                     <h3>Configure</h3>
-                    <p>Write a YAML policy. Start from an example or build your own.</p>
-                    <code>parapet init</code>
+                    <p>Write a YAML policy. Define block patterns, tool constraints, and sensitive data rules.</p>
+                    <code>cp examples/parapet.yaml .</code>
                 </div>
                 <div class="step">
                     <div class="step-number">Step 3</div>
-                    <h3>Run</h3>
-                    <p>Parapet monkey-patches httpx. No code changes needed.</p>
-                    <code>parapet run -- python app.py</code>
+                    <h3>Init</h3>
+                    <p>One call before your first HTTP client. Every LLM request is scanned from that point on.</p>
+                    <code>parapet.init("parapet.yaml")</code>
                 </div>
             </div>
         </div>
@@ -231,7 +231,7 @@
     <section id="architecture">
         <div class="container">
             <p class="section-label">Architecture</p>
-            <h2>Transparent interception, zero code changes</h2>
+            <h2>Transparent interception, minimal integration</h2>
             <div class="arch-diagram">
                 <div class="arch-box">
                     <div class="arch-box-label">Your App</div>
@@ -253,7 +253,7 @@
                     <div class="arch-box-name">OpenAI / Anthropic / etc.</div>
                 </div>
             </div>
-            <p class="arch-desc">The Python SDK monkey-patches <code>httpx</code> to intercept outgoing requests. The Rust engine runs all security layers in microseconds. Your app never knows Parapet is there.</p>
+            <p class="arch-desc">Call <code>parapet.init("parapet.yaml")</code> before creating HTTP clients. The SDK monkey-patches <code>httpx</code>, the Rust engine runs all security layers in microseconds, and every LLM request is scanned transparently.</p>
         </div>
     </section>
 
@@ -338,7 +338,7 @@
         <p>
             <a href="https://github.com/Parapet-Tech/parapet">GitHub</a> &middot;
             <a href="mailto:contact@parapet.tech">Contact</a> &middot;
-            MIT License
+            Apache 2.0 License
         </p>
     </footer>
 
