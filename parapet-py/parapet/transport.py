@@ -1,3 +1,6 @@
+# Copyright 2026 The Parapet Project
+# SPDX-License-Identifier: Apache-2.0
+
 """httpx transport patch for routing LLM API requests through the parapet engine.
 
 Monkey-patches ``httpx.Client`` and ``httpx.AsyncClient`` so that requests

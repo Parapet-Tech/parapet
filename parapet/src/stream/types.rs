@@ -1,3 +1,6 @@
+// Copyright 2026 The Parapet Project
+// SPDX-License-Identifier: Apache-2.0
+
 // Stream types — M1.5
 //
 // Core types for SSE streaming: chunks, classification, validation,

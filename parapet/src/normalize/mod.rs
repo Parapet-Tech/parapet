@@ -1,3 +1,6 @@
+// Copyright 2026 The Parapet Project
+// SPDX-License-Identifier: Apache-2.0
+
 // NFKC normalization, HTML strip, encoding hygiene — defined in M1.6
 //
 // L0 normalization is a pure string transformation applied to every message

@@ -1,3 +1,6 @@
+// Copyright 2026 The Parapet Project
+// SPDX-License-Identifier: Apache-2.0
+
 // Raw YAML deserialization types (internal)
 // These are separate from the public Config structs because:
 // 1. serde_yaml needs Deserialize, but our public types contain Regex (not Deserialize)

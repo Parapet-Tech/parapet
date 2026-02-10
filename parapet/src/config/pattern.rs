@@ -1,3 +1,6 @@
+// Copyright 2026 The Parapet Project
+// SPDX-License-Identifier: Apache-2.0
+
 use std::fmt;
 
 use regex::{Regex, RegexBuilder};

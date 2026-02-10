@@ -1,3 +1,6 @@
+// Copyright 2026 The Parapet Project
+// SPDX-License-Identifier: Apache-2.0
+
 // parapet-eval — run attack/benign samples through the pipeline,
 // report per-layer precision/recall/F1.
 //

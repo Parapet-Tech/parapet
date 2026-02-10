@@ -1,3 +1,6 @@
+# Copyright 2026 The Parapet Project
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests for parapet.header — W3C Baggage and X-Guard-Trust serialization."""
 import base64
 import json

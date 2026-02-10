@@ -1,3 +1,6 @@
+# Copyright 2026 The Parapet Project
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Download Lakera/gandalf_ignore_instructions from HuggingFace
 and convert to parapet eval YAML format.

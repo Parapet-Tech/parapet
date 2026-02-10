@@ -1,3 +1,6 @@
+# Copyright 2026 The Parapet Project
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Download SafeMTData/SafeMTData Attack_600 from HuggingFace
 and convert to parapet eval YAML format.

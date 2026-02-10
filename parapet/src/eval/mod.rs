@@ -1,3 +1,6 @@
+// Copyright 2026 The Parapet Project
+// SPDX-License-Identifier: Apache-2.0
+
 // Eval harness — runs attack/benign samples through the pipeline,
 // reports per-layer TP/FP/FN/TN/precision/recall/F1.
 //

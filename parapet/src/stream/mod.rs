@@ -1,3 +1,6 @@
+// Copyright 2026 The Parapet Project
+// SPDX-License-Identifier: Apache-2.0
+
 // SSE passthrough and tool call buffering — defined in M1.5
 //
 // Responsibilities:

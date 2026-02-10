@@ -1,3 +1,6 @@
+// Copyright 2026 The Parapet Project
+// SPDX-License-Identifier: Apache-2.0
+
 // Chunk classifiers — M1.5
 //
 // Determine how each SSE chunk should be handled: pass through,

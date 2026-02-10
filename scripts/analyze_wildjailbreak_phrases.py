@@ -1,3 +1,6 @@
+# Copyright 2026 The Parapet Project
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Analyze injection phrases in WildJailbreak adversarial_harmful prompts.
 Extract the actual matching text for each broader injection pattern,

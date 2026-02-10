@@ -1,3 +1,6 @@
+// Copyright 2026 The Parapet Project
+// SPDX-License-Identifier: Apache-2.0
+
 // Engine integration -- defined in M1.12
 //
 // Wires all layers together for non-streaming and streaming requests:

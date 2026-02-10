@@ -1,3 +1,6 @@
+// Copyright 2026 The Parapet Project
+// SPDX-License-Identifier: Apache-2.0
+
 use super::error::ConfigError;
 
 /// Resolves `${VAR_NAME}` references in a string from environment variables.

@@ -1,3 +1,6 @@
+// Copyright 2026 The Parapet Project
+// SPDX-License-Identifier: Apache-2.0
+
 // Constraint DSL evaluator -- defined in M1.9
 //
 // Evaluates tool calls in LLM responses against the contract defined

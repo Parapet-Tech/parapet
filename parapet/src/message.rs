@@ -1,3 +1,6 @@
+// Copyright 2026 The Parapet Project
+// SPDX-License-Identifier: Apache-2.0
+
 // Internal message representation — defined in M1.4a
 //
 // These are the canonical types that ALL layers operate on.

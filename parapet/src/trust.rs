@@ -1,3 +1,6 @@
+// Copyright 2026 The Parapet Project
+// SPDX-License-Identifier: Apache-2.0
+
 // Role-based trust assignment — defined in M1.7
 //
 // Assigns `TrustLevel` to each `Message` based on:

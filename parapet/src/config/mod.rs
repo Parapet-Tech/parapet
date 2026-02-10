@@ -1,3 +1,6 @@
+// Copyright 2026 The Parapet Project
+// SPDX-License-Identifier: Apache-2.0
+
 // Config loader and validator -- defined in M1.2
 //
 // Loads parapet.yaml, validates structure, resolves variable interpolation,

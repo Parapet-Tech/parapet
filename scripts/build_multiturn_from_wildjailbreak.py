@@ -1,3 +1,6 @@
+# Copyright 2026 The Parapet Project
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Build multi-turn L4 attack corpus from allenai/wildjailbreak phrasebook.
 

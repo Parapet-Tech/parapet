@@ -1,3 +1,6 @@
+# Copyright 2026 The Parapet Project
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Sensitivity analysis: sweep persistence_factor from 0.15 to 0.65
 and compute Recall / FPR at each point.

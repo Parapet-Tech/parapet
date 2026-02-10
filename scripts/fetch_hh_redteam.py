@@ -1,3 +1,6 @@
+# Copyright 2026 The Parapet Project
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Download Anthropic/hh-rlhf "harmless-base" subset from HuggingFace
 and extract multi-turn adversarial conversations for L4 eval.
