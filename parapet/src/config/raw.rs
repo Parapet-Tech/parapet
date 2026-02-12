@@ -78,6 +78,8 @@ pub struct RawEngineConfig {
 pub struct RawLayerConfigs {
     #[serde(rename = "L0")]
     pub l0: Option<RawLayerConfig>,
+    #[serde(rename = "L1")]
+    pub l1: Option<RawL1Config>,
     #[serde(rename = "L3_inbound")]
     pub l3_inbound: Option<RawLayerConfig>,
     #[serde(rename = "L3_outbound")]
@@ -93,6 +95,22 @@ pub struct RawLayerConfig {
     pub mode: String,
     pub block_action: Option<String>,
     pub window_chars: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RawL1Config {
+    #[serde(default = "default_l1_mode")]
+    pub mode: String,
+    #[serde(default = "default_l1_threshold")]
+    pub threshold: f64,
+}
+
+fn default_l1_mode() -> String {
+    "shadow".to_string()
+}
+
+fn default_l1_threshold() -> f64 {
+    0.5
 }
 
 #[derive(Debug, Deserialize)]

@@ -262,6 +262,20 @@ impl ProxyResponse {
             body: Body::from(body),
         }
     }
+
+    /// Create a 403 response tagged with the layer that blocked it.
+    /// Adds `X-Parapet-Blocked-By` header for eval/observability.
+    pub fn blocked(body: Vec<u8>, layer: &str) -> Self {
+        let mut headers = HeaderMap::new();
+        if let Ok(val) = layer.parse() {
+            headers.insert("x-parapet-blocked-by", val);
+        }
+        Self {
+            status: StatusCode::FORBIDDEN,
+            headers,
+            body: Body::from(body),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

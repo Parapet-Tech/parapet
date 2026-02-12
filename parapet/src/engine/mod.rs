@@ -7,6 +7,7 @@
 // - Parse request via provider adapter
 // - Trust assignment
 // - L0 normalization
+// - L1 lightweight classifier
 // - L3-inbound scanning
 // - Forward to upstream provider
 // - L3-outbound tool call validation + rewrite (non-streaming)
@@ -19,6 +20,7 @@ use std::io::Read as _;
 
 use crate::config::Config;
 use crate::constraint::{ConstraintEvaluator, DslConstraintEvaluator, ToolCallVerdict};
+use crate::layers::l1::{DefaultL1Scanner, L1Scanner, L1Verdict};
 use crate::layers::l3_inbound::{DefaultInboundScanner, InboundScanner, InboundVerdict};
 use crate::config::L4Mode;
 use crate::layers::l4::{DefaultMultiTurnScanner, L4Verdict, MultiTurnScanner};
@@ -159,6 +161,7 @@ pub struct EngineDeps {
     pub registry: Arc<dyn ProviderRegistry>,
     pub normalizer: Arc<dyn Normalizer>,
     pub trust_assigner: Arc<dyn TrustAssigner>,
+    pub l1_scanner: Option<Arc<dyn L1Scanner>>,
     pub inbound_scanner: Arc<dyn InboundScanner>,
     pub constraint_evaluator: Arc<dyn ConstraintEvaluator>,
     pub output_scanner: Arc<dyn OutputScanner>,
@@ -233,6 +236,63 @@ impl UpstreamClient for EngineUpstreamClient {
             }
         }
 
+        // 3.5) L1 lightweight classifier (if enabled)
+        if let (Some(scanner), Some(l1_config)) = (&self.deps.l1_scanner, &self.deps.config.policy.layers.l1) {
+            let l1_start = Instant::now();
+            let l1_verdict = scanner.scan(&messages, l1_config);
+            let l1_ms = l1_start.elapsed().as_secs_f64() * 1000.0;
+
+            match &l1_verdict {
+                L1Verdict::Block(block) if l1_config.mode == crate::config::L1Mode::Block => {
+                    tracing::info!(
+                        request_id = %ctx.request_id,
+                        contract_hash = %ctx.contract_hash,
+                        provider = ctx.provider_str,
+                        model = %ctx.model,
+                        layer = "L1",
+                        verdict = "block",
+                        role = ?block.role,
+                        message_index = block.message_index,
+                        score = block.score,
+                        reason = %block.reason,
+                        latency_ms = l1_ms,
+                        "L1 classifier blocked"
+                    );
+                    let body = adapter.serialize_error("request blocked by content policy", 403);
+                    return Ok(ProxyResponse::blocked(body, "L1"));
+                }
+                L1Verdict::Block(block) => {
+                    // Shadow mode: log but don't block
+                    tracing::info!(
+                        request_id = %ctx.request_id,
+                        contract_hash = %ctx.contract_hash,
+                        provider = ctx.provider_str,
+                        model = %ctx.model,
+                        layer = "L1",
+                        verdict = "shadow_block",
+                        role = ?block.role,
+                        message_index = block.message_index,
+                        score = block.score,
+                        reason = %block.reason,
+                        latency_ms = l1_ms,
+                        "L1 classifier detected (shadow)"
+                    );
+                }
+                L1Verdict::Allow => {
+                    tracing::debug!(
+                        request_id = %ctx.request_id,
+                        contract_hash = %ctx.contract_hash,
+                        provider = ctx.provider_str,
+                        model = %ctx.model,
+                        layer = "L1",
+                        verdict = "allow",
+                        latency_ms = l1_ms,
+                        "L1 classifier passed"
+                    );
+                }
+            }
+        }
+
         // 4) L3-inbound scanning (if enabled)
         if let Some(layer) = &self.deps.config.policy.layers.l3_inbound {
             if layer.mode == "block" {
@@ -257,7 +317,7 @@ impl UpstreamClient for EngineUpstreamClient {
                         );
                         // Generic message to client — don't leak pattern details
                         let body = adapter.serialize_error("request blocked by content policy", 403);
-                        return Ok(ProxyResponse::from_bytes(StatusCode::FORBIDDEN, body));
+                        return Ok(ProxyResponse::blocked(body, "L3-inbound"));
                     }
                     InboundVerdict::Allow => {
                         tracing::info!(
@@ -299,7 +359,7 @@ impl UpstreamClient for EngineUpstreamClient {
                     );
                     // Generic message to client — internal reason already logged above
                     let body = adapter.serialize_error("request blocked by content policy", 403);
-                    return Ok(ProxyResponse::from_bytes(StatusCode::FORBIDDEN, body));
+                    return Ok(ProxyResponse::blocked(body, "L4"));
                 }
                 L4Verdict::Block { .. } => {
                     // Shadow mode: log but don't block
@@ -879,6 +939,13 @@ impl HttpSender for ReqwestHttpSender {
 pub fn build_engine_client(config: Arc<Config>) -> EngineUpstreamClient {
     let session_store: Option<Arc<dyn crate::session::SessionStore>> = None; // Sprint 2
 
+    let l1_scanner: Option<Arc<dyn L1Scanner>> =
+        if config.policy.layers.l1.is_some() {
+            Some(Arc::new(DefaultL1Scanner::new()))
+        } else {
+            None
+        };
+
     let multi_turn_scanner: Option<Arc<dyn MultiTurnScanner>> =
         if config.policy.layers.l4.is_some() {
             Some(Arc::new(DefaultMultiTurnScanner::new()))
@@ -893,6 +960,7 @@ pub fn build_engine_client(config: Arc<Config>) -> EngineUpstreamClient {
         registry: Arc::new(DefaultProviderRegistry),
         normalizer: Arc::new(L0Normalizer::new()),
         trust_assigner: Arc::new(RoleTrustAssigner),
+        l1_scanner,
         inbound_scanner: Arc::new(DefaultInboundScanner::new()),
         constraint_evaluator: Arc::new(DslConstraintEvaluator::new()),
         output_scanner: Arc::new(L5aScanner),
@@ -1394,6 +1462,7 @@ mod tests {
             registry: Arc::new(DefaultRegistry),
             normalizer: Arc::new(NoopNormalizer),
             trust_assigner: Arc::new(NoopTrustAssigner),
+            l1_scanner: None,
             inbound_scanner: Arc::new(NoopInboundScanner),
             constraint_evaluator: Arc::new(DslConstraintEvaluator::new()),
             output_scanner: Arc::new(L5aScanner),
@@ -1444,6 +1513,7 @@ mod tests {
                 trust: TrustConfig::default(),
                 layers: LayerConfigs {
                     l0: None,
+                    l1: None,
                     l3_inbound: None,
                     l3_outbound: Some(LayerConfig {
                         mode: "block".to_string(),

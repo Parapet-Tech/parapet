@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::pattern::CompiledPattern;
-use super::types::{L4Config, L4Mode, L4PatternCategory, LayerConfig, LayerConfigs};
+use super::types::{L1Config, L1Mode, L4Config, L4Mode, L4PatternCategory, LayerConfig, LayerConfigs};
 
 /// The default block patterns YAML, embedded at compile time.
 /// Contains curated regex patterns across 9 attack categories.
@@ -105,6 +105,10 @@ pub fn default_layer_configs() -> LayerConfigs {
             mode: "sanitize".to_string(),
             block_action: None,
             window_chars: None,
+        }),
+        l1: Some(L1Config {
+            mode: L1Mode::Shadow,
+            threshold: 0.5,
         }),
         l3_inbound: Some(LayerConfig {
             mode: "block".to_string(),

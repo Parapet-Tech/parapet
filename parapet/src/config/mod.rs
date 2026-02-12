@@ -23,9 +23,9 @@ pub use loader::{compute_hash, load_config};
 pub use pattern::CompiledPattern;
 pub use source::{ConfigSource, FileSource, StringSource};
 pub use types::{
-    ArgumentConstraints, Config, ContentPolicy, EngineConfig, FailureMode, L4Config,
-    L4Mode, L4PatternCategory, LayerConfig, LayerConfigs, PolicyConfig, RuntimeConfig, ToolConfig,
-    TrustConfig,
+    ArgumentConstraints, Config, ContentPolicy, EngineConfig, FailureMode, L1Config, L1Mode,
+    L4Config, L4Mode, L4PatternCategory, LayerConfig, LayerConfigs, PolicyConfig, RuntimeConfig,
+    ToolConfig, TrustConfig,
 };
 
 // ---------------------------------------------------------------------------

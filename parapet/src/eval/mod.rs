@@ -23,6 +23,7 @@ use crate::engine::{
     DefaultProviderRegistry, EngineDeps, EngineUpstreamClient, HttpBody, HttpError, HttpRequest,
     HttpResponse, HttpSender, UpstreamResolver,
 };
+use crate::layers::l1::{DefaultL1Scanner, L1Scanner};
 use crate::layers::l3_inbound::DefaultInboundScanner;
 use crate::layers::l4::{DefaultMultiTurnScanner, MultiTurnScanner};
 use crate::layers::l5a::L5aScanner;
@@ -238,6 +239,13 @@ pub fn load_dataset(dir: &Path) -> Result<Vec<EvalCase>, String> {
 pub fn build_eval_engine(config: Arc<Config>) -> (EngineUpstreamClient, Arc<MockHttpSender>) {
     let mock = Arc::new(MockHttpSender::new());
 
+    let l1_scanner: Option<Arc<dyn L1Scanner>> =
+        if config.policy.layers.l1.is_some() {
+            Some(Arc::new(DefaultL1Scanner::new()))
+        } else {
+            None
+        };
+
     let multi_turn_scanner: Option<Arc<dyn MultiTurnScanner>> =
         if config.policy.layers.l4.is_some() {
             Some(Arc::new(DefaultMultiTurnScanner))
@@ -252,6 +260,7 @@ pub fn build_eval_engine(config: Arc<Config>) -> (EngineUpstreamClient, Arc<Mock
         registry: Arc::new(DefaultProviderRegistry),
         normalizer: Arc::new(L0Normalizer::new()),
         trust_assigner: Arc::new(RoleTrustAssigner),
+        l1_scanner,
         inbound_scanner: Arc::new(DefaultInboundScanner::new()),
         constraint_evaluator: Arc::new(DslConstraintEvaluator::new()),
         output_scanner: Arc::new(L5aScanner),
@@ -290,13 +299,14 @@ pub async fn run_eval(
         let response = engine.forward(Provider::OpenAi, request).await;
 
         // Collect response data
-        let (status, body) = match response {
+        let (status, headers, body) = match response {
             Ok(resp) => {
                 let status = resp.status;
+                let headers = resp.headers.clone();
                 let body_bytes = axum::body::to_bytes(resp.body, 10 * 1024 * 1024)
                     .await
                     .unwrap_or_default();
-                (status, String::from_utf8_lossy(&body_bytes).to_string())
+                (status, headers, String::from_utf8_lossy(&body_bytes).to_string())
             }
             Err(e) => {
                 results.push(EvalResult {
@@ -314,7 +324,7 @@ pub async fn run_eval(
         };
 
         // Determine verdict
-        let (actual, detail) = determine_verdict(case, status, &body);
+        let (actual, detail) = determine_verdict(case, status, &headers, &body);
         let expected = expected_action(&case.label);
         let correct = actual == expected;
 
@@ -617,12 +627,54 @@ fn expected_action(label: &str) -> String {
     }
 }
 
-fn determine_verdict(case: &EvalCase, status: StatusCode, body: &str) -> (String, String) {
+/// Extract the `X-Parapet-Blocked-By` header value from the response.
+fn blocked_by_layer(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-parapet-blocked-by")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+}
+
+fn determine_verdict(
+    case: &EvalCase,
+    status: StatusCode,
+    headers: &HeaderMap,
+    body: &str,
+) -> (String, String) {
     match case.layer.as_str() {
+        "l1" => {
+            // L1 blocks via 403 with X-Parapet-Blocked-By: L1
+            let blocked_by = blocked_by_layer(headers);
+            let fired = status == StatusCode::FORBIDDEN
+                && blocked_by.as_deref() == Some("L1");
+            let actual = if fired {
+                "blocked"
+            } else if status == StatusCode::FORBIDDEN {
+                // Blocked, but by a different layer — still counts as blocked
+                // for isolated L1 eval this shouldn't happen
+                "blocked"
+            } else {
+                "allowed"
+            };
+            let detail = format!(
+                "status={} blocked_by={}",
+                status.as_u16(),
+                blocked_by.as_deref().unwrap_or("none")
+            );
+            (actual.to_string(), detail)
+        }
         "l3_inbound" => {
             let fired = status == StatusCode::FORBIDDEN;
             let actual = if fired { "blocked" } else { "allowed" };
-            (actual.to_string(), format!("status={}", status.as_u16()))
+            let blocked_by = blocked_by_layer(headers);
+            (
+                actual.to_string(),
+                format!(
+                    "status={} blocked_by={}",
+                    status.as_u16(),
+                    blocked_by.as_deref().unwrap_or("none")
+                ),
+            )
         }
         "l3_outbound" => {
             // In rewrite mode, blocked tool calls are removed and refusal text injected.
@@ -649,7 +701,15 @@ fn determine_verdict(case: &EvalCase, status: StatusCode, body: &str) -> (String
         "l4" => {
             let fired = status == StatusCode::FORBIDDEN;
             let actual = if fired { "blocked" } else { "allowed" };
-            (actual.to_string(), format!("status={}", status.as_u16()))
+            let blocked_by = blocked_by_layer(headers);
+            (
+                actual.to_string(),
+                format!(
+                    "status={} blocked_by={}",
+                    status.as_u16(),
+                    blocked_by.as_deref().unwrap_or("none")
+                ),
+            )
         }
         other => ("allowed".to_string(), format!("unknown layer: {other}")),
     }
