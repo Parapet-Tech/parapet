@@ -1,0 +1,282 @@
+# Default L1 classifier weights
+# Compiled into the parapet binary at build time.
+#
+# Format: word unigrams and bigrams (lowercased) with learned weights.
+# Positive weight = indicative of prompt injection.
+# Negative weight = indicative of benign text (reduces false positives).
+#
+# Scoring: score = bias + sum(matched_weights)
+# If score >= threshold -> classify as injection.
+#
+# These are seed weights derived from known attack patterns.
+# Future releases will include weights trained on public datasets
+# (Deepset, HuggingFace PI collections, Garak outputs).
+
+bias: -0.65
+
+weights:
+  # =======================================================================
+  # Category: Instruction Override / Forget
+  # Bigrams and unigrams for "ignore previous instructions" family
+  # =======================================================================
+  "ignore previous": 0.85
+  "ignore all": 0.80
+  "ignore above": 0.80
+  "ignore everything": 0.75
+  "ignore prior": 0.75
+  "ignore any": 0.60
+  "disregard previous": 0.80
+  "disregard all": 0.75
+  "disregard above": 0.75
+  "disregard your": 0.65
+  "forget previous": 0.80
+  "forget all": 0.70
+  "forget about": 0.45
+  "forget everything": 0.75
+  "forget your": 0.60
+  "override instructions": 0.80
+  "override the": 0.35
+  "override system": 0.75
+  "override all": 0.70
+  "new instructions": 0.70
+  "new rules": 0.55
+  "replace instructions": 0.75
+  "replace your": 0.50
+  "previous instructions": 0.65
+  "prior instructions": 0.65
+  "above instructions": 0.65
+
+  # =======================================================================
+  # Category: Role Hijacking / Persona
+  # =======================================================================
+  "you are": 0.20
+  "you are now": 0.70
+  "from now": 0.40
+  "from now on": 0.55
+  "now on": 0.30
+  "act as": 0.50
+  "act like": 0.45
+  "pretend to": 0.50
+  "pretend you": 0.50
+  "simulate a": 0.40
+  "simulate an": 0.40
+  "roleplay as": 0.60
+  "roleplay a": 0.55
+  "play the": 0.25
+  "play role": 0.55
+  "assume role": 0.60
+  "assume the": 0.30
+  "new persona": 0.65
+  "new identity": 0.60
+  "new character": 0.45
+  "unrestricted ai": 0.80
+  "unrestricted assistant": 0.80
+  "unrestricted mode": 0.80
+  "unfiltered mode": 0.75
+  "uncensored mode": 0.75
+
+  # =======================================================================
+  # Category: Jailbreak Triggers
+  # =======================================================================
+  "jailbreak": 0.75
+  "jailbreak mode": 0.85
+  "dan mode": 0.85
+  "dan enabled": 0.80
+  "developer mode": 0.60
+  "developer override": 0.75
+  "debug mode": 0.35
+  "maintenance mode": 0.30
+  "do anything": 0.40
+  "anything now": 0.55
+  "do anything now": 0.70
+  "no restrictions": 0.65
+  "no limitations": 0.60
+  "no rules": 0.55
+  "no filters": 0.60
+  "no guidelines": 0.55
+  "no boundaries": 0.55
+  "without restrictions": 0.65
+  "without limitations": 0.60
+  "without filters": 0.60
+  "all restrictions": 0.45
+  "all filters": 0.40
+  "restrictions removed": 0.70
+  "filters disabled": 0.70
+  "filters removed": 0.70
+  "safety disabled": 0.75
+  "safety removed": 0.75
+  "safety off": 0.70
+  "remove all": 0.30
+  "remove safety": 0.70
+  "remove restrictions": 0.70
+  "disable safety": 0.75
+  "disable filters": 0.70
+  "disable all": 0.45
+  "enable jailbreak": 0.85
+  "enable developer": 0.55
+  "activate developer": 0.55
+
+  # =======================================================================
+  # Category: System Prompt Extraction
+  # =======================================================================
+  "system prompt": 0.55
+  "system message": 0.35
+  "system instructions": 0.55
+  "reveal your": 0.55
+  "reveal the": 0.30
+  "reveal system": 0.65
+  "show me": 0.10
+  "show your": 0.30
+  "show the": 0.10
+  "display your": 0.35
+  "display the": 0.15
+  "what are your": 0.30
+  "what is your": 0.15
+  "your instructions": 0.45
+  "your system": 0.30
+  "your prompt": 0.40
+  "your rules": 0.35
+  "output everything": 0.55
+  "output above": 0.60
+  "print everything": 0.45
+  "print above": 0.55
+  "repeat everything": 0.50
+  "repeat above": 0.55
+  "repeat your": 0.40
+  "give me the": 0.15
+  "give me your": 0.25
+  "the system prompt": 0.55
+  "full system": 0.45
+  "initial instructions": 0.55
+  "initial prompt": 0.50
+  "original instructions": 0.55
+  "original prompt": 0.50
+  "hidden instructions": 0.65
+  "hidden prompt": 0.60
+  "secret instructions": 0.65
+  "secret prompt": 0.60
+
+  # =======================================================================
+  # Category: Privilege Escalation
+  # =======================================================================
+  "i am the": 0.25
+  "i am admin": 0.65
+  "i am administrator": 0.65
+  "i am root": 0.60
+  "admin access": 0.55
+  "administrator access": 0.55
+  "root access": 0.50
+  "grant me": 0.45
+  "grant admin": 0.60
+  "sudo mode": 0.60
+  "sudo access": 0.60
+  "elevate privileges": 0.70
+  "elevate my": 0.50
+  "superuser": 0.40
+  "root user": 0.40
+  "have no restrictions": 0.65
+
+  # =======================================================================
+  # Category: Refusal Suppression
+  # =======================================================================
+  "must always": 0.35
+  "must comply": 0.55
+  "must obey": 0.60
+  "must answer": 0.40
+  "must respond": 0.35
+  "always comply": 0.60
+  "always obey": 0.65
+  "always answer": 0.40
+  "never refuse": 0.65
+  "never say no": 0.55
+  "never decline": 0.60
+  "never reject": 0.55
+  "cannot refuse": 0.65
+  "cannot say": 0.30
+  "cannot decline": 0.60
+  "do not refuse": 0.65
+  "do not say": 0.20
+  "do not decline": 0.60
+  "start your": 0.30
+  "start response": 0.40
+  "begin your": 0.25
+  "begin response": 0.35
+  "respond with": 0.20
+  "you will obey": 0.70
+  "you will comply": 0.70
+  "you must obey": 0.70
+  "you must comply": 0.65
+
+  # =======================================================================
+  # Category: Indirect Injection Markers
+  # These phrases appear in injected content (RAG docs, tool results)
+  # =======================================================================
+  "system:": 0.35
+  "admin:": 0.35
+  "root:": 0.30
+  "important:": 0.15
+  "urgent:": 0.20
+  "attention:": 0.15
+  "system: ignore": 0.75
+  "system: you": 0.55
+  "system: new": 0.55
+  "admin: override": 0.70
+  "admin: ignore": 0.70
+  "root: disable": 0.70
+  "important: before": 0.45
+  "important: ignore": 0.70
+  "todo: ignore": 0.65
+
+  # =======================================================================
+  # Category: Exfiltration / C2
+  # =======================================================================
+  "send all": 0.40
+  "send data": 0.35
+  "send to": 0.20
+  "send information": 0.40
+  "exfiltrate": 0.70
+  "environment variables": 0.40
+  "env variables": 0.35
+  "print env": 0.40
+  "all data to": 0.50
+  "access this url": 0.45
+
+  # =======================================================================
+  # Category: Template / Delimiter Abuse
+  # =======================================================================
+  "inst]": 0.55
+  "[/inst]": 0.60
+  "[inst]": 0.60
+  "<<sys>>": 0.65
+  "<|system|>": 0.65
+  "<|user|>": 0.50
+  "<|assistant|>": 0.50
+  "### system": 0.50
+  "### instruction": 0.50
+  "```system": 0.55
+  "end_turn": 0.50
+  "<|im_start|>": 0.65
+  "<|im_end|>": 0.55
+
+  # =======================================================================
+  # Category: Tool / Agent Manipulation
+  # =======================================================================
+  "call the tool": 0.55
+  "call tool": 0.50
+  "skip constraints": 0.70
+  "skip validation": 0.55
+  "skip the": 0.15
+  "bypass constraints": 0.70
+  "bypass validation": 0.60
+  "bypass security": 0.70
+  "bypass filter": 0.65
+  "modify the tool": 0.55
+  "modify tool": 0.50
+  "modify parameters": 0.50
+  "change the tool": 0.45
+  "redirect output": 0.50
+  "redirect the": 0.25
+  "tool instead": 0.35
+  "exec instead": 0.50
+  "execute instead": 0.45
+  "run instead": 0.35
