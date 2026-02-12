@@ -20,4 +20,4 @@ environment: "eval"
 # Only L1 active — L3 inbound disabled so it can't mask L1 results
 layers:
   L0: { mode: sanitize }
-  L1: { mode: block, threshold: 0.5 }
+  L1: { mode: block, threshold: 0.0 }
