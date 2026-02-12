@@ -107,8 +107,8 @@ pub fn default_layer_configs() -> LayerConfigs {
             window_chars: None,
         }),
         l1: Some(L1Config {
-            mode: L1Mode::Shadow,
-            threshold: 0.5,
+            mode: L1Mode::Block,
+            threshold: 0.0,
         }),
         l3_inbound: Some(LayerConfig {
             mode: "block".to_string(),
