@@ -96,6 +96,7 @@ fn build_test_engine(yaml: &str, mock_url: &str) -> EngineUpstreamClient {
         registry: Arc::new(parapet::engine::DefaultProviderRegistry),
         normalizer: Arc::new(L0Normalizer::new()),
         trust_assigner: Arc::new(RoleTrustAssigner),
+        l1_scanner: None,
         inbound_scanner: Arc::new(DefaultInboundScanner::new()),
         constraint_evaluator: Arc::new(DslConstraintEvaluator::new()),
         output_scanner: Arc::new(L5aScanner),

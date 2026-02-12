@@ -1,0 +1,23 @@
+parapet: v1
+
+tools:
+  _default:
+    allowed: true
+
+trust:
+  unknown_trust_policy:
+    system: trusted
+    assistant: trusted
+    user: untrusted
+    tool: untrusted
+
+engine:
+  on_failure: closed
+  timeout_ms: 5000
+
+environment: "eval"
+
+# Only L1 active — L3 inbound disabled so it can't mask L1 results
+layers:
+  L0: { mode: sanitize }
+  L1: { mode: block, threshold: 0.5 }

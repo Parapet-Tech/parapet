@@ -236,6 +236,25 @@ fn build_layer_configs(raw: Option<raw::RawLayerConfigs>) -> Result<LayerConfigs
         None => return Ok(default_layer_configs()),
     };
 
+    let l1 = raw
+        .l1
+        .map(|l1| {
+            let mode = match l1.mode.as_str() {
+                "shadow" => L1Mode::Shadow,
+                "block" => L1Mode::Block,
+                other => {
+                    return Err(ConfigError::Validation(format!(
+                        "unknown L1 mode \"{other}\", expected \"shadow\" or \"block\""
+                    )))
+                }
+            };
+            Ok(L1Config {
+                mode,
+                threshold: l1.threshold,
+            })
+        })
+        .transpose()?;
+
     let l4 = raw
         .l4
         .map(|l4| {
@@ -284,6 +303,7 @@ fn build_layer_configs(raw: Option<raw::RawLayerConfigs>) -> Result<LayerConfigs
             block_action: l.block_action,
             window_chars: l.window_chars,
         }),
+        l1,
         l3_inbound: raw.l3_inbound.map(|l| LayerConfig {
             mode: l.mode,
             block_action: l.block_action,

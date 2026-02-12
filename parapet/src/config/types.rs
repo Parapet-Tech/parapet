@@ -155,6 +155,7 @@ impl Default for EngineConfig {
 #[derive(Debug, Default)]
 pub struct LayerConfigs {
     pub l0: Option<LayerConfig>,
+    pub l1: Option<L1Config>,
     pub l3_inbound: Option<LayerConfig>,
     pub l3_outbound: Option<LayerConfig>,
     pub l5a: Option<LayerConfig>,
@@ -213,4 +214,22 @@ pub struct L4PatternCategory {
     pub weight: f64,
     /// Compiled regex patterns for this category.
     pub patterns: Vec<CompiledPattern>,
+}
+
+/// L1 operating mode.
+#[derive(Debug, Clone, PartialEq)]
+pub enum L1Mode {
+    /// Log detections but don't block (calibration mode).
+    Shadow,
+    /// Actively block requests exceeding score threshold.
+    Block,
+}
+
+/// Configuration for the L1 lightweight classifier layer.
+#[derive(Debug, Clone)]
+pub struct L1Config {
+    /// Operating mode: shadow (log-only) or block (enforce).
+    pub mode: L1Mode,
+    /// Score threshold for blocking. score >= threshold → block.
+    pub threshold: f64,
 }
