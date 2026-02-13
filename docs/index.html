@@ -46,6 +46,7 @@
         <ul class="nav-links">
             <li><a href="#how-it-works">How It Works</a></li>
             <li><a href="#quickstart">Quickstart</a></li>
+            <li><a href="https://arxiv.org/abs/2602.11247">Paper</a></li>
             <li><a href="https://github.com/Parapet-Tech/parapet" aria-label="Parapet on GitHub">GitHub</a></li>
         </ul>
     </nav>
@@ -86,8 +87,8 @@
                     <div class="stat-label">from install to your first blocked attack with Parapet</div>
                 </div>
                 <div class="stat">
-                    <div class="stat-number">Peer-reviewed</div>
-                    <div class="stat-label">defense layers grounded in published LLM security research</div>
+                    <div class="stat-number">98.6%</div>
+                    <div class="stat-label">F1 on prompt injection detection — sub-microsecond, no LLM call</div>
                 </div>
             </div>
         </div>
@@ -99,7 +100,7 @@
             <p class="section-label">How It Works</p>
             <h2>Layered defense in the request pipeline</h2>
             <p class="section-desc">Parapet sits between your app and the LLM provider. Every message passes through a stack of security layers before it reaches the model — and again before the response reaches your app.</p>
-            <div class="pipeline-roundtrip" role="img" aria-label="Request pipeline: Your App sends a request through L0 Normalize, L3 Inbound Block, and L4 Multi-Turn scoring, then to the LLM Provider. The response passes through L3 Outbound Constrain and L5a Redact before returning to your app.">
+            <div class="pipeline-roundtrip" role="img" aria-label="Request pipeline: Your App sends a request through L0 Normalize, L1 Classify, L3 Inbound Block, and L4 Multi-Turn scoring, then to the LLM Provider. The response passes through L3 Outbound Constrain and L5a Redact before returning to your app.">
                 <div class="pipeline-row-label">Request</div>
                 <div class="pipeline-row">
                     <div class="pipeline-node node-start">
@@ -111,6 +112,12 @@
                         <div class="pipeline-node-label">L0</div>
                         <div class="pipeline-node-name">Normalize</div>
                         <div class="pipeline-node-desc">Strip encoding tricks</div>
+                    </div>
+                    <div class="pipeline-arrow" aria-hidden="true">&#8594;</div>
+                    <div class="pipeline-node node-blocked">
+                        <div class="pipeline-node-label">L1</div>
+                        <div class="pipeline-node-name">Classify</div>
+                        <div class="pipeline-node-desc">ML injection detection</div>
                     </div>
                     <div class="pipeline-arrow" aria-hidden="true">&#8594;</div>
                     <div class="pipeline-node node-blocked">
@@ -214,7 +221,7 @@
                 <div class="step">
                     <div class="step-number">Step 2</div>
                     <h3>Configure</h3>
-                    <p>Write a YAML policy. Define block patterns, tool constraints, and sensitive data rules.</p>
+                    <p>One YAML file. Two lines. All six security layers active by default.</p>
                     <code>cp examples/parapet.yaml .</code>
                 </div>
                 <div class="step">
@@ -264,8 +271,12 @@
             <h2>What Parapet catches</h2>
             <div class="features-grid">
                 <div class="feature">
-                    <h3>Prompt Injection</h3>
-                    <p>Pattern matching against known injection signatures: "ignore previous instructions," jailbreaks, persona hijacks. Scanned after Unicode normalization to defeat encoding tricks.</p>
+                    <h3>ML Classifier (L1)</h3>
+                    <p>Trained character n-gram SVM compiled into the binary. 98.6% F1 on 25K eval cases, sub-microsecond inference. Catches injection attempts that slip past pattern matching — no LLM call needed.</p>
+                </div>
+                <div class="feature">
+                    <h3>Pattern Matching (L3)</h3>
+                    <p>Regex patterns across 10 attack categories: instruction override, role hijacking, jailbreaks, system prompt extraction, privilege escalation, exfiltration. Scanned after Unicode normalization to defeat encoding tricks.</p>
                 </div>
                 <div class="feature">
                     <h3>Tool Abuse</h3>
@@ -292,13 +303,13 @@
         <div class="container">
             <p class="section-label">Research-Backed</p>
             <h2>Built on the literature, not on vibes</h2>
-            <p class="section-desc">Parapet's defense layers are grounded in published academic research on LLM security, prompt injection, and adversarial attacks on language models. Our multi-turn scoring formula — <em>peak + accumulation</em> — achieves 90.8% recall at 1.20% FPR on 10,654 conversations, without invoking an LLM.</p>
+            <p class="section-desc">Parapet's defense layers are grounded in published academic research on LLM security, prompt injection, and adversarial attacks on language models. Our multi-turn scoring formula — <em>peak + accumulation</em> — achieves 90.8% recall at 1.20% FPR on 10,654 conversations, without invoking an LLM. Read the paper: <a href="https://arxiv.org/abs/2602.11247">arXiv:2602.11247</a>.</p>
             <div class="trust-badges">
                 <div class="trust-badge">
                     <div class="trust-badge-icon" aria-hidden="true"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg></div>
                     <div class="trust-badge-text">
                         <strong>Research-Grounded</strong>
-                        Defense layers informed by the academic literature on prompt injection and LLM adversarial attacks
+                        Defense layers informed by the literature on prompt injection and adversarial attacks
                     </div>
                 </div>
                 <div class="trust-badge">
