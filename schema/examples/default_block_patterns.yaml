@@ -23,7 +23,7 @@ block_patterns:
   - "(?i)simulate a completely (amoral|unrestricted|unfiltered)"
   - "(?i)act as (an? )?(unrestricted|unfiltered|uncensored|evil|malicious)"
   - "(?i)pretend (you are|to be) (an? )?(unrestricted|unfiltered|evil|malicious)"
-  - "(?i)from now on,? you (are|will|must|should)"
+  - "(?i)from now on,? you (are|will|must|should) .{0,30}(ignore|bypass|unrestricted|unfiltered|no limits|no restrictions|evil|malicious|jailbreak)"
   - "(?i)for the rest of this conversation"
   - "(?i)updated role:"
   - "(?i)updated tool instructions:"
@@ -43,14 +43,14 @@ block_patterns:
   # --- System Prompt Extraction ---
   - "(?i)(display|reveal|show|output|repeat|print|echo) (your |the )?(full |entire |complete )?(system ?prompt|system ?message|initial ?prompt)"
   - "(?i)what (are|is|were) your (system )?(prompt|instructions|rules|directives)"
-  - "(?i)(give|tell|send) me (your |the )?(system )?(prompt|instructions|rules)"
+  - "(?i)(give|tell|send) me (your |the )?system (prompt|instructions|rules)"
   - "(?i)output (everything|all|the text) (above|before|preceding)"
   - "(?i)repeat (everything|all|the text) (above|before|preceding)"
 
   # --- Privilege Escalation ---
-  - "(?i)(i am|i'm) (the |an? )?(admin|administrator|developer|root|superuser|owner)"
+  - "(?i)(i am|i'm) (the |an? )?(admin|administrator|root|superuser|owner)"
   - "(?i)(grant|give) (me |yourself )?(admin|root|elevated|full|unrestricted) (access|permissions|privileges)"
-  - "(?i)sudo (mode|access|command)"
+  - "(?i)sudo (mode|access)"
   - "(?i)(unlock|enable) (all |full |unrestricted )(capabilities|features|functions|access)"
   - "(?i)you have (no|zero) restrictions"
   - "(?i)(no|without|zero) (safety|content|ethical) (restrictions|filters|guidelines|limits)"

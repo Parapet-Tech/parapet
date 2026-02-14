@@ -294,43 +294,62 @@ impl UpstreamClient for EngineUpstreamClient {
         }
 
         // 4) L3-inbound scanning (if enabled)
+        // Always run the scanner to collect pattern matches (features for signal pipeline).
+        // Gate only the block action on mode, not the scan itself.
         if let Some(layer) = &self.deps.config.policy.layers.l3_inbound {
-            if layer.mode == "block" {
-                let l3i_start = Instant::now();
-                let inbound_verdict = self.deps.inbound_scanner.scan(&messages, &self.deps.config);
-                let l3i_ms = l3i_start.elapsed().as_secs_f64() * 1000.0;
+            let l3i_start = Instant::now();
+            let inbound_result = self.deps.inbound_scanner.scan(&messages, &self.deps.config);
+            let l3i_ms = l3i_start.elapsed().as_secs_f64() * 1000.0;
+            // TODO(v3-signal): pass inbound_result.matched_patterns to verdict processor
 
-                match &inbound_verdict {
-                    InboundVerdict::Block(block) => {
-                        tracing::info!(
-                            request_id = %ctx.request_id,
-                            contract_hash = %ctx.contract_hash,
-                            provider = ctx.provider_str,
-                            model = %ctx.model,
-                            layer = "L3-inbound",
-                            verdict = "block",
-                            role = ?block.role,
-                            message_index = block.message_index,
-                            reason = %block.reason,
-                            latency_ms = l3i_ms,
-                            "inbound blocked"
-                        );
-                        // Generic message to client — don't leak pattern details
-                        let body = adapter.serialize_error("request blocked by content policy", 403);
-                        return Ok(ProxyResponse::blocked(body, "L3-inbound"));
-                    }
-                    InboundVerdict::Allow => {
-                        tracing::info!(
-                            request_id = %ctx.request_id,
-                            contract_hash = %ctx.contract_hash,
-                            provider = ctx.provider_str,
-                            model = %ctx.model,
-                            layer = "L3-inbound",
-                            verdict = "allow",
-                            latency_ms = l3i_ms,
-                            "inbound allowed"
-                        );
-                    }
+            match &inbound_result.verdict {
+                InboundVerdict::Block(block) if layer.mode == "block" => {
+                    tracing::info!(
+                        request_id = %ctx.request_id,
+                        contract_hash = %ctx.contract_hash,
+                        provider = ctx.provider_str,
+                        model = %ctx.model,
+                        layer = "L3-inbound",
+                        verdict = "block",
+                        role = ?block.role,
+                        message_index = block.message_index,
+                        reason = %block.reason,
+                        matched_patterns = inbound_result.matched_patterns.len(),
+                        latency_ms = l3i_ms,
+                        "inbound blocked"
+                    );
+                    // Generic message to client — don't leak pattern details
+                    let body = adapter.serialize_error("request blocked by content policy", 403);
+                    return Ok(ProxyResponse::blocked(body, "L3-inbound"));
+                }
+                InboundVerdict::Block(block) => {
+                    // shadow/signal mode: log but don't block
+                    tracing::info!(
+                        request_id = %ctx.request_id,
+                        contract_hash = %ctx.contract_hash,
+                        provider = ctx.provider_str,
+                        model = %ctx.model,
+                        layer = "L3-inbound",
+                        verdict = "block_shadow",
+                        role = ?block.role,
+                        message_index = block.message_index,
+                        reason = %block.reason,
+                        matched_patterns = inbound_result.matched_patterns.len(),
+                        latency_ms = l3i_ms,
+                        "inbound would block (shadow mode)"
+                    );
+                }
+                InboundVerdict::Allow => {
+                    tracing::info!(
+                        request_id = %ctx.request_id,
+                        contract_hash = %ctx.contract_hash,
+                        provider = ctx.provider_str,
+                        model = %ctx.model,
+                        layer = "L3-inbound",
+                        verdict = "allow",
+                        latency_ms = l3i_ms,
+                        "inbound allowed"
+                    );
                 }
             }
         }
@@ -1449,8 +1468,11 @@ mod tests {
 
     struct NoopInboundScanner;
     impl InboundScanner for NoopInboundScanner {
-        fn scan(&self, _messages: &[Message], _config: &Config) -> InboundVerdict {
-            InboundVerdict::Allow
+        fn scan(&self, _messages: &[Message], _config: &Config) -> crate::layers::l3_inbound::InboundResult {
+            crate::layers::l3_inbound::InboundResult {
+                verdict: InboundVerdict::Allow,
+                matched_patterns: vec![],
+            }
         }
     }
 
