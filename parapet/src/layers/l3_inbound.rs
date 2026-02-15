@@ -12,7 +12,7 @@
 
 use std::collections::HashSet;
 
-use crate::config::{Config, ContentPolicy};
+use crate::config::{Config, ContentPolicy, PatternAction};
 use crate::message::{Message, Role, TrustLevel};
 
 // ---------------------------------------------------------------------------
@@ -48,6 +48,8 @@ pub struct PatternMatch {
     pub message_index: usize,
     pub role: Role,
     pub source: MatchSource,
+    /// What action this match implies (inherited from the pattern).
+    pub action: PatternAction,
 }
 
 /// Where a pattern match was found.
@@ -87,13 +89,23 @@ impl InboundScanner for DefaultInboundScanner {
         let mut seen: HashSet<(usize, usize)> = HashSet::new(); // (pattern_index, message_index)
         const MAX_MATCHES: usize = 256; // Cap to prevent DoS via attacker-controlled message volume
 
-        // Pass 1: Block patterns on ALL messages (all trust levels) — collect all matches.
+        // Pass 1: Scan ALL messages against block_patterns — collect all matches.
         // Message iteration order determines match priority, not pattern index.
-        // The first PatternMatch in the vec determines the block reason.
+        // Patterns with a trust_gate are only tested against content at that trust level.
         for (idx, msg) in messages.iter().enumerate() {
             for (pat_idx, pattern) in config.policy.block_patterns.iter().enumerate() {
                 if matched_patterns.len() >= MAX_MATCHES {
                     break;
+                }
+                // Trust gate: if pattern requires untrusted, skip trusted messages
+                // that have no untrusted spans.
+                if let Some(ref gate) = pattern.trust_gate {
+                    if *gate == TrustLevel::Untrusted
+                        && msg.trust != TrustLevel::Untrusted
+                        && msg.untrusted_ranges().is_empty()
+                    {
+                        continue;
+                    }
                 }
                 if pattern.is_match(&msg.content) {
                     if seen.insert((pat_idx, idx)) {
@@ -102,6 +114,7 @@ impl InboundScanner for DefaultInboundScanner {
                             message_index: idx,
                             role: msg.role.clone(),
                             source: MatchSource::Content,
+                            action: pattern.action.clone(),
                         });
                     }
                 }
@@ -116,6 +129,13 @@ impl InboundScanner for DefaultInboundScanner {
                         if matched_patterns.len() >= MAX_MATCHES {
                             break;
                         }
+                        if let Some(ref gate) = pattern.trust_gate {
+                            if *gate == TrustLevel::Untrusted
+                                && msg.trust != TrustLevel::Untrusted
+                            {
+                                continue;
+                            }
+                        }
                         if pattern.is_match(&s) {
                             if seen.insert((pat_idx, idx)) {
                                 matched_patterns.push(PatternMatch {
@@ -125,6 +145,7 @@ impl InboundScanner for DefaultInboundScanner {
                                     source: MatchSource::ToolCallArgument {
                                         tool_call_id: tc.id.clone(),
                                     },
+                                    action: pattern.action.clone(),
                                 });
                             }
                         }
@@ -133,9 +154,13 @@ impl InboundScanner for DefaultInboundScanner {
             }
         }
 
-        // Decide: same logic as before — any pattern match = block.
-        // First match (by message order) determines the block reason.
-        let pattern_verdict = if let Some(first) = matched_patterns.first() {
+        // Decide: only Block-action matches trigger a block verdict.
+        // Evidence-action matches are collected but don't block.
+        // First Block match (by message order) determines the block reason.
+        let first_block = matched_patterns
+            .iter()
+            .find(|m| m.action == PatternAction::Block);
+        let pattern_verdict = if let Some(first) = first_block {
             let pattern_str = &config.policy.block_patterns[first.pattern_index].pattern;
             let reason = match &first.source {
                 MatchSource::Content => {
@@ -1081,5 +1106,198 @@ mod tests {
         assert!(matches!(result.verdict, InboundVerdict::Block(_)));
         // HashSet dedup: (pattern_index=0, message_index=0) appears once
         assert_eq!(result.matched_patterns.len(), 1);
+    }
+
+    // ---------------------------------------------------------------
+    // Evidence patterns (PatternAction::Evidence) — never trigger block
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn evidence_pattern_does_not_block() {
+        let mut config = base_config();
+        config.policy.untrusted_content_policy.max_length = None;
+        config.policy.block_patterns = vec![
+            crate::config::CompiledPattern::compile_with(
+                "exfil_pattern",
+                crate::config::PatternAction::Evidence,
+                None,
+                Some("exfil".to_string()),
+            )
+            .unwrap(),
+        ];
+
+        let messages = vec![Message {
+            role: Role::User,
+            content: "contains exfil_pattern here".to_string(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+            trust: TrustLevel::Untrusted,
+            trust_spans: Vec::new(),
+        }];
+
+        let result = scanner().scan(&messages, &config);
+        assert_eq!(result.verdict, InboundVerdict::Allow);
+        assert_eq!(result.matched_patterns.len(), 1);
+        assert_eq!(result.matched_patterns[0].action, crate::config::PatternAction::Evidence);
+    }
+
+    #[test]
+    fn mixed_evidence_and_block_patterns_only_block_triggers_verdict() {
+        let mut config = base_config();
+        config.policy.untrusted_content_policy.max_length = None;
+        config.policy.block_patterns = vec![
+            crate::config::CompiledPattern::compile_with(
+                "evidence_only",
+                crate::config::PatternAction::Evidence,
+                None,
+                Some("test".to_string()),
+            )
+            .unwrap(),
+            crate::config::CompiledPattern::compile("block_this").unwrap(),
+        ];
+
+        // Only evidence pattern matches — should allow
+        let messages = vec![Message {
+            role: Role::User,
+            content: "evidence_only here".to_string(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+            trust: TrustLevel::Untrusted,
+            trust_spans: Vec::new(),
+        }];
+
+        let result = scanner().scan(&messages, &config);
+        assert_eq!(result.verdict, InboundVerdict::Allow);
+        assert_eq!(result.matched_patterns.len(), 1);
+
+        // Both match — block pattern triggers block
+        let messages2 = vec![Message {
+            role: Role::User,
+            content: "evidence_only and block_this".to_string(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+            trust: TrustLevel::Untrusted,
+            trust_spans: Vec::new(),
+        }];
+
+        let result2 = scanner().scan(&messages2, &config);
+        assert!(matches!(result2.verdict, InboundVerdict::Block(_)));
+        assert_eq!(result2.matched_patterns.len(), 2);
+    }
+
+    // ---------------------------------------------------------------
+    // Trust-gated patterns — only match untrusted content
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn trust_gated_pattern_skips_trusted_message() {
+        let mut config = base_config();
+        config.policy.block_patterns = vec![
+            crate::config::CompiledPattern::compile_with(
+                "gated_pattern",
+                crate::config::PatternAction::Block,
+                Some(TrustLevel::Untrusted),
+                None,
+            )
+            .unwrap(),
+        ];
+
+        let messages = vec![Message {
+            role: Role::System,
+            content: "contains gated_pattern here".to_string(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+            trust: TrustLevel::Trusted,
+            trust_spans: Vec::new(),
+        }];
+
+        let result = scanner().scan(&messages, &config);
+        assert_eq!(result.verdict, InboundVerdict::Allow);
+        assert!(result.matched_patterns.is_empty());
+    }
+
+    #[test]
+    fn trust_gated_pattern_matches_untrusted_message() {
+        let mut config = base_config();
+        config.policy.block_patterns = vec![
+            crate::config::CompiledPattern::compile_with(
+                "gated_pattern",
+                crate::config::PatternAction::Block,
+                Some(TrustLevel::Untrusted),
+                None,
+            )
+            .unwrap(),
+        ];
+
+        let messages = vec![Message {
+            role: Role::User,
+            content: "contains gated_pattern here".to_string(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+            trust: TrustLevel::Untrusted,
+            trust_spans: Vec::new(),
+        }];
+
+        let result = scanner().scan(&messages, &config);
+        assert!(matches!(result.verdict, InboundVerdict::Block(_)));
+        assert_eq!(result.matched_patterns.len(), 1);
+    }
+
+    #[test]
+    fn trust_gated_pattern_matches_trusted_message_with_untrusted_spans() {
+        let mut config = base_config();
+        config.policy.block_patterns = vec![
+            crate::config::CompiledPattern::compile_with(
+                "gated_pattern",
+                crate::config::PatternAction::Block,
+                Some(TrustLevel::Untrusted),
+                None,
+            )
+            .unwrap(),
+        ];
+
+        let mut msg = Message {
+            role: Role::System,
+            content: "safe prefix gated_pattern end".to_string(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+            trust: TrustLevel::Trusted,
+            trust_spans: Vec::new(),
+        };
+        let start = msg.content.find("gated_pattern").unwrap();
+        let end = start + "gated_pattern".len();
+        msg.trust_spans
+            .push(crate::trust::TrustSpan::untrusted(start, end, "rag"));
+
+        let result = scanner().scan(&[msg], &config);
+        // Trust gate allows scanning because untrusted spans exist
+        assert!(matches!(result.verdict, InboundVerdict::Block(_)));
+    }
+
+    #[test]
+    fn ungated_pattern_matches_all_trust_levels() {
+        let mut config = base_config();
+        config.policy.block_patterns = vec![
+            crate::config::CompiledPattern::compile("ungated").unwrap(), // trust_gate: None
+        ];
+
+        let messages = vec![Message {
+            role: Role::System,
+            content: "ungated content".to_string(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+            trust: TrustLevel::Trusted,
+            trust_spans: Vec::new(),
+        }];
+
+        let result = scanner().scan(&messages, &config);
+        assert!(matches!(result.verdict, InboundVerdict::Block(_)));
     }
 }

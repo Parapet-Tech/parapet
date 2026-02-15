@@ -154,6 +154,36 @@ async fn main() {
                 println!("  ... {} more failures (use --max-failures to show more)", failures.len() - shown);
             }
         }
+        // Evidence metrics
+        let ev = &report.evidence;
+        if ev.total_evidence_matches > 0 || ev.malicious_total > 0 {
+            println!();
+            println!("Evidence Signals");
+            println!("----------------");
+            println!("  Total evidence matches: {}", ev.total_evidence_matches);
+            if !ev.category_counts.is_empty() {
+                let mut cats: Vec<_> = ev.category_counts.iter().collect();
+                cats.sort_by_key(|(_, v)| std::cmp::Reverse(**v));
+                print!("  Categories: ");
+                for (i, (cat, count)) in cats.iter().enumerate() {
+                    if i > 0 { print!(", "); }
+                    print!("{}={}", cat, count);
+                }
+                println!();
+            }
+            println!(
+                "  Malicious with evidence: {}/{} ({:.1}%)",
+                ev.malicious_with_evidence,
+                ev.malicious_total,
+                ev.malicious_coverage * 100.0
+            );
+            println!(
+                "  Benign with evidence:    {}/{} ({:.1}%)",
+                ev.benign_with_evidence,
+                ev.benign_total,
+                ev.benign_evidence_rate * 100.0
+            );
+        }
         println!();
         println!(
             "Accuracy: {:.1}% ({}/{})",
