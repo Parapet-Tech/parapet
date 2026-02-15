@@ -99,6 +99,16 @@ pub struct EvalResult {
     pub actual: String,
     pub correct: bool,
     pub detail: String,
+    /// Number of evidence-action pattern matches (from x-parapet-evidence-count header).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub evidence_count: usize,
+    /// Evidence pattern categories that matched (from x-parapet-evidence-categories header).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub evidence_categories: Vec<String>,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -125,10 +135,31 @@ pub struct SourceMetrics {
     pub accuracy: f64,
 }
 
+#[derive(Debug, Default, Serialize)]
+pub struct EvidenceMetrics {
+    /// Total evidence matches across all cases.
+    pub total_evidence_matches: usize,
+    /// Per-category evidence match counts.
+    pub category_counts: HashMap<String, usize>,
+    /// Of malicious cases, how many had at least one evidence match.
+    pub malicious_with_evidence: usize,
+    /// Total malicious cases.
+    pub malicious_total: usize,
+    /// Evidence coverage: malicious_with_evidence / malicious_total.
+    pub malicious_coverage: f64,
+    /// Of benign cases, how many had at least one evidence match (FP signal).
+    pub benign_with_evidence: usize,
+    /// Total benign cases.
+    pub benign_total: usize,
+    /// Evidence FP rate: benign_with_evidence / benign_total.
+    pub benign_evidence_rate: f64,
+}
+
 #[derive(Debug, Serialize)]
 pub struct EvalReport {
     pub layers: Vec<LayerMetrics>,
     pub sources: Vec<SourceMetrics>,
+    pub evidence: EvidenceMetrics,
     pub results: Vec<EvalResult>,
     pub total_cases: usize,
     pub total_correct: usize,
@@ -318,6 +349,8 @@ pub async fn run_eval(
                     actual: "error".to_string(),
                     correct: false,
                     detail: format!("engine error: {e}"),
+                    evidence_count: 0,
+                    evidence_categories: Vec::new(),
                 });
                 continue;
             }
@@ -328,6 +361,10 @@ pub async fn run_eval(
         let expected = expected_action(&case.label);
         let correct = actual == expected;
 
+        // Extract evidence signals from response headers
+        let evidence_count = parse_evidence_count(&headers);
+        let evidence_categories = parse_evidence_categories(&headers);
+
         results.push(EvalResult {
             case_id: case.id.clone(),
             layer: case.layer.clone(),
@@ -337,6 +374,8 @@ pub async fn run_eval(
             actual,
             correct,
             detail,
+            evidence_count,
+            evidence_categories,
         });
     }
 
@@ -438,9 +477,42 @@ pub fn compute_metrics(results: &[EvalResult]) -> EvalReport {
         0.0
     };
 
+    // Evidence metrics: coverage on malicious cases, FP rate on benign cases.
+    let mut evidence = EvidenceMetrics::default();
+    for r in results {
+        evidence.total_evidence_matches += r.evidence_count;
+        for cat in &r.evidence_categories {
+            *evidence.category_counts.entry(cat.clone()).or_insert(0) += 1;
+        }
+        match r.label.as_str() {
+            "malicious" => {
+                evidence.malicious_total += 1;
+                if r.evidence_count > 0 {
+                    evidence.malicious_with_evidence += 1;
+                }
+            }
+            "benign" => {
+                evidence.benign_total += 1;
+                if r.evidence_count > 0 {
+                    evidence.benign_with_evidence += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    if evidence.malicious_total > 0 {
+        evidence.malicious_coverage =
+            evidence.malicious_with_evidence as f64 / evidence.malicious_total as f64;
+    }
+    if evidence.benign_total > 0 {
+        evidence.benign_evidence_rate =
+            evidence.benign_with_evidence as f64 / evidence.benign_total as f64;
+    }
+
     EvalReport {
         layers,
         sources,
+        evidence,
         results: Vec::new(), // populated by caller if needed
         total_cases,
         total_correct,
@@ -633,6 +705,24 @@ fn blocked_by_layer(headers: &HeaderMap) -> Option<String> {
         .get("x-parapet-blocked-by")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
+}
+
+/// Extract evidence count from `X-Parapet-Evidence-Count` header.
+fn parse_evidence_count(headers: &HeaderMap) -> usize {
+    headers
+        .get("x-parapet-evidence-count")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Extract evidence categories from `X-Parapet-Evidence-Categories` header.
+fn parse_evidence_categories(headers: &HeaderMap) -> Vec<String> {
+    headers
+        .get("x-parapet-evidence-categories")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(',').map(|c| c.trim().to_string()).collect())
+        .unwrap_or_default()
 }
 
 fn determine_verdict(
@@ -1345,6 +1435,8 @@ layers:
                 actual: "blocked".into(),
                 correct: true,
                 detail: String::new(),
+                evidence_count: 0,
+                evidence_categories: Vec::new(),
             },
             EvalResult {
                 case_id: "2".into(),
@@ -1355,6 +1447,8 @@ layers:
                 actual: "allowed".into(),
                 correct: true,
                 detail: String::new(),
+                evidence_count: 0,
+                evidence_categories: Vec::new(),
             },
             EvalResult {
                 case_id: "3".into(),
@@ -1365,6 +1459,8 @@ layers:
                 actual: "allowed".into(),
                 correct: false,
                 detail: String::new(),
+                evidence_count: 0,
+                evidence_categories: Vec::new(),
             },
         ];
 

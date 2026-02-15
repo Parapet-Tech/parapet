@@ -8,7 +8,8 @@ use sha2::{Digest, Sha256};
 use crate::message::TrustLevel;
 
 use super::defaults::{
-    default_block_patterns, default_l4_patterns, default_layer_configs, default_sensitive_patterns,
+    default_block_patterns, default_evidence_patterns, default_l4_patterns,
+    default_layer_configs, default_sensitive_patterns,
 };
 use super::error::ConfigError;
 use super::interpolation::resolve_variables;
@@ -61,6 +62,13 @@ pub fn load_config(source: &dyn ConfigSource) -> Result<Config, ConfigError> {
         .map(|p| CompiledPattern::compile(p))
         .collect::<Result<Vec<_>, _>>()?;
     block_patterns.extend(user_patterns);
+
+    // Append evidence patterns (action: Evidence, trust-gated to untrusted).
+    // These are scanned alongside block patterns but never trigger block verdicts.
+    // Gated by the same flag as block patterns — if defaults are disabled, evidence is too.
+    if raw.use_default_block_patterns != Some(false) {
+        block_patterns.extend(default_evidence_patterns());
+    }
 
     // Compile sensitive_patterns: defaults first, then user patterns
     let mut sensitive_patterns = if raw.use_default_sensitive_patterns != Some(false) {

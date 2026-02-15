@@ -18,7 +18,7 @@ use base64::Engine as _;
 use flate2::read::{DeflateDecoder, GzDecoder};
 use std::io::Read as _;
 
-use crate::config::Config;
+use crate::config::{Config, PatternAction};
 use crate::constraint::{ConstraintEvaluator, DslConstraintEvaluator, ToolCallVerdict};
 use crate::layers::l1::{DefaultL1Scanner, L1Scanner, L1Verdict};
 use crate::layers::l3_inbound::{DefaultInboundScanner, InboundScanner, InboundVerdict};
@@ -26,7 +26,7 @@ use crate::config::L4Mode;
 use crate::layers::l4::{DefaultMultiTurnScanner, L4Verdict, MultiTurnScanner};
 use crate::layers::l5a::{L5aScanner, OutputScanner};
 use crate::message::ToolCall;
-use crate::normalize::{normalize_messages_with_spans, L0Normalizer, Normalizer};
+use crate::normalize::{neutralize_role_markers, normalize_messages_with_spans, L0Normalizer, Normalizer};
 use crate::provider::{adapter_for, ProviderAdapter, ProviderType};
 use crate::proxy::{ProxyError, ProxyRequest, ProxyResponse, Provider, UpstreamClient};
 use crate::stream::{
@@ -233,6 +233,18 @@ impl UpstreamClient for EngineUpstreamClient {
         if let Some(layer) = &self.deps.config.policy.layers.l0 {
             if layer.mode == "sanitize" {
                 normalize_messages_with_spans(self.deps.normalizer.as_ref(), &mut messages);
+                // Role marker neutralization: replace chat template tokens in untrusted content.
+                // Runs after normalization so span offsets are already remapped.
+                let replacements = neutralize_role_markers(&mut messages);
+                if !replacements.is_empty() {
+                    tracing::info!(
+                        request_id = %ctx.request_id,
+                        layer = "L0",
+                        count = replacements.len(),
+                        tokens = ?replacements.iter().map(|r| r.token.as_str()).collect::<Vec<_>>(),
+                        "role markers neutralized in untrusted content"
+                    );
+                }
             }
         }
 
@@ -296,11 +308,32 @@ impl UpstreamClient for EngineUpstreamClient {
         // 4) L3-inbound scanning (if enabled)
         // Always run the scanner to collect pattern matches (features for signal pipeline).
         // Gate only the block action on mode, not the scan itself.
+        //
+        // Evidence signals: count evidence-action matches and surface via response
+        // headers (x-parapet-evidence-count, x-parapet-evidence-categories) for
+        // observability and eval harness consumption.
+        let mut evidence_count: usize = 0;
+        let mut evidence_categories: Vec<String> = Vec::new();
+
         if let Some(layer) = &self.deps.config.policy.layers.l3_inbound {
             let l3i_start = Instant::now();
             let inbound_result = self.deps.inbound_scanner.scan(&messages, &self.deps.config);
             let l3i_ms = l3i_start.elapsed().as_secs_f64() * 1000.0;
-            // TODO(v3-signal): pass inbound_result.matched_patterns to verdict processor
+
+            // Collect evidence signal summary from all matched patterns.
+            let mut cats = std::collections::BTreeSet::new();
+            for m in &inbound_result.matched_patterns {
+                if m.action == PatternAction::Evidence {
+                    evidence_count += 1;
+                    if let Some(cat) = self.deps.config.policy.block_patterns
+                        .get(m.pattern_index)
+                        .and_then(|p| p.category.as_ref())
+                    {
+                        cats.insert(cat.clone());
+                    }
+                }
+            }
+            evidence_categories = cats.into_iter().collect();
 
             match &inbound_result.verdict {
                 InboundVerdict::Block(block) if layer.mode == "block" => {
@@ -315,12 +348,15 @@ impl UpstreamClient for EngineUpstreamClient {
                         message_index = block.message_index,
                         reason = %block.reason,
                         matched_patterns = inbound_result.matched_patterns.len(),
+                        evidence_count = evidence_count,
                         latency_ms = l3i_ms,
                         "inbound blocked"
                     );
                     // Generic message to client — don't leak pattern details
                     let body = adapter.serialize_error("request blocked by content policy", 403);
-                    return Ok(ProxyResponse::blocked(body, "L3-inbound"));
+                    let mut resp = ProxyResponse::blocked(body, "L3-inbound");
+                    attach_evidence_headers(&mut resp.headers, evidence_count, &evidence_categories);
+                    return Ok(resp);
                 }
                 InboundVerdict::Block(block) => {
                     // shadow/signal mode: log but don't block
@@ -335,6 +371,7 @@ impl UpstreamClient for EngineUpstreamClient {
                         message_index = block.message_index,
                         reason = %block.reason,
                         matched_patterns = inbound_result.matched_patterns.len(),
+                        evidence_count = evidence_count,
                         latency_ms = l3i_ms,
                         "inbound would block (shadow mode)"
                     );
@@ -347,6 +384,7 @@ impl UpstreamClient for EngineUpstreamClient {
                         model = %ctx.model,
                         layer = "L3-inbound",
                         verdict = "allow",
+                        evidence_count = evidence_count,
                         latency_ms = l3i_ms,
                         "inbound allowed"
                     );
@@ -453,8 +491,8 @@ impl UpstreamClient for EngineUpstreamClient {
                     "streaming response has Content-Encoding; passing through without decompression"
                 );
             }
-            let resp = self.handle_streaming_response(provider, upstream, &ctx);
-
+            let mut resp = self.handle_streaming_response(provider, upstream, &ctx);
+            attach_evidence_headers(&mut resp.headers, evidence_count, &evidence_categories);
             return Ok(resp);
         }
 
@@ -483,6 +521,7 @@ impl UpstreamClient for EngineUpstreamClient {
 
         let processed = self.handle_non_streaming_response(provider, &body_bytes, &ctx);
 
+        attach_evidence_headers(&mut resp_headers, evidence_count, &evidence_categories);
         Ok(ProxyResponse {
             status: processed.status_override.unwrap_or(upstream.status),
             headers: resp_headers,
@@ -993,6 +1032,23 @@ pub fn build_engine_client(config: Arc<Config>) -> EngineUpstreamClient {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Attach evidence signal headers to a response for observability/eval.
+///
+/// Only writes headers when evidence_count > 0 to avoid noise on clean requests.
+fn attach_evidence_headers(headers: &mut HeaderMap, evidence_count: usize, evidence_categories: &[String]) {
+    if evidence_count == 0 {
+        return;
+    }
+    if let Ok(val) = evidence_count.to_string().parse() {
+        headers.insert("x-parapet-evidence-count", val);
+    }
+    if !evidence_categories.is_empty() {
+        if let Ok(val) = evidence_categories.join(",").parse() {
+            headers.insert("x-parapet-evidence-categories", val);
+        }
+    }
+}
 
 /// Check if the response has gzip Content-Encoding.
 fn is_gzip(headers: &HeaderMap) -> bool {
