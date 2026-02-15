@@ -39,8 +39,14 @@ pub struct CompiledPattern {
     /// If set, only match content at this trust level (or lower).
     /// `None` means scan all content regardless of trust.
     pub trust_gate: Option<TrustLevel>,
-    /// Category label for grouping evidence signals (e.g. "data_payload", "role_confusion").
+    /// Category label for grouping evidence signals (e.g. "exfil", "roleplay").
     pub category: Option<String>,
+    /// Weight for signal scoring. Higher = stronger signal. Default: 1.0.
+    pub weight: f64,
+    /// Atomic patterns bypass the verdict processor combiner — match = block.
+    /// Only structural exploits with zero FP in eval corpus qualify.
+    /// Default: false.
+    pub atomic: bool,
 }
 
 impl CompiledPattern {
@@ -57,6 +63,18 @@ impl CompiledPattern {
         trust_gate: Option<TrustLevel>,
         category: Option<String>,
     ) -> Result<Self, ConfigError> {
+        Self::compile_full(pattern, action, trust_gate, category, 1.0, false)
+    }
+
+    /// Compile a regex pattern with all metadata fields.
+    pub fn compile_full(
+        pattern: &str,
+        action: PatternAction,
+        trust_gate: Option<TrustLevel>,
+        category: Option<String>,
+        weight: f64,
+        atomic: bool,
+    ) -> Result<Self, ConfigError> {
         let regex = RegexBuilder::new(pattern)
             .size_limit(MAX_REGEX_SIZE)
             .build()
@@ -70,6 +88,8 @@ impl CompiledPattern {
             action,
             trust_gate,
             category,
+            weight,
+            atomic,
         })
     }
 
@@ -86,6 +106,8 @@ impl fmt::Debug for CompiledPattern {
             .field("action", &self.action)
             .field("trust_gate", &self.trust_gate)
             .field("category", &self.category)
+            .field("weight", &self.weight)
+            .field("atomic", &self.atomic)
             .finish()
     }
 }
@@ -96,5 +118,7 @@ impl PartialEq for CompiledPattern {
             && self.action == other.action
             && self.trust_gate == other.trust_gate
             && self.category == other.category
+            && self.weight == other.weight
+            && self.atomic == other.atomic
     }
 }

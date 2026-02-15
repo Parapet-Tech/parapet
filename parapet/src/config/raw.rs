@@ -10,13 +10,43 @@
 use serde::Deserialize;
 use std::collections::HashMap;
 
+/// A block pattern can be a plain regex string or an object with metadata.
+///
+/// Plain string (backward compatible):
+///   - "ignore previous instructions"
+///
+/// Object format (new):
+///   - pattern: "ignore previous instructions"
+///     category: instruction_bypass
+///     weight: 0.8
+///     atomic: false
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum RawBlockPattern {
+    /// Plain regex string — defaults: weight=1.0, atomic=false, category=None.
+    Simple(String),
+    /// Object with explicit metadata fields.
+    Full {
+        pattern: String,
+        category: Option<String>,
+        #[serde(default = "default_pattern_weight")]
+        weight: f64,
+        #[serde(default)]
+        atomic: bool,
+    },
+}
+
+fn default_pattern_weight() -> f64 {
+    1.0
+}
+
 #[derive(Debug, Deserialize)]
 pub struct RawConfig {
     pub parapet: String,
     #[serde(default)]
     pub tools: HashMap<String, RawToolPolicy>,
     #[serde(default)]
-    pub block_patterns: Vec<String>,
+    pub block_patterns: Vec<RawBlockPattern>,
     #[serde(default)]
     pub canary_tokens: Vec<String>,
     #[serde(default)]
