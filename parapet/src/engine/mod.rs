@@ -251,10 +251,10 @@ impl UpstreamClient for EngineUpstreamClient {
         // 3.5) L1 lightweight classifier (if enabled)
         if let (Some(scanner), Some(l1_config)) = (&self.deps.l1_scanner, &self.deps.config.policy.layers.l1) {
             let l1_start = Instant::now();
-            let l1_verdict = scanner.scan(&messages, l1_config);
+            let l1_result = scanner.scan(&messages, l1_config);
             let l1_ms = l1_start.elapsed().as_secs_f64() * 1000.0;
 
-            match &l1_verdict {
+            match &l1_result.verdict {
                 L1Verdict::Block(block) if l1_config.mode == crate::config::L1Mode::Block => {
                     tracing::info!(
                         request_id = %ctx.request_id,

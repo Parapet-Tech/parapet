@@ -823,4 +823,76 @@ block_patterns:
             "my custom attack"
         );
     }
+
+    // ---------------------------------------------------------------
+    // Block pattern object format (Chunk C: pattern metadata schema)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn block_pattern_object_format_parsed() {
+        let yaml = r#"
+parapet: v1
+use_default_block_patterns: false
+block_patterns:
+  - pattern: "role delimiter exploit"
+    category: delimiter_abuse
+    weight: 0.9
+    atomic: true
+"#;
+        let config = load_config(&make_source(yaml)).unwrap();
+        assert_eq!(config.policy.block_patterns.len(), 1);
+        let p = &config.policy.block_patterns[0];
+        assert_eq!(p.pattern, "role delimiter exploit");
+        assert_eq!(p.category.as_deref(), Some("delimiter_abuse"));
+        assert_eq!(p.weight, 0.9);
+        assert!(p.atomic);
+        assert_eq!(p.action, PatternAction::Block);
+    }
+
+    #[test]
+    fn block_pattern_mixed_string_and_object() {
+        let yaml = r#"
+parapet: v1
+use_default_block_patterns: false
+block_patterns:
+  - "simple string pattern"
+  - pattern: "object pattern"
+    category: injection
+    weight: 0.5
+  - "another string"
+"#;
+        let config = load_config(&make_source(yaml)).unwrap();
+        assert_eq!(config.policy.block_patterns.len(), 3);
+
+        // First: simple string, defaults
+        assert_eq!(config.policy.block_patterns[0].pattern, "simple string pattern");
+        assert_eq!(config.policy.block_patterns[0].weight, 1.0);
+        assert!(!config.policy.block_patterns[0].atomic);
+        assert!(config.policy.block_patterns[0].category.is_none());
+
+        // Second: object with metadata
+        assert_eq!(config.policy.block_patterns[1].pattern, "object pattern");
+        assert_eq!(config.policy.block_patterns[1].category.as_deref(), Some("injection"));
+        assert_eq!(config.policy.block_patterns[1].weight, 0.5);
+        assert!(!config.policy.block_patterns[1].atomic);
+
+        // Third: simple string again
+        assert_eq!(config.policy.block_patterns[2].pattern, "another string");
+    }
+
+    #[test]
+    fn block_pattern_object_defaults_weight_and_atomic() {
+        let yaml = r#"
+parapet: v1
+use_default_block_patterns: false
+block_patterns:
+  - pattern: "minimal object"
+"#;
+        let config = load_config(&make_source(yaml)).unwrap();
+        assert_eq!(config.policy.block_patterns.len(), 1);
+        let p = &config.policy.block_patterns[0];
+        assert_eq!(p.weight, 1.0, "weight should default to 1.0");
+        assert!(!p.atomic, "atomic should default to false");
+        assert!(p.category.is_none(), "category should default to None");
+    }
 }

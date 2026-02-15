@@ -59,7 +59,19 @@ pub fn load_config(source: &dyn ConfigSource) -> Result<Config, ConfigError> {
     let user_patterns = raw
         .block_patterns
         .iter()
-        .map(|p| CompiledPattern::compile(p))
+        .map(|p| match p {
+            raw::RawBlockPattern::Simple(s) => CompiledPattern::compile(s),
+            raw::RawBlockPattern::Full { pattern, category, weight, atomic } => {
+                CompiledPattern::compile_full(
+                    pattern,
+                    super::PatternAction::Block,
+                    None,
+                    category.clone(),
+                    *weight,
+                    *atomic,
+                )
+            }
+        })
         .collect::<Result<Vec<_>, _>>()?;
     block_patterns.extend(user_patterns);
 
