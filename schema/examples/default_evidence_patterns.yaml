@@ -26,9 +26,11 @@ evidence_patterns:
     pattern: "(?si)Thought:.*Action:"
 
   # Instruction bypass phrasing: classic override pattern.
-  # Vigil-style regex. Moderate FPR — could appear in security documentation.
+  # Expanded from Vigil's InstructionBypass YARA rule (deadbits/vigil-llm).
+  # 11 verbs × 8 adjectives (optional) × 22 objects × 5 suffixes (optional).
+  # Corpus validation: 616 mal, 7 ben, 98.9% precision on 17K L3 inbound cases.
   - category: instruction_bypass
-    pattern: "(?i)(Ignore|Disregard|Forget)\\s+(all\\s+)?(previous|prior|above|earlier)\\s+(instructions|context|rules|guidelines|directives)"
+    pattern: "(?i)(Ignore|Disregard|Skip|Forget|Neglect|Overlook|Omit|Bypass|Pay no attention to|Do not follow|Do not obey)\\s+(all\\s+)?((prior|previous|preceding|above|foregoing|earlier|initial)\\s+)?(content|text|instructions?|directives?|commands?|context|conversation|inputs?|data|messages?|communication|responses?|requests?|rules|guidelines)(\\s+and (start over|start anew|begin afresh|start from scratch))?"
 
   # ---------------------------------------------------------------
   # Group B: Statistical Anomaly Patterns
@@ -60,3 +62,51 @@ evidence_patterns:
   # Source: DMPI-PMHFE is_systemic feature.
   - category: authority_claim
     pattern: "(?i)(I am (the |your )?(administrator|developer|creator|owner|root|supervisor)|admin access granted|authorized (to|by) (the )?(admin|system|developer)|elevated privileges|I have (admin|root|developer) (access|rights|permissions))"
+
+  # ---------------------------------------------------------------
+  # Group D: Jailbreak Technique Patterns
+  # ---------------------------------------------------------------
+
+  # Developer/DAN mode: explicit jailbreak mode activation.
+  # "DAN" = "Do Anything Now", a well-known jailbreak persona.
+  # Corpus validation: 145 mal, 1 ben, 99.3% precision on 17K L3 inbound cases.
+  - category: developer_mode
+    pattern: "(?i)(DAN mode|do anything now|developer mode (enabled|activated|on)|jailbreak(ed)? mode|enable unrestricted mode)"
+
+  # Roleplay hijack: persona reassignment to bypass safety guardrails.
+  # Attacker makes the model "become" a character without restrictions.
+  # "pretend to be" captures both benign roleplay and malicious persona switch.
+  # 87.7% precision, 40 benign FPs (0.44% of benign) — acceptable for evidence.
+  # Corpus validation: 285 mal, 40 ben on 17K L3 inbound cases.
+  - category: roleplay
+    pattern: "(?i)(you are now\\s|pretend (to be|you are)|act as if you (are|were|have)|from now on you (are|will be)\\b)"
+
+  # Output hijack: forcing the model to output specific attacker-controlled text.
+  # Broad pattern catches "respond only with", "say exactly", "output only".
+  # 80% precision, 13 benign FPs — most are format instructions ("output only JSON").
+  # Corpus validation: 52 mal, 13 ben on 17K L3 inbound cases.
+  - category: output_hijack
+    pattern: "(?i)(respond (only|exclusively) with|output (only|exclusively)|answer (only|exclusively) with|say (only|exactly) |print (only|exactly) )"
+
+  # Hypothetical framing: wrapping harmful requests in fictional/educational context.
+  # "For educational purposes only" is a classic jailbreak qualifier.
+  # Corpus validation: 21 mal, 2 ben, 91.3% precision on 17K L3 inbound cases.
+  - category: hypothetical_framing
+    pattern: "(?i)(in a hypothetical|in a fictional (world|scenario|setting)|for (educational|research|academic) purposes only)"
+
+  # ---------------------------------------------------------------
+  # Group E: Secret/Password Extraction Patterns
+  # ---------------------------------------------------------------
+
+  # Password/secret extraction: data payloads asking to reveal passwords, secret words, keys.
+  # Dominant in MossCap (password game) and Gandalf datasets.
+  # Requires extraction context: "what is the password", "tell me the password", "reveal the password".
+  # Bare "password" alone is too broad (matches "reset my password").
+  - category: password_extraction
+    pattern: "(?i)((what('s| is) (the |your )?(password|secret word|secret key|magic word|codeword|passphrase))|(tell|give|show|reveal|share|leak|expose|disclose|divulge) .{0,15}(password|secret word|secret key|magic word|codeword|passphrase)|(password|secret word|passphrase) (is|was|equals?|=))"
+
+  # Restriction removal: explicit requests to disable safety guardrails.
+  # "no restrictions", "unfiltered", "uncensored" in data payloads signal injection.
+  # Corpus validation: 103 mal, 16 ben, 86.6% precision on FN-without-evidence cases.
+  - category: restriction_removal
+    pattern: "(?i)(no (restrictions|limitations|rules|filters|boundaries|guidelines)|without (restrictions|limitations|rules|filters)|unrestricted|unfiltered|uncensored)"
