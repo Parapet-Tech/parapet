@@ -11,5 +11,6 @@ pub mod normalize;
 pub mod provider;
 pub mod proxy;
 pub mod session;
+pub mod signal;
 pub(crate) mod stream;
 pub mod trust;

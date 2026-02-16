@@ -23,6 +23,8 @@ use crate::engine::{
     DefaultProviderRegistry, EngineDeps, EngineUpstreamClient, HttpBody, HttpError, HttpRequest,
     HttpResponse, HttpSender, UpstreamResolver,
 };
+use crate::signal::combiner::DefaultVerdictCombiner;
+use crate::signal::extractor::DefaultSignalExtractor;
 use crate::layers::l1::{DefaultL1Scanner, L1Scanner};
 use crate::layers::l3_inbound::DefaultInboundScanner;
 use crate::layers::l4::{DefaultMultiTurnScanner, MultiTurnScanner};
@@ -297,6 +299,8 @@ pub fn build_eval_engine(config: Arc<Config>) -> (EngineUpstreamClient, Arc<Mock
         output_scanner: Arc::new(L5aScanner),
         session_store: None,
         multi_turn_scanner,
+        signal_extractor: Arc::new(DefaultSignalExtractor),
+        verdict_combiner: Arc::new(DefaultVerdictCombiner),
     };
 
     (EngineUpstreamClient::new_with(deps), mock)
