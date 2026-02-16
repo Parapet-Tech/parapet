@@ -19,6 +19,8 @@ use parapet::layers::l3_inbound::DefaultInboundScanner;
 use parapet::layers::l5a::L5aScanner;
 use parapet::normalize::L0Normalizer;
 use parapet::proxy::{self, Provider};
+use parapet::signal::combiner::DefaultVerdictCombiner;
+use parapet::signal::extractor::DefaultSignalExtractor;
 use parapet::trust::RoleTrustAssigner;
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -102,6 +104,8 @@ fn build_test_engine(yaml: &str, mock_url: &str) -> EngineUpstreamClient {
         output_scanner: Arc::new(L5aScanner),
         session_store: None,
         multi_turn_scanner: None,
+        signal_extractor: Arc::new(DefaultSignalExtractor),
+        verdict_combiner: Arc::new(DefaultVerdictCombiner),
     };
 
     EngineUpstreamClient::new_with(deps)

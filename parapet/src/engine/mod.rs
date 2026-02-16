@@ -33,6 +33,8 @@ use crate::stream::{
     AnthropicChunkClassifier, OpenAiChunkClassifier, StreamProcessor, ToolCallBlockMode,
     ToolCallValidator, ValidationResult,
 };
+use crate::signal::combiner::{DefaultVerdictCombiner, VerdictCombiner};
+use crate::signal::extractor::{DefaultSignalExtractor, SignalExtractor};
 use crate::trust::{RoleTrustAssigner, TrustAssigner};
 use async_trait::async_trait;
 use axum::body::Body;
@@ -167,6 +169,8 @@ pub struct EngineDeps {
     pub output_scanner: Arc<dyn OutputScanner>,
     pub session_store: Option<Arc<dyn crate::session::SessionStore>>,
     pub multi_turn_scanner: Option<Arc<dyn MultiTurnScanner>>,
+    pub signal_extractor: Arc<dyn SignalExtractor>,
+    pub verdict_combiner: Arc<dyn VerdictCombiner>,
 }
 
 // ---------------------------------------------------------------------------
@@ -252,11 +256,18 @@ impl UpstreamClient for EngineUpstreamClient {
         // Store the first block response; later layers still run for signal collection.
         let mut pending_block: Option<ProxyResponse> = None;
 
+        // Hoisted layer results for the verdict processor.
+        let mut l1_result_opt: Option<crate::layers::l1::L1Result> = None;
+        let mut inbound_result_opt: Option<crate::layers::l3_inbound::InboundResult> = None;
+        let mut l4_result_opt: Option<crate::layers::l4::L4Result> = None;
+
         // 3.5) L1 lightweight classifier (if enabled)
         if let (Some(scanner), Some(l1_config)) = (&self.deps.l1_scanner, &self.deps.config.policy.layers.l1) {
             let l1_start = Instant::now();
             let l1_result = scanner.scan(&messages, l1_config);
             let l1_ms = l1_start.elapsed().as_secs_f64() * 1000.0;
+            l1_result_opt = Some(l1_result);
+            let l1_result = l1_result_opt.as_ref().unwrap();
 
             match &l1_result.verdict {
                 L1Verdict::Block(block) if l1_config.mode == crate::config::L1Mode::Block => {
@@ -323,6 +334,8 @@ impl UpstreamClient for EngineUpstreamClient {
             let l3i_start = Instant::now();
             let inbound_result = self.deps.inbound_scanner.scan(&messages, &self.deps.config);
             let l3i_ms = l3i_start.elapsed().as_secs_f64() * 1000.0;
+            inbound_result_opt = Some(inbound_result);
+            let inbound_result = inbound_result_opt.as_ref().unwrap();
 
             // Collect evidence signal summary from all matched patterns.
             let mut cats = std::collections::BTreeSet::new();
@@ -400,6 +413,8 @@ impl UpstreamClient for EngineUpstreamClient {
             let l4_start = Instant::now();
             let l4_result = scanner.scan(&messages, l4_config);
             let l4_ms = l4_start.elapsed().as_secs_f64() * 1000.0;
+            l4_result_opt = Some(l4_result);
+            let l4_result = l4_result_opt.as_ref().unwrap();
             let categories: Vec<&str> = l4_result.matched_categories.iter()
                 .map(|c| c.category.as_str()).collect();
 
@@ -454,7 +469,32 @@ impl UpstreamClient for EngineUpstreamClient {
             }
         }
 
-        // 5.5) Collect-then-decide: if any inbound layer blocked, return now.
+        // 5.5) Verdict processor (shadow — log only, no behavioral change).
+        {
+            let mut signals = Vec::new();
+            if let Some(ref l1r) = l1_result_opt {
+                signals.extend(self.deps.signal_extractor.extract_l1(l1r));
+            }
+            if let Some(ref l3r) = inbound_result_opt {
+                signals.extend(self.deps.signal_extractor.extract_l3(l3r, &*self.deps.config));
+            }
+            if let Some(ref l4r) = l4_result_opt {
+                signals.extend(self.deps.signal_extractor.extract_l4(l4r));
+            }
+            if !signals.is_empty() {
+                let verdict = self.deps.verdict_combiner.combine(&signals);
+                tracing::info!(
+                    request_id = %ctx.request_id,
+                    verdict_action = ?verdict.action,
+                    composite_score = verdict.composite_score,
+                    signal_count = signals.len(),
+                    contributing_count = verdict.contributing.len(),
+                    "verdict processor (shadow)"
+                );
+            }
+        }
+
+        // 5.6) Collect-then-decide: if any inbound layer blocked, return now.
         // All layers have run and logged their signals — the first blocker wins.
         if let Some(mut resp) = pending_block {
             attach_evidence_headers(&mut resp.headers, evidence_count, &evidence_categories);
@@ -1035,6 +1075,8 @@ pub fn build_engine_client(config: Arc<Config>) -> EngineUpstreamClient {
         output_scanner: Arc::new(L5aScanner),
         session_store,
         multi_turn_scanner,
+        signal_extractor: Arc::new(DefaultSignalExtractor::new()),
+        verdict_combiner: Arc::new(DefaultVerdictCombiner::new()),
     };
 
     EngineUpstreamClient::new_with(deps)
@@ -1557,6 +1599,8 @@ mod tests {
             output_scanner: Arc::new(L5aScanner),
             session_store: None,
             multi_turn_scanner: None,
+            signal_extractor: Arc::new(DefaultSignalExtractor::new()),
+            verdict_combiner: Arc::new(DefaultVerdictCombiner::new()),
         };
         EngineUpstreamClient::new_with(deps)
     }
