@@ -441,7 +441,7 @@ pub fn remap_trust_spans(
 /// Clamp a byte offset to the nearest valid UTF-8 character boundary.
 /// If the offset falls in the middle of a multi-byte character, round down
 /// to the start of that character.
-fn clamp_to_char_boundary(s: &str, offset: usize) -> usize {
+pub(crate) fn clamp_to_char_boundary(s: &str, offset: usize) -> usize {
     if offset >= s.len() {
         return s.len();
     }
