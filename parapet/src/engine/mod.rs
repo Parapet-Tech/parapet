@@ -248,6 +248,10 @@ impl UpstreamClient for EngineUpstreamClient {
             }
         }
 
+        // Collect-then-decide: run all inbound layers before deciding.
+        // Store the first block response; later layers still run for signal collection.
+        let mut pending_block: Option<ProxyResponse> = None;
+
         // 3.5) L1 lightweight classifier (if enabled)
         if let (Some(scanner), Some(l1_config)) = (&self.deps.l1_scanner, &self.deps.config.policy.layers.l1) {
             let l1_start = Instant::now();
@@ -271,7 +275,7 @@ impl UpstreamClient for EngineUpstreamClient {
                         "L1 classifier blocked"
                     );
                     let body = adapter.serialize_error("request blocked by content policy", 403);
-                    return Ok(ProxyResponse::blocked(body, "L1"));
+                    pending_block = Some(ProxyResponse::blocked(body, "L1"));
                 }
                 L1Verdict::Block(block) => {
                     // Shadow mode: log but don't block
@@ -352,11 +356,10 @@ impl UpstreamClient for EngineUpstreamClient {
                         latency_ms = l3i_ms,
                         "inbound blocked"
                     );
-                    // Generic message to client — don't leak pattern details
-                    let body = adapter.serialize_error("request blocked by content policy", 403);
-                    let mut resp = ProxyResponse::blocked(body, "L3-inbound");
-                    attach_evidence_headers(&mut resp.headers, evidence_count, &evidence_categories);
-                    return Ok(resp);
+                    if pending_block.is_none() {
+                        let body = adapter.serialize_error("request blocked by content policy", 403);
+                        pending_block = Some(ProxyResponse::blocked(body, "L3-inbound"));
+                    }
                 }
                 InboundVerdict::Block(block) => {
                     // shadow/signal mode: log but don't block
@@ -414,9 +417,10 @@ impl UpstreamClient for EngineUpstreamClient {
                         latency_ms = l4_ms,
                         "multi-turn attack blocked"
                     );
-                    // Generic message to client — internal reason already logged above
-                    let body = adapter.serialize_error("request blocked by content policy", 403);
-                    return Ok(ProxyResponse::blocked(body, "L4"));
+                    if pending_block.is_none() {
+                        let body = adapter.serialize_error("request blocked by content policy", 403);
+                        pending_block = Some(ProxyResponse::blocked(body, "L4"));
+                    }
                 }
                 L4Verdict::Block { .. } => {
                     // Shadow mode: log but don't block
@@ -448,6 +452,13 @@ impl UpstreamClient for EngineUpstreamClient {
                     );
                 }
             }
+        }
+
+        // 5.5) Collect-then-decide: if any inbound layer blocked, return now.
+        // All layers have run and logged their signals — the first blocker wins.
+        if let Some(mut resp) = pending_block {
+            attach_evidence_headers(&mut resp.headers, evidence_count, &evidence_categories);
+            return Ok(resp);
         }
 
         // 6) Forward to upstream

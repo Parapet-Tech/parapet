@@ -54,6 +54,7 @@ environment: "eval"
 
 layers:
   L0: { mode: sanitize }
+  L1: { mode: block, threshold: 0.0 }
   L3_inbound: { mode: block }
   L3_outbound: { mode: block, block_action: rewrite }
   L5a: { mode: redact }

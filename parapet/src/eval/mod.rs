@@ -733,19 +733,12 @@ fn determine_verdict(
 ) -> (String, String) {
     match case.layer.as_str() {
         "l1" => {
-            // L1 blocks via 403 with X-Parapet-Blocked-By: L1
+            // Only count as "blocked" if L1 specifically blocked it.
+            // A different layer blocking is irrelevant to L1's metrics.
             let blocked_by = blocked_by_layer(headers);
             let fired = status == StatusCode::FORBIDDEN
                 && blocked_by.as_deref() == Some("L1");
-            let actual = if fired {
-                "blocked"
-            } else if status == StatusCode::FORBIDDEN {
-                // Blocked, but by a different layer — still counts as blocked
-                // for isolated L1 eval this shouldn't happen
-                "blocked"
-            } else {
-                "allowed"
-            };
+            let actual = if fired { "blocked" } else { "allowed" };
             let detail = format!(
                 "status={} blocked_by={}",
                 status.as_u16(),
@@ -754,9 +747,11 @@ fn determine_verdict(
             (actual.to_string(), detail)
         }
         "l3_inbound" => {
-            let fired = status == StatusCode::FORBIDDEN;
-            let actual = if fired { "blocked" } else { "allowed" };
+            // Only count as "blocked" if L3-inbound specifically blocked it.
             let blocked_by = blocked_by_layer(headers);
+            let fired = status == StatusCode::FORBIDDEN
+                && blocked_by.as_deref() == Some("L3-inbound");
+            let actual = if fired { "blocked" } else { "allowed" };
             (
                 actual.to_string(),
                 format!(
@@ -767,8 +762,11 @@ fn determine_verdict(
             )
         }
         "l3_outbound" => {
+            // If an inbound layer blocked, no outbound processing happened.
+            if status == StatusCode::FORBIDDEN {
+                return ("allowed".to_string(), "inbound block — no outbound processing".to_string());
+            }
             // In rewrite mode, blocked tool calls are removed and refusal text injected.
-            // Check if refusal text is present (contains "blocked" in the message content).
             let fired = body.contains("blocked");
             let actual = if fired { "blocked" } else { "allowed" };
             let detail = if fired {
@@ -779,6 +777,10 @@ fn determine_verdict(
             (actual.to_string(), detail)
         }
         "l5a" => {
+            // If an inbound layer blocked, no outbound processing happened.
+            if status == StatusCode::FORBIDDEN {
+                return ("allowed".to_string(), "inbound block — no outbound processing".to_string());
+            }
             let fired = body.contains("[REDACTED]");
             let actual = if fired { "blocked" } else { "allowed" };
             let detail = if fired {
@@ -789,9 +791,11 @@ fn determine_verdict(
             (actual.to_string(), detail)
         }
         "l4" => {
-            let fired = status == StatusCode::FORBIDDEN;
-            let actual = if fired { "blocked" } else { "allowed" };
+            // Only count as "blocked" if L4 specifically blocked it.
             let blocked_by = blocked_by_layer(headers);
+            let fired = status == StatusCode::FORBIDDEN
+                && blocked_by.as_deref() == Some("L4");
+            let actual = if fired { "blocked" } else { "allowed" };
             (
                 actual.to_string(),
                 format!(
