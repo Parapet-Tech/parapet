@@ -176,9 +176,14 @@ mod onnx_impl {
                 .and_then(|b| b.commit_from_file(&onnx_path))
                 .map_err(|e| ModelInitError::OnnxError(e.to_string()))?;
 
-            // Load tokenizer.
-            let tokenizer = Tokenizer::from_file(&tokenizer_path)
+            // Load tokenizer. Disable built-in padding (gravitee-io exports
+            // default to Fixed(512)) — we pad dynamically to the actual max
+            // length in classify_batch, so short inputs stay short.
+            let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
                 .map_err(|e| ModelInitError::OnnxError(format!("tokenizer: {e}")))?;
+            tokenizer.with_padding(None);
+            tokenizer.with_truncation(None)
+                .map_err(|e| ModelInitError::OnnxError(format!("truncation config: {e}")))?;
 
             let pg = Self { session: Mutex::new(session), tokenizer };
 
