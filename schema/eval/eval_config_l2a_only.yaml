@@ -1,0 +1,35 @@
+parapet: v1
+
+tools:
+  _default:
+    allowed: true
+
+trust:
+  unknown_trust_policy:
+    system: trusted
+    assistant: trusted
+    user: untrusted
+    tool: untrusted
+
+engine:
+  on_failure: closed
+  timeout_ms: 30000
+
+environment: "eval"
+
+# L2a-only: isolates Prompt Guard 2 detection performance.
+# L0 sanitizes, L2a scans data payloads. No L1/L3/L4/L5a.
+layers:
+  L0: { mode: sanitize }
+  L2a:
+    mode: block
+    model: pg2-22m
+    pg_threshold: 0.5
+    block_threshold: 0.5
+    heuristic_weight: 0.3
+    fusion_confidence_agreement: 0.95
+    fusion_confidence_pg_only: 0.7
+    fusion_confidence_heuristic_only: 0.4
+    max_segments: 32
+    timeout_ms: 5000
+    max_concurrent_scans: 4

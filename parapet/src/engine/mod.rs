@@ -8,6 +8,7 @@
 // - Trust assignment
 // - L0 normalization
 // - L1 lightweight classifier
+// - L2a data payload detection (Prompt Guard 2 + heuristics)
 // - L3-inbound scanning
 // - Forward to upstream provider
 // - L3-outbound tool call validation + rewrite (non-streaming)
@@ -18,9 +19,10 @@ use base64::Engine as _;
 use flate2::read::{DeflateDecoder, GzDecoder};
 use std::io::Read as _;
 
-use crate::config::{Config, PatternAction};
+use crate::config::{Config, L2aMode, PatternAction};
 use crate::constraint::{ConstraintEvaluator, DslConstraintEvaluator, ToolCallVerdict};
 use crate::layers::l1::{DefaultL1Scanner, L1Scanner, L1Verdict};
+use crate::layers::l2a::L2aScanner;
 use crate::layers::l3_inbound::{DefaultInboundScanner, InboundScanner, InboundVerdict};
 use crate::config::L4Mode;
 use crate::layers::l4::{DefaultMultiTurnScanner, L4Verdict, MultiTurnScanner};
@@ -35,6 +37,7 @@ use crate::stream::{
 };
 use crate::signal::combiner::{DefaultVerdictCombiner, VerdictCombiner};
 use crate::signal::extractor::{DefaultSignalExtractor, SignalExtractor};
+use crate::signal::Signal;
 use crate::trust::{RoleTrustAssigner, TrustAssigner};
 use async_trait::async_trait;
 use axum::body::Body;
@@ -46,7 +49,7 @@ use futures_util::stream::{Stream, StreamExt};
 use futures_util::TryStreamExt;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -153,6 +156,30 @@ pub enum HttpError {
 }
 
 // ---------------------------------------------------------------------------
+// Startup errors
+// ---------------------------------------------------------------------------
+
+/// Error returned when `build_engine_client` cannot construct the engine.
+#[derive(Debug)]
+pub enum StartupError {
+    /// L2a configured in YAML but binary built without `--features l2a`.
+    FeatureDisabled(String),
+    /// L2a configured but model files missing or invalid.
+    ModelMissing(String),
+}
+
+impl std::fmt::Display for StartupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StartupError::FeatureDisabled(msg) => write!(f, "{msg}"),
+            StartupError::ModelMissing(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+impl std::error::Error for StartupError {}
+
+// ---------------------------------------------------------------------------
 // Engine dependencies
 // ---------------------------------------------------------------------------
 
@@ -164,6 +191,8 @@ pub struct EngineDeps {
     pub normalizer: Arc<dyn Normalizer>,
     pub trust_assigner: Arc<dyn TrustAssigner>,
     pub l1_scanner: Option<Arc<dyn L1Scanner>>,
+    pub l2a_scanner: Option<Arc<dyn L2aScanner>>,
+    pub l2a_semaphore: Option<Arc<tokio::sync::Semaphore>>,
     pub inbound_scanner: Arc<dyn InboundScanner>,
     pub constraint_evaluator: Arc<dyn ConstraintEvaluator>,
     pub output_scanner: Arc<dyn OutputScanner>,
@@ -315,6 +344,148 @@ impl UpstreamClient for EngineUpstreamClient {
                         verdict = "allow",
                         latency_ms = l1_ms,
                         "L1 classifier passed"
+                    );
+                }
+            }
+        }
+
+        // 3.7) L2a data payload detection (if enabled)
+        //
+        // Runs PG2 + heuristic fusion on untrusted data segments.
+        // Timeout and concurrency are engine-level concerns; the scanner is synchronous.
+        // Failure behavior depends on mode: Shadow=fail-open, Block=fail-closed.
+        let mut l2a_signals: Vec<Signal> = Vec::new();
+        if let (Some(scanner), Some(l2a_config), Some(semaphore)) = (
+            &self.deps.l2a_scanner,
+            &self.deps.config.policy.layers.l2a,
+            &self.deps.l2a_semaphore,
+        ) {
+            let permit = semaphore.clone().try_acquire_owned();
+            if let Ok(permit) = permit {
+                let l2a_timeout = Duration::from_millis(l2a_config.timeout_ms);
+                let l2a_start = Instant::now();
+
+                let scanner = Arc::clone(scanner);
+                let messages_clone = messages.clone();
+                let l2a_config_clone = l2a_config.clone();
+
+                // Move owned permit into the blocking task so it is held
+                // until the scan actually finishes, not just until the
+                // engine stops waiting (on timeout).
+                let scan_future = tokio::task::spawn_blocking(move || {
+                    let _permit = permit; // held until this closure returns
+                    scanner.scan(&messages_clone, &l2a_config_clone)
+                });
+
+                match tokio::time::timeout(l2a_timeout, scan_future).await {
+                    Ok(Ok(Ok(signals))) => {
+                        let l2a_ms = l2a_start.elapsed().as_secs_f64() * 1000.0;
+                        l2a_signals = signals;
+
+                        // Per-layer enforcement.
+                        let has_block = l2a_signals.iter()
+                            .any(|s| s.score >= l2a_config.block_threshold);
+                        match (&l2a_config.mode, has_block) {
+                            (L2aMode::Block, true) => {
+                                tracing::info!(
+                                    request_id = %ctx.request_id,
+                                    contract_hash = %ctx.contract_hash,
+                                    provider = ctx.provider_str,
+                                    model = %ctx.model,
+                                    layer = "L2a",
+                                    verdict = "block",
+                                    signal_count = l2a_signals.len(),
+                                    latency_ms = l2a_ms,
+                                    "L2a blocked"
+                                );
+                                if pending_block.is_none() {
+                                    let body = adapter.serialize_error(
+                                        "request blocked by content policy", 403
+                                    );
+                                    pending_block = Some(ProxyResponse::blocked(body, "L2a"));
+                                }
+                            }
+                            (L2aMode::Shadow, true) => {
+                                tracing::info!(
+                                    request_id = %ctx.request_id,
+                                    contract_hash = %ctx.contract_hash,
+                                    provider = ctx.provider_str,
+                                    model = %ctx.model,
+                                    layer = "L2a",
+                                    verdict = "shadow_block",
+                                    signal_count = l2a_signals.len(),
+                                    latency_ms = l2a_ms,
+                                    "L2a detected (shadow)"
+                                );
+                            }
+                            _ => {
+                                tracing::debug!(
+                                    request_id = %ctx.request_id,
+                                    layer = "L2a",
+                                    verdict = "allow",
+                                    signal_count = l2a_signals.len(),
+                                    latency_ms = l2a_ms,
+                                    "L2a scan complete"
+                                );
+                            }
+                        }
+                    }
+                    Ok(Ok(Err(scan_err))) => {
+                        // Scanner returned an error (classify failure or cardinality mismatch).
+                        let l2a_ms = l2a_start.elapsed().as_secs_f64() * 1000.0;
+                        tracing::error!(
+                            request_id = %ctx.request_id,
+                            layer = "L2a",
+                            error = %scan_err,
+                            latency_ms = l2a_ms,
+                            "L2a scan error"
+                        );
+                        if l2a_config.mode == L2aMode::Block {
+                            l2a_fail_closed_block(
+                                &mut pending_block, adapter.as_ref(), "scan error"
+                            );
+                        }
+                    }
+                    Ok(Err(join_err)) => {
+                        // Scan task panicked.
+                        tracing::error!(
+                            request_id = %ctx.request_id,
+                            layer = "L2a",
+                            error = %join_err,
+                            "L2a scan task panicked"
+                        );
+                        if l2a_config.mode == L2aMode::Block {
+                            l2a_fail_closed_block(
+                                &mut pending_block, adapter.as_ref(), "scan panicked"
+                            );
+                        }
+                    }
+                    Err(_) => {
+                        // Timeout.
+                        tracing::warn!(
+                            request_id = %ctx.request_id,
+                            layer = "L2a",
+                            timeout_ms = l2a_config.timeout_ms,
+                            "L2a scan timed out"
+                        );
+                        if l2a_config.mode == L2aMode::Block {
+                            l2a_fail_closed_block(
+                                &mut pending_block, adapter.as_ref(), "scan timed out"
+                            );
+                        }
+                    }
+                }
+            } else {
+                // Concurrency limit reached.
+                tracing::warn!(
+                    request_id = %ctx.request_id,
+                    layer = "L2a",
+                    max_concurrent = l2a_config.max_concurrent_scans,
+                    "L2a concurrency limit reached"
+                );
+                if l2a_config.mode == L2aMode::Block {
+                    l2a_fail_closed_block(
+                        &mut pending_block, adapter.as_ref(), "concurrency limit"
                     );
                 }
             }
@@ -475,6 +646,7 @@ impl UpstreamClient for EngineUpstreamClient {
             if let Some(ref l1r) = l1_result_opt {
                 signals.extend(self.deps.signal_extractor.extract_l1(l1r));
             }
+            signals.extend(l2a_signals);
             if let Some(ref l3r) = inbound_result_opt {
                 signals.extend(self.deps.signal_extractor.extract_l3(l3r, &*self.deps.config));
             }
@@ -1045,7 +1217,7 @@ impl HttpSender for ReqwestHttpSender {
 // Public factory for default engine client
 // ---------------------------------------------------------------------------
 
-pub fn build_engine_client(config: Arc<Config>) -> EngineUpstreamClient {
+pub fn build_engine_client(config: Arc<Config>) -> Result<EngineUpstreamClient, StartupError> {
     let session_store: Option<Arc<dyn crate::session::SessionStore>> = None; // Sprint 2
 
     let l1_scanner: Option<Arc<dyn L1Scanner>> =
@@ -1062,6 +1234,42 @@ pub fn build_engine_client(config: Arc<Config>) -> EngineUpstreamClient {
             None
         };
 
+    // L2a scanner construction.
+    // Fail-closed at startup: if L2a is configured, the model must be loadable.
+    // Feature-gate check: if config enables L2a but feature is disabled, error.
+    #[cfg(not(feature = "l2a"))]
+    if config.policy.layers.l2a.is_some() {
+        return Err(StartupError::FeatureDisabled(
+            "policy.layers.l2a is configured but binary was built without \
+             --features l2a. Rebuild with: cargo build --features l2a".into()
+        ));
+    }
+
+    #[cfg(feature = "l2a")]
+    let l2a_scanner: Option<Arc<dyn L2aScanner>> =
+        if let Some(l2a_config) = &config.policy.layers.l2a {
+            use crate::layers::l2a::DefaultL2aScanner;
+            use crate::layers::l2a::DefaultHeuristicScanner;
+            use crate::layers::l2a_model::OnnxPromptGuard;
+
+            let classifier = OnnxPromptGuard::init(l2a_config)
+                .map_err(|e| StartupError::ModelMissing(e.to_string()))?;
+            let heuristics = DefaultHeuristicScanner::new();
+            Some(Arc::new(DefaultL2aScanner::new(
+                Box::new(classifier),
+                Box::new(heuristics),
+            )))
+        } else {
+            None
+        };
+
+    #[cfg(not(feature = "l2a"))]
+    let l2a_scanner: Option<Arc<dyn L2aScanner>> = None;
+
+    let l2a_semaphore = config.policy.layers.l2a.as_ref().map(|l2a_config| {
+        Arc::new(tokio::sync::Semaphore::new(l2a_config.max_concurrent_scans))
+    });
+
     let deps = EngineDeps {
         config,
         http: Arc::new(ReqwestHttpSender::new(reqwest::Client::new())),
@@ -1070,6 +1278,8 @@ pub fn build_engine_client(config: Arc<Config>) -> EngineUpstreamClient {
         normalizer: Arc::new(L0Normalizer::new()),
         trust_assigner: Arc::new(RoleTrustAssigner),
         l1_scanner,
+        l2a_scanner,
+        l2a_semaphore,
         inbound_scanner: Arc::new(DefaultInboundScanner::new()),
         constraint_evaluator: Arc::new(DslConstraintEvaluator::new()),
         output_scanner: Arc::new(L5aScanner),
@@ -1079,12 +1289,27 @@ pub fn build_engine_client(config: Arc<Config>) -> EngineUpstreamClient {
         verdict_combiner: Arc::new(DefaultVerdictCombiner::new()),
     };
 
-    EngineUpstreamClient::new_with(deps)
+    Ok(EngineUpstreamClient::new_with(deps))
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Block the request when L2a enforcement cannot run.
+/// Only called in Block mode on scan failure (timeout/concurrency/panic/error).
+fn l2a_fail_closed_block(
+    pending_block: &mut Option<ProxyResponse>,
+    adapter: &dyn ProviderAdapter,
+    _reason: &str,
+) {
+    if pending_block.is_none() {
+        let body = adapter.serialize_error(
+            "request blocked by content policy (L2a unavailable)", 403
+        );
+        *pending_block = Some(ProxyResponse::blocked(body, "L2a"));
+    }
+}
 
 /// Attach evidence signal headers to a response for observability/eval.
 ///
@@ -1594,6 +1819,8 @@ mod tests {
             normalizer: Arc::new(NoopNormalizer),
             trust_assigner: Arc::new(NoopTrustAssigner),
             l1_scanner: None,
+            l2a_scanner: None,
+            l2a_semaphore: None,
             inbound_scanner: Arc::new(NoopInboundScanner),
             constraint_evaluator: Arc::new(DslConstraintEvaluator::new()),
             output_scanner: Arc::new(L5aScanner),
@@ -1647,6 +1874,7 @@ mod tests {
                 layers: LayerConfigs {
                     l0: None,
                     l1: None,
+                    l2a: None,
                     l3_inbound: None,
                     l3_outbound: Some(LayerConfig {
                         mode: "block".to_string(),
@@ -2401,6 +2629,407 @@ mod tests {
         let entries = compress_to_history(&messages);
         assert_eq!(entries[0].trust_level, TrustLevel::Trusted);
         assert_eq!(entries[1].trust_level, TrustLevel::Untrusted);
+    }
+
+    // -------------------------------------------------------------------
+    // StartupError tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn startup_error_display_feature_disabled() {
+        let e = StartupError::FeatureDisabled("missing l2a feature".into());
+        assert_eq!(e.to_string(), "missing l2a feature");
+    }
+
+    #[test]
+    fn startup_error_display_model_missing() {
+        let e = StartupError::ModelMissing("model not found".into());
+        assert_eq!(e.to_string(), "model not found");
+    }
+
+    #[test]
+    fn startup_error_is_error_trait() {
+        let e: Box<dyn std::error::Error> =
+            Box::new(StartupError::ModelMissing("test".into()));
+        assert!(e.to_string().contains("test"));
+    }
+
+    // -------------------------------------------------------------------
+    // Feature-gate test (we build without `l2a` by default)
+    // -------------------------------------------------------------------
+
+    #[cfg(not(feature = "l2a"))]
+    #[test]
+    fn build_engine_client_rejects_l2a_config_without_feature() {
+        use crate::config::{L2aConfig, L2aMode};
+
+        let mut config = base_config_with_canary("dummy");
+        config.policy.layers.l2a = Some(L2aConfig {
+            mode: L2aMode::Shadow,
+            model: "pg2-86m".to_string(),
+            model_dir: None,
+            pg_threshold: 0.5,
+            block_threshold: 0.7,
+            heuristic_weight: 0.3,
+            fusion_confidence_agreement: 0.9,
+            fusion_confidence_pg_only: 0.7,
+            fusion_confidence_heuristic_only: 0.4,
+            max_segments: 16,
+            timeout_ms: 200,
+            max_concurrent_scans: 4,
+        });
+        let result = build_engine_client(Arc::new(config));
+        match result {
+            Err(StartupError::FeatureDisabled(msg)) => {
+                assert!(msg.contains("--features l2a"));
+            }
+            Err(_) => panic!("expected FeatureDisabled, got different error"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // L2a pipeline integration (mock scanner)
+    // -------------------------------------------------------------------
+
+    use crate::layers::l2a::{L2aScanError, L2aScanner};
+    use crate::config::{L2aConfig, L2aMode};
+    use crate::signal::{LayerId, Signal, SignalKind};
+
+    struct MockL2aScanner {
+        signals: Vec<Signal>,
+    }
+
+    impl L2aScanner for MockL2aScanner {
+        fn scan(
+            &self,
+            _messages: &[crate::message::Message],
+            _config: &L2aConfig,
+        ) -> Result<Vec<Signal>, L2aScanError> {
+            Ok(self.signals.clone())
+        }
+    }
+
+    struct FailingL2aScanner;
+
+    impl L2aScanner for FailingL2aScanner {
+        fn scan(
+            &self,
+            _messages: &[crate::message::Message],
+            _config: &L2aConfig,
+        ) -> Result<Vec<Signal>, L2aScanError> {
+            Err(L2aScanError::ClassifyFailed("mock classify failure".into()))
+        }
+    }
+
+    /// Scanner that sleeps longer than the configured timeout.
+    struct SlowL2aScanner {
+        delay: std::time::Duration,
+    }
+
+    impl L2aScanner for SlowL2aScanner {
+        fn scan(
+            &self,
+            _messages: &[crate::message::Message],
+            _config: &L2aConfig,
+        ) -> Result<Vec<Signal>, L2aScanError> {
+            std::thread::sleep(self.delay);
+            Ok(vec![])
+        }
+    }
+
+    /// Scanner that panics (simulates ONNX runtime failure).
+    struct PanickingL2aScanner;
+
+    impl L2aScanner for PanickingL2aScanner {
+        fn scan(
+            &self,
+            _messages: &[crate::message::Message],
+            _config: &L2aConfig,
+        ) -> Result<Vec<Signal>, L2aScanError> {
+            panic!("onnx session exploded");
+        }
+    }
+
+    /// HTTP sender that returns a valid OpenAI-style 200 response.
+    struct SuccessHttpSender;
+
+    #[async_trait]
+    impl HttpSender for SuccessHttpSender {
+        async fn send(&self, _request: HttpRequest) -> Result<HttpResponse, HttpError> {
+            let body = serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "Hello!"
+                    }
+                }]
+            });
+            Ok(HttpResponse {
+                status: StatusCode::OK,
+                headers: HeaderMap::new(),
+                body: HttpBody::Full(Bytes::from(serde_json::to_vec(&body).unwrap())),
+            })
+        }
+    }
+
+    fn l2a_test_config() -> L2aConfig {
+        L2aConfig {
+            mode: L2aMode::Shadow,
+            model: "pg2-86m".to_string(),
+            model_dir: None,
+            pg_threshold: 0.5,
+            block_threshold: 0.7,
+            heuristic_weight: 0.3,
+            fusion_confidence_agreement: 0.9,
+            fusion_confidence_pg_only: 0.7,
+            fusion_confidence_heuristic_only: 0.4,
+            max_segments: 16,
+            timeout_ms: 200,
+            max_concurrent_scans: 4,
+        }
+    }
+
+    fn l2a_signal(score: f32, category: &str) -> Signal {
+        Signal {
+            layer: LayerId::L2a,
+            kind: SignalKind::Evidence,
+            score,
+            confidence: 0.9,
+            category: Some(category.to_string()),
+            message_index: Some(0),
+            segment_id: None,
+        }
+    }
+
+    fn engine_with_l2a_scanner(
+        config: Config,
+        scanner: Arc<dyn L2aScanner>,
+        semaphore_permits: usize,
+    ) -> EngineUpstreamClient {
+        let deps = EngineDeps {
+            config: Arc::new(config),
+            http: Arc::new(SuccessHttpSender),
+            resolver: Arc::new(NoopResolver),
+            registry: Arc::new(DefaultRegistry),
+            normalizer: Arc::new(NoopNormalizer),
+            trust_assigner: Arc::new(NoopTrustAssigner),
+            l1_scanner: None,
+            l2a_scanner: Some(scanner),
+            l2a_semaphore: Some(Arc::new(tokio::sync::Semaphore::new(semaphore_permits))),
+            inbound_scanner: Arc::new(NoopInboundScanner),
+            constraint_evaluator: Arc::new(DslConstraintEvaluator::new()),
+            output_scanner: Arc::new(L5aScanner),
+            session_store: None,
+            multi_turn_scanner: None,
+            signal_extractor: Arc::new(DefaultSignalExtractor::new()),
+            verdict_combiner: Arc::new(DefaultVerdictCombiner::new()),
+        };
+        EngineUpstreamClient::new_with(deps)
+    }
+
+    fn config_with_l2a(mode: L2aMode) -> Config {
+        let mut config = base_config_with_canary("dummy");
+        config.policy.layers.l2a = Some(L2aConfig {
+            mode,
+            ..l2a_test_config()
+        });
+        config
+    }
+
+    fn openai_request() -> ProxyRequest {
+        let body = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        ProxyRequest {
+            method: Method::POST,
+            uri: Uri::from_static("/v1/chat/completions"),
+            headers: HeaderMap::new(),
+            body: Bytes::from(serde_json::to_vec(&body).unwrap()),
+        }
+    }
+
+    fn blocked_by(resp: &ProxyResponse) -> Option<String> {
+        resp.headers
+            .get("x-parapet-blocked-by")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+    }
+
+    #[test]
+    fn l2a_fail_closed_block_sets_pending() {
+        use crate::provider::adapter_for;
+
+        let adapter = adapter_for(ProviderType::OpenAi);
+        let mut pending: Option<ProxyResponse> = None;
+        l2a_fail_closed_block(&mut pending, adapter.as_ref(), "test");
+        assert!(pending.is_some());
+        let resp = pending.unwrap();
+        assert_eq!(resp.status, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn l2a_fail_closed_block_first_block_wins() {
+        use crate::provider::adapter_for;
+
+        let adapter = adapter_for(ProviderType::OpenAi);
+        // Pre-set a block from another layer.
+        let existing = ProxyResponse::blocked(
+            adapter.serialize_error("blocked by L1", 403),
+            "L1",
+        );
+        let mut pending = Some(existing);
+        l2a_fail_closed_block(&mut pending, adapter.as_ref(), "test");
+        // Should not overwrite.
+        let resp = pending.unwrap();
+        assert_eq!(blocked_by(&resp).as_deref(), Some("L1"));
+    }
+
+    // -------------------------------------------------------------------
+    // L2a runtime-path tests via forward()
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn l2a_shadow_scan_success_does_not_block() {
+        let scanner = Arc::new(MockL2aScanner {
+            signals: vec![l2a_signal(0.9, "semantic_injection")],
+        });
+        let engine = engine_with_l2a_scanner(config_with_l2a(L2aMode::Shadow), scanner, 4);
+        let resp = engine.forward(Provider::OpenAi, openai_request()).await.unwrap();
+        // Shadow mode: signals above block_threshold logged but not blocked.
+        assert_eq!(resp.status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn l2a_block_scan_above_threshold_blocks() {
+        let scanner = Arc::new(MockL2aScanner {
+            signals: vec![l2a_signal(0.9, "semantic_injection")],
+        });
+        let engine = engine_with_l2a_scanner(config_with_l2a(L2aMode::Block), scanner, 4);
+        let resp = engine.forward(Provider::OpenAi, openai_request()).await.unwrap();
+        assert_eq!(resp.status, StatusCode::FORBIDDEN);
+        assert_eq!(blocked_by(&resp).as_deref(), Some("L2a"));
+    }
+
+    #[tokio::test]
+    async fn l2a_block_scan_below_threshold_allows() {
+        let scanner = Arc::new(MockL2aScanner {
+            signals: vec![l2a_signal(0.3, "semantic_injection")],
+        });
+        let engine = engine_with_l2a_scanner(config_with_l2a(L2aMode::Block), scanner, 4);
+        let resp = engine.forward(Provider::OpenAi, openai_request()).await.unwrap();
+        // Score 0.3 < block_threshold 0.7 → allow.
+        assert_eq!(resp.status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn l2a_shadow_scanner_error_fails_open() {
+        let scanner: Arc<dyn L2aScanner> = Arc::new(FailingL2aScanner);
+        let engine = engine_with_l2a_scanner(config_with_l2a(L2aMode::Shadow), scanner, 4);
+        let resp = engine.forward(Provider::OpenAi, openai_request()).await.unwrap();
+        // Shadow: fail-open — request proceeds.
+        assert_eq!(resp.status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn l2a_block_scanner_error_fails_closed() {
+        let scanner: Arc<dyn L2aScanner> = Arc::new(FailingL2aScanner);
+        let engine = engine_with_l2a_scanner(config_with_l2a(L2aMode::Block), scanner, 4);
+        let resp = engine.forward(Provider::OpenAi, openai_request()).await.unwrap();
+        assert_eq!(resp.status, StatusCode::FORBIDDEN);
+        assert_eq!(blocked_by(&resp).as_deref(), Some("L2a"));
+    }
+
+    #[tokio::test]
+    async fn l2a_shadow_timeout_fails_open() {
+        let scanner: Arc<dyn L2aScanner> = Arc::new(SlowL2aScanner {
+            delay: std::time::Duration::from_secs(5),
+        });
+        let mut cfg = config_with_l2a(L2aMode::Shadow);
+        cfg.policy.layers.l2a.as_mut().unwrap().timeout_ms = 10; // 10ms timeout
+        let engine = engine_with_l2a_scanner(cfg, scanner, 4);
+        let resp = engine.forward(Provider::OpenAi, openai_request()).await.unwrap();
+        // Shadow: fail-open on timeout.
+        assert_eq!(resp.status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn l2a_block_timeout_fails_closed() {
+        let scanner: Arc<dyn L2aScanner> = Arc::new(SlowL2aScanner {
+            delay: std::time::Duration::from_secs(5),
+        });
+        let mut cfg = config_with_l2a(L2aMode::Block);
+        cfg.policy.layers.l2a.as_mut().unwrap().timeout_ms = 10; // 10ms timeout
+        let engine = engine_with_l2a_scanner(cfg, scanner, 4);
+        let resp = engine.forward(Provider::OpenAi, openai_request()).await.unwrap();
+        assert_eq!(resp.status, StatusCode::FORBIDDEN);
+        assert_eq!(blocked_by(&resp).as_deref(), Some("L2a"));
+    }
+
+    #[tokio::test]
+    async fn l2a_shadow_panic_fails_open() {
+        let scanner: Arc<dyn L2aScanner> = Arc::new(PanickingL2aScanner);
+        let engine = engine_with_l2a_scanner(config_with_l2a(L2aMode::Shadow), scanner, 4);
+        let resp = engine.forward(Provider::OpenAi, openai_request()).await.unwrap();
+        // Shadow: fail-open on panic.
+        assert_eq!(resp.status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn l2a_block_panic_fails_closed() {
+        let scanner: Arc<dyn L2aScanner> = Arc::new(PanickingL2aScanner);
+        let engine = engine_with_l2a_scanner(config_with_l2a(L2aMode::Block), scanner, 4);
+        let resp = engine.forward(Provider::OpenAi, openai_request()).await.unwrap();
+        assert_eq!(resp.status, StatusCode::FORBIDDEN);
+        assert_eq!(blocked_by(&resp).as_deref(), Some("L2a"));
+    }
+
+    #[tokio::test]
+    async fn l2a_shadow_concurrency_limit_fails_open() {
+        let scanner: Arc<dyn L2aScanner> = Arc::new(MockL2aScanner { signals: vec![] });
+        // 0 permits = immediately exhausted.
+        let engine = engine_with_l2a_scanner(config_with_l2a(L2aMode::Shadow), scanner, 0);
+        let resp = engine.forward(Provider::OpenAi, openai_request()).await.unwrap();
+        // Shadow: fail-open when semaphore exhausted.
+        assert_eq!(resp.status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn l2a_block_concurrency_limit_fails_closed() {
+        let scanner: Arc<dyn L2aScanner> = Arc::new(MockL2aScanner { signals: vec![] });
+        // 0 permits = immediately exhausted.
+        let engine = engine_with_l2a_scanner(config_with_l2a(L2aMode::Block), scanner, 0);
+        let resp = engine.forward(Provider::OpenAi, openai_request()).await.unwrap();
+        assert_eq!(resp.status, StatusCode::FORBIDDEN);
+        assert_eq!(blocked_by(&resp).as_deref(), Some("L2a"));
+    }
+
+    #[tokio::test]
+    async fn l2a_no_scanner_configured_passes_through() {
+        // L2a config is None, scanner is None → zero overhead path.
+        let config = base_config_with_canary("dummy");
+        let deps = EngineDeps {
+            config: Arc::new(config),
+            http: Arc::new(SuccessHttpSender),
+            resolver: Arc::new(NoopResolver),
+            registry: Arc::new(DefaultRegistry),
+            normalizer: Arc::new(NoopNormalizer),
+            trust_assigner: Arc::new(NoopTrustAssigner),
+            l1_scanner: None,
+            l2a_scanner: None,
+            l2a_semaphore: None,
+            inbound_scanner: Arc::new(NoopInboundScanner),
+            constraint_evaluator: Arc::new(DslConstraintEvaluator::new()),
+            output_scanner: Arc::new(L5aScanner),
+            session_store: None,
+            multi_turn_scanner: None,
+            signal_extractor: Arc::new(DefaultSignalExtractor::new()),
+            verdict_combiner: Arc::new(DefaultVerdictCombiner::new()),
+        };
+        let engine = EngineUpstreamClient::new_with(deps);
+        let resp = engine.forward(Provider::OpenAi, openai_request()).await.unwrap();
+        assert_eq!(resp.status, StatusCode::OK);
     }
 }
 

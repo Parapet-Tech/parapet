@@ -99,6 +99,8 @@ fn build_test_engine(yaml: &str, mock_url: &str) -> EngineUpstreamClient {
         normalizer: Arc::new(L0Normalizer::new()),
         trust_assigner: Arc::new(RoleTrustAssigner),
         l1_scanner: None,
+        l2a_scanner: None,
+        l2a_semaphore: None,
         inbound_scanner: Arc::new(DefaultInboundScanner::new()),
         constraint_evaluator: Arc::new(DslConstraintEvaluator::new()),
         output_scanner: Arc::new(L5aScanner),

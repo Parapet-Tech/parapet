@@ -31,13 +31,18 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     json: bool,
 
-    /// Filter to a specific layer (l3_inbound, l3_outbound, l5a, l4)
+    /// Filter to a specific layer (l3_inbound, l3_outbound, l5a, l4, l2a)
     #[arg(long)]
     layer: Option<String>,
 
     /// Filter to a specific source dataset (filename without extension)
     #[arg(long)]
     source: Option<String>,
+
+    /// Remap all cases to a different layer for cross-layer comparison.
+    /// E.g., --remap-layer l2a re-labels L3 cases as L2a to test PG2 on the same payloads.
+    #[arg(long)]
+    remap_layer: Option<String>,
 
     /// Max failures to print (default: 50)
     #[arg(long, default_value_t = 50)]
@@ -77,6 +82,13 @@ async fn main() {
     // Filter by source if specified
     if let Some(ref source) = cli.source {
         cases.retain(|c| c.source == *source);
+    }
+
+    // Remap layer labels (for cross-layer comparison, e.g. testing L3 payloads through L2a)
+    if let Some(ref remap) = cli.remap_layer {
+        for case in &mut cases {
+            case.layer = remap.clone();
+        }
     }
 
     if cases.is_empty() {
