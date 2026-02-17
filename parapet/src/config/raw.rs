@@ -110,6 +110,8 @@ pub struct RawLayerConfigs {
     pub l0: Option<RawLayerConfig>,
     #[serde(rename = "L1")]
     pub l1: Option<RawL1Config>,
+    #[serde(rename = "L2a")]
+    pub l2a: Option<RawL2aConfig>,
     #[serde(rename = "L3_inbound")]
     pub l3_inbound: Option<RawLayerConfig>,
     #[serde(rename = "L3_outbound")]
@@ -118,6 +120,37 @@ pub struct RawLayerConfigs {
     pub l5a: Option<RawLayerConfig>,
     #[serde(rename = "L4")]
     pub l4: Option<RawL4Config>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RawL2aConfig {
+    pub mode: String,
+    pub model: String,
+    pub model_dir: Option<String>,
+    pub pg_threshold: f32,
+    pub block_threshold: f32,
+    pub heuristic_weight: f32,
+    pub fusion_confidence_agreement: f32,
+    pub fusion_confidence_pg_only: f32,
+    pub fusion_confidence_heuristic_only: f32,
+    #[serde(default = "default_l2a_max_segments")]
+    pub max_segments: usize,
+    #[serde(default = "default_l2a_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default = "default_l2a_max_concurrent_scans")]
+    pub max_concurrent_scans: usize,
+}
+
+fn default_l2a_max_segments() -> usize {
+    16
+}
+
+fn default_l2a_timeout_ms() -> u64 {
+    200
+}
+
+fn default_l2a_max_concurrent_scans() -> usize {
+    4
 }
 
 #[derive(Debug, Deserialize)]

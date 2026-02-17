@@ -96,7 +96,7 @@
       "type": "string"
     },
     "layers": {
-      "description": "Per-layer configuration. Keys are layer identifiers (L0, L3_inbound, L3_outbound, L5a).",
+      "description": "Per-layer configuration. Keys are layer identifiers (L0, L2a, L3_inbound, L3_outbound, L5a).",
       "type": "object",
       "additionalProperties": false,
       "properties": {
@@ -111,6 +111,9 @@
         },
         "L5a": {
           "$ref": "#/$defs/layerConfig"
+        },
+        "L2a": {
+          "$ref": "#/$defs/l2aConfig"
         }
       }
     }
@@ -207,6 +210,82 @@
           "description": "Maximum allowed content length per message in characters.",
           "type": "integer",
           "minimum": 0
+        }
+      }
+    },
+    "l2aConfig": {
+      "description": "Configuration for the L2a data payload detection layer (Prompt Guard 2).",
+      "type": "object",
+      "required": ["mode", "model", "pg_threshold", "block_threshold", "heuristic_weight", "fusion_confidence_agreement", "fusion_confidence_pg_only", "fusion_confidence_heuristic_only"],
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "description": "Operating mode: \"shadow\" (log-only) or \"block\" (enforce).",
+          "type": "string",
+          "enum": ["shadow", "block"]
+        },
+        "model": {
+          "description": "Model name: \"pg2-86m\" or \"pg2-22m\".",
+          "type": "string",
+          "enum": ["pg2-86m", "pg2-22m"]
+        },
+        "model_dir": {
+          "description": "Directory containing model files. Overrides $PARAPET_MODEL_DIR and default path.",
+          "type": "string"
+        },
+        "pg_threshold": {
+          "description": "PG2 sensor firing threshold (fusion input). Range: [0.0, 1.0].",
+          "type": "number",
+          "minimum": 0.0,
+          "maximum": 1.0
+        },
+        "block_threshold": {
+          "description": "Fused-score threshold for enforcement. Range: [0.0, 1.0].",
+          "type": "number",
+          "minimum": 0.0,
+          "maximum": 1.0
+        },
+        "heuristic_weight": {
+          "description": "Weight for heuristic-only scores in fusion. Range: [0.0, 1.0].",
+          "type": "number",
+          "minimum": 0.0,
+          "maximum": 1.0
+        },
+        "fusion_confidence_agreement": {
+          "description": "Confidence when PG2 + heuristic agree. Range: [0.0, 1.0].",
+          "type": "number",
+          "minimum": 0.0,
+          "maximum": 1.0
+        },
+        "fusion_confidence_pg_only": {
+          "description": "Confidence when PG2 fires alone. Range: [0.0, 1.0].",
+          "type": "number",
+          "minimum": 0.0,
+          "maximum": 1.0
+        },
+        "fusion_confidence_heuristic_only": {
+          "description": "Confidence when heuristic fires alone. Range: [0.0, 1.0].",
+          "type": "number",
+          "minimum": 0.0,
+          "maximum": 1.0
+        },
+        "max_segments": {
+          "description": "Maximum segments to scan per request.",
+          "type": "integer",
+          "minimum": 1,
+          "default": 16
+        },
+        "timeout_ms": {
+          "description": "Per-request scan timeout in milliseconds.",
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "default": 200
+        },
+        "max_concurrent_scans": {
+          "description": "Maximum concurrent L2a scans across in-flight requests.",
+          "type": "integer",
+          "minimum": 1,
+          "default": 4
         }
       }
     },

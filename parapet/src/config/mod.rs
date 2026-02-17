@@ -25,8 +25,8 @@ pub use pattern::{CompiledPattern, PatternAction};
 pub use source::{ConfigSource, FileSource, StringSource};
 pub use types::{
     ArgumentConstraints, Config, ContentPolicy, EngineConfig, FailureMode, L1Config, L1Mode,
-    L4Config, L4Mode, L4PatternCategory, LayerConfig, LayerConfigs, PolicyConfig, RuntimeConfig,
-    ToolConfig, TrustConfig,
+    L2aConfig, L2aMode, L4Config, L4Mode, L4PatternCategory, LayerConfig, LayerConfigs,
+    PolicyConfig, RuntimeConfig, ToolConfig, TrustConfig,
 };
 
 // ---------------------------------------------------------------------------
@@ -894,5 +894,211 @@ block_patterns:
         assert_eq!(p.weight, 1.0, "weight should default to 1.0");
         assert!(!p.atomic, "atomic should default to false");
         assert!(p.category.is_none(), "category should default to None");
+    }
+
+    // ---------------------------------------------------------------
+    // L2a config tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn layer_configs_default_has_l2a_none() {
+        let layers = LayerConfigs::default();
+        assert!(layers.l2a.is_none(), "L2a must not be enabled by default");
+    }
+
+    #[test]
+    fn l2a_config_parsed_with_all_fields() {
+        let yaml = r#"
+parapet: v1
+layers:
+  L2a:
+    mode: shadow
+    model: pg2-86m
+    pg_threshold: 0.5
+    block_threshold: 0.8
+    heuristic_weight: 0.3
+    fusion_confidence_agreement: 0.95
+    fusion_confidence_pg_only: 0.7
+    fusion_confidence_heuristic_only: 0.4
+    max_segments: 32
+    timeout_ms: 500
+    max_concurrent_scans: 8
+"#;
+        let config = load_config(&make_source(yaml)).unwrap();
+        let l2a = config.policy.layers.l2a.as_ref().unwrap();
+        assert_eq!(l2a.mode, L2aMode::Shadow);
+        assert_eq!(l2a.model, "pg2-86m");
+        assert!((l2a.pg_threshold - 0.5).abs() < f32::EPSILON);
+        assert!((l2a.block_threshold - 0.8).abs() < f32::EPSILON);
+        assert!((l2a.heuristic_weight - 0.3).abs() < f32::EPSILON);
+        assert!((l2a.fusion_confidence_agreement - 0.95).abs() < f32::EPSILON);
+        assert!((l2a.fusion_confidence_pg_only - 0.7).abs() < f32::EPSILON);
+        assert!((l2a.fusion_confidence_heuristic_only - 0.4).abs() < f32::EPSILON);
+        assert_eq!(l2a.max_segments, 32);
+        assert_eq!(l2a.timeout_ms, 500);
+        assert_eq!(l2a.max_concurrent_scans, 8);
+    }
+
+    #[test]
+    fn l2a_config_serde_defaults_applied() {
+        let yaml = r#"
+parapet: v1
+layers:
+  L2a:
+    mode: block
+    model: pg2-22m
+    pg_threshold: 0.5
+    block_threshold: 0.8
+    heuristic_weight: 0.3
+    fusion_confidence_agreement: 0.95
+    fusion_confidence_pg_only: 0.7
+    fusion_confidence_heuristic_only: 0.4
+"#;
+        let config = load_config(&make_source(yaml)).unwrap();
+        let l2a = config.policy.layers.l2a.as_ref().unwrap();
+        assert_eq!(l2a.mode, L2aMode::Block);
+        assert_eq!(l2a.max_segments, 16, "default max_segments");
+        assert_eq!(l2a.timeout_ms, 200, "default timeout_ms");
+        assert_eq!(l2a.max_concurrent_scans, 4, "default max_concurrent_scans");
+    }
+
+    #[test]
+    fn l2a_invalid_mode_rejected() {
+        let yaml = r#"
+parapet: v1
+layers:
+  L2a:
+    mode: turbo
+    model: pg2-86m
+    pg_threshold: 0.5
+    block_threshold: 0.8
+    heuristic_weight: 0.3
+    fusion_confidence_agreement: 0.95
+    fusion_confidence_pg_only: 0.7
+    fusion_confidence_heuristic_only: 0.4
+"#;
+        let err = load_config(&make_source(yaml)).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("turbo"), "error should mention invalid mode: {msg}");
+    }
+
+    #[test]
+    fn l2a_invalid_model_name_rejected() {
+        let yaml = r#"
+parapet: v1
+layers:
+  L2a:
+    mode: shadow
+    model: pg2-999b
+    pg_threshold: 0.5
+    block_threshold: 0.8
+    heuristic_weight: 0.3
+    fusion_confidence_agreement: 0.95
+    fusion_confidence_pg_only: 0.7
+    fusion_confidence_heuristic_only: 0.4
+"#;
+        let err = load_config(&make_source(yaml)).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("pg2-999b"),
+            "error should mention invalid model: {msg}"
+        );
+        assert!(
+            msg.contains("pg2-86m"),
+            "error should list known models: {msg}"
+        );
+    }
+
+    #[test]
+    fn l2a_pg_threshold_out_of_range_rejected() {
+        let yaml = r#"
+parapet: v1
+layers:
+  L2a:
+    mode: shadow
+    model: pg2-86m
+    pg_threshold: 1.5
+    block_threshold: 0.8
+    heuristic_weight: 0.3
+    fusion_confidence_agreement: 0.95
+    fusion_confidence_pg_only: 0.7
+    fusion_confidence_heuristic_only: 0.4
+"#;
+        let err = load_config(&make_source(yaml)).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("pg_threshold"), "error should name the field: {msg}");
+        assert!(msg.contains("[0.0, 1.0]"), "error should show valid range: {msg}");
+    }
+
+    #[test]
+    fn l2a_max_segments_zero_rejected() {
+        let yaml = r#"
+parapet: v1
+layers:
+  L2a:
+    mode: shadow
+    model: pg2-86m
+    pg_threshold: 0.5
+    block_threshold: 0.8
+    heuristic_weight: 0.3
+    fusion_confidence_agreement: 0.95
+    fusion_confidence_pg_only: 0.7
+    fusion_confidence_heuristic_only: 0.4
+    max_segments: 0
+"#;
+        let err = load_config(&make_source(yaml)).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("max_segments"), "error should name the field: {msg}");
+    }
+
+    #[test]
+    fn l2a_timeout_ms_zero_rejected() {
+        let yaml = r#"
+parapet: v1
+layers:
+  L2a:
+    mode: shadow
+    model: pg2-86m
+    pg_threshold: 0.5
+    block_threshold: 0.8
+    heuristic_weight: 0.3
+    fusion_confidence_agreement: 0.95
+    fusion_confidence_pg_only: 0.7
+    fusion_confidence_heuristic_only: 0.4
+    timeout_ms: 0
+"#;
+        let err = load_config(&make_source(yaml)).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("timeout_ms"), "error should name the field: {msg}");
+    }
+
+    #[test]
+    fn l2a_missing_required_field_rejected() {
+        // Missing pg_threshold — should fail at YAML parse level
+        let yaml = r#"
+parapet: v1
+layers:
+  L2a:
+    mode: shadow
+    model: pg2-86m
+    block_threshold: 0.8
+    heuristic_weight: 0.3
+    fusion_confidence_agreement: 0.95
+    fusion_confidence_pg_only: 0.7
+    fusion_confidence_heuristic_only: 0.4
+"#;
+        let err = load_config(&make_source(yaml)).unwrap_err();
+        assert!(
+            err.to_string().contains("pg_threshold") || err.to_string().contains("missing field"),
+            "error should indicate missing field: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn l2a_absent_from_config_means_none() {
+        let yaml = "parapet: v1\n";
+        let config = load_config(&make_source(yaml)).unwrap();
+        assert!(config.policy.layers.l2a.is_none());
     }
 }

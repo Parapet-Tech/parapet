@@ -148,6 +148,7 @@ pub fn default_layer_configs() -> LayerConfigs {
             mode: L1Mode::Block,
             threshold: 0.0,
         }),
+        l2a: None, // L2a requires explicit opt-in (model download + config)
         l3_inbound: Some(LayerConfig {
             mode: "block".to_string(),
             block_action: None,

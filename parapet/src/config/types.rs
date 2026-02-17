@@ -156,6 +156,7 @@ impl Default for EngineConfig {
 pub struct LayerConfigs {
     pub l0: Option<LayerConfig>,
     pub l1: Option<L1Config>,
+    pub l2a: Option<L2aConfig>,
     pub l3_inbound: Option<LayerConfig>,
     pub l3_outbound: Option<LayerConfig>,
     pub l5a: Option<LayerConfig>,
@@ -214,6 +215,49 @@ pub struct L4PatternCategory {
     pub weight: f64,
     /// Compiled regex patterns for this category.
     pub patterns: Vec<CompiledPattern>,
+}
+
+/// L2a operating mode.
+#[derive(Debug, Clone, PartialEq)]
+pub enum L2aMode {
+    /// Log detections but don't block (calibration mode).
+    /// On scan failure (timeout, concurrency limit, panic): fail-open.
+    Shadow,
+    /// Actively block requests exceeding block_threshold.
+    /// On scan failure: fail-closed.
+    Block,
+}
+
+/// Configuration for the L2a data payload detection layer.
+#[derive(Debug, Clone)]
+pub struct L2aConfig {
+    /// Operating mode: shadow (log-only) or block (enforce).
+    pub mode: L2aMode,
+    /// Model name: "pg2-86m" or "pg2-22m".
+    pub model: String,
+    /// Directory containing model files.
+    /// Resolution order: config.model_dir > $PARAPET_MODEL_DIR > ~/.parapet/models/
+    pub model_dir: Option<String>,
+    /// PG2 sensor firing threshold: pg_score >= this means "PG2 fired"
+    /// in the fusion function. Not the enforcement threshold.
+    pub pg_threshold: f32,
+    /// Fused-score threshold for per-layer enforcement.
+    /// When mode == Block, any signal with score >= block_threshold triggers a block.
+    pub block_threshold: f32,
+    /// Weight applied to heuristic-only scores in fusion.
+    pub heuristic_weight: f32,
+    /// Confidence when PG2 + heuristic agree.
+    pub fusion_confidence_agreement: f32,
+    /// Confidence when PG2 fires alone.
+    pub fusion_confidence_pg_only: f32,
+    /// Confidence when heuristic fires alone.
+    pub fusion_confidence_heuristic_only: f32,
+    /// Maximum segments to scan per request.
+    pub max_segments: usize,
+    /// Per-request timeout for the entire L2a scan in milliseconds.
+    pub timeout_ms: u64,
+    /// Maximum concurrent L2a scans across in-flight requests.
+    pub max_concurrent_scans: usize,
 }
 
 /// L1 operating mode.

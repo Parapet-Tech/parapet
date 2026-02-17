@@ -52,8 +52,13 @@ async fn main() {
         "config loaded"
     );
 
-    let upstream: std::sync::Arc<dyn proxy::UpstreamClient> =
-        std::sync::Arc::new(engine::build_engine_client(config));
+    let upstream: std::sync::Arc<dyn proxy::UpstreamClient> = match engine::build_engine_client(config) {
+        Ok(client) => std::sync::Arc::new(client),
+        Err(e) => {
+            tracing::error!(%e, "engine startup failed");
+            std::process::exit(1);
+        }
+    };
 
     let app = proxy::build_router(upstream);
 

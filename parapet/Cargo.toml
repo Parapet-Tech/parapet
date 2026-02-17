@@ -13,6 +13,14 @@ path = "src/main.rs"
 name = "parapet-eval"
 path = "src/bin/parapet_eval.rs"
 
+[[bin]]
+name = "parapet-fetch"
+path = "src/bin/parapet_fetch.rs"
+
+[[bin]]
+name = "pg2-diag"
+path = "src/bin/pg2_diag.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
 axum = "0.8"
@@ -45,6 +53,15 @@ reqwest = { version = "0.12", features = ["json", "stream", "gzip", "deflate"] }
 flate2 = "1"
 base64 = "0.22"
 phf = { version = "0.11", features = ["macros"] }
+dirs = "5"
+
+# Optional L2a dependencies (Prompt Guard 2 ONNX model)
+ort = { version = "2.0.0-rc.11", optional = true }
+tokenizers = { version = "0.20", optional = true, default-features = false, features = ["onig"] }
+ndarray = { version = "0.17", optional = true }
+
+[features]
+l2a = ["dep:ort", "dep:tokenizers", "dep:ndarray"]
 
 [dev-dependencies]
 tokio-test = "0.4"

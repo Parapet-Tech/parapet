@@ -26,6 +26,10 @@ use crate::engine::{
 use crate::signal::combiner::DefaultVerdictCombiner;
 use crate::signal::extractor::DefaultSignalExtractor;
 use crate::layers::l1::{DefaultL1Scanner, L1Scanner};
+#[cfg(feature = "l2a")]
+use crate::layers::l2a::{DefaultHeuristicScanner, DefaultL2aScanner, L2aScanner};
+#[cfg(feature = "l2a")]
+use crate::layers::l2a_model::OnnxPromptGuard;
 use crate::layers::l3_inbound::DefaultInboundScanner;
 use crate::layers::l4::{DefaultMultiTurnScanner, MultiTurnScanner};
 use crate::layers::l5a::L5aScanner;
@@ -286,6 +290,26 @@ pub fn build_eval_engine(config: Arc<Config>) -> (EngineUpstreamClient, Arc<Mock
             None
         };
 
+    // L2a scanner: feature-gated, constructed from config when present.
+    #[cfg(feature = "l2a")]
+    let (l2a_scanner, l2a_semaphore): (Option<Arc<dyn L2aScanner>>, Option<Arc<tokio::sync::Semaphore>>) =
+        if let Some(l2a_config) = &config.policy.layers.l2a {
+            let classifier = OnnxPromptGuard::init(l2a_config)
+                .unwrap_or_else(|e| panic!("L2a model init failed: {e}"));
+            let scanner: Arc<dyn L2aScanner> = Arc::new(DefaultL2aScanner::new(
+                Box::new(classifier),
+                Box::new(DefaultHeuristicScanner::new()),
+            ));
+            let semaphore = Arc::new(tokio::sync::Semaphore::new(l2a_config.max_concurrent_scans));
+            (Some(scanner), Some(semaphore))
+        } else {
+            (None, None)
+        };
+
+    #[cfg(not(feature = "l2a"))]
+    let (l2a_scanner, l2a_semaphore): (Option<Arc<dyn crate::layers::l2a::L2aScanner>>, Option<Arc<tokio::sync::Semaphore>>) =
+        (None, None);
+
     let deps = EngineDeps {
         config,
         http: mock.clone(),
@@ -294,6 +318,8 @@ pub fn build_eval_engine(config: Arc<Config>) -> (EngineUpstreamClient, Arc<Mock
         normalizer: Arc::new(L0Normalizer::new()),
         trust_assigner: Arc::new(RoleTrustAssigner),
         l1_scanner,
+        l2a_scanner,
+        l2a_semaphore,
         inbound_scanner: Arc::new(DefaultInboundScanner::new()),
         constraint_evaluator: Arc::new(DslConstraintEvaluator::new()),
         output_scanner: Arc::new(L5aScanner),
@@ -562,9 +588,42 @@ fn build_mock_response(case: &EvalCase) -> serde_json::Value {
 fn build_proxy_request(case: &EvalCase) -> ProxyRequest {
     if let Some(ref messages) = case.messages {
         build_multi_message_request(messages)
+    } else if case.layer == "l2a" {
+        // L2a eval cases with simple content: wrap as a tool result message
+        // so the L2a segment extractor sees the content as a data payload.
+        build_l2a_tool_result_request(&case.content)
     } else {
         build_legacy_request(&case.content)
     }
+}
+
+/// Wrap content as a tool result message for L2a evaluation.
+///
+/// L2a only scans data payloads: tool result messages and trust spans.
+/// For eval cases that provide a plain `content` string, we wrap it as:
+///   user: "look this up"  →  tool(untrusted): <content>
+///
+/// No trust spans needed: the eval config sets `tool: untrusted`, so the
+/// L2a extractor's Rule 2 scans the entire tool result as a data payload.
+/// This avoids ASCII-safe assertion failures from non-ASCII attack payloads.
+fn build_l2a_tool_result_request(content: &str) -> ProxyRequest {
+    let messages = vec![
+        EvalMessage {
+            role: "user".to_string(),
+            content: "look this up".to_string(),
+            name: None,
+            tool_call_id: None,
+            trust_spans: Vec::new(),
+        },
+        EvalMessage {
+            role: "tool".to_string(),
+            content: content.to_string(),
+            name: Some("data_source".to_string()),
+            tool_call_id: Some("call_l2a".to_string()),
+            trust_spans: Vec::new(),
+        },
+    ];
+    build_multi_message_request(&messages)
 }
 
 fn build_legacy_request(content: &str) -> ProxyRequest {
@@ -799,6 +858,21 @@ fn determine_verdict(
             let blocked_by = blocked_by_layer(headers);
             let fired = status == StatusCode::FORBIDDEN
                 && blocked_by.as_deref() == Some("L4");
+            let actual = if fired { "blocked" } else { "allowed" };
+            (
+                actual.to_string(),
+                format!(
+                    "status={} blocked_by={}",
+                    status.as_u16(),
+                    blocked_by.as_deref().unwrap_or("none")
+                ),
+            )
+        }
+        "l2a" => {
+            // Only count as "blocked" if L2a specifically blocked it.
+            let blocked_by = blocked_by_layer(headers);
+            let fired = status == StatusCode::FORBIDDEN
+                && blocked_by.as_deref() == Some("L2a");
             let actual = if fired { "blocked" } else { "allowed" };
             (
                 actual.to_string(),

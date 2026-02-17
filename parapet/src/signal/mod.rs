@@ -18,6 +18,7 @@ pub mod extractor;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LayerId {
     L1,
+    L2a,
     L3,
     L4,
 }
@@ -26,6 +27,7 @@ impl std::fmt::Display for LayerId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LayerId::L1 => write!(f, "L1"),
+            LayerId::L2a => write!(f, "L2a"),
             LayerId::L3 => write!(f, "L3"),
             LayerId::L4 => write!(f, "L4"),
         }
@@ -41,6 +43,20 @@ pub enum SignalKind {
     Evidence,
 }
 
+/// Attribution for segment-level signals.
+/// Lives in signal/ to avoid signal -> layers coupling.
+#[derive(Debug, Clone)]
+pub struct SegmentId {
+    /// Which message this signal came from.
+    pub message_index: usize,
+    /// Byte range within the message (None = full message).
+    pub byte_range: Option<(usize, usize)>,
+    /// Human-readable provenance label.
+    /// Convention: "tool_result", "tool_result:search_api",
+    /// "trust_span", "trust_span:rag_chunk".
+    pub source_label: Option<String>,
+}
+
 /// A normalized observation emitted by a layer.
 #[derive(Debug, Clone)]
 pub struct Signal {
@@ -51,12 +67,17 @@ pub struct Signal {
     pub score: f32,
     /// Reliability of the sensor for this observation, clamped to [0.0, 1.0].
     pub confidence: f32,
+    /// Which message produced this signal (general attribution).
+    pub message_index: Option<usize>,
+    /// Segment-level attribution (L2a-specific detail).
+    pub segment_id: Option<SegmentId>,
 }
 
 impl Signal {
     /// Construct a signal with clamped score and confidence.
     ///
     /// NaN and -INFINITY clamp to 0.0; INFINITY clamps to 1.0.
+    /// `message_index` and `segment_id` default to `None`.
     pub fn new(
         layer: LayerId,
         kind: SignalKind,
@@ -70,6 +91,8 @@ impl Signal {
             category,
             score: clamp_f32(score),
             confidence: clamp_f32(confidence),
+            message_index: None,
+            segment_id: None,
         }
     }
 }

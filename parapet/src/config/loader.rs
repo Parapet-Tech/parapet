@@ -275,6 +275,77 @@ fn build_layer_configs(raw: Option<raw::RawLayerConfigs>) -> Result<LayerConfigs
         })
         .transpose()?;
 
+    let l2a = raw
+        .l2a
+        .map(|l2a| {
+            let mode = match l2a.mode.as_str() {
+                "shadow" => L2aMode::Shadow,
+                "block" => L2aMode::Block,
+                other => {
+                    return Err(ConfigError::Validation(format!(
+                        "unknown L2a mode \"{other}\", expected \"shadow\" or \"block\""
+                    )))
+                }
+            };
+
+            // Validate model name against known models.
+            if !crate::layers::l2a_model::KNOWN_MODELS.contains(&l2a.model.as_str()) {
+                return Err(ConfigError::Validation(format!(
+                    "unknown L2a model \"{}\", expected one of: {}",
+                    l2a.model,
+                    crate::layers::l2a_model::KNOWN_MODELS.join(", "),
+                )));
+            }
+
+            // Validate all numeric fields with actionable error messages.
+            fn validate_unit(name: &str, v: f32) -> Result<(), ConfigError> {
+                if !(0.0..=1.0).contains(&v) {
+                    return Err(ConfigError::Validation(format!(
+                        "L2a {name} must be in [0.0, 1.0], got {v}"
+                    )));
+                }
+                Ok(())
+            }
+            validate_unit("pg_threshold", l2a.pg_threshold)?;
+            validate_unit("block_threshold", l2a.block_threshold)?;
+            validate_unit("heuristic_weight", l2a.heuristic_weight)?;
+            validate_unit("fusion_confidence_agreement", l2a.fusion_confidence_agreement)?;
+            validate_unit("fusion_confidence_pg_only", l2a.fusion_confidence_pg_only)?;
+            validate_unit("fusion_confidence_heuristic_only", l2a.fusion_confidence_heuristic_only)?;
+
+            if l2a.max_segments < 1 {
+                return Err(ConfigError::Validation(
+                    "L2a max_segments must be >= 1".into(),
+                ));
+            }
+            if l2a.timeout_ms == 0 {
+                return Err(ConfigError::Validation(
+                    "L2a timeout_ms must be > 0".into(),
+                ));
+            }
+            if l2a.max_concurrent_scans < 1 {
+                return Err(ConfigError::Validation(
+                    "L2a max_concurrent_scans must be >= 1".into(),
+                ));
+            }
+
+            Ok(L2aConfig {
+                mode,
+                model: l2a.model,
+                model_dir: l2a.model_dir,
+                pg_threshold: l2a.pg_threshold,
+                block_threshold: l2a.block_threshold,
+                heuristic_weight: l2a.heuristic_weight,
+                fusion_confidence_agreement: l2a.fusion_confidence_agreement,
+                fusion_confidence_pg_only: l2a.fusion_confidence_pg_only,
+                fusion_confidence_heuristic_only: l2a.fusion_confidence_heuristic_only,
+                max_segments: l2a.max_segments,
+                timeout_ms: l2a.timeout_ms,
+                max_concurrent_scans: l2a.max_concurrent_scans,
+            })
+        })
+        .transpose()?;
+
     let l4 = raw
         .l4
         .map(|l4| {
@@ -324,6 +395,7 @@ fn build_layer_configs(raw: Option<raw::RawLayerConfigs>) -> Result<LayerConfigs
             window_chars: l.window_chars,
         }),
         l1,
+        l2a,
         l3_inbound: raw.l3_inbound.map(|l| LayerConfig {
             mode: l.mode,
             block_action: l.block_action,
