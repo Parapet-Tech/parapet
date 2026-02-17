@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 export { createParapetFetch, ParapetTimeoutError } from "./transport.js";
-export { buildBaggageHeader } from "./header.js";
+export { buildBaggageHeader, buildTrustHeader } from "./header.js";
+export { TrustRegistry } from "./trust.js";
 export type {
   ParapetConfig,
   SessionOptions,
