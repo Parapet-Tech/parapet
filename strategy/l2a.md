@@ -11,40 +11,56 @@ L2a runs on CPU. No GPU required.
 | `pg2-22m` | 22M | ~85 MB | 59.5% | Low-latency blocking path |
 | `pg2-86m` | 86M | ~1.1 GB | 61.9% (+2.4pp) | Shadow analysis or high-latency budgets |
 
-### Latency snapshot: 22M vs 86M
+### Latency snapshot: fixed(512) vs dynamic padding
 
-| Metric | 22M | 86M | Ratio |
-|--------|----:|----:|------:|
-| Model load | 731 ms | 2,502 ms | 3.4x |
-| Short text (median) | 129 ms | 393 ms | 3.0x |
-| Medium text (median) | 133 ms | 666 ms | 5.0x |
-| Long text (median) | 137 ms | 613 ms | 4.5x |
+`pg2-22m`:
+
+| Case | Before | After | Speedup |
+|------|-------:|------:|--------:|
+| Short (9 tok) | 129 ms | 11 ms | 12x |
+| Medium (60 tok) | 133 ms | 19 ms | 7x |
+| Long (185 tok) | 137 ms | 40 ms | 3.4x |
+
+`pg2-86m`:
+
+| Case | Before | After | Speedup |
+|------|-------:|------:|--------:|
+| Short (9 tok) | 393 ms | 30 ms | 13x |
+| Medium (60 tok) | 666 ms | 58 ms | 11x |
+| Long (185 tok) | 613 ms | 136 ms | 4.5x |
+
+### Dynamic padding head-to-head (median)
+
+| Case | 22M | 86M | Ratio |
+|------|----:|----:|------:|
+| Short | 11 ms | 30 ms | 2.7x |
+| Medium | 19 ms | 58 ms | 3.0x |
+| Long | 40 ms | 136 ms | 3.4x |
 
 Observed on recent local benchmark runs. Absolute numbers vary by CPU and runtime environment.
 
 ## Config
 
 ```yaml
-policy:
-  layers:
-    L2a:
-      mode: shadow         # shadow | block
-      model: pg2-22m       # pg2-22m | pg2-86m
-      model_dir: null      # optional
-      pg_threshold: 0.5
-      block_threshold: 0.8
-      heuristic_weight: 0.3
-      fusion_confidence_agreement: 0.95
-      fusion_confidence_pg_only: 0.7
-      fusion_confidence_heuristic_only: 0.4
-      max_segments: 16
-      timeout_ms: 200
-      max_concurrent_scans: 4
+layers:
+  L2a:
+    mode: shadow         # shadow | block
+    model: pg2-22m       # pg2-22m | pg2-86m
+    model_dir: null      # optional
+    pg_threshold: 0.5
+    block_threshold: 0.8
+    heuristic_weight: 0.3
+    fusion_confidence_agreement: 0.95
+    fusion_confidence_pg_only: 0.7
+    fusion_confidence_heuristic_only: 0.4
+    max_segments: 16
+    timeout_ms: 200
+    max_concurrent_scans: 4
 ```
 
 Model path resolution order:
 
-1. `policy.layers.L2a.model_dir` (config)
+1. `layers.L2a.model_dir` (config)
 2. `$PARAPET_MODEL_DIR` (environment)
 3. `~/.parapet/models/` (default)
 
@@ -144,8 +160,8 @@ The 86M model gains +1-5pp recall across every dataset with no increase in false
 
 ### Which model to use
 
-- **pg2-22m**: Default for production blocking. Similar precision and much lower latency.
-- **pg2-86m**: Use in shadow mode for sampled/high-risk traffic when +2.4pp recall justifies 3x-5x latency.
+- **pg2-22m**: Default for production blocking. Dynamic padding puts short queries around 11 ms median with strong recall/precision.
+- **pg2-86m**: Use when latency budget allows and +2.4pp recall is worth roughly 2.7x-3.4x slower inference.
 
 ## How L2a works
 
