@@ -4,6 +4,9 @@ import {
   ParapetTimeoutError,
 } from "../src/transport.js";
 import type { TransportOptions } from "../src/types.js";
+import { runWithContext } from "../src/context.js";
+import type { ParapetContext } from "../src/context.js";
+import { TrustRegistry } from "../src/trust.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -220,7 +223,7 @@ describe("header injection", () => {
     );
   });
 
-  it("adds baggage header when opts.baggage is set", async () => {
+  it("adds baggage header from session context", async () => {
     let capturedHeaders: Headers | undefined;
     const baseFetch = vi.fn(
       async (input: string | URL | Request, init?: RequestInit) => {
@@ -229,16 +232,16 @@ describe("header injection", () => {
       },
     );
 
-    const pfetch = createParapetFetch(
-      baseFetch as typeof fetch,
-      opts({ baggage: { userId: "u_1", role: "admin" } }),
+    const pfetch = createParapetFetch(baseFetch as typeof fetch, opts());
+    await runWithContext(
+      { userId: "u_1", role: "admin", trustRegistry: new TrustRegistry() },
+      () => pfetch("https://api.openai.com/v1/chat/completions"),
     );
-    await pfetch("https://api.openai.com/v1/chat/completions");
 
     expect(capturedHeaders?.get("baggage")).toBe("user_id=u_1,role=admin");
   });
 
-  it("omits baggage header when opts.baggage is not set", async () => {
+  it("omits baggage header when no session context", async () => {
     let capturedHeaders: Headers | undefined;
     const baseFetch = vi.fn(
       async (input: string | URL | Request, init?: RequestInit) => {
@@ -614,6 +617,31 @@ describe("pre-aborted signal", () => {
     }
   });
 
+  it("throws ParapetTimeoutError before body scanning when trust context is active", async () => {
+    const baseFetch = vi.fn(async () => mockResponse());
+
+    const pfetch = createParapetFetch(baseFetch as typeof fetch, opts());
+    const body = JSON.stringify({
+      messages: [{ role: "user", content: "untrusted data" }],
+    });
+
+    await expect(
+      runWithContext(
+        ctxWithTrust([{ content: "untrusted data", source: "rag" }]),
+        () =>
+          pfetch("https://api.openai.com/v1/chat/completions", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body,
+            signal: AbortSignal.abort("cancelled"),
+          }),
+      ),
+    ).rejects.toThrow(ParapetTimeoutError);
+
+    // baseFetch must NOT be called — abort check fires before body scan.
+    expect(baseFetch).toHaveBeenCalledTimes(0);
+  });
+
   it("does not bail on pre-aborted signals for non-intercepted hosts", async () => {
     const baseFetch = vi.fn(async () => mockResponse());
 
@@ -686,5 +714,265 @@ describe("engine request property preservation", () => {
     expect(capturedReq?.method).toBe("POST");
     expect(capturedReq?.redirect).toBe("manual");
     expect(capturedReq?.credentials).toBe("omit");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Trust header injection via context
+// ---------------------------------------------------------------------------
+
+/** Helper: create a context with trust entries registered. */
+function ctxWithTrust(
+  entries: Array<{ content: string; source: string }>,
+  sessionOpts?: { userId?: string; role?: string },
+): ParapetContext {
+  const reg = new TrustRegistry();
+  for (const e of entries) {
+    reg.register(e.content, e.source);
+  }
+  return { ...sessionOpts, trustRegistry: reg };
+}
+
+describe("trust header injection", () => {
+  it("adds x-guard-trust when context has entries and body is JSON", async () => {
+    let capturedHeaders: Headers | undefined;
+    const baseFetch = vi.fn(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        capturedHeaders = extractHeaders(input, init);
+        return mockResponse();
+      },
+    );
+
+    const pfetch = createParapetFetch(baseFetch as typeof fetch, opts());
+    const body = JSON.stringify({
+      model: "gpt-4",
+      messages: [{ role: "user", content: "untrusted data" }],
+    });
+
+    await runWithContext(
+      ctxWithTrust([{ content: "untrusted data", source: "rag" }]),
+      () =>
+        pfetch("https://api.openai.com/v1/chat/completions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body,
+        }),
+    );
+
+    expect(capturedHeaders?.has("x-guard-trust")).toBe(true);
+    expect(capturedHeaders?.get("x-guard-trust")).toMatch(/^inline:/);
+  });
+
+  it("trust header decodes to correct span data", async () => {
+    let capturedHeaders: Headers | undefined;
+    const baseFetch = vi.fn(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        capturedHeaders = extractHeaders(input, init);
+        return mockResponse();
+      },
+    );
+
+    const pfetch = createParapetFetch(baseFetch as typeof fetch, opts());
+    const body = JSON.stringify({
+      messages: [{ role: "user", content: "secret RAG" }],
+    });
+
+    await runWithContext(
+      ctxWithTrust([{ content: "secret RAG", source: "rag" }]),
+      () =>
+        pfetch("https://api.openai.com/v1/chat/completions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body,
+        }),
+    );
+
+    const header = capturedHeaders?.get("x-guard-trust")!;
+    const base64 = header.slice("inline:".length);
+    const spans = JSON.parse(Buffer.from(base64, "base64").toString("utf8"));
+
+    expect(spans).toHaveLength(1);
+    expect(spans[0].src).toBe("rag");
+
+    // Verify byte offsets point to the right content in the body
+    const buf = Buffer.from(body, "utf8");
+    const extracted = buf.slice(spans[0].s, spans[0].e).toString("utf8");
+    expect(extracted).toBe("secret RAG");
+  });
+
+  it("omits x-guard-trust when no session context", async () => {
+    let capturedHeaders: Headers | undefined;
+    const baseFetch = vi.fn(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        capturedHeaders = extractHeaders(input, init);
+        return mockResponse();
+      },
+    );
+
+    const pfetch = createParapetFetch(baseFetch as typeof fetch, opts());
+    await pfetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ messages: [] }),
+    });
+
+    expect(capturedHeaders?.has("x-guard-trust")).toBe(false);
+  });
+
+  it("omits x-guard-trust when trust registry is empty", async () => {
+    let capturedHeaders: Headers | undefined;
+    const baseFetch = vi.fn(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        capturedHeaders = extractHeaders(input, init);
+        return mockResponse();
+      },
+    );
+
+    const pfetch = createParapetFetch(baseFetch as typeof fetch, opts());
+
+    await runWithContext(
+      { trustRegistry: new TrustRegistry() },
+      () =>
+        pfetch("https://api.openai.com/v1/chat/completions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ messages: [] }),
+        }),
+    );
+
+    expect(capturedHeaders?.has("x-guard-trust")).toBe(false);
+  });
+
+  it("omits x-guard-trust when content-type is not JSON", async () => {
+    let capturedHeaders: Headers | undefined;
+    const baseFetch = vi.fn(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        capturedHeaders = extractHeaders(input, init);
+        return mockResponse();
+      },
+    );
+
+    const pfetch = createParapetFetch(baseFetch as typeof fetch, opts());
+
+    await runWithContext(
+      ctxWithTrust([{ content: "data", source: "rag" }]),
+      () =>
+        pfetch("https://api.openai.com/v1/chat/completions", {
+          method: "POST",
+          headers: { "Content-Type": "multipart/form-data" },
+          body: "data",
+        }),
+    );
+
+    expect(capturedHeaders?.has("x-guard-trust")).toBe(false);
+  });
+
+  it("omits x-guard-trust when no content-type header", async () => {
+    let capturedHeaders: Headers | undefined;
+    const baseFetch = vi.fn(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        capturedHeaders = extractHeaders(input, init);
+        return mockResponse();
+      },
+    );
+
+    const pfetch = createParapetFetch(baseFetch as typeof fetch, opts());
+
+    await runWithContext(
+      ctxWithTrust([{ content: "data", source: "rag" }]),
+      () => pfetch("https://api.openai.com/v1/chat/completions"),
+    );
+
+    expect(capturedHeaders?.has("x-guard-trust")).toBe(false);
+  });
+
+  it("handles +json content-type subtypes", async () => {
+    let capturedHeaders: Headers | undefined;
+    const baseFetch = vi.fn(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        capturedHeaders = extractHeaders(input, init);
+        return mockResponse();
+      },
+    );
+
+    const pfetch = createParapetFetch(baseFetch as typeof fetch, opts());
+    const body = JSON.stringify({ data: "payload" });
+
+    await runWithContext(
+      ctxWithTrust([{ content: "payload", source: "web" }]),
+      () =>
+        pfetch("https://api.openai.com/v1/chat/completions", {
+          method: "POST",
+          headers: { "Content-Type": "application/vnd.api+json; charset=utf-8" },
+          body,
+        }),
+    );
+
+    expect(capturedHeaders?.has("x-guard-trust")).toBe(true);
+  });
+
+  it("body is still forwarded correctly when trust spans are computed", async () => {
+    let capturedBody: string | null = null;
+    const baseFetch = vi.fn(async (input: string | URL | Request) => {
+      if (input instanceof Request) {
+        capturedBody = await input.text();
+      }
+      return mockResponse();
+    });
+
+    const pfetch = createParapetFetch(baseFetch as typeof fetch, opts());
+    const body = JSON.stringify({
+      messages: [{ role: "user", content: "untrusted" }],
+    });
+
+    await runWithContext(
+      ctxWithTrust([{ content: "untrusted", source: "rag" }]),
+      () =>
+        pfetch("https://api.openai.com/v1/chat/completions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body,
+        }),
+    );
+
+    expect(capturedBody).toBe(body);
+  });
+
+  it("failopen still works when trust spans are active", async () => {
+    let callCount = 0;
+    let fallbackBody: string | null = null;
+    const baseFetch = vi.fn(async (input: string | URL | Request) => {
+      callCount++;
+      if (callCount === 1) {
+        const sysErr = Object.assign(new Error("connect ECONNREFUSED"), {
+          code: "ECONNREFUSED",
+        });
+        throw new TypeError("fetch failed", { cause: sysErr });
+      }
+      if (input instanceof Request) {
+        fallbackBody = await input.text();
+      }
+      return mockResponse();
+    });
+
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const pfetch = createParapetFetch(baseFetch as typeof fetch, opts());
+    const body = JSON.stringify({ messages: [{ content: "data" }] });
+
+    await runWithContext(
+      ctxWithTrust([{ content: "data", source: "rag" }]),
+      () =>
+        pfetch("https://api.openai.com/v1/chat/completions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body,
+        }),
+    );
+
+    expect(callCount).toBe(2);
+    expect(fallbackBody).toBe(body);
+
+    warnSpy.mockRestore();
   });
 });
