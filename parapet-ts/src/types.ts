@@ -23,5 +23,4 @@ export interface TransportOptions {
   port: number;
   interceptedHosts?: string[];
   timeoutMs?: number;
-  baggage?: SessionOptions;
 }

@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type { TransportOptions } from "./types.js";
-import { buildBaggageHeader } from "./header.js";
+import { buildBaggageHeader, buildTrustHeader } from "./header.js";
+import { getContext } from "./context.js";
+import { isJsonContentType } from "./trust.js";
 
 const DEFAULT_HOSTS: ReadonlySet<string> = new Set([
   "api.openai.com",
@@ -83,23 +85,41 @@ export function createParapetFetch(
     url.hostname = "127.0.0.1";
     url.port = String(opts.port);
 
-    // Build headers: clone from original request, add ours.
-    const headers = new Headers(originalReq.headers);
-    headers.set("x-parapet-original-host", originalHost);
-
-    // Baggage from static options (Chunk 3 replaces this with context).
-    if (opts.baggage) {
-      const baggage = buildBaggageHeader(opts.baggage);
-      if (baggage) {
-        headers.set("baggage", baggage);
-      }
-    }
-
     // Fail fast if the caller already aborted before we start.
     if (originalReq.signal.aborted) {
       throw new ParapetTimeoutError("engine call aborted", {
         cause: originalReq.signal.reason,
       });
+    }
+
+    // Build headers: clone from original request, add ours.
+    const headers = new Headers(originalReq.headers);
+    headers.set("x-parapet-original-host", originalHost);
+
+    // Read session context (AsyncLocalStorage).
+    const ctx = getContext();
+    if (ctx) {
+      // Baggage from session context.
+      const baggage = buildBaggageHeader({
+        userId: ctx.userId,
+        role: ctx.role,
+      });
+      if (baggage) {
+        headers.set("baggage", baggage);
+      }
+
+      // Trust spans: only when registry has entries AND body is JSON.
+      if (ctx.trustRegistry.hasEntries) {
+        const contentType = headers.get("content-type");
+        if (isJsonContentType(contentType)) {
+          const bodyText = await originalReq.clone().text();
+          const spans = ctx.trustRegistry.findSpans(bodyText);
+          const trustHeader = buildTrustHeader(spans);
+          if (trustHeader) {
+            headers.set("x-guard-trust", trustHeader);
+          }
+        }
+      }
     }
 
     // Compose caller signal with engine timeout.
