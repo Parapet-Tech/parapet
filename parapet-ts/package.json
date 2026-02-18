@@ -1,6 +1,6 @@
 {
   "name": "@parapet-tech/parapet",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "TypeScript SDK for Parapet LLM proxy firewall",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -36,7 +36,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/Parapet-Tech/parapet",
+    "url": "git+https://github.com/Parapet-Tech/parapet.git",
     "directory": "parapet-ts"
   },
   "homepage": "https://parapet.tech/",
