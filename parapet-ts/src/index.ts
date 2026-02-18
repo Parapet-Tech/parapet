@@ -1,14 +1,18 @@
 // Copyright 2026 The Parapet Project
 // SPDX-License-Identifier: Apache-2.0
 
-import type { SessionOptions } from "./types.js";
+import type { ParapetConfig, SessionOptions } from "./types.js";
 import type { ParapetContext } from "./context.js";
 import { getContext, runWithContext } from "./context.js";
 import { TrustRegistry } from "./trust.js";
+import { createParapetFetch, DEFAULT_INTERCEPTED_HOSTS } from "./transport.js";
+import { EngineManager } from "./sidecar.js";
 
-export { createParapetFetch, ParapetTimeoutError } from "./transport.js";
+export { createParapetFetch, ParapetTimeoutError, DEFAULT_INTERCEPTED_HOSTS } from "./transport.js";
 export { buildBaggageHeader, buildTrustHeader } from "./header.js";
 export { TrustRegistry } from "./trust.js";
+export { EngineManager } from "./sidecar.js";
+export type { SidecarDeps } from "./sidecar.js";
 export type { ParapetContext } from "./context.js";
 export type {
   ParapetConfig,
@@ -16,6 +20,16 @@ export type {
   TrustSpan,
   TransportOptions,
 } from "./types.js";
+
+// ---------------------------------------------------------------------------
+// Module-level state
+// ---------------------------------------------------------------------------
+
+let engine: EngineManager | null = null;
+let parapetFetch: typeof globalThis.fetch | null = null;
+
+/** @internal Injected deps for testing — used by EngineManager when non-null. */
+let _testDeps: import("./sidecar.js").SidecarDeps | null = null;
 
 /**
  * Run a callback within a Parapet session context.
@@ -59,4 +73,97 @@ export function untrusted(content: string, source: string): string {
     );
   }
   return ctx.trustRegistry.register(content, source);
+}
+
+// ---------------------------------------------------------------------------
+// init / getParapetFetch
+// ---------------------------------------------------------------------------
+
+const DEFAULT_PORT = 9800;
+
+/**
+ * Initialize Parapet. Starts the engine sidecar and creates the fetch wrapper.
+ *
+ * Idempotent: same config file contents + canonical path → no-op.
+ * Changed contents or path → stops old engine, starts fresh.
+ */
+export async function init(config: ParapetConfig): Promise<void> {
+  const port = config.port ?? DEFAULT_PORT;
+  const autoStart = config.autoStart ?? true;
+
+  if (autoStart) {
+    // Reuse the existing manager if port AND canonical config path
+    // match. Uses realpath for path comparison — "./parapet.yaml" and
+    // "/abs/path/parapet.yaml" are treated as identical if they resolve
+    // to the same file. Content-level idempotency (hash check) is
+    // delegated to engine.start().
+    if (
+      engine &&
+      engine.port === port &&
+      engine.matchesCanonicalConfig(config.configPath)
+    ) {
+      await engine.start(); // No-op if config content unchanged.
+    } else {
+      // Different port, different config, or no engine — stop old, create new.
+      if (engine) {
+        await engine.stop();
+      }
+      engine = new EngineManager({
+        configPath: config.configPath,
+        port,
+        deps: _testDeps ?? undefined,
+      });
+      await engine.start();
+    }
+  } else if (engine) {
+    // autoStart disabled but old engine exists — stop it.
+    await engine.stop();
+    engine = null;
+  }
+
+  const hosts = config.extraHosts
+    ? [...DEFAULT_INTERCEPTED_HOSTS, ...config.extraHosts]
+    : undefined;
+
+  parapetFetch = createParapetFetch(globalThis.fetch, {
+    port,
+    interceptedHosts: hosts,
+  });
+}
+
+/**
+ * Get the Parapet-wrapped fetch function.
+ * Use with OpenAI SDK: `new OpenAI({ fetch: getParapetFetch() })`
+ *
+ * Throws if `init()` has not been called.
+ */
+export function getParapetFetch(): typeof globalThis.fetch {
+  if (!parapetFetch) {
+    throw new Error(
+      "parapet.getParapetFetch() called before init(). " +
+        "Call parapet.init() first.",
+    );
+  }
+  return parapetFetch;
+}
+
+/**
+ * Shut down the engine sidecar (if managed).
+ * Called automatically on process exit; exposed for explicit cleanup.
+ */
+export async function shutdown(): Promise<void> {
+  if (engine) {
+    await engine.stop();
+    engine = null;
+  }
+  parapetFetch = null;
+}
+
+/** @internal Reset module state for testing. Optionally inject deps for EngineManager. */
+export function _resetForTesting(
+  deps?: import("./sidecar.js").SidecarDeps,
+): void {
+  engine = null;
+  parapetFetch = null;
+  _testDeps = deps ?? null;
 }
