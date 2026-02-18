@@ -1,5 +1,5 @@
 {
-  "name": "parapet",
+  "name": "@parapet-tech/parapet",
   "version": "0.1.0",
   "description": "TypeScript SDK for Parapet LLM proxy firewall",
   "main": "dist/index.js",
@@ -11,22 +11,40 @@
     }
   },
   "type": "module",
+  "sideEffects": false,
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=18.0.0"
   },
   "scripts": {
     "build": "tsc",
+    "prepublishOnly": "npm run build",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
   },
   "files": [
     "dist"
   ],
+  "keywords": [
+    "parapet",
+    "llm",
+    "proxy",
+    "firewall",
+    "openai",
+    "trust",
+    "security"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Parapet-Tech/parapet",
+    "directory": "parapet-ts"
+  },
+  "homepage": "https://parapet.tech/",
   "license": "Apache-2.0",
   "dependencies": {},
   "devDependencies": {
+    "@types/node": "^22.0.0",
     "typescript": "^5.7.0",
-    "vitest": "^3.0.0",
-    "@types/node": "^22.0.0"
+    "vitest": "^3.0.0"
   }
 }

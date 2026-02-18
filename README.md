@@ -10,8 +10,8 @@ Transparent LLM proxy firewall. Scans every request and response for prompt inje
 # Python SDK (includes engine sidecar)
 pip install parapet
 
-# TypeScript SDK (preview, from source)
-cd parapet-ts && npm install && npm run build
+# TypeScript SDK
+npm install @parapet-tech/parapet
 
 # Or build the Rust engine directly
 cd parapet && cargo build --release
@@ -77,27 +77,25 @@ parapet-engine --config parapet.yaml --port 9800
 export OPENAI_API_BASE=http://127.0.0.1:9800
 ```
 
-**TypeScript SDK (Chunk 1 preview)** -- fetch wrapper for OpenAI SDK / native fetch:
+**TypeScript SDK** -- fetch wrapper with session context, trust tracking, and engine sidecar:
 
 ```typescript
 import OpenAI from "openai";
-import { createParapetFetch } from "parapet";
+import { init, session, untrusted, getParapetFetch } from "@parapet-tech/parapet";
 
-// Run parapet-engine separately (same as zero-SDK mode).
-const pfetch = createParapetFetch(globalThis.fetch, {
-  port: 9800,
-  baggage: { userId: "u_1", role: "admin" }, // static baggage in Chunk 1
-});
+await init({ configPath: "parapet.yaml" });
 
-const openai = new OpenAI({ fetch: pfetch });
+const openai = new OpenAI({ fetch: getParapetFetch() });
 
-const response = await openai.chat.completions.create({
-  model: "gpt-4o-mini",
-  messages: [{ role: "user", content: "Hello" }],
+const answer = await session({ userId: "u_1", role: "admin" }, async () => {
+  return openai.chat.completions.create({
+    model: "gpt-4o-mini",
+    messages: [
+      { role: "user", content: "Summarize this: " + untrusted(doc, "rag") },
+    ],
+  });
 });
 ```
-
-Chunk 1 includes URL rewriting, host allowlist matching, `x-parapet-original-host` + optional baggage header injection, failopen on `ECONNREFUSED`, and failclosed on timeout/abort.
 
 ### 3. See it work
 
@@ -258,7 +256,7 @@ cd parapet && cargo build --features l2a --release
 # Python SDK + tests
 cd parapet-py && pip install -e ".[dev]" && pytest tests/ -v
 
-# TypeScript SDK (preview) + tests
+# TypeScript SDK + tests
 cd parapet-ts && npm install && npm test && npm run build
 ```
 
