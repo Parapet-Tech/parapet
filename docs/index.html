@@ -60,9 +60,17 @@
             <p class="hero-label">Open-source LLM security</p>
             <h1>Stop prompt injection <em>before</em> it reaches your LLM</h1>
             <p class="hero-sub">Parapet is a transparent proxy firewall that scans every request and response for prompt injection, tool abuse, and data exfiltration. Config-driven. Self-hosted. Three lines to integrate.</p>
-            <div class="hero-install">
+            <div class="lang-toggle" role="radiogroup" aria-label="Language selection">
+                <button class="lang-btn active" data-lang="python" role="radio" aria-checked="true">Python</button>
+                <button class="lang-btn" data-lang="typescript" role="radio" aria-checked="false">TypeScript</button>
+            </div>
+            <div class="hero-install lang-python">
                 <span aria-hidden="true">$</span>
                 <code>pip install parapet</code>
+            </div>
+            <div class="hero-install lang-typescript" hidden>
+                <span aria-hidden="true">$</span>
+                <code>npm install @parapet-tech/parapet</code>
             </div>
             <div class="hero-ctas">
                 <a href="https://github.com/Parapet-Tech/parapet" class="btn btn-primary">View on GitHub</a>
@@ -99,15 +107,10 @@
         <div class="container">
             <p class="section-label">How It Works</p>
             <h2>Layered defense in the request pipeline</h2>
-            <p class="section-desc">Parapet sits between your app and the LLM provider. Every message passes through a stack of security layers before it reaches the model — and again before the response reaches your app.</p>
-            <div class="pipeline-roundtrip" role="img" aria-label="Request pipeline: Your App sends a request through L0 Normalize, L1 Classify, L3 Inbound Block, and L4 Multi-Turn scoring, then to the LLM Provider. The response passes through L3 Outbound Constrain and L5a Redact before returning to your app.">
+            <p class="section-desc">Parapet sits between your app and the LLM provider. Every message passes through a stack of security layers before it reaches the model, and again before the response reaches your app.</p>
+            <div class="pipeline-roundtrip" role="img" aria-label="Request pipeline: L0 Normalize, L1 Classify, L2a Data Payload Scan, L3 Inbound Block, and L4 Multi-Turn scoring. Response pipeline: L3 Outbound Constrain and L5a Redact.">
                 <div class="pipeline-row-label">Request</div>
                 <div class="pipeline-row">
-                    <div class="pipeline-node node-start">
-                        <div class="pipeline-node-name">Your App</div>
-                        <div class="pipeline-node-desc">SDK intercepts</div>
-                    </div>
-                    <div class="pipeline-arrow" aria-hidden="true">&#8594;</div>
                     <div class="pipeline-node">
                         <div class="pipeline-node-label">L0</div>
                         <div class="pipeline-node-name">Normalize</div>
@@ -121,6 +124,12 @@
                     </div>
                     <div class="pipeline-arrow" aria-hidden="true">&#8594;</div>
                     <div class="pipeline-node node-blocked">
+                        <div class="pipeline-node-label">L2a</div>
+                        <div class="pipeline-node-name">Scan</div>
+                        <div class="pipeline-node-desc">Neural data scan</div>
+                    </div>
+                    <div class="pipeline-arrow" aria-hidden="true">&#8594;</div>
+                    <div class="pipeline-node node-blocked">
                         <div class="pipeline-node-label">L3 Inbound</div>
                         <div class="pipeline-node-name">Block</div>
                         <div class="pipeline-node-desc">Pattern &amp; injection scan</div>
@@ -131,34 +140,29 @@
                         <div class="pipeline-node-name">Multi-Turn</div>
                         <div class="pipeline-node-desc">Cross-turn risk scoring</div>
                     </div>
-                    <div class="pipeline-arrow" aria-hidden="true">&#8594;</div>
-                    <div class="pipeline-node node-end">
-                        <div class="pipeline-node-name">LLM Provider</div>
-                        <div class="pipeline-node-desc">OpenAI, Anthropic, etc.</div>
-                    </div>
                 </div>
                 <div class="pipeline-row-label">Response</div>
                 <div class="pipeline-row">
-                    <div class="pipeline-node node-start">
-                        <div class="pipeline-node-name">Your App</div>
-                        <div class="pipeline-node-desc">Clean response</div>
+                    <div class="pipeline-node node-end">
+                        <div class="pipeline-node-name">LLM Provider</div>
+                        <div class="pipeline-node-desc">Returns response</div>
                     </div>
-                    <div class="pipeline-arrow" aria-hidden="true">&#8592;</div>
-                    <div class="pipeline-node">
-                        <div class="pipeline-node-label">L5a</div>
-                        <div class="pipeline-node-name">Redact</div>
-                        <div class="pipeline-node-desc">Strip secrets from output</div>
-                    </div>
-                    <div class="pipeline-arrow" aria-hidden="true">&#8592;</div>
+                    <div class="pipeline-arrow" aria-hidden="true">&#8594;</div>
                     <div class="pipeline-node node-blocked">
                         <div class="pipeline-node-label">L3 Outbound</div>
                         <div class="pipeline-node-name">Constrain</div>
                         <div class="pipeline-node-desc">Tool &amp; action limits</div>
                     </div>
-                    <div class="pipeline-arrow" aria-hidden="true">&#8592;</div>
-                    <div class="pipeline-node node-end">
-                        <div class="pipeline-node-name">LLM Provider</div>
-                        <div class="pipeline-node-desc">Returns response</div>
+                    <div class="pipeline-arrow" aria-hidden="true">&#8594;</div>
+                    <div class="pipeline-node">
+                        <div class="pipeline-node-label">L5a</div>
+                        <div class="pipeline-node-name">Redact</div>
+                        <div class="pipeline-node-desc">Strip output secrets</div>
+                    </div>
+                    <div class="pipeline-arrow" aria-hidden="true">&#8594;</div>
+                    <div class="pipeline-node node-start">
+                        <div class="pipeline-node-name">Your App</div>
+                        <div class="pipeline-node-desc">Clean response</div>
                     </div>
                 </div>
             </div>
@@ -216,19 +220,21 @@
                     <div class="step-number">Step 1</div>
                     <h3>Install</h3>
                     <p>Parapet works with any OpenAI-compatible provider.</p>
-                    <code>pip install parapet</code>
+                    <code class="lang-python">pip install parapet</code>
+                    <code class="lang-typescript" hidden>npm install @parapet-tech/parapet</code>
                 </div>
                 <div class="step">
                     <div class="step-number">Step 2</div>
                     <h3>Configure</h3>
-                    <p>Create a YAML file with one line. All six security layers active by default.</p>
+                    <p>Create a YAML file with one line. All security layers active by default.</p>
                     <code>parapet: v1</code>
                 </div>
                 <div class="step">
                     <div class="step-number">Step 3</div>
                     <h3>Init</h3>
-                    <p>One call before your first HTTP client. Every LLM request is scanned from that point on.</p>
-                    <code>parapet.init("parapet.yaml")</code>
+                    <p>One call. Every LLM request is scanned from that point on.</p>
+                    <code class="lang-python">parapet.init()</code>
+                    <code class="lang-typescript" hidden>await init()</code>
                 </div>
             </div>
         </div>
@@ -242,7 +248,7 @@
             <div class="arch-diagram">
                 <div class="arch-box">
                     <div class="arch-box-label">Your App</div>
-                    <div class="arch-box-name">Python + httpx</div>
+                    <div class="arch-box-name">Python / TypeScript</div>
                 </div>
                 <div class="arch-arrow" aria-hidden="true">&#8594;</div>
                 <div class="arch-box arch-parapet">
@@ -252,7 +258,7 @@
                 <div class="arch-arrow" aria-hidden="true">&#8594;</div>
                 <div class="arch-box">
                     <div class="arch-box-label">Parapet Engine</div>
-                    <div class="arch-box-name">Rust (fast path)</div>
+                    <div class="arch-box-name">Rust sidecar</div>
                 </div>
                 <div class="arch-arrow" aria-hidden="true">&#8594;</div>
                 <div class="arch-box">
@@ -260,7 +266,7 @@
                     <div class="arch-box-name">OpenAI / Anthropic / etc.</div>
                 </div>
             </div>
-            <p class="arch-desc">Call <code>parapet.init("parapet.yaml")</code> before creating HTTP clients. The SDK monkey-patches <code>httpx</code>, the Rust engine runs all security layers in microseconds, and every LLM request is scanned transparently.</p>
+            <p class="arch-desc">The Python SDK patches <code>httpx</code> transparently. The TypeScript SDK wraps <code>fetch</code> with session context and trust tracking. Both start the Rust engine as a sidecar. Or skip the SDK entirely and point any OpenAI-compatible client at the proxy.</p>
         </div>
     </section>
 
@@ -272,7 +278,11 @@
             <div class="features-grid">
                 <div class="feature">
                     <h3>ML Classifier (L1)</h3>
-                    <p>Trained character n-gram SVM compiled into the binary. 98.6% F1 on 25K eval cases, sub-microsecond inference. Catches injection attempts that slip past pattern matching — no LLM call needed.</p>
+                    <p>Trained character n-gram SVM compiled into the binary. 98.6% F1 on 25K eval cases, sub-microsecond inference. Catches injection attempts that slip past pattern matching. No LLM call needed.</p>
+                </div>
+                <div class="feature">
+                    <h3>Data Payload Scanner (L2a)</h3>
+                    <p>Neural scanning of tool results and RAG documents via Meta's Prompt Guard 2 ONNX model combined with structural heuristics. Runs on CPU, no GPU required. 0.04% false positive rate across 4,742 benign inputs.</p>
                 </div>
                 <div class="feature">
                     <h3>Pattern Matching (L3)</h3>
@@ -316,7 +326,7 @@
                     <div class="trust-badge-icon" aria-hidden="true"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></div>
                     <div class="trust-badge-text">
                         <strong>Open Source</strong>
-                        Free deterministic layers, self-hosted, no data leaves your infrastructure
+                        Free defense-in-depth stack, self-hosted, no data leaves your infrastructure
                     </div>
                 </div>
                 <div class="trust-badge">
@@ -353,5 +363,23 @@
         </p>
     </footer>
 
+    <script>
+    document.querySelectorAll('.lang-toggle').forEach(function(toggle) {
+        toggle.addEventListener('click', function(e) {
+            var btn = e.target.closest('.lang-btn');
+            if (!btn) return;
+            var lang = btn.dataset.lang;
+            document.querySelectorAll('.lang-btn').forEach(function(b) {
+                b.classList.remove('active');
+                b.setAttribute('aria-checked', 'false');
+            });
+            btn.classList.add('active');
+            btn.setAttribute('aria-checked', 'true');
+            document.querySelectorAll('.lang-python, .lang-typescript').forEach(function(el) {
+                el.hidden = !el.classList.contains('lang-' + lang);
+            });
+        });
+    });
+    </script>
 </body>
 </html>
