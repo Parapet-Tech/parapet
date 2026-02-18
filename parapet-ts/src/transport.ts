@@ -132,7 +132,7 @@ export function createParapetFetch(
     // failopen retry. The clone is consumed by the engine attempt.
     // Using new Request(url, clone) preserves ALL request properties
     // (credentials, cache, integrity, keepalive, referrer, etc.).
-    const engineReq = new Request(url.toString(), originalReq.clone());
+    const engineReq = new Request(url.toString(), originalReq.clone() as RequestInit);
     // Override headers (we added x-parapet-original-host + baggage)
     // and signal (we composed caller + timeout).
     const engineInit: RequestInit = {
