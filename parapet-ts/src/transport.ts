@@ -6,13 +6,15 @@ import { buildBaggageHeader, buildTrustHeader } from "./header.js";
 import { getContext } from "./context.js";
 import { isJsonContentType } from "./trust.js";
 
-const DEFAULT_HOSTS: ReadonlySet<string> = new Set([
+export const DEFAULT_INTERCEPTED_HOSTS: readonly string[] = [
   "api.openai.com",
   "api.anthropic.com",
   "api.cerebras.ai",
   "api.groq.com",
   "generativelanguage.googleapis.com",
-]);
+];
+
+const DEFAULT_HOSTS: ReadonlySet<string> = new Set(DEFAULT_INTERCEPTED_HOSTS);
 
 const DEFAULT_TIMEOUT_MS = 5000;
 

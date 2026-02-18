@@ -15,6 +15,7 @@ parapet/
       normalize/            # NFKC, HTML strip, encoding hygiene
       stream/               # SSE passthrough, tool call buffering
       config/               # parapet.yaml schema, validation, contract_hash
+      bin/                  # CLI tools (parapet-eval, parapet-fetch, pg2-diag)
     tests/                  # Integration tests (full proxy round-trips)
   parapet-py/               # Python SDK (thin: init, session)
     parapet/
@@ -23,9 +24,18 @@ parapet/
       sidecar.py            # Engine process lifecycle (start, stop, orphan detection)
       header.py             # W3C Baggage serialization
     tests/
-  schema/                   # JSON Schema for parapet.yaml
+  parapet-ts/               # TypeScript SDK (preview)
+    src/
+      transport.ts          # Fetch wrapper, URL rewrite + failover
+      header.ts             # W3C Baggage serialization
+      trust.ts              # Trust metadata helpers
+    test/                   # Vitest coverage for transport/header/context/trust
+  strategy/                 # Layer docs, configs, and eval snapshots
+  scripts/                  # Dataset fetch/convert/analyze/training scripts
+  schema/                   # Config schema + eval datasets/configs/results
     parapet.schema.json
     examples/
+    eval/
 ```
 
 ## Key Files
@@ -36,6 +46,8 @@ parapet/
 | `parapet/src/message.rs` | `Message`, `Role`, `TrustLevel`, `ToolCall` types |
 | `parapet/src/provider/mod.rs` | OpenAI + Anthropic request/response parsing |
 | `parapet/src/config/mod.rs` | `parapet.yaml` loader, validator, `contract_hash` |
+| `parapet/src/bin/parapet_eval.rs` | Evaluation harness CLI (`parapet-eval`) |
+| `parapet/src/bin/pg2_diag.rs` | Prompt Guard 2 diagnostics/benchmark helper |
 | `parapet/src/trust.rs` | Role-based trust assignment + per-tool overrides |
 | `parapet/src/normalize/mod.rs` | L0: NFKC, HTML strip, zero-width removal |
 | `parapet/src/layers/l3_inbound.rs` | Block patterns (all messages) + content policy (untrusted) |
@@ -47,6 +59,11 @@ parapet/
 | `parapet-py/parapet/transport.py` | httpx monkey-patch, failopen/failclosed |
 | `parapet-py/parapet/sidecar.py` | Engine subprocess lifecycle, PID file, heartbeat |
 | `parapet-py/parapet/header.py` | W3C Baggage serialization |
+| `parapet-ts/src/transport.ts` | TypeScript fetch wrapper for OpenAI/fetch clients |
+| `strategy/layers.md` | Canonical layer pipeline guide + links to per-layer docs |
+| `scripts/train_l1.py` | Retrains L1 classifier and regenerates `l1_weights.rs` |
+| `scripts/fetch_*.py` | Pulls open-source eval/training datasets |
+| `schema/eval/eval_config.yaml` | Default eval harness config |
 | `schema/parapet.schema.json` | JSON Schema for config validation |
 
 ## Building & Running
@@ -54,12 +71,27 @@ parapet/
 ```bash
 # Rust engine
 cd parapet && cargo build
-cargo test                    # 200+ unit tests
+cargo test
+
+# Optional: enable L2a data payload scanning
+cd parapet && cargo build --features l2a --release
+
+# Eval harness (JSON output)
+cd parapet && cargo run --bin parapet-eval -- \
+  --config ../schema/eval/eval_config.yaml \
+  --dataset ../schema/eval/ \
+  --json
 
 # Python SDK
 cd parapet-py
 pip install -e ".[dev]"
-pytest tests/ -v              # 30 tests
+pytest tests/ -v
+
+# TypeScript SDK (preview)
+cd parapet-ts
+npm install
+npm test
+npm run build
 ```
 
 ## API Endpoints
