@@ -1665,17 +1665,29 @@ struct RawTrustHeaderSpan {
     src: Option<String>,
 }
 
+/// A message's content location within the serialized request body.
+struct ContentRegion {
+    msg_idx: usize,
+    body_start: usize,
+    body_end: usize,
+    escaped_interior: String,
+}
+
 /// Parse X-Guard-Trust header and attach trust spans to messages.
 ///
 /// Format: `inline:<base64-encoded JSON>`
 /// JSON: `[{"s": <start>, "e": <end>, "src": "<source>"}, ...]`
 ///
-/// Byte offsets in the header reference positions in the SERIALIZED request body.
-/// Since we've already parsed messages, we need to map body-level offsets to
-/// per-message content offsets. We find each message's content string within
-/// the serialized body and adjust span offsets relative to the content start.
+/// Byte offsets in the header reference positions in the SERIALIZED request body
+/// (JSON-escaped). This function:
+/// 1. Builds an offset map of where each message's content appears in the body,
+///    using sequential search to handle repeated content correctly.
+/// 2. Maps body-level offsets to escaped-interior-relative offsets.
+/// 3. Converts escaped-interior offsets to raw content offsets via
+///    `escaped_byte_to_raw` (handles `\"`, `\\`, `\n`, etc.).
+/// 4. Validates final offsets and logs warnings for unmapped/invalid spans.
 ///
-/// If parsing fails, logs a warning and returns (graceful degradation).
+/// If header parsing fails, logs a warning and returns (graceful degradation).
 fn parse_trust_header(headers: &HeaderMap, body: &[u8], messages: &mut [crate::message::Message]) {
     let header_value = match headers.get("x-guard-trust").and_then(|v| v.to_str().ok()) {
         Some(v) => v,
@@ -1710,47 +1722,380 @@ fn parse_trust_header(headers: &HeaderMap, body: &[u8], messages: &mut [crate::m
         return;
     }
 
-    // The body is the full JSON request. Trust spans reference byte offsets within
-    // this body. For each message, find where its content appears in the body and
-    // compute per-message span offsets.
     let body_str = match std::str::from_utf8(body) {
         Ok(s) => s,
         Err(_) => return,
     };
 
-    for msg in messages.iter_mut() {
+    // Phase 1: Build offset map for all messages.
+    // Search is scoped to the "messages" array to avoid matching "content"
+    // keys in unrelated objects (e.g. metadata, tool definitions).
+    // Within that array, anchors to "content" JSON keys so non-content
+    // fields are never matched. Sequential search_from handles repeats.
+    let (msg_array_start, msg_array_end) = match find_messages_array_range(body_str) {
+        Some(range) => range,
+        None => {
+            tracing::debug!("trust header: could not locate messages array in body");
+            return;
+        }
+    };
+
+    let mut regions: Vec<ContentRegion> = Vec::new();
+    let mut search_from: usize = msg_array_start;
+
+    for (idx, msg) in messages.iter().enumerate() {
         if msg.content.is_empty() {
             continue;
         }
 
-        // Find the JSON-escaped form of the content in the body.
-        // json.dumps adds quotes, so strip them to get the escaped interior.
         let escaped_content = match serde_json::to_string(&msg.content) {
             Ok(s) => s,
             Err(_) => continue,
         };
-        let escaped_interior = &escaped_content[1..escaped_content.len() - 1];
+        let escaped_interior = escaped_content[1..escaped_content.len() - 1].to_string();
 
-        // Find where this content appears in the body (byte offset)
-        if let Some(content_byte_offset) = body_str.find(escaped_interior) {
-            let content_byte_end = content_byte_offset + escaped_interior.len();
-
-            for span in &spans {
-                // Check if this span overlaps with this message's content in the body
-                if span.s < content_byte_end && span.e > content_byte_offset {
-                    // Compute message-relative offsets
-                    let rel_start = span.s.saturating_sub(content_byte_offset);
-                    let rel_end = span.e.min(content_byte_end) - content_byte_offset;
-
-                    msg.trust_spans.push(crate::trust::TrustSpan::untrusted(
-                        rel_start,
-                        rel_end,
-                        span.src.clone().unwrap_or_else(|| "unknown".to_string()),
-                    ));
-                }
-            }
+        if let Some(body_start) =
+            find_content_field_value(body_str, search_from, msg_array_end, &escaped_interior)
+        {
+            let body_end = body_start + escaped_interior.len();
+            regions.push(ContentRegion {
+                msg_idx: idx,
+                body_start,
+                body_end,
+                escaped_interior,
+            });
+            search_from = body_end;
+        } else {
+            tracing::debug!(
+                msg_idx = idx,
+                "trust header: could not locate message content in serialized body"
+            );
         }
     }
+
+    // Phase 2: Map each raw span to message-relative offsets.
+    let mut unmapped_count: usize = 0;
+
+    for span in &spans {
+        if span.s >= span.e {
+            tracing::warn!(
+                start = span.s,
+                end = span.e,
+                "trust header: span has inverted or empty byte range, skipping"
+            );
+            unmapped_count += 1;
+            continue;
+        }
+
+        let mut matched = false;
+
+        for region in &regions {
+            if span.s < region.body_end && span.e > region.body_start {
+                // Offsets within the escaped interior
+                let esc_start = span.s.saturating_sub(region.body_start);
+                let esc_end = span.e.min(region.body_end) - region.body_start;
+
+                if esc_start >= esc_end {
+                    continue;
+                }
+
+                // Convert escaped-interior offsets to raw content offsets
+                let raw_start = escaped_byte_to_raw(&region.escaped_interior, esc_start);
+                let raw_end = escaped_byte_to_raw(&region.escaped_interior, esc_end);
+
+                let content_len = messages[region.msg_idx].content.len();
+                if raw_start >= raw_end || raw_end > content_len {
+                    tracing::warn!(
+                        msg_idx = region.msg_idx,
+                        raw_start,
+                        raw_end,
+                        content_len,
+                        "trust header: span maps to invalid range in message content, skipping"
+                    );
+                    continue;
+                }
+
+                messages[region.msg_idx].trust_spans.push(
+                    crate::trust::TrustSpan::untrusted(
+                        raw_start,
+                        raw_end,
+                        span.src.clone().unwrap_or_else(|| "unknown".to_string()),
+                    ),
+                );
+                matched = true;
+            }
+        }
+
+        if !matched {
+            tracing::warn!(
+                start = span.s,
+                end = span.e,
+                "trust header: span does not overlap any message content"
+            );
+            unmapped_count += 1;
+        }
+    }
+
+    if unmapped_count > 0 {
+        tracing::warn!(
+            unmapped = unmapped_count,
+            total = spans.len(),
+            "trust header: some spans could not be mapped to messages"
+        );
+    }
+}
+
+/// Find the byte range of the top-level `"messages"` JSON array in the body.
+///
+/// Returns `(start, end)` where `start` is the `[` position and `end` is
+/// one past the matching `]`. Only matches `"messages"` at brace depth 1
+/// (directly inside the root JSON object). Handles nested arrays/objects
+/// and JSON strings correctly via depth tracking with string-escape awareness.
+fn find_messages_array_range(body: &str) -> Option<(usize, usize)> {
+    let key = b"\"messages\"";
+
+    // Walk the body tracking brace/bracket depth and string state.
+    // Only consider a "messages" key match when brace_depth == 1
+    // (i.e. we are directly inside the root JSON object).
+    let bytes = body.as_bytes();
+    let mut brace_depth: usize = 0;
+    let mut bracket_depth: usize = 0;
+    let mut in_string = false;
+    let mut escape_next = false;
+    let mut key_pos: Option<usize> = None;
+
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+
+        if escape_next {
+            escape_next = false;
+            i += 1;
+            continue;
+        }
+
+        if in_string {
+            match b {
+                b'\\' => escape_next = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
+
+        match b {
+            b'"' => {
+                // Check if this starts the "messages" key at root level
+                if brace_depth == 1 && bracket_depth == 0
+                    && i + key.len() <= bytes.len()
+                    && &bytes[i..i + key.len()] == key
+                {
+                    key_pos = Some(i);
+                    i += key.len();
+                    // in_string is still false because we consumed the
+                    // entire quoted key including the closing quote
+                    continue;
+                }
+                in_string = true;
+            }
+            b'{' => brace_depth += 1,
+            b'}' => brace_depth = brace_depth.saturating_sub(1),
+            b'[' => bracket_depth += 1,
+            b']' => bracket_depth = bracket_depth.saturating_sub(1),
+            _ => {}
+        }
+        i += 1;
+    }
+
+    let key_pos = key_pos?;
+    let after_key = key_pos + key.len();
+
+    // Skip whitespace, expect colon
+    let rest = body[after_key..].trim_start();
+    if !rest.starts_with(':') {
+        return None;
+    }
+    let after_colon = after_key + (body[after_key..].len() - rest.len()) + 1;
+
+    // Skip whitespace, expect opening bracket
+    let rest2 = body[after_colon..].trim_start();
+    if !rest2.starts_with('[') {
+        return None;
+    }
+    let array_start = after_colon + (body[after_colon..].len() - rest2.len());
+
+    // Walk forward to find the matching closing bracket
+    let mut depth: usize = 0;
+    let mut in_string = false;
+    let mut escape_next = false;
+
+    for (i, b) in body[array_start..].bytes().enumerate() {
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
+        if in_string {
+            match b {
+                b'\\' => escape_next = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((array_start, array_start + i + 1));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+/// Find the byte offset of a "content" field's string value within `body[from..to]`.
+///
+/// Searches for `"content"` JSON keys, skips whitespace around the colon,
+/// then checks if the string value interior matches `escaped_interior`.
+/// Returns the body-level byte offset of the value interior start (after
+/// the opening quote).
+///
+/// The `to` bound scopes the search (e.g. to within the messages array)
+/// so that "content" keys in unrelated objects are never matched.
+fn find_content_field_value(
+    body: &str,
+    from: usize,
+    to: usize,
+    escaped_interior: &str,
+) -> Option<usize> {
+    let key = "\"content\"";
+    let mut pos = from;
+
+    while pos < to {
+        let hit = body[pos..to].find(key)?;
+        let after_key = pos + hit + key.len();
+        if after_key >= to {
+            return None;
+        }
+
+        // Skip whitespace, expect colon
+        let rest = &body[after_key..to];
+        let trimmed = rest.trim_start();
+        if !trimmed.starts_with(':') {
+            pos = after_key;
+            continue;
+        }
+        let after_colon = after_key + (rest.len() - trimmed.len()) + 1;
+        if after_colon >= to {
+            return None;
+        }
+
+        // Skip whitespace after colon, expect opening quote
+        let rest2 = &body[after_colon..to];
+        let trimmed2 = rest2.trim_start();
+        if !trimmed2.starts_with('"') {
+            // Value is not a string (null, array, etc.) — skip this key
+            pos = after_colon;
+            continue;
+        }
+        let value_interior_start = after_colon + (rest2.len() - trimmed2.len()) + 1;
+        if value_interior_start >= to {
+            return None;
+        }
+
+        if body[value_interior_start..to].starts_with(escaped_interior) {
+            return Some(value_interior_start);
+        }
+
+        // This "content" key didn't match; keep searching
+        pos = value_interior_start;
+    }
+
+    None
+}
+
+/// Convert a byte position in JSON-escaped string space to the corresponding
+/// position in raw (unescaped) string space.
+///
+/// JSON escape sequences (`\"`, `\\`, `\n`, `\uXXXX`, etc.) occupy more bytes
+/// in escaped form than in raw form. Walks the escaped string up to
+/// `target_esc_pos` and counts equivalent raw bytes.
+///
+/// Handles UTF-16 surrogate pairs (`\uD83D\uDE00` → single 4-byte char).
+fn escaped_byte_to_raw(escaped: &str, target_esc_pos: usize) -> usize {
+    let bytes = escaped.as_bytes();
+    let mut esc_pos = 0;
+    let mut raw_pos = 0;
+
+    while esc_pos < target_esc_pos && esc_pos < bytes.len() {
+        if bytes[esc_pos] == b'\\' && esc_pos + 1 < bytes.len() {
+            let next = bytes[esc_pos + 1];
+            if matches!(next, b'"' | b'\\' | b'/' | b'n' | b'r' | b't' | b'b' | b'f') {
+                // 2-byte escape → 1 raw byte
+                if esc_pos + 2 > target_esc_pos {
+                    break; // target lands mid-escape; snap to start
+                }
+                esc_pos += 2;
+                raw_pos += 1;
+            } else if next == b'u' && esc_pos + 5 < bytes.len() {
+                // \uXXXX — check for surrogate pair
+                if esc_pos + 6 > target_esc_pos {
+                    break;
+                }
+                let hex_str = std::str::from_utf8(&bytes[esc_pos + 2..esc_pos + 6])
+                    .unwrap_or("0000");
+                let code_unit = u32::from_str_radix(hex_str, 16).unwrap_or(0);
+
+                // High surrogate (U+D800..U+DBFF) followed by \uXXXX low surrogate?
+                if (0xD800..=0xDBFF).contains(&code_unit)
+                    && esc_pos + 11 < bytes.len()
+                    && bytes[esc_pos + 6] == b'\\'
+                    && bytes[esc_pos + 7] == b'u'
+                {
+                    let low_hex = std::str::from_utf8(&bytes[esc_pos + 8..esc_pos + 12])
+                        .unwrap_or("0000");
+                    let low_unit = u32::from_str_radix(low_hex, 16).unwrap_or(0);
+
+                    if (0xDC00..=0xDFFF).contains(&low_unit) {
+                        // Valid surrogate pair → single code point
+                        if esc_pos + 12 > target_esc_pos {
+                            break;
+                        }
+                        let cp = 0x10000
+                            + ((code_unit - 0xD800) << 10)
+                            + (low_unit - 0xDC00);
+                        let char_len = char::from_u32(cp).map_or(4, |c| c.len_utf8());
+                        esc_pos += 12;
+                        raw_pos += char_len;
+                    } else {
+                        // High surrogate not followed by valid low — replacement char
+                        esc_pos += 6;
+                        raw_pos += 3;
+                    }
+                } else {
+                    // Regular BMP code point or lone low surrogate
+                    let char_len = char::from_u32(code_unit).map_or(3, |c| c.len_utf8());
+                    esc_pos += 6;
+                    raw_pos += char_len;
+                }
+            } else {
+                // Unknown escape — treat backslash as literal
+                esc_pos += 1;
+                raw_pos += 1;
+            }
+        } else {
+            esc_pos += 1;
+            raw_pos += 1;
+        }
+    }
+
+    raw_pos
 }
 
 fn apply_l3_outbound_openai(
