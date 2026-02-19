@@ -4,6 +4,7 @@
 pub mod config;
 pub mod constraint;
 pub mod engine;
+#[cfg(feature = "eval")]
 pub mod eval;
 pub mod layers;
 pub mod message;

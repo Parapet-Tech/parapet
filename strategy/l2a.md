@@ -182,7 +182,7 @@ L2a requires the `l2a` cargo feature and MSVC toolchain on Windows:
 
 ```bash
 # Build
-cargo +stable-x86_64-pc-windows-msvc build --features l2a --release
+cargo +stable-x86_64-pc-windows-msvc build --features l2a,eval --release
 
 # Run tests
 cargo +stable-x86_64-pc-windows-msvc test --features l2a
