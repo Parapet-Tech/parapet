@@ -77,7 +77,7 @@ cargo test
 cd parapet && cargo build --features l2a --release
 
 # Eval harness (JSON output)
-cd parapet && cargo run --bin parapet-eval -- \
+cd parapet && cargo run --features eval --bin parapet-eval -- \
   --config ../schema/eval/eval_config.yaml \
   --dataset ../schema/eval/ \
   --json

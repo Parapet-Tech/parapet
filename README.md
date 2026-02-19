@@ -215,7 +215,7 @@ TLDR: prevents automated jailbreak attacks. Known limitations: content safety, s
 ## Eval harness
 
 ```bash
-cargo run --bin parapet-eval -- \
+cargo run --features eval --bin parapet-eval -- \
   --config schema/eval/eval_config.yaml \
   --dataset schema/eval/ \
   --json
@@ -226,7 +226,7 @@ Test cases across L1 classifier, L3 single-turn, and L4 multi-turn evaluations, 
 Run L1-only eval:
 
 ```bash
-cargo run --bin parapet-eval -- \
+cargo run --features eval --bin parapet-eval -- \
   --config schema/eval/eval_config_l1_only.yaml \
   --dataset schema/eval/ \
   --layer l1
