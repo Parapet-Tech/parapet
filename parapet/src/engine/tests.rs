@@ -743,6 +743,428 @@ fn parse_trust_header_span_without_src_defaults_to_unknown() {
 }
 
 // -------------------------------------------------------------------
+// V4-01: Trust-span correctness regression tests
+// -------------------------------------------------------------------
+
+#[test]
+fn parse_trust_header_repeated_content_maps_to_correct_message() {
+    // Two messages with identical content. Span targets the second one.
+    let body = serde_json::json!({
+        "model": "gpt-4",
+        "messages": [
+            {"role": "user", "content": "same text"},
+            {"role": "assistant", "content": "reply"},
+            {"role": "user", "content": "same text"}
+        ]
+    });
+    let body_bytes = serde_json::to_vec(&body).unwrap();
+    let body_str = std::str::from_utf8(&body_bytes).unwrap();
+
+    // Find the SECOND occurrence of "same text" in the body
+    let first_pos = body_str.find("same text").unwrap();
+    let second_pos = body_str[first_pos + 1..].find("same text").unwrap() + first_pos + 1;
+
+    let spans = serde_json::json!([
+        {"s": second_pos, "e": second_pos + "same text".len(), "src": "rag"}
+    ]);
+    let encoded = base64::engine::general_purpose::STANDARD
+        .encode(serde_json::to_vec(&spans).unwrap());
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-guard-trust", format!("inline:{encoded}").parse().unwrap());
+
+    let mut messages = vec![
+        Message::new(Role::User, "same text"),
+        Message::new(Role::Assistant, "reply"),
+        Message::new(Role::User, "same text"),
+    ];
+
+    parse_trust_header(&headers, &body_bytes, &mut messages);
+
+    // First "same text" message should have NO spans
+    assert!(
+        messages[0].trust_spans.is_empty(),
+        "first message should not have spans: got {:?}",
+        messages[0].trust_spans
+    );
+    // Second "same text" message (index 2) should have the span
+    assert_eq!(messages[2].trust_spans.len(), 1);
+    assert_eq!(messages[2].trust_spans[0].start, 0);
+    assert_eq!(messages[2].trust_spans[0].end, "same text".len());
+    assert_eq!(messages[2].trust_spans[0].source.as_deref(), Some("rag"));
+}
+
+#[test]
+fn parse_trust_header_out_of_bounds_span_is_not_attached() {
+    let body = serde_json::json!({
+        "messages": [{"role": "user", "content": "hello"}]
+    });
+    let body_bytes = serde_json::to_vec(&body).unwrap();
+
+    // Span at offset 9999, well beyond any content
+    let spans = serde_json::json!([
+        {"s": 9999, "e": 10010, "src": "bogus"}
+    ]);
+    let encoded = base64::engine::general_purpose::STANDARD
+        .encode(serde_json::to_vec(&spans).unwrap());
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-guard-trust", format!("inline:{encoded}").parse().unwrap());
+
+    let mut messages = vec![Message::new(Role::User, "hello")];
+    parse_trust_header(&headers, &body_bytes, &mut messages);
+
+    assert!(messages[0].trust_spans.is_empty());
+}
+
+#[test]
+fn parse_trust_header_inverted_range_is_rejected() {
+    let body = serde_json::json!({
+        "messages": [{"role": "user", "content": "hello"}]
+    });
+    let body_bytes = serde_json::to_vec(&body).unwrap();
+
+    // s > e → inverted
+    let spans = serde_json::json!([
+        {"s": 50, "e": 10, "src": "bad"}
+    ]);
+    let encoded = base64::engine::general_purpose::STANDARD
+        .encode(serde_json::to_vec(&spans).unwrap());
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-guard-trust", format!("inline:{encoded}").parse().unwrap());
+
+    let mut messages = vec![Message::new(Role::User, "hello")];
+    parse_trust_header(&headers, &body_bytes, &mut messages);
+
+    assert!(messages[0].trust_spans.is_empty());
+}
+
+#[test]
+fn parse_trust_header_escaped_quotes_map_to_raw_offsets() {
+    // Content with double-quotes: raw is 13 bytes, escaped interior is 15 bytes
+    let raw_content = r#"say "hello" ok"#; // 14 bytes: s a y   " h e l l o "   o k
+    let body = serde_json::json!({
+        "messages": [{"role": "user", "content": raw_content}]
+    });
+    let body_bytes = serde_json::to_vec(&body).unwrap();
+    let body_str = std::str::from_utf8(&body_bytes).unwrap();
+
+    // In the serialized body, the content is: say \"hello\" ok (16 escaped bytes)
+    // We want to mark "hello" as untrusted.
+    // In escaped body: \"hello\" starts at offset 4 from content start
+    // In escaped form: \  "  h  e  l  l  o  \  "
+    //                  4  5  6  7  8  9  10 11 12
+    // So "hello" in escaped space is at escaped offset 6..11 from content start
+    let escaped_content = serde_json::to_string(raw_content).unwrap();
+    let escaped_interior = &escaped_content[1..escaped_content.len() - 1];
+    let content_start = body_str.find(escaped_interior).unwrap();
+
+    // Find "hello" in the escaped interior
+    let hello_esc_start = escaped_interior.find("hello").unwrap();
+    let hello_esc_end = hello_esc_start + "hello".len();
+
+    let spans = serde_json::json!([
+        {"s": content_start + hello_esc_start, "e": content_start + hello_esc_end, "src": "test"}
+    ]);
+    let encoded = base64::engine::general_purpose::STANDARD
+        .encode(serde_json::to_vec(&spans).unwrap());
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-guard-trust", format!("inline:{encoded}").parse().unwrap());
+
+    let mut messages = vec![Message::new(Role::User, raw_content)];
+    parse_trust_header(&headers, &body_bytes, &mut messages);
+
+    assert_eq!(messages[0].trust_spans.len(), 1);
+    let span = &messages[0].trust_spans[0];
+    // "hello" in raw content is at byte offset 5..10
+    let slice = &raw_content[span.start..span.end];
+    assert_eq!(slice, "hello", "span should cover 'hello' in raw content, got '{slice}'");
+}
+
+#[test]
+fn parse_trust_header_escaped_newline_maps_to_raw_offset() {
+    // Content with a newline: raw "line1\nline2" (11 bytes), escaped "line1\\nline2" (12 bytes)
+    let raw_content = "line1\nline2";
+    let body = serde_json::json!({
+        "messages": [{"role": "user", "content": raw_content}]
+    });
+    let body_bytes = serde_json::to_vec(&body).unwrap();
+    let body_str = std::str::from_utf8(&body_bytes).unwrap();
+
+    let escaped_content = serde_json::to_string(raw_content).unwrap();
+    let escaped_interior = &escaped_content[1..escaped_content.len() - 1];
+    let content_start = body_str.find(escaped_interior).unwrap();
+
+    // Mark "line2" as untrusted. In escaped interior: "line1\nline2"
+    // "line2" starts at escaped offset 7 (l i n e 1 \ n l i n e 2)
+    let line2_esc_start = escaped_interior.find("line2").unwrap();
+    let line2_esc_end = line2_esc_start + "line2".len();
+
+    let spans = serde_json::json!([
+        {"s": content_start + line2_esc_start, "e": content_start + line2_esc_end, "src": "test"}
+    ]);
+    let encoded = base64::engine::general_purpose::STANDARD
+        .encode(serde_json::to_vec(&spans).unwrap());
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-guard-trust", format!("inline:{encoded}").parse().unwrap());
+
+    let mut messages = vec![Message::new(Role::User, raw_content)];
+    parse_trust_header(&headers, &body_bytes, &mut messages);
+
+    assert_eq!(messages[0].trust_spans.len(), 1);
+    let span = &messages[0].trust_spans[0];
+    let slice = &raw_content[span.start..span.end];
+    assert_eq!(slice, "line2", "span should cover 'line2' in raw content, got '{slice}'");
+}
+
+#[test]
+fn parse_trust_header_content_in_non_message_field_not_matched() {
+    // "gpt-4" appears in "model" field before "content" field.
+    // Span targets the "content" field occurrence — should not bind to "model".
+    let body = serde_json::json!({
+        "model": "gpt-4",
+        "messages": [
+            {"role": "user", "content": "gpt-4"}
+        ]
+    });
+    let body_bytes = serde_json::to_vec(&body).unwrap();
+    let body_str = std::str::from_utf8(&body_bytes).unwrap();
+
+    // The SDK would find "gpt-4" in the content field. Find it anchored to "content":
+    // We need the byte offset of "gpt-4" inside the "content" field, not the "model" field.
+    let content_key_pos = body_str.find(r#""content":"gpt-4""#)
+        .or_else(|| body_str.find(r#""content": "gpt-4""#))
+        .expect("content field should exist");
+    let content_value_pos = body_str[content_key_pos..].find("gpt-4").unwrap() + content_key_pos;
+
+    let spans = serde_json::json!([
+        {"s": content_value_pos, "e": content_value_pos + "gpt-4".len(), "src": "rag"}
+    ]);
+    let encoded = base64::engine::general_purpose::STANDARD
+        .encode(serde_json::to_vec(&spans).unwrap());
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-guard-trust", format!("inline:{encoded}").parse().unwrap());
+
+    let mut messages = vec![Message::new(Role::User, "gpt-4")];
+    parse_trust_header(&headers, &body_bytes, &mut messages);
+
+    assert_eq!(messages[0].trust_spans.len(), 1);
+    let span = &messages[0].trust_spans[0];
+    assert_eq!(span.start, 0);
+    assert_eq!(span.end, "gpt-4".len());
+}
+
+#[test]
+fn parse_trust_header_non_message_content_key_not_matched() {
+    // Exact reproduction from review: "content" key exists outside messages array.
+    // {"meta":{"content":"abcd"},"messages":[{"role":"user","content":"abc"}]}
+    // find_content_field_value must not match meta.content.
+    let body_str = r#"{"meta":{"content":"abcd"},"messages":[{"role":"user","content":"abc"}]}"#;
+    let body_bytes = body_str.as_bytes();
+
+    // Span targets "abc" inside the messages content field
+    let msg_content_pos = body_str.rfind("\"abc\"").unwrap() + 1; // skip opening quote
+    let spans = serde_json::json!([
+        {"s": msg_content_pos, "e": msg_content_pos + 3, "src": "test"}
+    ]);
+    let encoded = base64::engine::general_purpose::STANDARD
+        .encode(serde_json::to_vec(&spans).unwrap());
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-guard-trust", format!("inline:{encoded}").parse().unwrap());
+
+    let mut messages = vec![Message::new(Role::User, "abc")];
+    parse_trust_header(&headers, body_bytes, &mut messages);
+
+    // Should map to the message, not the meta field
+    assert_eq!(messages[0].trust_spans.len(), 1);
+    let span = &messages[0].trust_spans[0];
+    assert_eq!(span.start, 0);
+    assert_eq!(span.end, 3);
+    assert_eq!(&"abc"[span.start..span.end], "abc");
+}
+
+#[test]
+fn parse_trust_header_meta_content_span_not_attached() {
+    // Span points at meta.content value (outside messages array).
+    // Should NOT be attached to any message.
+    let body_str = r#"{"meta":{"content":"abcd"},"messages":[{"role":"user","content":"hello"}]}"#;
+    let body_bytes = body_str.as_bytes();
+
+    let meta_pos = body_str.find("abcd").unwrap();
+    let spans = serde_json::json!([
+        {"s": meta_pos, "e": meta_pos + 4, "src": "bad"}
+    ]);
+    let encoded = base64::engine::general_purpose::STANDARD
+        .encode(serde_json::to_vec(&spans).unwrap());
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-guard-trust", format!("inline:{encoded}").parse().unwrap());
+
+    let mut messages = vec![Message::new(Role::User, "hello")];
+    parse_trust_header(&headers, body_bytes, &mut messages);
+
+    assert!(messages[0].trust_spans.is_empty());
+}
+
+#[test]
+fn parse_trust_header_model_field_span_not_attached_to_message() {
+    // Span points at "model" field value, NOT the "content" field.
+    // Should not be attached to any message.
+    let body = serde_json::json!({
+        "model": "gpt-4",
+        "messages": [
+            {"role": "user", "content": "hello world"}
+        ]
+    });
+    let body_bytes = serde_json::to_vec(&body).unwrap();
+    let body_str = std::str::from_utf8(&body_bytes).unwrap();
+
+    // Span targets "gpt-4" in the model field
+    let model_pos = body_str.find("gpt-4").unwrap();
+
+    let spans = serde_json::json!([
+        {"s": model_pos, "e": model_pos + "gpt-4".len(), "src": "bad"}
+    ]);
+    let encoded = base64::engine::general_purpose::STANDARD
+        .encode(serde_json::to_vec(&spans).unwrap());
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-guard-trust", format!("inline:{encoded}").parse().unwrap());
+
+    let mut messages = vec![Message::new(Role::User, "hello world")];
+    parse_trust_header(&headers, &body_bytes, &mut messages);
+
+    // "gpt-4" span is in the model field, not overlapping the content region
+    assert!(messages[0].trust_spans.is_empty());
+}
+
+#[test]
+fn parse_trust_header_nested_messages_key_ignored() {
+    // A nested "messages" key inside another object must NOT be used
+    // as the messages array boundary. Only the top-level "messages" counts.
+    let body_str = r#"{"meta":{"messages":[{"content":"trap"}]},"messages":[{"role":"user","content":"real"}]}"#;
+    let body_bytes = body_str.as_bytes();
+
+    // Span points at "real" inside the top-level messages array
+    let real_pos = body_str.rfind("real").unwrap();
+
+    let spans = serde_json::json!([
+        {"s": real_pos, "e": real_pos + "real".len(), "src": "rag"}
+    ]);
+    let encoded = base64::engine::general_purpose::STANDARD
+        .encode(serde_json::to_vec(&spans).unwrap());
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-guard-trust", format!("inline:{encoded}").parse().unwrap());
+
+    let mut messages = vec![Message::new(Role::User, "real")];
+    parse_trust_header(&headers, &body_bytes, &mut messages);
+
+    // The span should attach to the message, mapping to content offsets 0..4
+    assert_eq!(messages[0].trust_spans.len(), 1);
+    assert_eq!(messages[0].trust_spans[0].start, 0);
+    assert_eq!(messages[0].trust_spans[0].end, 4);
+    assert_eq!(messages[0].trust_spans[0].source.as_deref(), Some("rag"));
+}
+
+#[test]
+fn parse_trust_header_nested_messages_trap_not_matched() {
+    // Span points at "trap" inside a nested (non-top-level) "messages" key.
+    // This should NOT be attached to any message.
+    let body_str = r#"{"meta":{"messages":[{"content":"trap"}]},"messages":[{"role":"user","content":"real"}]}"#;
+    let body_bytes = body_str.as_bytes();
+
+    // Span targets "trap" inside meta.messages
+    let trap_pos = body_str.find("trap").unwrap();
+
+    let spans = serde_json::json!([
+        {"s": trap_pos, "e": trap_pos + "trap".len(), "src": "bad"}
+    ]);
+    let encoded = base64::engine::general_purpose::STANDARD
+        .encode(serde_json::to_vec(&spans).unwrap());
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-guard-trust", format!("inline:{encoded}").parse().unwrap());
+
+    let mut messages = vec![Message::new(Role::User, "real")];
+    parse_trust_header(&headers, &body_bytes, &mut messages);
+
+    // "trap" is in meta.messages, outside the top-level messages array range,
+    // so no span should be attached
+    assert!(messages[0].trust_spans.is_empty());
+}
+
+#[test]
+fn escaped_byte_to_raw_surrogate_pair() {
+    // \uD83D\uDE00 = 😀 (U+1F600), which is 4 bytes in UTF-8
+    // Escaped: 12 bytes (\uD83D\uDE00), raw: 4 bytes
+    let escaped = r#"\uD83D\uDE00"#;
+    assert_eq!(escaped_byte_to_raw(escaped, 0), 0);
+    assert_eq!(escaped_byte_to_raw(escaped, 12), 4); // full pair → 4-byte char
+}
+
+#[test]
+fn escaped_byte_to_raw_surrogate_pair_with_trailing_text() {
+    // \uD83D\uDE00x → 😀x → 5 raw bytes (4 for emoji + 1 for 'x')
+    let escaped = r#"\uD83D\uDE00x"#;
+    assert_eq!(escaped_byte_to_raw(escaped, 12), 4); // after pair
+    assert_eq!(escaped_byte_to_raw(escaped, 13), 5); // after 'x'
+}
+
+#[test]
+fn escaped_byte_to_raw_bmp_unicode_escape() {
+    // \u00E9 = é (U+00E9), which is 2 bytes in UTF-8
+    let escaped = r#"caf\u00E9"#;
+    assert_eq!(escaped_byte_to_raw(escaped, 3), 3);  // 'caf'
+    assert_eq!(escaped_byte_to_raw(escaped, 9), 5);  // 'caf' + é (2 UTF-8 bytes)
+}
+
+#[test]
+fn escaped_byte_to_raw_no_escapes() {
+    assert_eq!(escaped_byte_to_raw("hello world", 0), 0);
+    assert_eq!(escaped_byte_to_raw("hello world", 5), 5);
+    assert_eq!(escaped_byte_to_raw("hello world", 11), 11);
+}
+
+#[test]
+fn escaped_byte_to_raw_quote_escapes() {
+    // escaped: say \"hi\"   (positions: s=0 a=1 y=2 ' '=3 \=4 "=5 h=6 i=7 \=8 "=9)
+    // raw:     say "hi"     (positions: s=0 a=1 y=2 ' '=3 "=4 h=5 i=6 "=7)
+    let escaped = r#"say \"hi\""#;
+    assert_eq!(escaped_byte_to_raw(escaped, 0), 0); // 's'
+    assert_eq!(escaped_byte_to_raw(escaped, 4), 4); // start of \"
+    assert_eq!(escaped_byte_to_raw(escaped, 6), 5); // 'h' — after first escape
+    assert_eq!(escaped_byte_to_raw(escaped, 8), 7); // start of second \"
+    assert_eq!(escaped_byte_to_raw(escaped, 10), 8); // end
+}
+
+#[test]
+fn escaped_byte_to_raw_newline_escape() {
+    // escaped: "a\nb" (positions: a=0 \=1 n=2 b=3)
+    // raw:     "a\nb" (positions: a=0 \n=1 b=2)
+    let escaped = r#"a\nb"#;
+    assert_eq!(escaped_byte_to_raw(escaped, 0), 0);
+    assert_eq!(escaped_byte_to_raw(escaped, 1), 1); // start of \n
+    assert_eq!(escaped_byte_to_raw(escaped, 3), 2); // 'b'
+    assert_eq!(escaped_byte_to_raw(escaped, 4), 3); // end
+}
+
+#[test]
+fn escaped_byte_to_raw_multiple_escapes() {
+    // escaped: \\\"  (4 bytes: backslash-backslash-backslash-quote)
+    // raw:     \"    (2 bytes: literal backslash + literal quote)
+    let escaped = r#"\\\""#;
+    assert_eq!(escaped_byte_to_raw(escaped, 0), 0);
+    assert_eq!(escaped_byte_to_raw(escaped, 2), 1); // after first escape
+    assert_eq!(escaped_byte_to_raw(escaped, 4), 2); // after second escape
+}
+
+// -------------------------------------------------------------------
 // Session ID extraction from W3C Baggage header (M8)
 // -------------------------------------------------------------------
 
