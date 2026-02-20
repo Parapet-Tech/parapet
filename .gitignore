@@ -26,6 +26,9 @@ paper/*.aux
 paper/*.log
 paper/*.out
 
+# Secrets
+.env
+
 # OS
 .DS_Store
 Thumbs.db

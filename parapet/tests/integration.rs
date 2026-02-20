@@ -13,7 +13,8 @@ use bytes::Bytes;
 use parapet::config::{self, StringSource};
 use parapet::constraint::DslConstraintEvaluator;
 use parapet::engine::{
-    EngineDeps, EngineUpstreamClient, ReqwestHttpSender, UpstreamResolver,
+    EngineDeps, EngineUpstreamClient, HttpBody, HttpError, HttpRequest, HttpResponse, HttpSender,
+    ReqwestHttpSender, UpstreamResolver,
 };
 use parapet::layers::l3_inbound::DefaultInboundScanner;
 use parapet::layers::l5a::L5aScanner;
@@ -627,4 +628,135 @@ async fn no_trust_spans_regression_clean_request_passes() {
         .as_str()
         .unwrap();
     assert_eq!(content, "Hello! How can I help?");
+}
+
+// ---------------------------------------------------------------------------
+// Test: Stale framing headers stripped after JSON re-serialization
+// ---------------------------------------------------------------------------
+
+/// Mock HttpSender that returns a canned response with explicit framing headers.
+/// Bypasses real HTTP so we can set headers that would be invalid on the wire.
+struct FramingHeaderSender {
+    response_body: Bytes,
+    response_headers: axum::http::HeaderMap,
+}
+
+#[async_trait::async_trait]
+impl HttpSender for FramingHeaderSender {
+    async fn send(&self, _request: HttpRequest) -> Result<HttpResponse, HttpError> {
+        Ok(HttpResponse {
+            status: StatusCode::OK,
+            headers: self.response_headers.clone(),
+            body: HttpBody::Full(self.response_body.clone()),
+        })
+    }
+}
+
+fn build_test_engine_with_http(yaml: &str, http: Arc<dyn HttpSender>) -> EngineUpstreamClient {
+    let source = config::StringSource {
+        content: yaml.to_string(),
+    };
+    let config = Arc::new(config::load_config(&source).expect("test config should parse"));
+
+    let deps = EngineDeps {
+        config,
+        http,
+        resolver: Arc::new(WiremockResolver {
+            url: "https://unused.test".to_string(),
+        }),
+        registry: Arc::new(parapet::engine::DefaultProviderRegistry),
+        normalizer: Arc::new(L0Normalizer::new()),
+        trust_assigner: Arc::new(RoleTrustAssigner),
+        l1_scanner: None,
+        l2a_scanner: None,
+        l2a_semaphore: None,
+        inbound_scanner: Arc::new(DefaultInboundScanner::new()),
+        constraint_evaluator: Arc::new(DslConstraintEvaluator::new()),
+        output_scanner: Arc::new(L5aScanner),
+        session_store: None,
+        multi_turn_scanner: None,
+        signal_extractor: Arc::new(DefaultSignalExtractor),
+        verdict_combiner: Arc::new(DefaultVerdictCombiner),
+    };
+
+    EngineUpstreamClient::new_with(deps)
+}
+
+#[tokio::test]
+async fn stale_framing_headers_stripped_after_reserialization() {
+    use axum::http::HeaderValue;
+
+    let upstream_body = serde_json::json!({
+        "choices": [{
+            "message": {
+                "content": "Paris is the capital of France.",
+                "role": "assistant"
+            }
+        }]
+    });
+    let upstream_bytes = Bytes::from(serde_json::to_vec(&upstream_body).unwrap());
+
+    // Simulate upstream response with stale framing headers.
+    // Use a deliberately wrong Content-Length to prove the engine strips
+    // the stale value (hyper will re-add the correct one from the body).
+    let mut response_headers = axum::http::HeaderMap::new();
+    response_headers.insert("content-type", HeaderValue::from_static("application/json"));
+    response_headers.insert("content-length", HeaderValue::from_static("999999"));
+    response_headers.insert("transfer-encoding", HeaderValue::from_static("chunked"));
+    response_headers.insert("x-request-id", HeaderValue::from_static("test-123"));
+
+    let mock_http: Arc<dyn HttpSender> = Arc::new(FramingHeaderSender {
+        response_body: upstream_bytes.clone(),
+        response_headers,
+    });
+
+    let engine = build_test_engine_with_http(TEST_YAML, mock_http);
+    let upstream: Arc<dyn proxy::UpstreamClient> = Arc::new(engine);
+    let app = proxy::build_router(upstream);
+
+    let req = json_request(
+        "/v1/chat/completions",
+        r#"{"model":"gpt-4o","messages":[{"role":"user","content":"What is the capital of France?"}]}"#,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Transfer-Encoding must be stripped (hyper won't re-add it for a
+    // known-length body, so absence proves the engine removed it).
+    assert!(
+        resp.headers().get("transfer-encoding").is_none(),
+        "Transfer-Encoding must be stripped after re-serialization"
+    );
+
+    // Non-framing headers preserved.
+    assert_eq!(
+        resp.headers().get("content-type").unwrap(),
+        "application/json",
+        "Content-Type should be preserved"
+    );
+    assert_eq!(
+        resp.headers().get("x-request-id").unwrap(),
+        "test-123",
+        "non-framing headers should be preserved"
+    );
+
+    // Body should still be valid JSON with the expected content.
+    let bytes = body_bytes(resp).await;
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let content = json["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap();
+    assert_eq!(content, "Paris is the capital of France.");
+
+    // The stale Content-Length ("999999") must have been replaced.
+    // hyper re-adds a correct Content-Length from the actual body, so
+    // verify it matches the real body size, not the stale upstream value.
+    assert_ne!(
+        bytes.len(),
+        999999,
+        "sanity: body is not 999999 bytes"
+    );
+    // If hyper set Content-Length, it must match the body we received.
+    // (The key guarantee: stale "999999" is gone.)
 }

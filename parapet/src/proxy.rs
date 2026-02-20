@@ -120,7 +120,9 @@ pub trait UpstreamClient: Send + Sync {
 ///
 /// Returns `None` for paths that do not map to a known provider.
 pub fn detect_provider(path: &str) -> Option<Provider> {
-    if path.starts_with("/v1/chat/completions") {
+    if path.starts_with("/v1/chat/completions")
+        || path.starts_with("/openai/v1/chat/completions")
+    {
         Some(Provider::OpenAi)
     } else if path.starts_with("/v1/messages") {
         Some(Provider::Anthropic)
@@ -387,6 +389,14 @@ mod tests {
     fn detect_openai_provider() {
         assert_eq!(
             detect_provider("/v1/chat/completions"),
+            Some(Provider::OpenAi)
+        );
+    }
+
+    #[test]
+    fn detect_openai_provider_with_openai_prefix() {
+        assert_eq!(
+            detect_provider("/openai/v1/chat/completions"),
             Some(Provider::OpenAi)
         );
     }
