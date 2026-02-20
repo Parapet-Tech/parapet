@@ -744,6 +744,15 @@ impl UpstreamClient for EngineUpstreamClient {
 
         let processed = self.handle_non_streaming_response(provider, &body_bytes, &ctx);
 
+        // The body was re-serialized (JSON parse → process → to_vec), so
+        // the upstream framing headers are stale.  Strip them and let
+        // hyper set correct values from the actual body.
+        // Content-Encoding is NOT stripped here — maybe_decompress already
+        // handles it when decompression occurs, and removing it on
+        // passthrough (e.g. JSON parse failure) would be incorrect.
+        resp_headers.remove(reqwest::header::CONTENT_LENGTH);
+        resp_headers.remove(reqwest::header::TRANSFER_ENCODING);
+
         attach_evidence_headers(&mut resp_headers, evidence_count, &evidence_categories);
         Ok(ProxyResponse {
             status: processed.status_override.unwrap_or(upstream.status),

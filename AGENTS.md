@@ -92,6 +92,11 @@ cd parapet-ts
 npm install
 npm test
 npm run build
+
+# E2E tests (requires API key in .env + release engine binary)
+cd parapet && cargo build --release
+cd parapet-py && pytest tests/test_e2e.py -v
+cd parapet-ts && E2E=1 npm run test:e2e
 ```
 
 ## API Endpoints
@@ -99,6 +104,7 @@ npm run build
 | Endpoint | Description |
 |----------|-------------|
 | `POST /v1/chat/completions` | OpenAI-compatible proxy |
+| `POST /openai/v1/chat/completions` | OpenAI-compatible proxy (Groq path) |
 | `POST /v1/messages` | Anthropic-compatible proxy |
 | `GET /v1/heartbeat` | SDK heartbeat (sidecar watchdog) |
 
