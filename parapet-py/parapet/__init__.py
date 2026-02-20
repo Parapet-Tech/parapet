@@ -11,14 +11,13 @@ from __future__ import annotations
 
 import logging
 from contextlib import contextmanager
-from contextvars import ContextVar
 from pathlib import Path
 from typing import Generator
 
-from parapet.header import build_baggage_header
+from parapet.header import _active_baggage, build_baggage_header
 from parapet.sidecar import EngineState, start_engine
 from parapet.transport import patch_httpx
-from parapet.trust import _ensure_registry
+from parapet.trust import _ensure_registry, _restore_registry, _swap_registry
 from typing import Iterable
 
 __all__ = ["init", "session", "untrusted"]
@@ -29,11 +28,6 @@ _DEFAULT_PORT = 9800
 
 # Module-level engine state — single instance shared across init/session.
 _engine_state = EngineState()
-
-# Active baggage for the current context (set inside session(), cleared on exit).
-_active_baggage: ContextVar[str | None] = ContextVar(
-    "parapet_active_baggage", default=None
-)
 
 
 class SessionContext:
@@ -103,11 +97,13 @@ def session(
         )
 
     baggage = build_baggage_header(user_id=user_id, role=role)
-    token = _active_baggage.set(baggage)
+    baggage_token = _active_baggage.set(baggage)
+    trust_token = _swap_registry()
     try:
         yield SessionContext(baggage=baggage)
     finally:
-        _active_baggage.reset(token)
+        _restore_registry(trust_token)
+        _active_baggage.reset(baggage_token)
 
 
 def untrusted(content: str, source: str = "unknown") -> str:

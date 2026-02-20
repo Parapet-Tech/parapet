@@ -159,6 +159,54 @@ class TestContextVarIntegration:
         assert get_registry() is None
 
 
+class TestRegistrySwapRestore:
+    """Token-based swap/restore for session-scoped isolation."""
+
+    def test_swap_creates_fresh_registry(self):
+        from parapet.trust import _swap_registry, _restore_registry
+        _clear_registry()
+        _ensure_registry().register("before_swap")
+        token = _swap_registry()
+        try:
+            reg = get_registry()
+            assert reg is not None
+            assert reg.entry_count == 0  # fresh, no carryover
+        finally:
+            _restore_registry(token)
+
+    def test_restore_recovers_previous_registry(self):
+        from parapet.trust import _swap_registry, _restore_registry
+        _clear_registry()
+        outer = _ensure_registry()
+        outer.register("outer_entry")
+        token = _swap_registry()
+        try:
+            get_registry().register("inner_entry")
+        finally:
+            _restore_registry(token)
+        restored = get_registry()
+        assert restored is outer
+        assert restored.entry_count == 1  # only outer_entry
+
+    def test_nested_swaps_isolate_correctly(self):
+        from parapet.trust import _swap_registry, _restore_registry
+        _clear_registry()
+        _ensure_registry().register("level_0")
+        token_1 = _swap_registry()
+        try:
+            get_registry().register("level_1")
+            token_2 = _swap_registry()
+            try:
+                assert get_registry().entry_count == 0  # level_2: fresh
+                get_registry().register("level_2")
+            finally:
+                _restore_registry(token_2)
+            assert get_registry().entry_count == 1  # back to level_1
+        finally:
+            _restore_registry(token_1)
+        assert get_registry().entry_count == 1  # back to level_0
+
+
 class TestPublicApi:
     """Test the parapet.untrusted() public function."""
 

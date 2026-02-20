@@ -7,9 +7,10 @@ Monkey-patches ``httpx.Client`` and ``httpx.AsyncClient`` so that requests
 to known LLM API hosts are transparently routed through ``localhost:<port>``.
 
 Failopen behavior:
-    Connection refused -> fall back to original URL (engine down is not fatal).
+    Connection refused / connect timeout -> fall back to original URL
+    (engine down is not fatal).
 Failclosed behavior:
-    Timeout -> raise error (do not silently bypass).
+    Read timeout -> raise error (a slow engine is not silently bypassed).
 """
 from __future__ import annotations
 
@@ -18,7 +19,7 @@ from typing import Optional
 
 import httpx
 
-from parapet.header import build_trust_header
+from parapet.header import build_trust_header, get_active_baggage
 from parapet.trust import get_registry
 
 __all__ = [
@@ -102,10 +103,25 @@ class ParapetTransport(httpx.BaseTransport):
         headers = {k: v for k, v in request.headers.items() if k.lower() != "host"}
         headers["x-parapet-original-host"] = original_url.host
 
-        # Inject trust spans if registry has entries
+        # Inject session baggage if an active session exists.
+        # Merge with any existing caller-provided baggage rather than replacing it.
+        baggage = get_active_baggage()
+        if baggage:
+            existing = headers.get("baggage")
+            headers["baggage"] = f"{existing},{baggage}" if existing else baggage
+
+        # Inject trust spans if registry has entries.
+        # Guard against RequestNotRead for streaming request bodies —
+        # degrade gracefully (skip trust header) rather than crash.
+        body: bytes | None = None
+        try:
+            body = request.content
+        except httpx.RequestNotRead:
+            logger.debug("Request body is a stream; skipping trust span injection")
+
         registry = get_registry()
-        if registry is not None:
-            spans = registry.find_spans(request.content)
+        if registry is not None and body:
+            spans = registry.find_spans(body)
             trust_header = build_trust_header(spans)
             if trust_header is not None:
                 headers["x-guard-trust"] = trust_header
@@ -114,14 +130,16 @@ class ParapetTransport(httpx.BaseTransport):
             method=request.method,
             url=proxy_url,
             headers=headers,
-            content=request.content,
+            content=body if body is not None else request.stream,
             extensions=request.extensions,
         )
 
         try:
             return self._wrapped.handle_request(proxy_request)
-        except (ConnectionError, OSError) as exc:
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
             # Failopen: engine is unreachable, fall back to original URL.
+            # ConnectError = refused/DNS failure. ConnectTimeout = engine not responding.
+            # ReadTimeout is NOT caught — a slow engine is failclosed.
             logger.warning(
                 "Engine unreachable (%s), failing open to %s",
                 exc,
@@ -131,7 +149,7 @@ class ParapetTransport(httpx.BaseTransport):
                 method=request.method,
                 url=original_url,
                 headers=request.headers,
-                content=request.content,
+                content=body if body is not None else request.stream,
                 extensions=request.extensions,
             )
             return self._wrapped.handle_request(fallback_request)
@@ -170,10 +188,24 @@ class AsyncParapetTransport(httpx.AsyncBaseTransport):
         headers = {k: v for k, v in request.headers.items() if k.lower() != "host"}
         headers["x-parapet-original-host"] = original_url.host
 
-        # Inject trust spans if registry has entries
+        # Inject session baggage if an active session exists.
+        # Merge with any existing caller-provided baggage rather than replacing it.
+        baggage = get_active_baggage()
+        if baggage:
+            existing = headers.get("baggage")
+            headers["baggage"] = f"{existing},{baggage}" if existing else baggage
+
+        # Inject trust spans if registry has entries.
+        # Guard against RequestNotRead for streaming request bodies.
+        body: bytes | None = None
+        try:
+            body = request.content
+        except httpx.RequestNotRead:
+            logger.debug("Request body is a stream; skipping trust span injection")
+
         registry = get_registry()
-        if registry is not None:
-            spans = registry.find_spans(request.content)
+        if registry is not None and body:
+            spans = registry.find_spans(body)
             trust_header = build_trust_header(spans)
             if trust_header is not None:
                 headers["x-guard-trust"] = trust_header
@@ -182,13 +214,14 @@ class AsyncParapetTransport(httpx.AsyncBaseTransport):
             method=request.method,
             url=proxy_url,
             headers=headers,
-            content=request.content,
+            content=body if body is not None else request.stream,
             extensions=request.extensions,
         )
 
         try:
             return await self._wrapped.handle_async_request(proxy_request)
-        except (ConnectionError, OSError) as exc:
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            # Failopen: engine is unreachable, fall back to original URL.
             logger.warning(
                 "Engine unreachable (%s), failing open to %s",
                 exc,
@@ -198,7 +231,7 @@ class AsyncParapetTransport(httpx.AsyncBaseTransport):
                 method=request.method,
                 url=original_url,
                 headers=request.headers,
-                content=request.content,
+                content=body if body is not None else request.stream,
                 extensions=request.extensions,
             )
             return await self._wrapped.handle_async_request(fallback_request)

@@ -13,7 +13,7 @@ byte ranges as ``X-Guard-Trust`` header spans.
 from __future__ import annotations
 
 import json
-from contextvars import ContextVar
+from contextvars import ContextVar, Token
 from dataclasses import dataclass
 
 __all__ = ["TrustRegistry", "TrustSpan", "get_registry"]
@@ -155,3 +155,23 @@ def _clear_registry() -> None:
     if reg is not None:
         reg.clear()
     _registry.set(None)
+
+
+def _swap_registry(new: TrustRegistry | None = None) -> Token:
+    """Replace the current registry and return a token to restore it later.
+
+    Used by ``session()`` to give each session a fresh, isolated registry.
+    If *new* is None, a fresh ``TrustRegistry`` is created automatically.
+    """
+    if new is None:
+        new = TrustRegistry()
+    return _registry.set(new)
+
+
+def _restore_registry(token: Token) -> None:
+    """Restore the trust registry to its previous value using *token*.
+
+    Handles nested sessions correctly — each level gets its own registry
+    and the outer one is restored on exit.
+    """
+    _registry.reset(token)
