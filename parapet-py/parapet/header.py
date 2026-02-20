@@ -6,6 +6,7 @@
 Includes:
 - W3C Baggage header (``baggage: key1=value1,key2=value2``)
 - X-Guard-Trust header (``inline:<base64-encoded JSON>``)
+- Active baggage ContextVar for session-scoped propagation
 
 Values are percent-encoded to handle special characters safely.
 """
@@ -14,9 +15,20 @@ from __future__ import annotations
 import base64
 import json
 import logging
+from contextvars import ContextVar
 from urllib.parse import quote
 
-__all__ = ["build_baggage_header", "build_trust_header"]
+__all__ = ["build_baggage_header", "build_trust_header", "get_active_baggage"]
+
+# Active baggage for the current session scope (set by session(), read by transport).
+_active_baggage: ContextVar[str | None] = ContextVar(
+    "parapet_active_baggage", default=None
+)
+
+
+def get_active_baggage() -> str | None:
+    """Return the active baggage string for the current context, or None."""
+    return _active_baggage.get()
 
 MAX_TRUST_HEADER_BYTES = 4096  # 4KB inline limit
 

@@ -87,3 +87,55 @@ class TestSessionContextManager:
         """session() with only role sets partial baggage."""
         with parapet.session(role="viewer") as ctx:
             assert ctx.baggage == "role=viewer"
+
+
+class TestSessionTrustIsolation:
+    """Trust registry entries from one session must not leak into another."""
+
+    def setup_method(self):
+        _engine_state.initialized = True
+        _engine_state.process = MagicMock()
+        _engine_state.port = 9800
+
+    def teardown_method(self):
+        _engine_state.initialized = False
+        _engine_state.process = None
+        _engine_state.port = None
+
+    def test_entries_do_not_leak_across_sessions(self):
+        """Untrusted strings from session A are invisible in session B."""
+        from parapet.trust import get_registry
+
+        with parapet.session(user_id="u_A"):
+            parapet.untrusted("secret_A", source="rag")
+            assert get_registry().entry_count == 1
+
+        with parapet.session(user_id="u_B"):
+            assert get_registry().entry_count == 0  # clean slate
+
+    def test_nested_sessions_get_independent_registries(self):
+        """Inner session has its own registry; outer is restored on exit."""
+        from parapet.trust import get_registry
+
+        with parapet.session(user_id="outer"):
+            parapet.untrusted("outer_data")
+            assert get_registry().entry_count == 1
+            with parapet.session(user_id="inner"):
+                assert get_registry().entry_count == 0
+                parapet.untrusted("inner_data")
+                assert get_registry().entry_count == 1
+            # Back to outer — inner_data gone, outer_data restored.
+            assert get_registry().entry_count == 1
+
+    def test_session_clears_registry_on_exception(self):
+        """Trust registry is cleaned up even if the session body raises."""
+        from parapet.trust import get_registry
+
+        with pytest.raises(ValueError):
+            with parapet.session(user_id="u_err"):
+                parapet.untrusted("leaked?")
+                raise ValueError("boom")
+
+        # After the failed session, registry should be restored (not leaked).
+        with parapet.session(user_id="u_next"):
+            assert get_registry().entry_count == 0
