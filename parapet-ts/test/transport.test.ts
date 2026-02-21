@@ -241,6 +241,32 @@ describe("header injection", () => {
     expect(capturedHeaders?.get("baggage")).toBe("user_id=u_1,role=admin");
   });
 
+  it("merges session baggage with caller-provided baggage", async () => {
+    let capturedHeaders: Headers | undefined;
+    const baseFetch = vi.fn(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        capturedHeaders = extractHeaders(input, init);
+        return mockResponse();
+      },
+    );
+
+    const pfetch = createParapetFetch(baseFetch as typeof fetch, opts());
+    await runWithContext(
+      { userId: "u_1", role: "admin", trustRegistry: new TrustRegistry() },
+      () =>
+        pfetch("https://api.openai.com/v1/chat/completions", {
+          headers: { baggage: "app_version=2.0" },
+        }),
+    );
+
+    const baggage = capturedHeaders?.get("baggage");
+    expect(baggage).toContain("app_version=2.0");
+    expect(baggage).toContain("user_id=u_1");
+    expect(baggage).toContain("role=admin");
+    // Caller baggage comes first, session baggage is appended.
+    expect(baggage).toBe("app_version=2.0,user_id=u_1,role=admin");
+  });
+
   it("omits baggage header when no session context", async () => {
     let capturedHeaders: Headers | undefined;
     const baseFetch = vi.fn(

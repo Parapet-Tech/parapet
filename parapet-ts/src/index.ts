@@ -7,6 +7,7 @@ import { getContext, runWithContext } from "./context.js";
 import { TrustRegistry } from "./trust.js";
 import { createParapetFetch, DEFAULT_INTERCEPTED_HOSTS } from "./transport.js";
 import { EngineManager } from "./sidecar.js";
+import { existsSync } from "node:fs";
 
 export { createParapetFetch, ParapetTimeoutError, DEFAULT_INTERCEPTED_HOSTS } from "./transport.js";
 export { buildBaggageHeader, buildTrustHeader } from "./header.js";
@@ -45,6 +46,12 @@ export function session<T>(
   opts: SessionOptions,
   fn: () => T,
 ): T {
+  if (!parapetFetch) {
+    throw new Error(
+      "parapet.session() called before init(). " +
+        "Call parapet.init() first.",
+    );
+  }
   const ctx: ParapetContext = {
     userId: opts.userId,
     role: opts.role,
@@ -69,7 +76,7 @@ export function untrusted(content: string, source: string): string {
   if (!ctx) {
     throw new Error(
       "parapet.untrusted() called outside a session. " +
-        "Wrap your code in parapet.session() first.",
+        "Call parapet.init() and wrap your code in parapet.session() first.",
     );
   }
   return ctx.trustRegistry.register(content, source);
@@ -90,6 +97,13 @@ const DEFAULT_PORT = 9800;
 export async function init(config: ParapetConfig): Promise<void> {
   const port = config.port ?? DEFAULT_PORT;
   const autoStart = config.autoStart ?? true;
+
+  if (autoStart) {
+    const exists = _testDeps ? _testDeps.exists(config.configPath) : existsSync(config.configPath);
+    if (!exists) {
+      throw new Error(`Config file not found: ${config.configPath}`);
+    }
+  }
 
   if (autoStart) {
     // Reuse the existing manager if port AND canonical config path

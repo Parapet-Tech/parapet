@@ -1,5 +1,5 @@
-import { describe, it, expect } from "vitest";
-import { session, untrusted } from "../src/index.js";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { init, session, untrusted, shutdown, _resetForTesting } from "../src/index.js";
 import { getContext, runWithContext } from "../src/context.js";
 import { TrustRegistry } from "../src/trust.js";
 
@@ -8,6 +8,16 @@ import { TrustRegistry } from "../src/trust.js";
 // ---------------------------------------------------------------------------
 
 describe("session context propagation", () => {
+  beforeEach(async () => {
+    _resetForTesting();
+    await init({ configPath: "unused", autoStart: false });
+  });
+
+  afterEach(async () => {
+    await shutdown();
+    _resetForTesting();
+  });
+
   it("provides context inside the callback", async () => {
     let captured: ReturnType<typeof getContext>;
     await session({ userId: "u_1", role: "admin" }, async () => {
@@ -95,6 +105,16 @@ describe("session context propagation", () => {
 // ---------------------------------------------------------------------------
 
 describe("nested sessions", () => {
+  beforeEach(async () => {
+    _resetForTesting();
+    await init({ configPath: "unused", autoStart: false });
+  });
+
+  afterEach(async () => {
+    await shutdown();
+    _resetForTesting();
+  });
+
   it("inner session overrides outer context", async () => {
     await session({ userId: "outer", role: "admin" }, async () => {
       expect(getContext()!.userId).toBe("outer");
@@ -143,6 +163,16 @@ describe("nested sessions", () => {
 // ---------------------------------------------------------------------------
 
 describe("untrusted()", () => {
+  beforeEach(async () => {
+    _resetForTesting();
+    await init({ configPath: "unused", autoStart: false });
+  });
+
+  afterEach(async () => {
+    await shutdown();
+    _resetForTesting();
+  });
+
   it("registers content in session's trust registry", async () => {
     await session({}, async () => {
       untrusted("some data", "rag");

@@ -4,6 +4,7 @@ import type { ChildProcess } from "node:child_process";
 import type { SidecarDeps } from "../src/sidecar.js";
 import {
   init,
+  session,
   getParapetFetch,
   shutdown,
   _resetForTesting,
@@ -84,6 +85,10 @@ describe("module lifecycle: init / getParapetFetch / shutdown", () => {
     expect(() => getParapetFetch()).toThrow(/before init/);
   });
 
+  it("session() throws before init()", () => {
+    expect(() => session({ userId: "u_1" }, () => {})).toThrow(/before init/);
+  });
+
   it("getParapetFetch() returns a function after init()", async () => {
     await init({ configPath: CONFIG_PATH, port: 9800, autoStart: false });
 
@@ -146,6 +151,12 @@ describe("init() idempotency with autoStart: true", () => {
     _resetForTesting();
   });
 
+  it("throws on missing config file when autoStart is true", async () => {
+    await expect(
+      init({ configPath: "/nonexistent/parapet.yaml", port: 9800 }),
+    ).rejects.toThrow(/Config file not found/);
+  });
+
   it("same config twice → single spawn, no restart", async () => {
     await init({ configPath: CONFIG_PATH, port: 9800 });
     expect(mock.spawnCount()).toBe(1);
@@ -181,6 +192,9 @@ describe("init() idempotency with autoStart: true", () => {
   });
 
   it("symlink then real path → same canonical identity, no respawn", async () => {
+    // Register the symlink path in mock FS so the existence check passes.
+    mock.deps.writeFile("./symlink.yaml", CONFIG_CONTENT);
+
     // Override realpath to simulate symlink resolution.
     const origRealpath = mock.deps.realpath;
     mock.deps.realpath = (p: string) => {

@@ -107,7 +107,8 @@ export function createParapetFetch(
         role: ctx.role,
       });
       if (baggage) {
-        headers.set("baggage", baggage);
+        const existing = headers.get("baggage");
+        headers.set("baggage", existing ? `${existing},${baggage}` : baggage);
       }
 
       // Trust spans: only when registry has entries AND body is JSON.
