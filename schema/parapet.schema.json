@@ -80,7 +80,7 @@
       "additionalProperties": false,
       "properties": {
         "on_failure": {
-          "description": "Behavior when the engine cannot be reached. \"open\" bypasses and logs (connection refused). \"closed\" returns an error.",
+          "description": "Behavior when any guardrail layer hits a runtime error. \"open\" (default) logs the error, skips the failing layer, and continues. \"closed\" blocks the request (503) on any layer runtime error, even if other layers passed.",
           "type": "string",
           "enum": ["open", "closed"]
         },
