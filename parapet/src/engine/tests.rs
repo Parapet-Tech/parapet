@@ -510,6 +510,49 @@ fn default_is_allowed_host_rejects_unknown() {
 }
 
 // -------------------------------------------------------------------
+// Streaming detection/header rewrite tests
+// -------------------------------------------------------------------
+
+#[test]
+fn is_streaming_request_true_when_body_stream_flag_set() {
+    let headers = HeaderMap::new();
+    let body = Bytes::from_static(br#"{"stream":true}"#);
+    assert!(is_streaming_request(&headers, &body));
+}
+
+#[test]
+fn is_streaming_request_true_when_accepts_event_stream() {
+    let mut headers = HeaderMap::new();
+    headers.insert(reqwest::header::ACCEPT, "text/event-stream".parse().unwrap());
+    let body = Bytes::from_static(br#"{"stream":false}"#);
+    assert!(is_streaming_request(&headers, &body));
+}
+
+#[test]
+fn is_streaming_request_accept_header_overrides_stream_false() {
+    let mut headers = HeaderMap::new();
+    headers.insert(reqwest::header::ACCEPT, "text/event-stream".parse().unwrap());
+    let body = Bytes::from_static(br#"{"stream":false}"#);
+    assert!(
+        is_streaming_request(&headers, &body),
+        "Accept: text/event-stream should take precedence over stream=false"
+    );
+}
+
+#[test]
+fn force_identity_encoding_for_streaming_overrides_existing_value() {
+    let mut headers = HeaderMap::new();
+    headers.insert(reqwest::header::ACCEPT_ENCODING, "gzip".parse().unwrap());
+    force_identity_encoding_for_streaming(&mut headers);
+    assert_eq!(
+        headers
+            .get(reqwest::header::ACCEPT_ENCODING)
+            .and_then(|v| v.to_str().ok()),
+        Some("identity")
+    );
+}
+
+// -------------------------------------------------------------------
 // Decompression tests
 // -------------------------------------------------------------------
 
@@ -621,6 +664,483 @@ fn non_streaming_gzip_response_still_scannable() {
     let output = String::from_utf8_lossy(&processed.body);
     assert!(!output.contains("123-45-6789"));
     assert!(output.contains("[REDACTED]"));
+}
+
+// -------------------------------------------------------------------
+// Streaming compression spike harness (V4-11)
+// -------------------------------------------------------------------
+
+struct RecordingHttpSender {
+    captured: std::sync::Mutex<Vec<HttpRequest>>,
+    status: StatusCode,
+    headers: HeaderMap,
+    response_full: Option<Bytes>,
+    response_chunks: Option<Vec<Bytes>>,
+}
+
+impl RecordingHttpSender {
+    fn with_stream_response(headers: HeaderMap, chunks: Vec<Bytes>) -> Self {
+        Self {
+            captured: std::sync::Mutex::new(Vec::new()),
+            status: StatusCode::OK,
+            headers,
+            response_full: None,
+            response_chunks: Some(chunks),
+        }
+    }
+
+    fn with_full_response(headers: HeaderMap, body: Bytes) -> Self {
+        Self {
+            captured: std::sync::Mutex::new(Vec::new()),
+            status: StatusCode::OK,
+            headers,
+            response_full: Some(body),
+            response_chunks: None,
+        }
+    }
+
+    fn captured_request(&self) -> HttpRequest {
+        self.captured
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("expected captured request")
+    }
+}
+
+#[async_trait]
+impl HttpSender for RecordingHttpSender {
+    async fn send(&self, request: HttpRequest) -> Result<HttpResponse, HttpError> {
+        self.captured.lock().unwrap().push(request);
+
+        let body = if let Some(full) = &self.response_full {
+            HttpBody::Full(full.clone())
+        } else {
+            let chunks = self
+                .response_chunks
+                .clone()
+                .unwrap_or_default();
+            let stream = futures_util::stream::iter(chunks.into_iter().map(Ok::<Bytes, HttpError>));
+            HttpBody::Stream(Box::pin(stream))
+        };
+
+        Ok(HttpResponse {
+            status: self.status,
+            headers: self.headers.clone(),
+            body,
+        })
+    }
+}
+
+fn engine_with_http_sender(config: Config, http: Arc<dyn HttpSender>) -> EngineUpstreamClient {
+    let deps = EngineDeps {
+        config: Arc::new(config),
+        http,
+        resolver: Arc::new(NoopResolver),
+        registry: Arc::new(DefaultRegistry),
+        normalizer: Arc::new(NoopNormalizer),
+        trust_assigner: Arc::new(NoopTrustAssigner),
+        l1_scanner: None,
+        l2a_scanner: None,
+        l2a_semaphore: None,
+        inbound_scanner: Arc::new(NoopInboundScanner),
+        constraint_evaluator: Arc::new(DslConstraintEvaluator::new()),
+        output_scanner: Arc::new(L5aScanner),
+        session_store: None,
+        multi_turn_scanner: None,
+        signal_extractor: Arc::new(DefaultSignalExtractor::new()),
+        verdict_combiner: Arc::new(DefaultVerdictCombiner::new()),
+    };
+    EngineUpstreamClient::new_with(deps)
+}
+
+fn streaming_l5a_config(canary: &str) -> Config {
+    let mut config = base_config_with_canary(canary);
+    config.policy.layers.l5a = Some(LayerConfig {
+        mode: "redact".to_string(),
+        block_action: None,
+        window_chars: Some(64),
+    });
+    config
+}
+
+fn openai_request_with_stream(stream: bool, headers: HeaderMap) -> ProxyRequest {
+    let body = serde_json::json!({
+        "model": "gpt-4o",
+        "stream": stream,
+        "messages": [{"role": "user", "content": "hello"}]
+    });
+
+    ProxyRequest {
+        method: Method::POST,
+        uri: Uri::from_static("/v1/chat/completions"),
+        headers,
+        body: Bytes::from(serde_json::to_vec(&body).unwrap()),
+    }
+}
+
+fn anthropic_request_with_stream(stream: bool, headers: HeaderMap) -> ProxyRequest {
+    let body = serde_json::json!({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 64,
+        "stream": stream,
+        "messages": [{"role": "user", "content": "hello"}]
+    });
+
+    ProxyRequest {
+        method: Method::POST,
+        uri: Uri::from_static("/v1/messages"),
+        headers,
+        body: Bytes::from(serde_json::to_vec(&body).unwrap()),
+    }
+}
+
+fn openai_sse_payload_with_secret() -> String {
+    [
+        r#"data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"content":"prefix TOPSECRET suffix"},"finish_reason":null}]}"#,
+        "",
+        "data: [DONE]",
+        "",
+    ]
+    .join("\n")
+}
+
+fn anthropic_sse_payload_with_secret() -> String {
+    [
+        "event: message_start",
+        r#"data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude-3-5-sonnet-20241022"}}"#,
+        "",
+        "event: content_block_start",
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+        "",
+        "event: content_block_delta",
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"prefix TOPSECRET suffix"}}"#,
+        "",
+        "event: content_block_stop",
+        r#"data: {"type":"content_block_stop","index":0}"#,
+        "",
+        "event: message_stop",
+        r#"data: {"type":"message_stop"}"#,
+        "",
+    ]
+    .join("\n")
+}
+
+async fn collect_proxy_body(response: ProxyResponse) -> Bytes {
+    axum::body::to_bytes(response.body, 10 * 1024 * 1024)
+        .await
+        .expect("body should be readable")
+}
+
+#[tokio::test]
+async fn streaming_request_forces_accept_encoding_identity() {
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert("content-type", "text/event-stream".parse().unwrap());
+    let sender = Arc::new(RecordingHttpSender::with_stream_response(
+        response_headers,
+        vec![Bytes::from("data: [DONE]\n\n")],
+    ));
+
+    let engine = engine_with_http_sender(
+        streaming_l5a_config("TOPSECRET"),
+        sender.clone(),
+    );
+
+    let mut request_headers = HeaderMap::new();
+    request_headers.insert(reqwest::header::ACCEPT_ENCODING, "gzip".parse().unwrap());
+    let request = openai_request_with_stream(true, request_headers);
+
+    let _ = engine.forward(Provider::OpenAi, request).await.unwrap();
+    let captured = sender.captured_request();
+
+    assert_eq!(captured.stream, true);
+    assert_eq!(
+        captured
+            .headers
+            .get(reqwest::header::ACCEPT_ENCODING)
+            .and_then(|v| v.to_str().ok()),
+        Some("identity")
+    );
+}
+
+#[tokio::test]
+async fn non_streaming_request_preserves_accept_encoding_header() {
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert("content-type", "application/json".parse().unwrap());
+    let sender = Arc::new(RecordingHttpSender::with_full_response(
+        response_headers,
+        Bytes::from_static(br#"{"choices":[{"message":{"content":"ok"}}]}"#),
+    ));
+
+    let engine = engine_with_http_sender(
+        streaming_l5a_config("TOPSECRET"),
+        sender.clone(),
+    );
+
+    let mut request_headers = HeaderMap::new();
+    request_headers.insert(reqwest::header::ACCEPT_ENCODING, "gzip".parse().unwrap());
+    let request = openai_request_with_stream(false, request_headers);
+
+    let _ = engine.forward(Provider::OpenAi, request).await.unwrap();
+    let captured = sender.captured_request();
+
+    assert_eq!(captured.stream, false);
+    assert_eq!(
+        captured
+            .headers
+            .get(reqwest::header::ACCEPT_ENCODING)
+            .and_then(|v| v.to_str().ok()),
+        Some("gzip")
+    );
+}
+
+#[tokio::test]
+async fn streaming_spike_harness_uncompressed_sse_redacts_split_secret() {
+    let sse = openai_sse_payload_with_secret();
+    let split_at = sse.find("TOPSECRET").expect("secret marker should exist") + 3;
+    let chunks = vec![
+        Bytes::from(sse[..split_at].to_string()),
+        Bytes::from(sse[split_at..].to_string()),
+    ];
+
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert("content-type", "text/event-stream".parse().unwrap());
+    let sender = Arc::new(RecordingHttpSender::with_stream_response(
+        response_headers,
+        chunks,
+    ));
+
+    let engine = engine_with_http_sender(
+        streaming_l5a_config("TOPSECRET"),
+        sender,
+    );
+
+    let response = engine
+        .forward(Provider::OpenAi, openai_request_with_stream(true, HeaderMap::new()))
+        .await
+        .unwrap();
+
+    let body = collect_proxy_body(response).await;
+    let body_str = String::from_utf8_lossy(&body);
+
+    assert!(body_str.contains("[REDACTED]"));
+    assert!(!body_str.contains("TOPSECRET"));
+}
+
+#[tokio::test]
+async fn streaming_spike_harness_gzip_sse_passes_through_with_gap() {
+    let sse = openai_sse_payload_with_secret();
+    let gzip = gzip_compress(sse.as_bytes());
+
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert("content-type", "text/event-stream".parse().unwrap());
+    response_headers.insert(reqwest::header::CONTENT_ENCODING, "gzip".parse().unwrap());
+    let sender = Arc::new(RecordingHttpSender::with_stream_response(
+        response_headers,
+        vec![Bytes::from(gzip)],
+    ));
+
+    let engine = engine_with_http_sender(
+        streaming_l5a_config("TOPSECRET"),
+        sender,
+    );
+
+    let response = engine
+        .forward(Provider::OpenAi, openai_request_with_stream(true, HeaderMap::new()))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response
+            .headers
+            .get(reqwest::header::CONTENT_ENCODING)
+            .and_then(|v| v.to_str().ok()),
+        Some("gzip")
+    );
+
+    let body = collect_proxy_body(response).await;
+    let decompressed = decompress_gzip(&body).expect("gzip stream should remain valid");
+    let decompressed_str = String::from_utf8_lossy(&decompressed);
+
+    assert!(decompressed_str.contains("TOPSECRET"));
+    assert!(!decompressed_str.contains("[REDACTED]"));
+}
+
+#[tokio::test]
+async fn streaming_spike_harness_gzip_sse_multichunk_passes_through_with_gap() {
+    let sse = openai_sse_payload_with_secret();
+    let gzip = gzip_compress(sse.as_bytes());
+    let split = gzip.len() / 2;
+    let chunks = vec![
+        Bytes::copy_from_slice(&gzip[..split]),
+        Bytes::copy_from_slice(&gzip[split..]),
+    ];
+
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert("content-type", "text/event-stream".parse().unwrap());
+    response_headers.insert(reqwest::header::CONTENT_ENCODING, "gzip".parse().unwrap());
+    let sender = Arc::new(RecordingHttpSender::with_stream_response(
+        response_headers,
+        chunks,
+    ));
+
+    let engine = engine_with_http_sender(streaming_l5a_config("TOPSECRET"), sender);
+
+    let response = engine
+        .forward(
+            Provider::OpenAi,
+            openai_request_with_stream(true, HeaderMap::new()),
+        )
+        .await
+        .unwrap();
+
+    let body = collect_proxy_body(response).await;
+    let decompressed = decompress_gzip(&body).expect("gzip stream should remain valid");
+    let decompressed_str = String::from_utf8_lossy(&decompressed);
+
+    assert!(decompressed_str.contains("TOPSECRET"));
+    assert!(!decompressed_str.contains("[REDACTED]"));
+}
+
+#[tokio::test]
+async fn streaming_spike_harness_deflate_sse_passes_through_with_gap() {
+    let sse = openai_sse_payload_with_secret();
+    let deflate = deflate_compress(sse.as_bytes());
+
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert("content-type", "text/event-stream".parse().unwrap());
+    response_headers.insert(reqwest::header::CONTENT_ENCODING, "deflate".parse().unwrap());
+    let sender = Arc::new(RecordingHttpSender::with_stream_response(
+        response_headers,
+        vec![Bytes::from(deflate)],
+    ));
+
+    let engine = engine_with_http_sender(
+        streaming_l5a_config("TOPSECRET"),
+        sender,
+    );
+
+    let response = engine
+        .forward(Provider::OpenAi, openai_request_with_stream(true, HeaderMap::new()))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response
+            .headers
+            .get(reqwest::header::CONTENT_ENCODING)
+            .and_then(|v| v.to_str().ok()),
+        Some("deflate")
+    );
+
+    let body = collect_proxy_body(response).await;
+    let decompressed = decompress_deflate(&body).expect("deflate stream should remain valid");
+    let decompressed_str = String::from_utf8_lossy(&decompressed);
+
+    assert!(decompressed_str.contains("TOPSECRET"));
+    assert!(!decompressed_str.contains("[REDACTED]"));
+}
+
+#[tokio::test]
+async fn streaming_spike_harness_deflate_sse_multichunk_passes_through_with_gap() {
+    let sse = openai_sse_payload_with_secret();
+    let deflate = deflate_compress(sse.as_bytes());
+    let split = deflate.len() / 2;
+    let chunks = vec![
+        Bytes::copy_from_slice(&deflate[..split]),
+        Bytes::copy_from_slice(&deflate[split..]),
+    ];
+
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert("content-type", "text/event-stream".parse().unwrap());
+    response_headers.insert(reqwest::header::CONTENT_ENCODING, "deflate".parse().unwrap());
+    let sender = Arc::new(RecordingHttpSender::with_stream_response(
+        response_headers,
+        chunks,
+    ));
+
+    let engine = engine_with_http_sender(streaming_l5a_config("TOPSECRET"), sender);
+
+    let response = engine
+        .forward(
+            Provider::OpenAi,
+            openai_request_with_stream(true, HeaderMap::new()),
+        )
+        .await
+        .unwrap();
+
+    let body = collect_proxy_body(response).await;
+    let decompressed = decompress_deflate(&body).expect("deflate stream should remain valid");
+    let decompressed_str = String::from_utf8_lossy(&decompressed);
+
+    assert!(decompressed_str.contains("TOPSECRET"));
+    assert!(!decompressed_str.contains("[REDACTED]"));
+}
+
+#[tokio::test]
+async fn streaming_spike_harness_anthropic_uncompressed_sse_redacts_secret() {
+    let sse = anthropic_sse_payload_with_secret();
+    let split_at = sse.find("TOPSECRET").expect("secret marker should exist") + 3;
+    let chunks = vec![
+        Bytes::from(sse[..split_at].to_string()),
+        Bytes::from(sse[split_at..].to_string()),
+    ];
+
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert("content-type", "text/event-stream".parse().unwrap());
+    let sender = Arc::new(RecordingHttpSender::with_stream_response(
+        response_headers,
+        chunks,
+    ));
+
+    let engine = engine_with_http_sender(streaming_l5a_config("TOPSECRET"), sender);
+
+    let response = engine
+        .forward(
+            Provider::Anthropic,
+            anthropic_request_with_stream(true, HeaderMap::new()),
+        )
+        .await
+        .unwrap();
+
+    let body = collect_proxy_body(response).await;
+    let body_str = String::from_utf8_lossy(&body);
+
+    assert!(body_str.contains("[REDACTED]"));
+    assert!(!body_str.contains("TOPSECRET"));
+}
+
+#[tokio::test]
+async fn compressed_stream_skip_increments_telemetry_counter() {
+    let before = streaming_compressed_sse_skip_count();
+
+    let sse = openai_sse_payload_with_secret();
+    let gzip = gzip_compress(sse.as_bytes());
+
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert("content-type", "text/event-stream".parse().unwrap());
+    response_headers.insert(reqwest::header::CONTENT_ENCODING, "gzip".parse().unwrap());
+    let sender = Arc::new(RecordingHttpSender::with_stream_response(
+        response_headers,
+        vec![Bytes::from(gzip)],
+    ));
+
+    let engine = engine_with_http_sender(streaming_l5a_config("TOPSECRET"), sender);
+
+    let _ = engine
+        .forward(
+            Provider::OpenAi,
+            openai_request_with_stream(true, HeaderMap::new()),
+        )
+        .await
+        .unwrap();
+
+    let after = streaming_compressed_sse_skip_count();
+    assert!(
+        after > before,
+        "compressed SSE skip counter should increase"
+    );
 }
 
 // -------------------------------------------------------------------

@@ -42,13 +42,14 @@ use crate::trust::{RoleTrustAssigner, TrustAssigner};
 use async_trait::async_trait;
 use axum::body::Body;
 use bytes::Bytes;
-use axum::http::{HeaderMap, Method, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 #[cfg(test)]
 use axum::http::Uri;
 use futures_util::stream::{Stream, StreamExt};
 use futures_util::TryStreamExt;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -674,7 +675,7 @@ impl UpstreamClient for EngineUpstreamClient {
         }
 
         // 6) Forward to upstream
-        let stream = is_streaming_request(&request.body);
+        let stream = is_streaming_request(&request.headers, &request.body);
         let url = build_upstream_url(self.deps.resolver.as_ref(), provider, &request);
 
         // Reverse proxy header hygiene:
@@ -685,6 +686,9 @@ impl UpstreamClient for EngineUpstreamClient {
         let mut fwd_headers = request.headers.clone();
         fwd_headers.remove("x-parapet-original-host");
         fwd_headers.remove(reqwest::header::HOST);
+        if stream {
+            force_identity_encoding_for_streaming(&mut fwd_headers);
+        }
 
         let http_req = HttpRequest {
             method: request.method.clone(),
@@ -706,14 +710,6 @@ impl UpstreamClient for EngineUpstreamClient {
             })?;
 
         if stream {
-            // Content-Encoding on SSE is rare (providers send chunked transfer,
-            // not gzip'd SSE). Log a warning if we see it, but pass through.
-            if is_gzip(&upstream.headers) || is_deflate(&upstream.headers) {
-                tracing::warn!(
-                    request_id = %ctx.request_id,
-                    "streaming response has Content-Encoding; passing through without decompression"
-                );
-            }
             let mut resp = self.handle_streaming_response(provider, upstream, &ctx);
             attach_evidence_headers(&mut resp.headers, evidence_count, &evidence_categories);
             return Ok(resp);
@@ -764,6 +760,26 @@ impl UpstreamClient for EngineUpstreamClient {
 
 impl EngineUpstreamClient {
     fn handle_streaming_response(&self, provider: Provider, upstream: HttpResponse, ctx: &RequestContext) -> ProxyResponse {
+        let compressed_stream = is_gzip(&upstream.headers) || is_deflate(&upstream.headers);
+        let content_encoding = upstream
+            .headers
+            .get(reqwest::header::CONTENT_ENCODING)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+
+        if compressed_stream {
+            let compressed_sse_skip_count = increment_streaming_compressed_sse_skip_count();
+            tracing::warn!(
+                request_id = %ctx.request_id,
+                contract_hash = %ctx.contract_hash,
+                provider = ctx.provider_str,
+                model = %ctx.model,
+                content_encoding = content_encoding.as_deref().unwrap_or("unknown"),
+                compressed_sse_skip_count,
+                "upstream returned compressed SSE despite identity request; streaming redaction will be skipped"
+            );
+        }
+
         let (validator, block_mode) = if let Some(layer) = &self.deps.config.policy.layers.l3_outbound {
             if layer.mode == "block" {
                 let mode = match layer.block_action.as_deref() {
@@ -805,7 +821,7 @@ impl EngineUpstreamClient {
         let processed_stream = processor.process(stream);
 
         let redacted_stream = if let Some(layer) = &self.deps.config.policy.layers.l5a {
-            if layer.mode == "redact" {
+            if layer.mode == "redact" && !compressed_stream {
                 tracing::info!(
                     request_id = %ctx.request_id,
                     contract_hash = %ctx.contract_hash,
@@ -1451,13 +1467,56 @@ fn extract_model(body: &Bytes) -> String {
         .unwrap_or_default()
 }
 
-fn is_streaming_request(body: &Bytes) -> bool {
+/// Telemetry counter for streaming responses where upstream still returned
+/// compressed SSE and L5a streaming redaction was skipped.
+static COMPRESSED_SSE_REDACTION_SKIP_COUNT: AtomicU64 = AtomicU64::new(0);
+
+fn increment_streaming_compressed_sse_skip_count() -> u64 {
+    COMPRESSED_SSE_REDACTION_SKIP_COUNT.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+#[cfg(test)]
+fn streaming_compressed_sse_skip_count() -> u64 {
+    COMPRESSED_SSE_REDACTION_SKIP_COUNT.load(Ordering::Relaxed)
+}
+
+fn is_streaming_request(headers: &HeaderMap, body: &Bytes) -> bool {
+    // Precedence decision: if caller advertises SSE in `Accept`, treat as
+    // streaming even when JSON body has `"stream": false`.
+    // This keeps behavior compatible with SSE clients that rely on headers.
+    if accepts_event_stream(headers) {
+        return true;
+    }
+
     let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) else {
         return false;
     };
     json.get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
+}
+
+fn accepts_event_stream(headers: &HeaderMap) -> bool {
+    headers
+        .get(reqwest::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            v.split(',').any(|part| {
+                let token = part.trim();
+                token.eq_ignore_ascii_case("text/event-stream")
+                    || token
+                        .to_ascii_lowercase()
+                        .starts_with("text/event-stream;")
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn force_identity_encoding_for_streaming(headers: &mut HeaderMap) {
+    headers.insert(
+        reqwest::header::ACCEPT_ENCODING,
+        HeaderValue::from_static("identity"),
+    );
 }
 
 /// Extract session ID from W3C Baggage header.
