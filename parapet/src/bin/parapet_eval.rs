@@ -15,6 +15,7 @@ use std::sync::Arc;
 use clap::Parser;
 use parapet::config::{self, FileSource};
 use parapet::eval;
+use std::io::Write;
 
 #[derive(Parser)]
 #[command(name = "parapet-eval", about = "Parapet eval harness")]
@@ -47,6 +48,10 @@ struct Cli {
     /// Max failures to print (default: 50)
     #[arg(long, default_value_t = 50)]
     max_failures: usize,
+
+    /// Write JSON output to file instead of stdout
+    #[arg(long)]
+    output: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -105,7 +110,17 @@ async fn main() {
 
     if cli.json {
         report.results = results;
-        println!("{}", serde_json::to_string_pretty(&report).unwrap());
+        let json = serde_json::to_string_pretty(&report).unwrap();
+        if let Some(ref path) = cli.output {
+            let mut f = std::fs::File::create(path).unwrap_or_else(|e| {
+                eprintln!("failed to create {}: {e}", path.display());
+                std::process::exit(1);
+            });
+            f.write_all(json.as_bytes()).unwrap();
+            eprintln!("wrote {} bytes to {}", json.len(), path.display());
+        } else {
+            println!("{}", json);
+        }
     } else {
         // Human-readable output
         println!();

@@ -38,14 +38,19 @@ from sklearn.model_selection import cross_val_score, train_test_split
 
 
 
-# ProtectAI recipe: 12 datasets used for prompt injection detection training.
+# ProtectAI recipe: 11 datasets + supplemental jailbreak attacks.
 # https://huggingface.co/protectai/deberta-v3-base-prompt-injection-v2
 PROTECTAI_FILES = [
-    # attack
+    # attack — ProtectAI recipe
     "opensource_gandalf_attacks.yaml",            # Lakera/gandalf_ignore_instructions
     "opensource_chatgpt_jailbreak_attacks.yaml",   # rubend18/ChatGPT-Jailbreak-Prompts
     "opensource_imoxto_attacks.yaml",              # imoxto/prompt_injection_cleaned_dataset-v2
     "opensource_hackaprompt_attacks.yaml",          # hackaprompt/hackaprompt-dataset
+    # attack — supplemental jailbreak
+    "opensource_jailbreak_cls_attacks.yaml",       # jackhhao/jailbreak-classification
+    # benign — hard negatives
+    "opensource_notinject_benign.yaml",            # leolee99/NotInject (trigger-word FP reduction)
+    "opensource_wildguardmix_benign.yaml",         # allenai/wildguardmix (safety-adjacent benign)
     # benign
     "opensource_awesome_chatgpt_benign.yaml",      # fka/awesome-chatgpt-prompts
     "opensource_teven_benign.yaml",                # teven/prompted_examples
@@ -69,7 +74,16 @@ def load_data(data_dir, max_per_file=0, seed=42):
 
     Returns (entries, file_stats) where entries have id, content, label, source.
     """
-    files = [str(Path(data_dir) / f) for f in PROTECTAI_FILES]
+    # Look in data_dir and data_dir/staging for each file
+    files = []
+    for f in PROTECTAI_FILES:
+        p = Path(data_dir) / f
+        if p.exists():
+            files.append(str(p))
+        elif (Path(data_dir) / "staging" / f).exists():
+            files.append(str(Path(data_dir) / "staging" / f))
+        else:
+            files.append(str(p))  # will be caught by missing check
     missing = [f for f in files if not Path(f).exists()]
     if missing:
         print(f"ERROR: Missing dataset files:", file=sys.stderr)
@@ -381,7 +395,7 @@ def main():
     parser = argparse.ArgumentParser(description="Train L1 classifier and codegen Rust weights")
     parser.add_argument("--data-dir", type=str, default="schema/eval",
                         help="Directory containing opensource_*.yaml datasets (default: schema/eval)")
-    parser.add_argument("--max-per-file", type=int, default=1000,
+    parser.add_argument("--max-per-file", type=int, default=0,
                         help="Max samples per dataset file to prevent dominance (default: 1000, 0=unlimited)")
     parser.add_argument("--holdout-pct", type=float, default=0.2,
                         help="Fraction of data to hold out for eval (default: 0.2)")
