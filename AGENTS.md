@@ -36,6 +36,7 @@ parapet/
     parapet.schema.json
     examples/
     eval/
+      staging/              # Datasets not yet in eval baseline (used for training only)
 ```
 
 ## Key Files
@@ -61,7 +62,9 @@ parapet/
 | `parapet-py/parapet/header.py` | W3C Baggage serialization |
 | `parapet-ts/src/transport.ts` | TypeScript fetch wrapper for OpenAI/fetch clients |
 | `strategy/layers.md` | Canonical layer pipeline guide + links to per-layer docs |
-| `scripts/train_l1.py` | Retrains L1 classifier and regenerates `l1_weights.rs` |
+| `parapet/src/layers/l1_weights.rs` | Auto-generated L1 classifier weights (phf_map, 2,217 features) |
+| `schema/eval/l1_holdout.yaml` | Auto-generated L1 holdout eval set |
+| `scripts/train_l1.py` | Retrains L1 classifier and regenerates `l1_weights.rs` + `l1_holdout.yaml` |
 | `scripts/fetch_*.py` | Pulls open-source eval/training datasets |
 | `schema/eval/eval_config.yaml` | Default eval harness config |
 | `schema/parapet.schema.json` | JSON Schema for config validation |
@@ -80,7 +83,12 @@ cd parapet && cargo build --features l2a --release
 cd parapet && cargo run --features eval --bin parapet-eval -- \
   --config ../schema/eval/eval_config.yaml \
   --dataset ../schema/eval/ \
-  --json
+  --json \
+  --output ../schema/eval/results/output.json
+
+# L1 retrain (regenerates l1_weights.rs + l1_holdout.yaml)
+python scripts/train_l1.py --data-dir schema/eval
+cd parapet && cargo build && cargo test -- l1
 
 # Python SDK
 cd parapet-py
