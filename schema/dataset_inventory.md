@@ -17,6 +17,7 @@ Versioned alongside eval configs and YAML files in `schema/eval/`.
 | jailbreak-cls | [rubend18/ChatGPT-Jailbreak-Prompts](https://huggingface.co/datasets/rubend18/ChatGPT-Jailbreak-Prompts) | — | varies | train | attack+benign | `text` | `label` 0/1 | `fetch_jailbreak_cls.py` | `opensource_jailbreak_cls_{attacks,benign}.yaml` |
 | hackaprompt | [hackaprompt/hackaprompt-dataset](https://huggingface.co/datasets/Hackaprompt/hackaprompt-dataset) | — | varies | — | attack-only | `user_input` | all attack | `fetch_hackaprompt.py` | `opensource_hackaprompt_attacks.yaml` |
 | chatgpt-jailbreak | [rubend18/ChatGPT-Jailbreak-Prompts](https://huggingface.co/datasets/rubend18/ChatGPT-Jailbreak-Prompts) | — | varies | — | attack-only | `Prompt` | all attack | `fetch_chatgpt_jailbreak.py` | `opensource_chatgpt_jailbreak_attacks.yaml` |
+| imoxto | [imoxto/prompt_injection_cleaned_dataset-v2](https://huggingface.co/datasets/imoxto/prompt_injection_cleaned_dataset-v2) | Not specified | 535K | 1,000a (label=1 only) | train | attack-only | `text` | `label` 0/1 | `fetch_imoxto.py` | `opensource_imoxto_attacks.yaml` |
 
 ### Benign-only datasets (fetched and wired)
 
@@ -45,11 +46,19 @@ Versioned alongside eval configs and YAML files in `schema/eval/`.
 | geekyrakshit | [geekyrakshit/prompt-injection-dataset](https://huggingface.co/datasets/geekyrakshit/prompt-injection-dataset) | Not declared | 534,434 | 500 (mixed) | test | attack+benign | `prompt` | `label` 0/1 | `fetch_geekyrakshit.py` | `opensource_geekyrakshit_{attacks,benign}.yaml` |
 | safeguard | [xTRam1/safe-guard-prompt-injection](https://huggingface.co/datasets/xTRam1/safe-guard-prompt-injection) | Not declared | 10,296 | 2,060 (full test) | test | attack+benign | `text` | `label` 0/1 | `fetch_safeguard.py` | `opensource_safeguard_{attacks,benign}.yaml` |
 
+### V4-10B new datasets (staging/)
+
+Datasets fetched for L1 training but kept in `schema/eval/staging/` to avoid changing the eval baseline.
+
+| ID | Source | License | Rows | Type | Script | Output (staging/) |
+|----|--------|---------|------|------|--------|-------------------|
+| notinject | [leolee99/NotInject](https://huggingface.co/datasets/leolee99/NotInject) | MIT | 339b | benign-only (hard negatives with trigger words) | `fetch_notinject.py` | `opensource_notinject_benign.yaml` |
+| wildguardmix | [allenai/wildguardmix](https://huggingface.co/datasets/allenai/wildguardmix) | Apache-2.0 (gated) | 2,000a + 2,000b | attack+benign | `fetch_wildguardmix.py` | `opensource_wildguardmix_{attacks,benign}.yaml` |
+| protectai-val | [protectai/prompt-injection-validation](https://huggingface.co/datasets/protectai/prompt-injection-validation) | Apache-2.0 | 1,365a + 1,762b | attack+benign (7 splits) | `fetch_protectai_validation.py` | `opensource_protectai_val_{attacks,benign}.yaml` |
+
 ### Removed
 
-| ID | Source | Reason | Tracked In |
-|----|--------|--------|------------|
-| imoxto | [imoxto/prompt_injection_cleaned_dataset-v2](https://huggingface.co/datasets/imoxto/prompt_injection_cleaned_dataset-v2) | Corrupted HackAPrompt duplicate — 535K rows of full prompt templates with unreliable labels. Duplicates `hackaprompt`. Was in L1 training recipe; cleanup tracked as V4-10B. | V4-10B |
+(none currently)
 
 ### Not available
 
@@ -65,7 +74,7 @@ Versioned alongside eval configs and YAML files in `schema/eval/`.
 - **jbb-paraphrase** is derived from **jbb** (JailbreakBench). Paraphrased variants of the same behaviors — complementary, not duplicative.
 - **jailbreakv** includes multimodal jailbreaks (text + image). The fetch script extracts text-only `jailbreak_query` field; image-based attacks are not captured.
 - **llmail** is all-attack with no benign counterpart. Pair with benign email/instruction datasets for balanced eval.
-- **imoxto** was 100% HackAPrompt data — fully duplicated by **hackaprompt**. Removed.
+- **imoxto** overlaps with **hackaprompt** (same competition data in full prompt templates). Restored in V4-10B — despite overlap, the full prompt templates improve L1 recall on realistic injection patterns. Filtered to label=1 (attack) only, capped at 1,000.
 
 ## Benchmark Suites (V4-10 workstream 3)
 
@@ -89,6 +98,10 @@ python scripts/fetch_llmail.py
 python scripts/fetch_promptshield.py
 python scripts/fetch_geekyrakshit.py
 python scripts/fetch_safeguard.py
+python scripts/fetch_imoxto.py
+python scripts/fetch_notinject.py
+python scripts/fetch_wildguardmix.py        # requires HF_TOKEN (gated dataset)
+python scripts/fetch_protectai_validation.py
 ```
 
 After fetching, verify with the eval harness:
