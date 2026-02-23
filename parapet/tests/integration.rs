@@ -16,8 +16,10 @@ use parapet::engine::{
     EngineDeps, EngineUpstreamClient, HttpBody, HttpError, HttpRequest, HttpResponse, HttpSender,
     ReqwestHttpSender, UpstreamResolver,
 };
-use parapet::layers::l3_inbound::DefaultInboundScanner;
+use parapet::config::Config;
+use parapet::layers::l3_inbound::{DefaultInboundScanner, InboundResult, InboundScanner};
 use parapet::layers::l5a::L5aScanner;
+use parapet::message::Message;
 use parapet::normalize::L0Normalizer;
 use parapet::proxy::{self, Provider};
 use parapet::signal::combiner::DefaultVerdictCombiner;
@@ -759,4 +761,85 @@ async fn stale_framing_headers_stripped_after_reserialization() {
     );
     // If hyper set Content-Length, it must match the body we received.
     // (The key guarantee: stale "999999" is gone.)
+}
+
+// ---------------------------------------------------------------------------
+// Test: on_failure: closed + panicking L3-inbound scanner → 503
+// ---------------------------------------------------------------------------
+
+struct PanickingInboundScanner;
+
+impl InboundScanner for PanickingInboundScanner {
+    fn scan(&self, _messages: &[Message], _config: &Config) -> InboundResult {
+        panic!("intentional scanner panic for integration test");
+    }
+}
+
+fn build_test_engine_with_panicking_inbound(yaml: &str, mock_url: &str) -> EngineUpstreamClient {
+    let source = StringSource {
+        content: yaml.to_string(),
+    };
+    let config = Arc::new(config::load_config(&source).expect("test config should parse"));
+
+    let deps = EngineDeps {
+        config,
+        http: Arc::new(ReqwestHttpSender::new(reqwest::Client::new())),
+        resolver: Arc::new(WiremockResolver {
+            url: mock_url.to_string(),
+        }),
+        registry: Arc::new(parapet::engine::DefaultProviderRegistry),
+        normalizer: Arc::new(L0Normalizer::new()),
+        trust_assigner: Arc::new(RoleTrustAssigner),
+        l1_scanner: None,
+        l2a_scanner: None,
+        l2a_semaphore: None,
+        inbound_scanner: Arc::new(PanickingInboundScanner),
+        constraint_evaluator: Arc::new(DslConstraintEvaluator::new()),
+        output_scanner: Arc::new(L5aScanner),
+        session_store: None,
+        multi_turn_scanner: None,
+        signal_extractor: Arc::new(DefaultSignalExtractor),
+        verdict_combiner: Arc::new(DefaultVerdictCombiner),
+    };
+
+    EngineUpstreamClient::new_with(deps)
+}
+
+#[tokio::test]
+async fn on_failure_closed_panicking_scanner_returns_503() {
+    let mock_server = MockServer::start().await;
+
+    // Upstream doesn't matter — scanner panics before forwarding.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {"content": "ok"}}]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let engine = build_test_engine_with_panicking_inbound(TEST_YAML, &mock_server.uri());
+    let upstream: Arc<dyn proxy::UpstreamClient> = Arc::new(engine);
+    let app = proxy::build_router(upstream);
+
+    let req = json_request(
+        "/v1/chat/completions",
+        r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hello"}]}"#,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+
+    // on_failure: closed in TEST_YAML → 503 on scanner panic.
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        resp.headers().get("x-parapet-action").unwrap(),
+        "error"
+    );
+    assert_eq!(
+        resp.headers().get("x-parapet-layer").unwrap(),
+        "L3-inbound"
+    );
+    assert_eq!(
+        resp.headers().get("x-parapet-error").unwrap(),
+        "scanner_panic"
+    );
 }
