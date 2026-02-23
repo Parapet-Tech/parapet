@@ -19,7 +19,7 @@ use base64::Engine as _;
 use flate2::read::{DeflateDecoder, GzDecoder};
 use std::io::Read as _;
 
-use crate::config::{Config, L2aMode, PatternAction};
+use crate::config::{Config, FailureMode, L2aMode, PatternAction};
 use crate::constraint::{ConstraintEvaluator, DslConstraintEvaluator, ToolCallVerdict};
 use crate::layers::l1::{DefaultL1Scanner, L1Scanner, L1Verdict};
 use crate::layers::l2a::L2aScanner;
@@ -291,61 +291,77 @@ impl UpstreamClient for EngineUpstreamClient {
         let mut inbound_result_opt: Option<crate::layers::l3_inbound::InboundResult> = None;
         let mut l4_result_opt: Option<crate::layers::l4::L4Result> = None;
 
+        let on_failure = &self.deps.config.runtime.engine.on_failure;
+
         // 3.5) L1 lightweight classifier (if enabled)
         if let (Some(scanner), Some(l1_config)) = (&self.deps.l1_scanner, &self.deps.config.policy.layers.l1) {
             let l1_start = Instant::now();
-            let l1_result = scanner.scan(&messages, l1_config);
+            let l1_scan = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                scanner.scan(&messages, l1_config)
+            }));
             let l1_ms = l1_start.elapsed().as_secs_f64() * 1000.0;
-            l1_result_opt = Some(l1_result);
-            let l1_result = l1_result_opt.as_ref().unwrap();
 
-            match &l1_result.verdict {
-                L1Verdict::Block(block) if l1_config.mode == crate::config::L1Mode::Block => {
-                    tracing::info!(
-                        request_id = %ctx.request_id,
-                        contract_hash = %ctx.contract_hash,
-                        provider = ctx.provider_str,
-                        model = %ctx.model,
-                        layer = "L1",
-                        verdict = "block",
-                        role = ?block.role,
-                        message_index = block.message_index,
-                        score = block.score,
-                        reason = %block.reason,
-                        latency_ms = l1_ms,
-                        "L1 classifier blocked"
-                    );
-                    let body = adapter.serialize_error("request blocked by content policy", 403);
-                    pending_block = Some(ProxyResponse::blocked(body, "L1"));
+            match l1_scan {
+                Ok(l1_result) => {
+                    l1_result_opt = Some(l1_result);
                 }
-                L1Verdict::Block(block) => {
-                    // Shadow mode: log but don't block
-                    tracing::info!(
-                        request_id = %ctx.request_id,
-                        contract_hash = %ctx.contract_hash,
-                        provider = ctx.provider_str,
-                        model = %ctx.model,
-                        layer = "L1",
-                        verdict = "shadow_block",
-                        role = ?block.role,
-                        message_index = block.message_index,
-                        score = block.score,
-                        reason = %block.reason,
-                        latency_ms = l1_ms,
-                        "L1 classifier detected (shadow)"
-                    );
+                Err(_) => {
+                    if let Some(resp) = handle_layer_error(on_failure, adapter.as_ref(), "L1", "scanner_panic", "scanner panicked", &ctx.request_id) {
+                        return Ok(resp);
+                    }
+                    // on_failure: open — skip L1, continue pipeline
                 }
-                L1Verdict::Allow => {
-                    tracing::debug!(
-                        request_id = %ctx.request_id,
-                        contract_hash = %ctx.contract_hash,
-                        provider = ctx.provider_str,
-                        model = %ctx.model,
-                        layer = "L1",
-                        verdict = "allow",
-                        latency_ms = l1_ms,
-                        "L1 classifier passed"
-                    );
+            }
+
+            if let Some(ref l1_result) = l1_result_opt {
+                match &l1_result.verdict {
+                    L1Verdict::Block(block) if l1_config.mode == crate::config::L1Mode::Block => {
+                        tracing::info!(
+                            request_id = %ctx.request_id,
+                            contract_hash = %ctx.contract_hash,
+                            provider = ctx.provider_str,
+                            model = %ctx.model,
+                            layer = "L1",
+                            verdict = "block",
+                            role = ?block.role,
+                            message_index = block.message_index,
+                            score = block.score,
+                            reason = %block.reason,
+                            latency_ms = l1_ms,
+                            "L1 classifier blocked"
+                        );
+                        let body = adapter.serialize_error("request blocked by content policy", 403);
+                        pending_block = Some(ProxyResponse::blocked(body, "L1"));
+                    }
+                    L1Verdict::Block(block) => {
+                        // Shadow mode: log but don't block
+                        tracing::info!(
+                            request_id = %ctx.request_id,
+                            contract_hash = %ctx.contract_hash,
+                            provider = ctx.provider_str,
+                            model = %ctx.model,
+                            layer = "L1",
+                            verdict = "shadow_block",
+                            role = ?block.role,
+                            message_index = block.message_index,
+                            score = block.score,
+                            reason = %block.reason,
+                            latency_ms = l1_ms,
+                            "L1 classifier detected (shadow)"
+                        );
+                    }
+                    L1Verdict::Allow => {
+                        tracing::debug!(
+                            request_id = %ctx.request_id,
+                            contract_hash = %ctx.contract_hash,
+                            provider = ctx.provider_str,
+                            model = %ctx.model,
+                            layer = "L1",
+                            verdict = "allow",
+                            latency_ms = l1_ms,
+                            "L1 classifier passed"
+                        );
+                    }
                 }
             }
         }
@@ -354,7 +370,7 @@ impl UpstreamClient for EngineUpstreamClient {
         //
         // Runs PG2 + heuristic fusion on untrusted data segments.
         // Timeout and concurrency are engine-level concerns; the scanner is synchronous.
-        // Failure behavior depends on mode: Shadow=fail-open, Block=fail-closed.
+        // Runtime errors respect engine.on_failure (open=skip, closed=503).
         let mut l2a_signals: Vec<Signal> = Vec::new();
         if let (Some(scanner), Some(l2a_config), Some(semaphore)) = (
             &self.deps.l2a_scanner,
@@ -433,61 +449,27 @@ impl UpstreamClient for EngineUpstreamClient {
                     }
                     Ok(Ok(Err(scan_err))) => {
                         // Scanner returned an error (classify failure or cardinality mismatch).
-                        let l2a_ms = l2a_start.elapsed().as_secs_f64() * 1000.0;
-                        tracing::error!(
-                            request_id = %ctx.request_id,
-                            layer = "L2a",
-                            error = %scan_err,
-                            latency_ms = l2a_ms,
-                            "L2a scan error"
-                        );
-                        if l2a_config.mode == L2aMode::Block {
-                            l2a_fail_closed_block(
-                                &mut pending_block, adapter.as_ref(), "scan error"
-                            );
+                        if let Some(resp) = handle_layer_error(on_failure, adapter.as_ref(), "L2a", "scan_error", &format!("scan error: {scan_err}"), &ctx.request_id) {
+                            return Ok(resp);
                         }
                     }
                     Ok(Err(join_err)) => {
                         // Scan task panicked.
-                        tracing::error!(
-                            request_id = %ctx.request_id,
-                            layer = "L2a",
-                            error = %join_err,
-                            "L2a scan task panicked"
-                        );
-                        if l2a_config.mode == L2aMode::Block {
-                            l2a_fail_closed_block(
-                                &mut pending_block, adapter.as_ref(), "scan panicked"
-                            );
+                        if let Some(resp) = handle_layer_error(on_failure, adapter.as_ref(), "L2a", "scanner_panic", &format!("scan panicked: {join_err}"), &ctx.request_id) {
+                            return Ok(resp);
                         }
                     }
                     Err(_) => {
                         // Timeout.
-                        tracing::warn!(
-                            request_id = %ctx.request_id,
-                            layer = "L2a",
-                            timeout_ms = l2a_config.timeout_ms,
-                            "L2a scan timed out"
-                        );
-                        if l2a_config.mode == L2aMode::Block {
-                            l2a_fail_closed_block(
-                                &mut pending_block, adapter.as_ref(), "scan timed out"
-                            );
+                        if let Some(resp) = handle_layer_error(on_failure, adapter.as_ref(), "L2a", "scan_timeout", &format!("scan timed out ({}ms)", l2a_config.timeout_ms), &ctx.request_id) {
+                            return Ok(resp);
                         }
                     }
                 }
             } else {
                 // Concurrency limit reached.
-                tracing::warn!(
-                    request_id = %ctx.request_id,
-                    layer = "L2a",
-                    max_concurrent = l2a_config.max_concurrent_scans,
-                    "L2a concurrency limit reached"
-                );
-                if l2a_config.mode == L2aMode::Block {
-                    l2a_fail_closed_block(
-                        &mut pending_block, adapter.as_ref(), "concurrency limit"
-                    );
+                if let Some(resp) = handle_layer_error(on_failure, adapter.as_ref(), "L2a", "concurrency_limit", "concurrency limit reached", &ctx.request_id) {
+                    return Ok(resp);
                 }
             }
         }
@@ -504,11 +486,23 @@ impl UpstreamClient for EngineUpstreamClient {
 
         if let Some(layer) = &self.deps.config.policy.layers.l3_inbound {
             let l3i_start = Instant::now();
-            let inbound_result = self.deps.inbound_scanner.scan(&messages, &self.deps.config);
+            let scanner_ref = &self.deps.inbound_scanner;
+            let config_ref = &self.deps.config;
+            let l3i_scan = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                scanner_ref.scan(&messages, config_ref)
+            }));
             let l3i_ms = l3i_start.elapsed().as_secs_f64() * 1000.0;
-            inbound_result_opt = Some(inbound_result);
-            let inbound_result = inbound_result_opt.as_ref().unwrap();
 
+            match l3i_scan {
+                Ok(result) => { inbound_result_opt = Some(result); }
+                Err(_) => {
+                    if let Some(resp) = handle_layer_error(on_failure, adapter.as_ref(), "L3-inbound", "scanner_panic", "scanner panicked", &ctx.request_id) {
+                        return Ok(resp);
+                    }
+                }
+            }
+
+            if let Some(ref inbound_result) = inbound_result_opt {
             // Collect evidence signal summary from all matched patterns.
             let mut cats = std::collections::BTreeSet::new();
             for m in &inbound_result.matched_patterns {
@@ -578,15 +572,27 @@ impl UpstreamClient for EngineUpstreamClient {
                     );
                 }
             }
+            } // if let Some(ref inbound_result)
         }
 
         // 5) L4 multi-turn scanning (if enabled)
         if let (Some(scanner), Some(l4_config)) = (&self.deps.multi_turn_scanner, &self.deps.config.policy.layers.l4) {
             let l4_start = Instant::now();
-            let l4_result = scanner.scan(&messages, l4_config);
+            let l4_scan = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                scanner.scan(&messages, l4_config)
+            }));
             let l4_ms = l4_start.elapsed().as_secs_f64() * 1000.0;
-            l4_result_opt = Some(l4_result);
-            let l4_result = l4_result_opt.as_ref().unwrap();
+
+            match l4_scan {
+                Ok(result) => { l4_result_opt = Some(result); }
+                Err(_) => {
+                    if let Some(resp) = handle_layer_error(on_failure, adapter.as_ref(), "L4", "scanner_panic", "scanner panicked", &ctx.request_id) {
+                        return Ok(resp);
+                    }
+                }
+            }
+
+            if let Some(ref l4_result) = l4_result_opt {
             let categories: Vec<&str> = l4_result.matched_categories.iter()
                 .map(|c| c.category.as_str()).collect();
 
@@ -639,6 +645,7 @@ impl UpstreamClient for EngineUpstreamClient {
                     );
                 }
             }
+            } // if let Some(ref l4_result)
         }
 
         // 5.5) Verdict processor (shadow — log only, no behavioral change).
@@ -750,6 +757,11 @@ impl UpstreamClient for EngineUpstreamClient {
         resp_headers.remove(reqwest::header::TRANSFER_ENCODING);
 
         attach_evidence_headers(&mut resp_headers, evidence_count, &evidence_categories);
+        if let Some(extra) = processed.extra_headers {
+            for (key, value) in extra.iter() {
+                resp_headers.insert(key, value.clone());
+            }
+        }
         Ok(ProxyResponse {
             status: processed.status_override.unwrap_or(upstream.status),
             headers: resp_headers,
@@ -866,6 +878,7 @@ impl EngineUpstreamClient {
                 return ProcessedResponse {
                     status_override: None,
                     body: body.clone(),
+                    extra_headers: None,
                 }
             }
         };
@@ -909,6 +922,7 @@ impl EngineUpstreamClient {
                         return ProcessedResponse {
                             status_override: Some(StatusCode::FORBIDDEN),
                             body: Bytes::from(body),
+                            extra_headers: None,
                         };
                     }
                     Ok(()) if !blocked_tools.is_empty() => {
@@ -948,62 +962,108 @@ impl EngineUpstreamClient {
                 return ProcessedResponse {
                     status_override: None,
                     body: body.clone(),
+                    extra_headers: None,
                 }
             }
         };
 
-        let redacted = if let Some(layer) = &self.deps.config.policy.layers.l5a {
-            if layer.mode == "redact" {
-                let l5a_start = Instant::now();
-                let result = self.deps
-                    .output_scanner
-                    .scan_and_redact(&String::from_utf8_lossy(&serialized), &self.deps.config);
-                let l5a_ms = l5a_start.elapsed().as_secs_f64() * 1000.0;
+        // L5a output redaction — wrapped with catch_unwind for on_failure handling.
+        let on_failure = &self.deps.config.runtime.engine.on_failure;
 
-                if result.redactions.is_empty() {
-                    tracing::info!(
-                        request_id = %ctx.request_id,
-                        contract_hash = %ctx.contract_hash,
-                        provider = ctx.provider_str,
-                        model = %ctx.model,
-                        layer = "L5a",
-                        verdict = "clean",
-                        latency_ms = l5a_ms,
-                        "no redactions needed"
-                    );
-                } else {
-                    for r in &result.redactions {
+        let l5a_layer = match &self.deps.config.policy.layers.l5a {
+            Some(layer) if layer.mode == "redact" => Some(layer),
+            _ => None,
+        };
+
+        if let Some(_layer) = l5a_layer {
+            let scanner = &self.deps.output_scanner;
+            let config = &self.deps.config;
+            let text = String::from_utf8_lossy(&serialized);
+
+            let l5a_start = Instant::now();
+            let l5a_scan = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                scanner.scan_and_redact(&text, config)
+            }));
+            let l5a_ms = l5a_start.elapsed().as_secs_f64() * 1000.0;
+
+            match l5a_scan {
+                Ok(result) => {
+                    if result.redactions.is_empty() {
                         tracing::info!(
                             request_id = %ctx.request_id,
                             contract_hash = %ctx.contract_hash,
                             provider = ctx.provider_str,
                             model = %ctx.model,
                             layer = "L5a",
-                            verdict = "redact",
-                            pattern = %r.pattern,
-                            position = r.position,
+                            verdict = "clean",
                             latency_ms = l5a_ms,
-                            "L5a redacted sensitive content"
+                            "no redactions needed"
                         );
+                    } else {
+                        for r in &result.redactions {
+                            tracing::info!(
+                                request_id = %ctx.request_id,
+                                contract_hash = %ctx.contract_hash,
+                                provider = ctx.provider_str,
+                                model = %ctx.model,
+                                layer = "L5a",
+                                verdict = "redact",
+                                pattern = %r.pattern,
+                                position = r.position,
+                                latency_ms = l5a_ms,
+                                "L5a redacted sensitive content"
+                            );
+                        }
+                    }
+                    return ProcessedResponse {
+                        status_override: None,
+                        body: Bytes::from(result.content),
+                        extra_headers: None,
+                    };
+                }
+                Err(_) => {
+                    // L5a panicked — check on_failure.
+                    match on_failure {
+                        FailureMode::Closed => {
+                            tracing::error!(
+                                request_id = %ctx.request_id,
+                                layer = "L5a",
+                                failure_mode = "closed",
+                                error_type = "scanner_panic",
+                                "layer runtime error — blocking request (on_failure: closed)"
+                            );
+                            let err_body = adapter.serialize_error(
+                                "service unavailable (guardrail layer error)", 503
+                            );
+                            let mut hdrs = HeaderMap::new();
+                            if let Ok(v) = "error".parse() { hdrs.insert("x-parapet-action", v); }
+                            if let Ok(v) = "L5a".parse() { hdrs.insert("x-parapet-layer", v); }
+                            if let Ok(v) = "scanner_panic".parse() { hdrs.insert("x-parapet-error", v); }
+                            return ProcessedResponse {
+                                status_override: Some(StatusCode::SERVICE_UNAVAILABLE),
+                                body: Bytes::from(err_body),
+                                extra_headers: Some(hdrs),
+                            };
+                        }
+                        FailureMode::Open => {
+                            tracing::warn!(
+                                request_id = %ctx.request_id,
+                                layer = "L5a",
+                                failure_mode = "open",
+                                error_type = "scanner_panic",
+                                "layer runtime error — skipping L5a (on_failure: open)"
+                            );
+                            // Skip redaction, return original serialized body.
+                        }
                     }
                 }
-                result
-            } else {
-                return ProcessedResponse {
-                    status_override: None,
-                    body: Bytes::from(serialized),
-                };
             }
-        } else {
-            return ProcessedResponse {
-                status_override: None,
-                body: Bytes::from(serialized),
-            };
-        };
+        }
 
         ProcessedResponse {
             status_override: None,
-            body: Bytes::from(redacted.content),
+            body: Bytes::from(serialized),
+            extra_headers: None,
         }
     }
 }
@@ -1011,6 +1071,8 @@ impl EngineUpstreamClient {
 struct ProcessedResponse {
     status_override: Option<StatusCode>,
     body: Bytes,
+    /// Extra headers to merge into the final response (e.g. error metadata from on_failure).
+    extra_headers: Option<HeaderMap>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1321,18 +1383,57 @@ pub fn build_engine_client(config: Arc<Config>) -> Result<EngineUpstreamClient, 
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Block the request when L2a enforcement cannot run.
-/// Only called in Block mode on scan failure (timeout/concurrency/panic/error).
-fn l2a_fail_closed_block(
-    pending_block: &mut Option<ProxyResponse>,
+/// Build a 503 error response for a layer runtime failure (`on_failure: closed`).
+///
+/// Headers: `X-Parapet-Action: error`, `X-Parapet-Layer: <layer>`, `X-Parapet-Error: <error_type>`.
+fn layer_error_503(adapter: &dyn ProviderAdapter, layer: &str, error_type: &str) -> ProxyResponse {
+    let body = adapter.serialize_error("service unavailable (guardrail layer error)", 503);
+    let mut headers = HeaderMap::new();
+    if let Ok(v) = "error".parse() { headers.insert("x-parapet-action", v); }
+    if let Ok(v) = layer.parse() { headers.insert("x-parapet-layer", v); }
+    if let Ok(v) = error_type.parse() { headers.insert("x-parapet-error", v); }
+    ProxyResponse {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        headers,
+        body: Body::from(body),
+    }
+}
+
+/// Handle a layer runtime error according to `on_failure` config.
+///
+/// Returns `Some(503 response)` in Closed mode (caller should return early).
+/// Returns `None` in Open mode (caller should skip the layer and continue).
+fn handle_layer_error(
+    on_failure: &FailureMode,
     adapter: &dyn ProviderAdapter,
-    _reason: &str,
-) {
-    if pending_block.is_none() {
-        let body = adapter.serialize_error(
-            "request blocked by content policy (L2a unavailable)", 403
-        );
-        *pending_block = Some(ProxyResponse::blocked(body, "L2a"));
+    layer: &str,
+    error_type: &str,
+    error: &str,
+    request_id: &str,
+) -> Option<ProxyResponse> {
+    match on_failure {
+        FailureMode::Closed => {
+            tracing::error!(
+                request_id = %request_id,
+                layer = layer,
+                failure_mode = "closed",
+                error_type = error_type,
+                error = error,
+                "layer runtime error — blocking request (on_failure: closed)"
+            );
+            Some(layer_error_503(adapter, layer, error_type))
+        }
+        FailureMode::Open => {
+            tracing::warn!(
+                request_id = %request_id,
+                layer = layer,
+                failure_mode = "open",
+                error_type = error_type,
+                error = error,
+                "layer runtime error — skipping layer (on_failure: open)"
+            );
+            None
+        }
     }
 }
 

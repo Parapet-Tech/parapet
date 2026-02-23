@@ -2144,32 +2144,28 @@ fn blocked_by(resp: &ProxyResponse) -> Option<String> {
 }
 
 #[test]
-fn l2a_fail_closed_block_sets_pending() {
+fn handle_layer_error_closed_returns_503() {
     use crate::provider::adapter_for;
+    use crate::config::FailureMode;
 
     let adapter = adapter_for(ProviderType::OpenAi);
-    let mut pending: Option<ProxyResponse> = None;
-    l2a_fail_closed_block(&mut pending, adapter.as_ref(), "test");
-    assert!(pending.is_some());
-    let resp = pending.unwrap();
-    assert_eq!(resp.status, StatusCode::FORBIDDEN);
+    let resp = handle_layer_error(&FailureMode::Closed, adapter.as_ref(), "L2a", "scan_error", "test error", "req-1");
+    assert!(resp.is_some());
+    let resp = resp.unwrap();
+    assert_eq!(resp.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(resp.headers.get("x-parapet-action").unwrap(), "error");
+    assert_eq!(resp.headers.get("x-parapet-layer").unwrap(), "L2a");
+    assert_eq!(resp.headers.get("x-parapet-error").unwrap(), "scan_error");
 }
 
 #[test]
-fn l2a_fail_closed_block_first_block_wins() {
+fn handle_layer_error_open_returns_none() {
     use crate::provider::adapter_for;
+    use crate::config::FailureMode;
 
     let adapter = adapter_for(ProviderType::OpenAi);
-    // Pre-set a block from another layer.
-    let existing = ProxyResponse::blocked(
-        adapter.serialize_error("blocked by L1", 403),
-        "L1",
-    );
-    let mut pending = Some(existing);
-    l2a_fail_closed_block(&mut pending, adapter.as_ref(), "test");
-    // Should not overwrite.
-    let resp = pending.unwrap();
-    assert_eq!(blocked_by(&resp).as_deref(), Some("L1"));
+    let resp = handle_layer_error(&FailureMode::Open, adapter.as_ref(), "L1", "scanner_panic", "test error", "req-1");
+    assert!(resp.is_none());
 }
 
 // -------------------------------------------------------------------
@@ -2219,12 +2215,16 @@ async fn l2a_shadow_scanner_error_fails_open() {
 }
 
 #[tokio::test]
-async fn l2a_block_scanner_error_fails_closed() {
+async fn l2a_scanner_error_on_failure_closed_returns_503() {
     let scanner: Arc<dyn L2aScanner> = Arc::new(FailingL2aScanner);
-    let engine = engine_with_l2a_scanner(config_with_l2a(L2aMode::Block), scanner, 4);
+    let mut cfg = config_with_l2a(L2aMode::Block);
+    cfg.runtime.engine.on_failure = FailureMode::Closed;
+    let engine = engine_with_l2a_scanner(cfg, scanner, 4);
     let resp = engine.forward(Provider::OpenAi, openai_request()).await.unwrap();
-    assert_eq!(resp.status, StatusCode::FORBIDDEN);
-    assert_eq!(blocked_by(&resp).as_deref(), Some("L2a"));
+    assert_eq!(resp.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(resp.headers.get("x-parapet-action").unwrap(), "error");
+    assert_eq!(resp.headers.get("x-parapet-layer").unwrap(), "L2a");
+    assert_eq!(resp.headers.get("x-parapet-error").unwrap(), "scan_error");
 }
 
 #[tokio::test]
@@ -2241,16 +2241,19 @@ async fn l2a_shadow_timeout_fails_open() {
 }
 
 #[tokio::test]
-async fn l2a_block_timeout_fails_closed() {
+async fn l2a_timeout_on_failure_closed_returns_503() {
     let scanner: Arc<dyn L2aScanner> = Arc::new(SlowL2aScanner {
         delay: std::time::Duration::from_secs(5),
     });
     let mut cfg = config_with_l2a(L2aMode::Block);
+    cfg.runtime.engine.on_failure = FailureMode::Closed;
     cfg.policy.layers.l2a.as_mut().unwrap().timeout_ms = 10; // 10ms timeout
     let engine = engine_with_l2a_scanner(cfg, scanner, 4);
     let resp = engine.forward(Provider::OpenAi, openai_request()).await.unwrap();
-    assert_eq!(resp.status, StatusCode::FORBIDDEN);
-    assert_eq!(blocked_by(&resp).as_deref(), Some("L2a"));
+    assert_eq!(resp.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(resp.headers.get("x-parapet-action").unwrap(), "error");
+    assert_eq!(resp.headers.get("x-parapet-layer").unwrap(), "L2a");
+    assert_eq!(resp.headers.get("x-parapet-error").unwrap(), "scan_timeout");
 }
 
 #[tokio::test]
@@ -2263,12 +2266,16 @@ async fn l2a_shadow_panic_fails_open() {
 }
 
 #[tokio::test]
-async fn l2a_block_panic_fails_closed() {
+async fn l2a_panic_on_failure_closed_returns_503() {
     let scanner: Arc<dyn L2aScanner> = Arc::new(PanickingL2aScanner);
-    let engine = engine_with_l2a_scanner(config_with_l2a(L2aMode::Block), scanner, 4);
+    let mut cfg = config_with_l2a(L2aMode::Block);
+    cfg.runtime.engine.on_failure = FailureMode::Closed;
+    let engine = engine_with_l2a_scanner(cfg, scanner, 4);
     let resp = engine.forward(Provider::OpenAi, openai_request()).await.unwrap();
-    assert_eq!(resp.status, StatusCode::FORBIDDEN);
-    assert_eq!(blocked_by(&resp).as_deref(), Some("L2a"));
+    assert_eq!(resp.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(resp.headers.get("x-parapet-action").unwrap(), "error");
+    assert_eq!(resp.headers.get("x-parapet-layer").unwrap(), "L2a");
+    assert_eq!(resp.headers.get("x-parapet-error").unwrap(), "scanner_panic");
 }
 
 #[tokio::test]
@@ -2282,13 +2289,17 @@ async fn l2a_shadow_concurrency_limit_fails_open() {
 }
 
 #[tokio::test]
-async fn l2a_block_concurrency_limit_fails_closed() {
+async fn l2a_concurrency_limit_on_failure_closed_returns_503() {
     let scanner: Arc<dyn L2aScanner> = Arc::new(MockL2aScanner { signals: vec![] });
     // 0 permits = immediately exhausted.
-    let engine = engine_with_l2a_scanner(config_with_l2a(L2aMode::Block), scanner, 0);
+    let mut cfg = config_with_l2a(L2aMode::Block);
+    cfg.runtime.engine.on_failure = FailureMode::Closed;
+    let engine = engine_with_l2a_scanner(cfg, scanner, 0);
     let resp = engine.forward(Provider::OpenAi, openai_request()).await.unwrap();
-    assert_eq!(resp.status, StatusCode::FORBIDDEN);
-    assert_eq!(blocked_by(&resp).as_deref(), Some("L2a"));
+    assert_eq!(resp.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(resp.headers.get("x-parapet-action").unwrap(), "error");
+    assert_eq!(resp.headers.get("x-parapet-layer").unwrap(), "L2a");
+    assert_eq!(resp.headers.get("x-parapet-error").unwrap(), "concurrency_limit");
 }
 
 #[tokio::test]
@@ -2315,5 +2326,72 @@ async fn l2a_no_scanner_configured_passes_through() {
     };
     let engine = EngineUpstreamClient::new_with(deps);
     let resp = engine.forward(Provider::OpenAi, openai_request()).await.unwrap();
+    assert_eq!(resp.status, StatusCode::OK);
+}
+
+// -------------------------------------------------------------------
+// L5a on_failure tests — panicking output scanner
+// -------------------------------------------------------------------
+
+use crate::layers::l5a::ScanResult;
+
+struct PanickingOutputScanner;
+
+impl OutputScanner for PanickingOutputScanner {
+    fn scan_and_redact(&self, _content: &str, _config: &Config) -> ScanResult {
+        panic!("intentional L5a panic for test");
+    }
+}
+
+fn config_with_l5a_redact() -> Config {
+    let mut config = base_config_with_canary("dummy");
+    config.policy.layers.l5a = Some(LayerConfig {
+        mode: "redact".to_string(),
+        block_action: None,
+        window_chars: None,
+    });
+    config
+}
+
+fn engine_with_output_scanner(config: Config, scanner: Arc<dyn OutputScanner>) -> EngineUpstreamClient {
+    let deps = EngineDeps {
+        config: Arc::new(config),
+        http: Arc::new(SuccessHttpSender),
+        resolver: Arc::new(NoopResolver),
+        registry: Arc::new(DefaultRegistry),
+        normalizer: Arc::new(NoopNormalizer),
+        trust_assigner: Arc::new(NoopTrustAssigner),
+        l1_scanner: None,
+        l2a_scanner: None,
+        l2a_semaphore: None,
+        inbound_scanner: Arc::new(NoopInboundScanner),
+        constraint_evaluator: Arc::new(DslConstraintEvaluator::new()),
+        output_scanner: scanner,
+        session_store: None,
+        multi_turn_scanner: None,
+        signal_extractor: Arc::new(DefaultSignalExtractor::new()),
+        verdict_combiner: Arc::new(DefaultVerdictCombiner::new()),
+    };
+    EngineUpstreamClient::new_with(deps)
+}
+
+#[tokio::test]
+async fn l5a_panic_on_failure_closed_returns_503() {
+    let mut cfg = config_with_l5a_redact();
+    cfg.runtime.engine.on_failure = FailureMode::Closed;
+    let engine = engine_with_output_scanner(cfg, Arc::new(PanickingOutputScanner));
+    let resp = engine.forward(Provider::OpenAi, openai_request()).await.unwrap();
+    assert_eq!(resp.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(resp.headers.get("x-parapet-action").unwrap(), "error");
+    assert_eq!(resp.headers.get("x-parapet-layer").unwrap(), "L5a");
+    assert_eq!(resp.headers.get("x-parapet-error").unwrap(), "scanner_panic");
+}
+
+#[tokio::test]
+async fn l5a_panic_on_failure_open_skips_redaction() {
+    let cfg = config_with_l5a_redact(); // default on_failure: Open
+    let engine = engine_with_output_scanner(cfg, Arc::new(PanickingOutputScanner));
+    let resp = engine.forward(Provider::OpenAi, openai_request()).await.unwrap();
+    // on_failure: open — skip L5a, return upstream response as-is.
     assert_eq!(resp.status, StatusCode::OK);
 }
