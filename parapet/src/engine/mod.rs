@@ -21,7 +21,7 @@ use std::io::Read as _;
 
 use crate::config::{Config, FailureMode, L2aMode, PatternAction};
 use crate::constraint::{ConstraintEvaluator, DslConstraintEvaluator, ToolCallVerdict};
-use crate::layers::l1::{DefaultL1Scanner, L1Scanner, L1Verdict};
+use crate::layers::l1::{DefaultL1Scanner, EnsembleL1Scanner, L1Scanner, L1Verdict};
 use crate::layers::l2a::L2aScanner;
 use crate::layers::l3_inbound::{DefaultInboundScanner, InboundScanner, InboundVerdict};
 use crate::config::L4Mode;
@@ -1308,8 +1308,12 @@ pub fn build_engine_client(config: Arc<Config>) -> Result<EngineUpstreamClient, 
     let session_store: Option<Arc<dyn crate::session::SessionStore>> = None; // Sprint 2
 
     let l1_scanner: Option<Arc<dyn L1Scanner>> =
-        if config.policy.layers.l1.is_some() {
-            Some(Arc::new(DefaultL1Scanner::new()))
+        if let Some(l1_config) = &config.policy.layers.l1 {
+            if l1_config.specialists.is_empty() {
+                Some(Arc::new(DefaultL1Scanner::new()))
+            } else {
+                Some(Arc::new(EnsembleL1Scanner::new(&l1_config.specialists)))
+            }
         } else {
             None
         };

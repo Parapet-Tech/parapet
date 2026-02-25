@@ -274,6 +274,16 @@ pub enum L1Mode {
 pub struct L1Config {
     /// Operating mode: shadow (log-only) or block (enforce).
     pub mode: L1Mode,
-    /// Score threshold for blocking. score >= threshold → block.
+    /// Score threshold for blocking (generalist). score >= threshold → block.
+    pub threshold: f64,
+    /// Per-specialist threshold overrides. Key = specialist name.
+    /// If present, the ensemble scanner activates.
+    pub specialists: HashMap<String, L1SpecialistConfig>,
+}
+
+/// Per-specialist configuration for the L1 ensemble.
+#[derive(Debug, Clone)]
+pub struct L1SpecialistConfig {
+    /// Score threshold in raw SVM margin space.
     pub threshold: f64,
 }

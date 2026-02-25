@@ -7,8 +7,9 @@
 // 2. We do variable interpolation and regex compilation between raw and public
 // 3. Keeps the public API clean
 
-use serde::Deserialize;
 use std::collections::HashMap;
+
+use serde::Deserialize;
 
 /// A block pattern can be a plain regex string or an object with metadata.
 ///
@@ -165,6 +166,15 @@ pub struct RawL1Config {
     #[serde(default = "default_l1_mode")]
     pub mode: String,
     #[serde(default = "default_l1_threshold")]
+    pub threshold: f64,
+    /// Per-specialist threshold overrides. Key = specialist name.
+    #[serde(default)]
+    pub specialists: HashMap<String, RawL1SpecialistConfig>,
+}
+
+/// Per-specialist configuration in L1 ensemble.
+#[derive(Debug, Deserialize)]
+pub struct RawL1SpecialistConfig {
     pub threshold: f64,
 }
 

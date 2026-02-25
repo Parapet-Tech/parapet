@@ -212,6 +212,14 @@ async fn main() {
             );
         }
         println!();
+        println!("Timing");
+        println!("------");
+        println!("  Wall:  {:.0}ms", report.timing.wall_ms);
+        println!("  Mean:  {:.2}ms", report.timing.mean_ms);
+        println!("  p50:   {:.2}ms", report.timing.p50_ms);
+        println!("  p95:   {:.2}ms", report.timing.p95_ms);
+        println!("  p99:   {:.2}ms", report.timing.p99_ms);
+        println!();
         println!(
             "Accuracy: {:.1}% ({}/{})",
             report.accuracy * 100.0,
