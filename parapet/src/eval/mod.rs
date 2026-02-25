@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use axum::http::{HeaderMap, Method, StatusCode};
@@ -25,7 +26,7 @@ use crate::engine::{
 };
 use crate::signal::combiner::DefaultVerdictCombiner;
 use crate::signal::extractor::DefaultSignalExtractor;
-use crate::layers::l1::{DefaultL1Scanner, L1Scanner};
+use crate::layers::l1::{DefaultL1Scanner, EnsembleL1Scanner, L1Scanner};
 #[cfg(feature = "l2a")]
 use crate::layers::l2a::{DefaultHeuristicScanner, DefaultL2aScanner, L2aScanner};
 #[cfg(feature = "l2a")]
@@ -111,6 +112,8 @@ pub struct EvalResult {
     /// Evidence pattern categories that matched (from x-parapet-evidence-categories header).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub evidence_categories: Vec<String>,
+    /// Wall-clock time for this case (engine.forward + response read), in milliseconds.
+    pub duration_ms: f64,
 }
 
 fn is_zero(n: &usize) -> bool {
@@ -161,11 +164,26 @@ pub struct EvidenceMetrics {
     pub benign_evidence_rate: f64,
 }
 
+#[derive(Debug, Default, Serialize)]
+pub struct TimingMetrics {
+    /// Total wall-clock time for the eval run, in milliseconds.
+    pub wall_ms: f64,
+    /// Mean per-case duration, in milliseconds.
+    pub mean_ms: f64,
+    /// Median (p50) per-case duration, in milliseconds.
+    pub p50_ms: f64,
+    /// 95th percentile per-case duration, in milliseconds.
+    pub p95_ms: f64,
+    /// 99th percentile per-case duration, in milliseconds.
+    pub p99_ms: f64,
+}
+
 #[derive(Debug, Serialize)]
 pub struct EvalReport {
     pub layers: Vec<LayerMetrics>,
     pub sources: Vec<SourceMetrics>,
     pub evidence: EvidenceMetrics,
+    pub timing: TimingMetrics,
     pub results: Vec<EvalResult>,
     pub total_cases: usize,
     pub total_correct: usize,
@@ -277,8 +295,12 @@ pub fn build_eval_engine(config: Arc<Config>) -> (EngineUpstreamClient, Arc<Mock
     let mock = Arc::new(MockHttpSender::new());
 
     let l1_scanner: Option<Arc<dyn L1Scanner>> =
-        if config.policy.layers.l1.is_some() {
-            Some(Arc::new(DefaultL1Scanner::new()))
+        if let Some(l1_config) = &config.policy.layers.l1 {
+            if l1_config.specialists.is_empty() {
+                Some(Arc::new(DefaultL1Scanner::new()))
+            } else {
+                Some(Arc::new(EnsembleL1Scanner::new(&l1_config.specialists)))
+            }
         } else {
             None
         };
@@ -356,7 +378,8 @@ pub async fn run_eval(
         // Build proxy request
         let request = build_proxy_request(case);
 
-        // Run through engine
+        // Run through engine (timed)
+        let case_start = Instant::now();
         let response = engine.forward(Provider::OpenAi, request).await;
 
         // Collect response data
@@ -370,6 +393,7 @@ pub async fn run_eval(
                 (status, headers, String::from_utf8_lossy(&body_bytes).to_string())
             }
             Err(e) => {
+                let duration_ms = case_start.elapsed().as_secs_f64() * 1000.0;
                 results.push(EvalResult {
                     case_id: case.id.clone(),
                     layer: case.layer.clone(),
@@ -381,10 +405,12 @@ pub async fn run_eval(
                     detail: format!("engine error: {e}"),
                     evidence_count: 0,
                     evidence_categories: Vec::new(),
+                    duration_ms,
                 });
                 continue;
             }
         };
+        let duration_ms = case_start.elapsed().as_secs_f64() * 1000.0;
 
         // Determine verdict
         let (actual, detail) = determine_verdict(case, status, &headers, &body);
@@ -406,6 +432,7 @@ pub async fn run_eval(
             detail,
             evidence_count,
             evidence_categories,
+            duration_ms,
         });
     }
 
@@ -539,10 +566,30 @@ pub fn compute_metrics(results: &[EvalResult]) -> EvalReport {
             evidence.benign_with_evidence as f64 / evidence.benign_total as f64;
     }
 
+    // Timing percentiles from per-case durations.
+    let timing = {
+        let mut durations: Vec<f64> = results.iter().map(|r| r.duration_ms).collect();
+        durations.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let n = durations.len();
+        if n > 0 {
+            let sum: f64 = durations.iter().sum();
+            TimingMetrics {
+                wall_ms: sum,
+                mean_ms: sum / n as f64,
+                p50_ms: durations[n / 2],
+                p95_ms: durations[(n as f64 * 0.95) as usize],
+                p99_ms: durations[(n as f64 * 0.99).min((n - 1) as f64) as usize],
+            }
+        } else {
+            TimingMetrics::default()
+        }
+    };
+
     EvalReport {
         layers,
         sources,
         evidence,
+        timing,
         results: Vec::new(), // populated by caller if needed
         total_cases,
         total_correct,
@@ -794,42 +841,27 @@ fn determine_verdict(
     headers: &HeaderMap,
     body: &str,
 ) -> (String, String) {
+    let blocked_by = blocked_by_layer(headers);
+    let detail = format!(
+        "status={} blocked_by={}",
+        status.as_u16(),
+        blocked_by.as_deref().unwrap_or("none")
+    );
+
     match case.layer.as_str() {
-        "l1" => {
-            // Only count as "blocked" if L1 specifically blocked it.
-            // A different layer blocking is irrelevant to L1's metrics.
-            let blocked_by = blocked_by_layer(headers);
-            let fired = status == StatusCode::FORBIDDEN
-                && blocked_by.as_deref() == Some("L1");
+        // Inbound layers: any 403 = blocked. When running a single-layer
+        // config only that layer can fire; when running the full stack this
+        // gives the correct "did the stack catch it?" answer.
+        "l1" | "l3_inbound" | "l2a" | "l4" => {
+            let fired = status == StatusCode::FORBIDDEN;
             let actual = if fired { "blocked" } else { "allowed" };
-            let detail = format!(
-                "status={} blocked_by={}",
-                status.as_u16(),
-                blocked_by.as_deref().unwrap_or("none")
-            );
             (actual.to_string(), detail)
-        }
-        "l3_inbound" => {
-            // Only count as "blocked" if L3-inbound specifically blocked it.
-            let blocked_by = blocked_by_layer(headers);
-            let fired = status == StatusCode::FORBIDDEN
-                && blocked_by.as_deref() == Some("L3-inbound");
-            let actual = if fired { "blocked" } else { "allowed" };
-            (
-                actual.to_string(),
-                format!(
-                    "status={} blocked_by={}",
-                    status.as_u16(),
-                    blocked_by.as_deref().unwrap_or("none")
-                ),
-            )
         }
         "l3_outbound" => {
             // If an inbound layer blocked, no outbound processing happened.
             if status == StatusCode::FORBIDDEN {
                 return ("allowed".to_string(), "inbound block — no outbound processing".to_string());
             }
-            // In rewrite mode, blocked tool calls are removed and refusal text injected.
             let fired = body.contains("blocked");
             let actual = if fired { "blocked" } else { "allowed" };
             let detail = if fired {
@@ -852,36 +884,6 @@ fn determine_verdict(
                 "content unchanged".to_string()
             };
             (actual.to_string(), detail)
-        }
-        "l4" => {
-            // Only count as "blocked" if L4 specifically blocked it.
-            let blocked_by = blocked_by_layer(headers);
-            let fired = status == StatusCode::FORBIDDEN
-                && blocked_by.as_deref() == Some("L4");
-            let actual = if fired { "blocked" } else { "allowed" };
-            (
-                actual.to_string(),
-                format!(
-                    "status={} blocked_by={}",
-                    status.as_u16(),
-                    blocked_by.as_deref().unwrap_or("none")
-                ),
-            )
-        }
-        "l2a" => {
-            // Only count as "blocked" if L2a specifically blocked it.
-            let blocked_by = blocked_by_layer(headers);
-            let fired = status == StatusCode::FORBIDDEN
-                && blocked_by.as_deref() == Some("L2a");
-            let actual = if fired { "blocked" } else { "allowed" };
-            (
-                actual.to_string(),
-                format!(
-                    "status={} blocked_by={}",
-                    status.as_u16(),
-                    blocked_by.as_deref().unwrap_or("none")
-                ),
-            )
         }
         other => ("allowed".to_string(), format!("unknown layer: {other}")),
     }
@@ -1519,6 +1521,7 @@ layers:
                 detail: String::new(),
                 evidence_count: 0,
                 evidence_categories: Vec::new(),
+                duration_ms: 1.0,
             },
             EvalResult {
                 case_id: "2".into(),
@@ -1531,6 +1534,7 @@ layers:
                 detail: String::new(),
                 evidence_count: 0,
                 evidence_categories: Vec::new(),
+                duration_ms: 2.0,
             },
             EvalResult {
                 case_id: "3".into(),
@@ -1543,6 +1547,7 @@ layers:
                 detail: String::new(),
                 evidence_count: 0,
                 evidence_categories: Vec::new(),
+                duration_ms: 3.0,
             },
         ];
 

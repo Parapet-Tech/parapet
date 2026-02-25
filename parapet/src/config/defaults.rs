@@ -147,6 +147,7 @@ pub fn default_layer_configs() -> LayerConfigs {
         l1: Some(L1Config {
             mode: L1Mode::Block,
             threshold: 0.0,
+            specialists: std::collections::HashMap::new(),
         }),
         l2a: None, // L2a requires explicit opt-in (model download + config)
         l3_inbound: Some(LayerConfig {

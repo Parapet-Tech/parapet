@@ -25,8 +25,8 @@ pub use pattern::{CompiledPattern, PatternAction};
 pub use source::{ConfigSource, FileSource, StringSource};
 pub use types::{
     ArgumentConstraints, Config, ContentPolicy, EngineConfig, FailureMode, L1Config, L1Mode,
-    L2aConfig, L2aMode, L4Config, L4Mode, L4PatternCategory, LayerConfig, LayerConfigs,
-    PolicyConfig, RuntimeConfig, ToolConfig, TrustConfig,
+    L1SpecialistConfig, L2aConfig, L2aMode, L4Config, L4Mode, L4PatternCategory, LayerConfig,
+    LayerConfigs, PolicyConfig, RuntimeConfig, ToolConfig, TrustConfig,
 };
 
 // ---------------------------------------------------------------------------
