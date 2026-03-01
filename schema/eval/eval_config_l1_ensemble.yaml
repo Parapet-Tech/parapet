@@ -1,0 +1,35 @@
+parapet: v1
+
+tools:
+  _default:
+    allowed: true
+
+trust:
+  unknown_trust_policy:
+    system: trusted
+    assistant: trusted
+    user: untrusted
+    tool: untrusted
+
+engine:
+  on_failure: closed
+  timeout_ms: 5000
+
+environment: "eval"
+
+# L1 ensemble -- asymmetric routing (h=2.0, spec=1.0)
+layers:
+  L0: { mode: sanitize }
+  L1:
+    mode: block
+    threshold: 0.0
+    min_agree: 2
+    generalist_solo_threshold: 2.0
+    specialists:
+      generalist:          { threshold: 0.5 }
+      exfiltration:        { threshold: 1.0 }
+      adversarial_suffix:  { threshold: 1.0 }
+      indirect_injection:  { threshold: 1.0 }
+      meta_probe:          { threshold: 1.0 }
+      instruction_override: { threshold: 1.0 }
+      roleplay_jailbreak:  { threshold: 1.0 }

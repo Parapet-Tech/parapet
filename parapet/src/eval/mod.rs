@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use async_trait::async_trait;
-use axum::http::{HeaderMap, Method, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
@@ -299,7 +299,11 @@ pub fn build_eval_engine(config: Arc<Config>) -> (EngineUpstreamClient, Arc<Mock
             if l1_config.specialists.is_empty() {
                 Some(Arc::new(DefaultL1Scanner::new()))
             } else {
-                Some(Arc::new(EnsembleL1Scanner::new(&l1_config.specialists)))
+                Some(Arc::new(EnsembleL1Scanner::new(
+                    &l1_config.specialists,
+                    l1_config.min_agree,
+                    l1_config.generalist_solo_threshold,
+                )))
             }
         } else {
             None
@@ -375,8 +379,10 @@ pub async fn run_eval(
         // Set mock response for this case
         mock.set_response(build_mock_response(case));
 
-        // Build proxy request
-        let request = build_proxy_request(case);
+        // Build proxy request and stamp a stable request ID so engine traces
+        // can be correlated back to this exact eval case.
+        let mut request = build_proxy_request(case);
+        inject_eval_request_id(&mut request, case);
 
         // Run through engine (timed)
         let case_start = Instant::now();
@@ -641,6 +647,21 @@ fn build_proxy_request(case: &EvalCase) -> ProxyRequest {
         build_l2a_tool_result_request(&case.content)
     } else {
         build_legacy_request(&case.content)
+    }
+}
+
+fn inject_eval_request_id(request: &mut ProxyRequest, case: &EvalCase) {
+    let raw = format!("eval:{}:{}", case.source, case.id);
+    let request_id: String = raw
+        .chars()
+        .map(|c| match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' | ':' => c,
+            _ => '_',
+        })
+        .collect();
+
+    if let Ok(v) = HeaderValue::from_str(&request_id) {
+        request.headers.insert("x-request-id", v);
     }
 }
 

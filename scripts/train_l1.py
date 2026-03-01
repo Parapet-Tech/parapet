@@ -28,6 +28,7 @@ import argparse
 import glob
 import random
 import sys
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -37,28 +38,42 @@ from sklearn.svm import LinearSVC
 from sklearn.model_selection import cross_val_score, train_test_split
 
 
+def squash(text: str) -> str:
+    """Python port of l1.rs::squash() — lowercase then keep only alphanumeric.
+
+    Matches Rust behavior: lowercase first (so combining marks from e.g.
+    Turkish İ are produced), then filter to is_alphanumeric only.
+    """
+    return "".join(c for c in text.casefold() if c.isalnum())
+
+
 
 # ProtectAI recipe: 11 datasets + supplemental jailbreak attacks.
 # https://huggingface.co/protectai/deberta-v3-base-prompt-injection-v2
+# PROTECTAI_FILES = [
+#     # attack — ProtectAI recipe
+#     "opensource_gandalf_attacks.yaml",            # Lakera/gandalf_ignore_instructions
+#     "opensource_chatgpt_jailbreak_attacks.yaml",   # rubend18/ChatGPT-Jailbreak-Prompts
+#     "opensource_imoxto_attacks.yaml",              # imoxto/prompt_injection_cleaned_dataset-v2
+#     "opensource_hackaprompt_attacks.yaml",          # hackaprompt/hackaprompt-dataset
+#     # attack — supplemental jailbreak
+#     "opensource_jailbreak_cls_attacks.yaml",       # jackhhao/jailbreak-classification
+#     # benign — hard negatives
+#     "opensource_notinject_benign.yaml",            # leolee99/NotInject (trigger-word FP reduction)
+#     "opensource_wildguardmix_benign.yaml",         # allenai/wildguardmix (safety-adjacent benign)
+#     # benign
+#     "opensource_awesome_chatgpt_benign.yaml",      # fka/awesome-chatgpt-prompts
+#     "opensource_teven_benign.yaml",                # teven/prompted_examples
+#     "opensource_dahoas_benign.yaml",               # Dahoas/synthetic-hh-rlhf-prompts + hh_prompt_format
+#     "opensource_chatgpt_prompts_benign.yaml",      # MohamedRashad/ChatGPT-prompts
+#     "opensource_hf_instruction_benign.yaml",       # HuggingFaceH4/instruction-dataset
+#     "opensource_no_robots_benign.yaml",            # HuggingFaceH4/no_robots
+#     "opensource_ultrachat_benign.yaml",            # HuggingFaceH4/ultrachat_200k
+# ]
+
 PROTECTAI_FILES = [
-    # attack — ProtectAI recipe
-    "opensource_gandalf_attacks.yaml",            # Lakera/gandalf_ignore_instructions
-    "opensource_chatgpt_jailbreak_attacks.yaml",   # rubend18/ChatGPT-Jailbreak-Prompts
-    "opensource_imoxto_attacks.yaml",              # imoxto/prompt_injection_cleaned_dataset-v2
-    "opensource_hackaprompt_attacks.yaml",          # hackaprompt/hackaprompt-dataset
-    # attack — supplemental jailbreak
-    "opensource_jailbreak_cls_attacks.yaml",       # jackhhao/jailbreak-classification
-    # benign — hard negatives
-    "opensource_notinject_benign.yaml",            # leolee99/NotInject (trigger-word FP reduction)
-    "opensource_wildguardmix_benign.yaml",         # allenai/wildguardmix (safety-adjacent benign)
-    # benign
-    "opensource_awesome_chatgpt_benign.yaml",      # fka/awesome-chatgpt-prompts
-    "opensource_teven_benign.yaml",                # teven/prompted_examples
-    "opensource_dahoas_benign.yaml",               # Dahoas/synthetic-hh-rlhf-prompts + hh_prompt_format
-    "opensource_chatgpt_prompts_benign.yaml",      # MohamedRashad/ChatGPT-prompts
-    "opensource_hf_instruction_benign.yaml",       # HuggingFaceH4/instruction-dataset
-    "opensource_no_robots_benign.yaml",            # HuggingFaceH4/no_robots
-    "opensource_ultrachat_benign.yaml",            # HuggingFaceH4/ultrachat_200k
+    "t2/attacks51042.yaml",
+    "t2/global_benign_25K.yaml"
 ]
 
 
@@ -235,7 +250,9 @@ def train_model(texts, labels):
     )
     X = vectorizer.fit_transform(texts)
 
-    model = LinearSVC(C=0.1, max_iter=100_000, dual="auto", class_weight="balanced")
+    # L1 penalty lets regularization prune features mathematically
+    # rather than choking at the vectorizer. dual=False required for L1.
+    model = LinearSVC(C=0.1, penalty="l1", dual=False, max_iter=100_000, class_weight="balanced")
 
     # Cross-validate on training set
     scores = cross_val_score(model, X, labels, cv=5, scoring="f1")
@@ -362,7 +379,7 @@ def codegen_phf(bias, weights, out_path, provenance):
     ]
     for fname, stats in sorted(provenance["files"].items()):
         prov_lines.append(f"//   {fname}: {stats['attacks']}atk + {stats['benign']}ben")
-    prov_lines.append(f"// Model: CountVectorizer(analyzer='char_wb', ngram_range=(3,5), binary=True) + LinearSVC(C=0.1)")
+    prov_lines.append(f"// Model: CountVectorizer(analyzer='char_wb', ngram_range=(3,5), binary=True) + LinearSVC(C=0.1, penalty='l1')")
     prov_lines.append(f"// Features: {len(weights)} character n-grams after pruning")
     provenance_block = "\n".join(prov_lines)
 
@@ -405,6 +422,8 @@ def main():
                         help="Prune weights with |w| below this (default: 0.05)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for reproducibility (default: 42)")
+    parser.add_argument("--squash-augment", action="store_true",
+                        help="Double training data by appending squashed version of every sample")
     parser.add_argument("--out", type=str,
                         default="parapet/src/layers/l1_weights.rs",
                         help="Output path for generated Rust file")
@@ -418,6 +437,23 @@ def main():
 
     # 3. Save holdout
     save_holdout(holdout_entries, args.holdout_out, args.seed, args.holdout_pct)
+
+    # 3b. Squash augmentation — double training data with squashed variants
+    if args.squash_augment:
+        n_before = len(train_entries)
+        augmented = []
+        for entry in train_entries:
+            squashed_content = squash(entry["content"])
+            if squashed_content and squashed_content != entry["content"]:
+                augmented.append({
+                    **entry,
+                    "id": entry["id"] + "_sq",
+                    "content": squashed_content,
+                    "description": f"squashed: {entry['description']}",
+                })
+        train_entries.extend(augmented)
+        print(f"\nSquash augmentation: {n_before} → {len(train_entries)} "
+              f"(+{len(augmented)} squashed)", file=sys.stderr)
 
     # 4. Train (on train set only)
     train_texts = [e["content"] for e in train_entries]

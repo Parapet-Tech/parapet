@@ -278,6 +278,8 @@ fn build_layer_configs(raw: Option<raw::RawLayerConfigs>) -> Result<LayerConfigs
             Ok(L1Config {
                 mode,
                 threshold: l1.threshold,
+                min_agree: l1.min_agree,
+                generalist_solo_threshold: l1.generalist_solo_threshold,
                 specialists,
             })
         })

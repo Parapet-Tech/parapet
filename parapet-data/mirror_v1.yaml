@@ -1,0 +1,195 @@
+# MirrorSpec v1 — curated eval mirror across all 8 attack reasons
+#
+# Usage:
+#   python -m parapet_data curate --spec mirror_v1.yaml --output ./curated/ --base-dir ..
+#
+# Sources point at pre-curated samples in schema/eval/attack_types/.
+# total_target is omitted — takes all 3,000 samples as-is.
+
+name: mirror_v1
+version: "1.0.0"
+seed: 42
+ratio: 1.0
+
+backfill:
+  strategy: fail
+  log_gaps: true
+
+allow_partial_mirror: false
+
+cells:
+  - reason: instruction_override
+    teaching_goal: "Neutralize 'text mentioning instructions = attack' correlation"
+    languages: [EN]
+    format_distribution:
+      prose: 0.7
+      structured: 0.2
+      code: 0.1
+    length_distribution:
+      short: 0.6
+      medium: 0.3
+      long: 0.1
+    attack_sources:
+      - name: instruction_override_attacks
+        path: schema/eval/attack_types/instruction_override/samples_malicious.yaml
+        language: EN
+        extractor: col_content
+    benign_sources:
+      - name: instruction_override_benign
+        path: schema/eval/attack_types/instruction_override/samples_benign.yaml
+        language: EN
+        extractor: col_content
+
+  - reason: roleplay_jailbreak
+    teaching_goal: "Neutralize 'roleplay/character language = attack' correlation"
+    languages: [EN]
+    format_distribution:
+      prose: 0.8
+      structured: 0.1
+      code: 0.1
+    length_distribution:
+      short: 0.2
+      medium: 0.3
+      long: 0.5
+    attack_sources:
+      - name: roleplay_jailbreak_attacks
+        path: schema/eval/attack_types/roleplay_jailbreak/samples_malicious.yaml
+        language: EN
+        extractor: col_content
+    benign_sources:
+      - name: roleplay_jailbreak_benign
+        path: schema/eval/attack_types/roleplay_jailbreak/samples_benign.yaml
+        language: EN
+        extractor: col_content
+
+  - reason: meta_probe
+    teaching_goal: "Neutralize 'questions about the system = attack' correlation"
+    languages: [EN]
+    format_distribution:
+      prose: 0.8
+      structured: 0.1
+      code: 0.1
+    length_distribution:
+      short: 0.4
+      medium: 0.4
+      long: 0.2
+    attack_sources:
+      - name: meta_probe_attacks
+        path: schema/eval/attack_types/meta_probe/samples_malicious.yaml
+        language: EN
+        extractor: col_content
+    benign_sources:
+      - name: meta_probe_benign
+        path: schema/eval/attack_types/meta_probe/samples_benign.yaml
+        language: EN
+        extractor: col_content
+
+  - reason: exfiltration
+    teaching_goal: "Neutralize 'requesting data output = attack' correlation"
+    languages: [EN]
+    format_distribution:
+      prose: 0.6
+      structured: 0.3
+      code: 0.1
+    length_distribution:
+      short: 0.3
+      medium: 0.3
+      long: 0.4
+    attack_sources:
+      - name: exfiltration_attacks
+        path: schema/eval/attack_types/exfiltration/samples_malicious.yaml
+        language: EN
+        extractor: col_content
+    benign_sources:
+      - name: exfiltration_benign
+        path: schema/eval/attack_types/exfiltration/samples_benign.yaml
+        language: EN
+        extractor: col_content
+
+  - reason: adversarial_suffix
+    teaching_goal: "Neutralize 'high-entropy/garbled text = attack' correlation"
+    languages: [EN]
+    format_distribution:
+      prose: 0.5
+      structured: 0.2
+      code: 0.3
+    length_distribution:
+      short: 0.5
+      medium: 0.4
+      long: 0.1
+    attack_sources:
+      - name: adversarial_suffix_attacks
+        path: schema/eval/attack_types/adversarial_suffix/samples_malicious.yaml
+        language: EN
+        extractor: col_content
+    benign_sources:
+      - name: adversarial_suffix_benign
+        path: schema/eval/attack_types/adversarial_suffix/samples_benign.yaml
+        language: EN
+        extractor: col_content
+
+  - reason: indirect_injection
+    teaching_goal: "Neutralize 'embedded instructions in context = attack' correlation"
+    languages: [EN]
+    format_distribution:
+      prose: 0.5
+      structured: 0.4
+      code: 0.1
+    length_distribution:
+      short: 0.2
+      medium: 0.3
+      long: 0.5
+    attack_sources:
+      - name: indirect_injection_attacks
+        path: schema/eval/attack_types/indirect_injection/samples_malicious.yaml
+        language: EN
+        extractor: col_content
+    benign_sources:
+      - name: indirect_injection_benign
+        path: schema/eval/attack_types/indirect_injection/samples_benign.yaml
+        language: EN
+        extractor: col_content
+
+  - reason: obfuscation
+    teaching_goal: "Neutralize 'base64/ROT13/encoded text = attack' correlation"
+    languages: [EN]
+    format_distribution:
+      prose: 0.3
+      structured: 0.4
+      code: 0.3
+    length_distribution:
+      short: 0.4
+      medium: 0.4
+      long: 0.2
+    attack_sources:
+      - name: obfuscation_attacks
+        path: schema/eval/attack_types/obfuscation/samples_malicious.yaml
+        language: EN
+        extractor: col_content
+    benign_sources:
+      - name: obfuscation_benign
+        path: schema/eval/attack_types/obfuscation/samples_benign.yaml
+        language: EN
+        extractor: col_content
+
+  - reason: constraint_bypass
+    teaching_goal: "Neutralize 'requests to ignore rules = attack' correlation"
+    languages: [EN]
+    format_distribution:
+      prose: 0.8
+      structured: 0.1
+      code: 0.1
+    length_distribution:
+      short: 0.3
+      medium: 0.3
+      long: 0.4
+    attack_sources:
+      - name: constraint_bypass_attacks
+        path: schema/eval/attack_types/constraint_bypass/samples_malicious.yaml
+        language: EN
+        extractor: col_content
+    benign_sources:
+      - name: constraint_bypass_benign
+        path: schema/eval/attack_types/constraint_bypass/samples_benign.yaml
+        language: EN
+        extractor: col_content

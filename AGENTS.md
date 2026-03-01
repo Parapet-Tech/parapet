@@ -69,6 +69,58 @@ parapet/
 | `schema/eval/eval_config.yaml` | Default eval harness config |
 | `schema/parapet.schema.json` | JSON Schema for config validation |
 
+## L1 Classifier (Current Work)
+
+### Architecture
+L1 is a char n-gram SVM (`CountVectorizer` + `LinearSVC`) compiled to Rust `phf_map` weights for very low-latency inference. Runtime scoring uses:
+
+1. raw text pass
+2. squashed alphanumeric-only pass
+3. max(raw, squashed)
+
+### Training Pipeline
+Run from `parapet/`:
+
+1. `scripts/curate_global_benign.py` - build benign corpus from TheWall
+2. `scripts/train_l1_specialist_variant.py` - train/eval/codegen
+3. `cargo build && cargo test -- l1` - compile and validate generated weights
+
+### Key Flags
+- `--apply-l0-transform` - align train preprocessing with runtime L0
+- `--squash-augment` - augment train set with squashed variants
+- `--analyzer char_wb` - default analyzer for L1 (do not switch casually)
+
+### Current Data Notes
+- Attack training set: `schema/eval/training/attacks51042.yaml` (~51k)
+- Benign composition target:
+  - categories: instructions/chat/creative/code/hard-negatives/knowledge/system-prompts
+  - languages: EN 75, RU 10, ZH 8, AR 7
+  - lengths: short 25, medium 40, long 25, structured 10
+
+### Known Issues
+- `pi-cleaned-v2` negative class has attack contamination
+- whitespace artifacts can leak into n-gram features
+- LinearSVC scaling past ~60k-150k total samples is compute-sensitive
+- older 96.2% F1 numbers were invalid due to eval contamination
+
+### Clean Holdout Baselines
+| Config | F1 | Recall | Precision |
+|--------|----|--------|-----------|
+| 51k attack + 25k benign (clean) | 0.937 | 0.945 | 0.929 |
+| 51k attack + 51k benign (1:1) | 0.931 | 0.911 | 0.952 |
+
+### What Does Not Work Well for L1
+- kernel SVM (support vector cost too high for L1 latency budget)
+- neural models at L1 gate latency target
+- RL framing for one-shot binary classification
+- scaling data volume without curation quality controls
+
+## Experiment Conventions
+- Training experiments: `schema/eval/t2/`
+- Strategy docs: `strategy/`
+- Run scripts from `parapet/` so relative paths resolve correctly
+- Always review top features and FP/FN outputs after training
+
 ## Building & Running
 
 ```bash

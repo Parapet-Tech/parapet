@@ -52,11 +52,21 @@ struct Cli {
     /// Write JSON output to file instead of stdout
     #[arg(long)]
     output: Option<PathBuf>,
+
+    /// Emit per-specialist L1 raw scores as CSV (for meta-classifier training).
+    /// Bypasses the engine — scores L1 cases directly against all specialists.
+    #[arg(long, default_value_t = false)]
+    l1_scores: bool,
 }
 
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+
+    // Init tracing so engine warn/error logs are visible
+    if std::env::var("RUST_LOG").is_ok() {
+        tracing_subscriber::fmt::init();
+    }
 
     // Load config
     let source = FileSource {
@@ -99,6 +109,74 @@ async fn main() {
     if cases.is_empty() {
         eprintln!("no eval cases found");
         std::process::exit(1);
+    }
+
+    // --- L1 scores mode: emit per-specialist raw scores as CSV ---
+    if cli.l1_scores {
+        use parapet::layers::l1::EnsembleL1Scanner;
+
+        // Filter to L1 cases only
+        cases.retain(|c| c.layer == "l1");
+        eprintln!("scoring {} L1 cases against all specialists...", cases.len());
+
+        let l1_config = config
+            .policy
+            .layers
+            .l1
+            .as_ref()
+            .expect("L1 config required for --l1-scores");
+
+        let scanner = EnsembleL1Scanner::new(
+            &l1_config.specialists,
+            l1_config.min_agree,
+            l1_config.generalist_solo_threshold,
+        );
+
+        // Get specialist names from the first case's score
+        let dummy_names: Vec<String> = if let Some(first) = cases.first() {
+            scanner
+                .score_all(&first.content)
+                .iter()
+                .map(|(name, _)| name.to_string())
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // CSV header
+        let mut out: Box<dyn Write> = if let Some(ref path) = cli.output {
+            Box::new(std::fs::File::create(path).unwrap_or_else(|e| {
+                eprintln!("failed to create {}: {e}", path.display());
+                std::process::exit(1);
+            }))
+        } else {
+            Box::new(std::io::stdout())
+        };
+
+        write!(out, "case_id,label,source").unwrap();
+        for name in &dummy_names {
+            write!(out, ",{}", name).unwrap();
+        }
+        writeln!(out).unwrap();
+
+        let progress_interval = (cases.len() / 20).max(1);
+        for (i, case) in cases.iter().enumerate() {
+            if i > 0 && i % progress_interval == 0 {
+                eprintln!("  [{}/{}] ({:.0}%)", i, cases.len(), i as f64 / cases.len() as f64 * 100.0);
+            }
+
+            let scores = scanner.score_all(&case.content);
+            write!(out, "{},{},{}", case.id, case.label, case.source).unwrap();
+            for (_, score) in &scores {
+                write!(out, ",{:.6}", score).unwrap();
+            }
+            writeln!(out).unwrap();
+        }
+
+        if let Some(ref path) = cli.output {
+            eprintln!("wrote scores to {}", path.display());
+        }
+        return;
     }
 
     eprintln!("running {} eval cases...", cases.len());
