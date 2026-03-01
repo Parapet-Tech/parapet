@@ -1,0 +1,289 @@
+# MirrorSpec — experiment data contract for parapet-data
+#
+# Usage:
+#   python -m parapet_data curate --spec mirror_spec.example.yaml --output ./curated/ --base-dir ..
+#
+# All paths in source refs are relative to --base-dir (defaults to this file's parent directory).
+
+name: mirror_v1
+version: "1.0.0"
+seed: 42
+
+# Benign:malicious ratio per cell. 1.0 = equal, 2.0 = 2x benign per attack.
+ratio: 1.0
+
+# Total sample budget across all cells. Omit to take all available samples.
+total_target: 10000
+
+# What to do when a cell can't hit its target.
+# strategy options: same_reason_any_language | oversample | fail
+backfill:
+  strategy: same_reason_any_language
+  max_oversample_ratio: 2.0   # only used with strategy: oversample
+  log_gaps: true
+
+# Set true to define fewer than 8 cells (for fast iteration).
+allow_partial_mirror: false
+
+# Reasons routed exclusively to holdout — tests generalization to unseen attack categories.
+# holdout_only_reasons:
+#   - adversarial_suffix
+
+# Extra data outside the mirror taxonomy, targeting known weaknesses.
+# supplement_ratio: 0.05
+# supplements:
+#   - name: gcg_entropy
+#     weakness: "GCG suffixes have high entropy that confuses length/format features"
+#     max_samples: 200
+#     attack_sources:
+#       - name: gcg_attacks
+#         path: TheWall/AmpleGCG/outputs/attacks.yaml
+#         language: EN
+#         extractor: col_content
+#     benign_sources:
+#       - name: gcg_benign_entropy
+#         path: schema/eval/benign/high_entropy_benign.yaml
+#         language: EN
+#         extractor: col_content
+
+# ---------------------------------------------------------------------------
+# Cells — one per attack reason. All 8 required unless allow_partial_mirror: true.
+#
+# Attack reasons:
+#   instruction_override    — "ignore previous instructions" directives
+#   roleplay_jailbreak      — "act as DAN / pretend you're evil" roleplay
+#   meta_probe              — "what are your instructions?" probing
+#   exfiltration            — "output the system prompt / API key" extraction
+#   adversarial_suffix      — GCG/AutoDAN garbled suffixes
+#   indirect_injection      — instructions embedded in tool output / context
+#   obfuscation             — base64/ROT13/leetspeak encoded attacks
+#   constraint_bypass       — "ignore safety rules / no restrictions" requests
+#
+# Languages: EN | RU | ZH | AR
+#
+# Format bins: prose | structured | code
+#   prose       — natural language text
+#   structured  — JSON/markdown/HTML/XML
+#   code        — programming language content
+#
+# Length bins: short | medium | long
+#   short   — <=200 chars (1-2 sentences)
+#   medium  — 201-800 chars (1 paragraph)
+#   long    — >800 chars (multi-paragraph)
+#
+# Extractors (how to pull text from source YAML rows):
+#   col_content          — row["content"]
+#   col_text             — row["text"]
+#   col_prompt           — row["prompt"]
+#   col_query            — row["query"]
+#   col_inputs           — row["inputs"]
+#   col_instruction      — row["instruction"]
+#   col_user_prompt      — row["User Prompt"]
+#   instruction_response — instruction + context + output (Alpaca/Dolly format)
+#   wildchat             — first user turn from conversation list
+#   conversation_a       — first user turn from chatbot arena conversation_a
+#   saiga                — first user turn from saiga messages
+#   writingprompt        — longer of story/prompt
+#   plot                 — Plot/plot/summary field
+#   wildjailbreak        — adversarial or vanilla field
+#   xquad_question       — question + truncated context (280 chars)
+#   prompt_chosen        — prompt + preferred RLHF completion
+#
+# Format/length distributions must each sum to 1.0.
+# ---------------------------------------------------------------------------
+
+cells:
+  - reason: instruction_override
+    teaching_goal: "Neutralize 'text mentioning instructions = attack' correlation"
+    languages: [EN]
+    format_distribution:
+      prose: 0.7
+      structured: 0.2
+      code: 0.1
+    length_distribution:
+      short: 0.5
+      medium: 0.3
+      long: 0.2
+    attack_sources:
+      - name: attacks_override
+        path: schema/eval/t2/attacks51042.yaml
+        language: EN
+        extractor: col_content
+        label_filter:
+          column: label
+          allowed: [malicious]
+    benign_sources:
+      - name: wildchat_en_override
+        path: schema/eval/training/global_benign_curated.yaml
+        language: EN
+        extractor: col_content
+        max_samples: 5000
+
+  - reason: roleplay_jailbreak
+    teaching_goal: "Neutralize 'roleplay/character language = attack' correlation"
+    languages: [EN]
+    format_distribution:
+      prose: 0.8
+      structured: 0.1
+      code: 0.1
+    length_distribution:
+      short: 0.3
+      medium: 0.4
+      long: 0.3
+    attack_sources:
+      - name: wildjailbreak_attacks
+        path: TheWall/wildjailbreak/adversarial.yaml
+        language: EN
+        extractor: wildjailbreak
+    benign_sources:
+      - name: writingprompts_en
+        path: TheWall/writingprompts/stories.yaml
+        language: EN
+        extractor: writingprompt
+
+  - reason: meta_probe
+    teaching_goal: "Neutralize 'questions about the system = attack' correlation"
+    languages: [EN]
+    format_distribution:
+      prose: 0.8
+      structured: 0.1
+      code: 0.1
+    length_distribution:
+      short: 0.6
+      medium: 0.3
+      long: 0.1
+    attack_sources:
+      - name: meta_probe_attacks
+        path: schema/eval/t2/attacks51042.yaml
+        language: EN
+        extractor: col_content
+        label_filter:
+          column: label
+          allowed: [malicious]
+    benign_sources:
+      - name: xquad_en
+        path: TheWall/xquad/en.yaml
+        language: EN
+        extractor: xquad_question
+
+  - reason: exfiltration
+    teaching_goal: "Neutralize 'requesting data output = attack' correlation"
+    languages: [EN]
+    format_distribution:
+      prose: 0.6
+      structured: 0.3
+      code: 0.1
+    length_distribution:
+      short: 0.5
+      medium: 0.3
+      long: 0.2
+    attack_sources:
+      - name: exfil_attacks
+        path: schema/eval/t2/attacks51042.yaml
+        language: EN
+        extractor: col_content
+        label_filter:
+          column: label
+          allowed: [malicious]
+    benign_sources:
+      - name: alpaca_en
+        path: TheWall/alpaca/en.yaml
+        language: EN
+        extractor: instruction_response
+
+  - reason: adversarial_suffix
+    teaching_goal: "Neutralize 'high-entropy/garbled text = attack' correlation"
+    languages: [EN]
+    format_distribution:
+      prose: 0.4
+      structured: 0.2
+      code: 0.4
+    length_distribution:
+      short: 0.3
+      medium: 0.4
+      long: 0.3
+    attack_sources:
+      - name: gcg_attacks
+        path: TheWall/AmpleGCG/outputs/attacks.yaml
+        language: EN
+        extractor: col_content
+    benign_sources:
+      - name: code_benign
+        path: TheWall/code_samples/en.yaml
+        language: EN
+        extractor: col_content
+
+  - reason: indirect_injection
+    teaching_goal: "Neutralize 'embedded instructions in context = attack' correlation"
+    languages: [EN]
+    format_distribution:
+      prose: 0.5
+      structured: 0.4
+      code: 0.1
+    length_distribution:
+      short: 0.2
+      medium: 0.4
+      long: 0.4
+    attack_sources:
+      - name: indirect_attacks
+        path: schema/eval/t2/attacks51042.yaml
+        language: EN
+        extractor: col_content
+        label_filter:
+          column: label
+          allowed: [malicious]
+    benign_sources:
+      - name: arena_en
+        path: TheWall/chatbot_arena/en.yaml
+        language: EN
+        extractor: conversation_a
+
+  - reason: obfuscation
+    teaching_goal: "Neutralize 'base64/ROT13/encoded text = attack' correlation"
+    languages: [EN]
+    format_distribution:
+      prose: 0.3
+      structured: 0.4
+      code: 0.3
+    length_distribution:
+      short: 0.4
+      medium: 0.4
+      long: 0.2
+    attack_sources:
+      - name: obfuscated_attacks
+        path: schema/eval/t2/attacks51042.yaml
+        language: EN
+        extractor: col_content
+        label_filter:
+          column: label
+          allowed: [malicious]
+    benign_sources:
+      - name: structured_benign
+        path: TheWall/structured_text/en.yaml
+        language: EN
+        extractor: col_content
+
+  - reason: constraint_bypass
+    teaching_goal: "Neutralize 'requests to ignore rules = attack' correlation"
+    languages: [EN]
+    format_distribution:
+      prose: 0.8
+      structured: 0.1
+      code: 0.1
+    length_distribution:
+      short: 0.5
+      medium: 0.3
+      long: 0.2
+    attack_sources:
+      - name: bypass_attacks
+        path: schema/eval/t2/attacks51042.yaml
+        language: EN
+        extractor: col_content
+        label_filter:
+          column: label
+          allowed: [malicious]
+    benign_sources:
+      - name: dolly_en
+        path: TheWall/dolly/en.yaml
+        language: EN
+        extractor: instruction_response

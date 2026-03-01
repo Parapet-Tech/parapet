@@ -2168,6 +2168,21 @@ fn handle_layer_error_open_returns_none() {
     assert!(resp.is_none());
 }
 
+#[test]
+fn request_id_from_headers_uses_incoming_header() {
+    let mut headers = HeaderMap::new();
+    headers.insert("x-request-id", "eval:test-case-42".parse().unwrap());
+    assert_eq!(request_id_from_headers(&headers), "eval:test-case-42");
+}
+
+#[test]
+fn request_id_from_headers_falls_back_to_uuid() {
+    let headers = HeaderMap::new();
+    let request_id = request_id_from_headers(&headers);
+    assert!(!request_id.is_empty());
+    assert!(uuid::Uuid::parse_str(&request_id).is_ok());
+}
+
 // -------------------------------------------------------------------
 // L2a runtime-path tests via forward()
 // -------------------------------------------------------------------

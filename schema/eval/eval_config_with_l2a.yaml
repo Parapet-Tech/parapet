@@ -1,0 +1,78 @@
+parapet: v1
+
+tools:
+  _default:
+    allowed: false
+  read_file:
+    allowed: true
+    constraints:
+      path:
+        type: string
+        starts_with: "/safe/"
+        not_contains:
+          - "../"
+  write_file:
+    allowed: true
+    constraints:
+      path:
+        type: string
+        starts_with: "/safe/"
+        not_contains:
+          - "../"
+  search_code:
+    allowed: true
+  internal_lookup:
+    allowed: true
+    trust: trusted
+
+trust:
+  unknown_trust_policy:
+    system: trusted
+    assistant: trusted
+    user: untrusted
+    tool: untrusted
+  auto_untrusted_roles:
+    - tool
+
+untrusted_content_policy:
+  max_length: 500
+
+canary_tokens:
+  - "{{CANARY_EVAL}}"
+  - "{{CANARY_SECRET_9x7k}}"
+
+sensitive_patterns:
+  - "SECRET_KEY=[A-Za-z0-9]{8,}"
+  - "PRIVATE_TOKEN=[A-Za-z0-9]{8,}"
+  - "sk-[A-Za-z0-9]{20,}"
+
+engine:
+  on_failure: closed
+  timeout_ms: 5000
+
+environment: "eval"
+
+# Full stack + L2a in block mode.
+# Identical to eval_config.yaml but with L2a added.
+layers:
+  L0: { mode: sanitize }
+  L1: { mode: block, threshold: 0.0 }
+  L2a:
+    mode: block
+    model: pg2-22m
+    pg_threshold: 0.5
+    block_threshold: 0.5
+    heuristic_weight: 0.3
+    fusion_confidence_agreement: 0.95
+    fusion_confidence_pg_only: 0.7
+    fusion_confidence_heuristic_only: 0.4
+    max_segments: 32
+    timeout_ms: 5000
+    max_concurrent_scans: 4
+  L3_inbound: { mode: block }
+  L3_outbound: { mode: block, block_action: rewrite }
+  L5a: { mode: redact }
+  L4:
+    mode: block
+    risk_threshold: 0.7
+    min_user_turns: 2

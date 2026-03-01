@@ -230,7 +230,7 @@ impl UpstreamClient for EngineUpstreamClient {
         // Build request context for structured logging
         let model = extract_model(&request.body);
         let ctx = RequestContext {
-            request_id: Uuid::new_v4().to_string(),
+            request_id: request_id_from_headers(&request.headers),
             contract_hash: self.deps.config.contract_hash.clone(),
             provider_str: match provider {
                 Provider::OpenAi => "openai",
@@ -1312,7 +1312,11 @@ pub fn build_engine_client(config: Arc<Config>) -> Result<EngineUpstreamClient, 
             if l1_config.specialists.is_empty() {
                 Some(Arc::new(DefaultL1Scanner::new()))
             } else {
-                Some(Arc::new(EnsembleL1Scanner::new(&l1_config.specialists)))
+                Some(Arc::new(EnsembleL1Scanner::new(
+                    &l1_config.specialists,
+                    l1_config.min_agree,
+                    l1_config.generalist_solo_threshold,
+                )))
             }
         } else {
             None
@@ -1401,6 +1405,16 @@ fn layer_error_503(adapter: &dyn ProviderAdapter, layer: &str, error_type: &str)
         headers,
         body: Body::from(body),
     }
+}
+
+fn request_id_from_headers(headers: &HeaderMap) -> String {
+    headers
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| Uuid::new_v4().to_string())
 }
 
 /// Handle a layer runtime error according to `on_failure` config.
