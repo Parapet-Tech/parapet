@@ -28,6 +28,7 @@ from .models import (
     compute_semantic_hash,
     compute_source_hash,
 )
+from .guardrails import check_feature_coverage
 from .sampler import Sample, SamplingResult
 
 logger = logging.getLogger(__name__)
@@ -40,11 +41,43 @@ logger = logging.getLogger(__name__)
 DEFAULT_SPLIT_RATIOS = {"train": 0.8, "val": 0.1, "holdout": 0.1}
 
 
+def _allocate_split_counts(
+    n: int,
+    *,
+    val_ratio: float,
+    holdout_ratio: float,
+    min_stratum_for_floor: int = 3,
+) -> tuple[int, int, int]:
+    """Allocate train/val/holdout counts for one stratum."""
+    if n <= 0:
+        return 0, 0, 0
+
+    n_holdout = int(n * holdout_ratio)
+    n_val = int(n * val_ratio)
+
+    if n >= min_stratum_for_floor and holdout_ratio > 0 and n_holdout == 0:
+        n_holdout = 1
+    if n >= min_stratum_for_floor and val_ratio > 0 and n_val == 0 and (n - n_holdout) >= 2:
+        n_val = 1
+
+    while n_holdout + n_val > n:
+        if n_val >= n_holdout and n_val > 0:
+            n_val -= 1
+        elif n_holdout > 0:
+            n_holdout -= 1
+        else:
+            break
+
+    n_train = n - n_holdout - n_val
+    return n_train, n_val, n_holdout
+
+
 def split_samples(
     samples: list[Sample],
     ratios: dict[str, float] | None = None,
     holdout_only_reasons: Sequence[str] = (),
     seed: int = 42,
+    stratified: bool = True,
 ) -> dict[str, list[Sample]]:
     """Split samples into train/val/holdout.
 
@@ -65,22 +98,70 @@ def split_samples(
             remainder.append(s)
 
     rng = random.Random(seed)
-    rng.shuffle(remainder)
-
-    # Compute split sizes from remainder
-    n = len(remainder)
     holdout_ratio = ratios.get("holdout", 0.1)
     val_ratio = ratios.get("val", 0.1)
 
-    n_holdout = int(n * holdout_ratio)
-    n_val = int(n * val_ratio)
-    n_train = n - n_holdout - n_val
+    splits: dict[str, list[Sample]] = {"train": [], "val": [], "holdout": []}
 
-    splits: dict[str, list[Sample]] = {
-        "train": remainder[:n_train],
-        "val": remainder[n_train : n_train + n_val],
-        "holdout": remainder[n_train + n_val :] + holdout_only,
-    }
+    if not stratified:
+        rng.shuffle(remainder)
+        n = len(remainder)
+        n_holdout = int(n * holdout_ratio)
+        n_val = int(n * val_ratio)
+        n_train = n - n_holdout - n_val
+        splits["train"] = remainder[:n_train]
+        splits["val"] = remainder[n_train : n_train + n_val]
+        splits["holdout"] = remainder[n_train + n_val :]
+    else:
+        # Primary strata: preserve label/reason/language proportions.
+        primary_groups: dict[tuple[str, str, str], list[Sample]] = {}
+        for sample in remainder:
+            key = (sample.label, sample.reason, sample.language)
+            primary_groups.setdefault(key, []).append(sample)
+
+        final_strata: list[list[Sample]] = []
+        for primary_key in sorted(primary_groups.keys()):
+            primary_samples = primary_groups[primary_key]
+            secondary: dict[tuple[str, str], list[Sample]] = {}
+            for sample in primary_samples:
+                sec_key = (sample.format_bin, sample.length_bin)
+                secondary.setdefault(sec_key, []).append(sample)
+
+            collapsed: list[Sample] = []
+            for sec_key in sorted(secondary.keys()):
+                sec_samples = secondary[sec_key]
+                if len(sec_samples) < 3:
+                    collapsed.extend(sec_samples)
+                    logger.debug(
+                        "Collapsing tiny sub-stratum %s/%s size=%d to primary stratum",
+                        primary_key,
+                        sec_key,
+                        len(sec_samples),
+                    )
+                else:
+                    final_strata.append(sec_samples)
+            if collapsed:
+                final_strata.append(collapsed)
+
+        for stratum in final_strata:
+            local = list(stratum)
+            rng.shuffle(local)
+            n = len(local)
+            n_train, n_val, n_holdout = _allocate_split_counts(
+                n, val_ratio=val_ratio, holdout_ratio=holdout_ratio
+            )
+            splits["train"].extend(local[:n_train])
+            splits["val"].extend(local[n_train : n_train + n_val])
+            splits["holdout"].extend(local[n_train + n_val :])
+            if n >= 3 and (n_val == 0 or n_holdout == 0):
+                logger.warning(
+                    "Stratum size=%d received sparse allocation (val=%d, holdout=%d)",
+                    n,
+                    n_val,
+                    n_holdout,
+                )
+
+    splits["holdout"].extend(holdout_only)
 
     for name, split in splits.items():
         logger.info(
@@ -167,6 +248,9 @@ def compose(
     output_dir: Path,
     base_dir: Path | None = None,
     fmt: OutputFormat = "yaml",
+    stratified_split: bool = True,
+    min_df: int | None = None,
+    max_features: int | None = None,
 ) -> CurationManifest:
     """Compose the final curated dataset from sampling results.
 
@@ -187,6 +271,7 @@ def compose(
         all_samples,
         holdout_only_reasons=holdout_reasons,
         seed=spec.seed,
+        stratified=stratified_split,
     )
 
     # Write per split
@@ -236,6 +321,20 @@ def compose(
         sampling_result.cell_fills,
     )
 
+    feature_coverage_warnings: list[str] = []
+    if min_df is not None and max_features is not None:
+        quota_profile = None
+        if spec.language_quota is not None:
+            quota_profile = {
+                lang.value: pct for lang, pct in spec.language_quota.profile.items()
+            }
+        feature_coverage_warnings = check_feature_coverage(
+            composition=composition_report(all_samples),
+            min_df=min_df,
+            max_features=max_features,
+            language_quota=quota_profile,
+        )
+
     return CurationManifest(
         spec_name=spec.name,
         spec_version=spec.version,
@@ -253,6 +352,7 @@ def compose(
         cell_fills=sampling_result.cell_fills,
         gaps=sampling_result.gaps,
         cross_contamination_dropped=sampling_result.cross_contamination_dropped,
+        feature_coverage_warnings=feature_coverage_warnings,
     )
 
 

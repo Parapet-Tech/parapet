@@ -116,6 +116,62 @@ class TestSplitSamples:
         h2 = [s.content_hash for s in s2["train"]]
         assert h1 != h2
 
+    def test_stratified_false_uses_shuffle_slice(self) -> None:
+        samples = _make_samples(100, "benign") + _make_samples(100, "malicious")
+        splits = split_samples(samples, seed=42, stratified=False)
+        assert len(splits["train"]) + len(splits["val"]) + len(splits["holdout"]) == 200
+
+    def test_stratified_preserves_reason_language_presence(self) -> None:
+        en = [
+            Sample(
+                content=f"EN {i}",
+                content_hash=f"en_{i}",
+                label="benign",
+                reason="instruction_override",
+                source_name="s",
+                language="EN",
+                format_bin="prose",
+                length_bin="short",
+            )
+            for i in range(40)
+        ]
+        ru = [
+            Sample(
+                content=f"RU {i}",
+                content_hash=f"ru_{i}",
+                label="benign",
+                reason="instruction_override",
+                source_name="s",
+                language="RU",
+                format_bin="prose",
+                length_bin="short",
+            )
+            for i in range(20)
+        ]
+        splits = split_samples(en + ru, seed=42, stratified=True)
+        train_langs = {s.language for s in splits["train"]}
+        holdout_langs = {s.language for s in splits["holdout"]}
+        assert "EN" in train_langs and "RU" in train_langs
+        assert "EN" in holdout_langs and "RU" in holdout_langs
+
+    def test_small_stratum_gets_val_and_holdout(self) -> None:
+        small_stratum = [
+            Sample(
+                content=f"tiny {i}",
+                content_hash=f"tiny_{i}",
+                label="benign",
+                reason="obfuscation",
+                source_name="s",
+                language="EN",
+                format_bin="prose",
+                length_bin="short",
+            )
+            for i in range(5)
+        ]
+        splits = split_samples(small_stratum, seed=7, stratified=True)
+        assert len(splits["val"]) >= 1
+        assert len(splits["holdout"]) >= 1
+
 
 # ---------------------------------------------------------------------------
 # JSONL writing

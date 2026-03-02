@@ -1,0 +1,32 @@
+# TrainConfig — iteration mode with F1-calibrated threshold
+#
+# Same as iteration_v1.yaml but sweeps [-1.5, -1.0, -0.5, 0.0, 0.5, 1.0]
+# on the val split to pick the threshold that maximizes F1.
+
+specialist: generalist
+mode: iteration
+
+# Feature extraction
+analyzer: char_wb
+ngram_min: 3
+ngram_max: 5
+max_features: 10000    # iteration cap: <= 15000
+min_df: 5
+
+# SVM
+c: 0.1
+class_weight: none
+max_iter: 100000
+
+# Cross-validation (0 = skip for speed)
+cv_folds: 0
+cv_max_samples: 120000
+
+# Threshold
+threshold_policy: calibrate_f1
+threshold_value: -0.5    # fallback if calibration fails
+
+# Pruning
+prune_threshold: 0.05
+
+seed: 42

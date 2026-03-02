@@ -6,7 +6,7 @@ import hashlib
 import json
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -56,6 +56,9 @@ class RuntimeIdentity(BaseModel):
     env_hash: str
 
 
+BaselineFamily = Literal["random", "pg2", "protectai_repro", "protectai_size_matched"]
+
+
 class RunManifest(BaseModel):
     """One complete experiment run."""
 
@@ -66,6 +69,12 @@ class RunManifest(BaseModel):
     eval_result: EvalResult
     pg2_baseline: EvalResult | None = None
     delta: dict[str, float] | None = None
+    baseline_results: dict[str, EvalResult] = Field(default_factory=dict)
+    baseline_deltas: dict[str, dict[str, float]] = Field(default_factory=dict)
+    baseline_family: BaselineFamily | None = None
+    baseline_recipe_hash: str | None = None
+    baseline_data_hash: str | None = None
+    baseline_data_size: int | None = Field(default=None, ge=0)
     error_file: Path | None = None
     semantic_parity_hash: str | None = None
 
@@ -73,6 +82,18 @@ class RunManifest(BaseModel):
     def ensure_delta_consistency(self) -> "RunManifest":
         if self.pg2_baseline is None and self.delta is not None:
             raise ValueError("delta cannot be set without pg2_baseline")
+        identity_fields = (
+            self.baseline_family,
+            self.baseline_recipe_hash,
+            self.baseline_data_hash,
+            self.baseline_data_size,
+        )
+        provided = [field is not None for field in identity_fields]
+        if any(provided) and not all(provided):
+            raise ValueError(
+                "baseline_family, baseline_recipe_hash, baseline_data_hash, and baseline_data_size "
+                "must be set together"
+            )
         return self
 
 
@@ -107,14 +128,9 @@ def compute_semantic_parity_hash(
                 optional_keys = {"backfill_sources"}
                 present_keys = {str(k) for k in raw.keys()}
                 missing = required_keys - present_keys
-                unknown = present_keys - (required_keys | optional_keys)
                 if missing:
                     raise ValueError(
                         f"Invalid per-cell counts for '{reason}': missing keys {sorted(missing)}"
-                    )
-                if unknown:
-                    raise ValueError(
-                        f"Invalid per-cell counts for '{reason}': unknown keys {sorted(unknown)}"
                     )
                 backfill_sources = raw.get("backfill_sources", [])
                 if isinstance(backfill_sources, (str, bytes)):
@@ -151,7 +167,7 @@ def compute_semantic_parity_hash(
 
 
 def compute_metric_delta(eval_result: EvalResult, baseline_result: EvalResult) -> dict[str, float]:
-    """Compute metric deltas against PG2 baseline."""
+    """Compute metric deltas against a baseline result."""
 
     return {
         "f1_delta": eval_result.f1 - baseline_result.f1,

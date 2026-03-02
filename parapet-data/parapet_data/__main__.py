@@ -71,6 +71,9 @@ def cmd_curate(args: argparse.Namespace) -> None:
             file=sys.stderr,
         )
 
+    if (args.min_df is None) != (args.max_features is None):
+        raise ValueError("--min-df and --max-features must be provided together")
+
     # Compose
     fmt: OutputFormat = args.format
     print(f"\nComposing splits ({fmt})...", file=sys.stderr)
@@ -80,6 +83,9 @@ def cmd_curate(args: argparse.Namespace) -> None:
         output_dir=output_dir,
         base_dir=base_dir,
         fmt=fmt,
+        stratified_split=args.stratified,
+        min_df=args.min_df,
+        max_features=args.max_features,
     )
 
     # Write manifest
@@ -105,6 +111,13 @@ def cmd_curate(args: argparse.Namespace) -> None:
     print(f"  Manifest: {manifest_path}", file=sys.stderr)
     print(f"  Semantic hash: {manifest.semantic_hash[:16]}...", file=sys.stderr)
     print(f"  Output hash:   {manifest.output_hash[:16]}...", file=sys.stderr)
+    if manifest.feature_coverage_warnings:
+        print(
+            f"  Feature coverage warnings: {len(manifest.feature_coverage_warnings)}",
+            file=sys.stderr,
+        )
+        for warning in manifest.feature_coverage_warnings:
+            print(f"    - {warning}", file=sys.stderr)
 
 
 def main() -> None:
@@ -132,6 +145,24 @@ def main() -> None:
         choices=["yaml", "jsonl"],
         default="yaml",
         help="Output format for split files (default: yaml)",
+    )
+    curate_parser.add_argument(
+        "--stratified",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use stratified split logic (default: true)",
+    )
+    curate_parser.add_argument(
+        "--min-df",
+        type=int,
+        default=None,
+        help="Vectorizer min_df for feature-coverage guardrails",
+    )
+    curate_parser.add_argument(
+        "--max-features",
+        type=int,
+        default=None,
+        help="Vectorizer max_features for feature-coverage guardrails",
     )
 
     args = parser.parse_args()

@@ -14,6 +14,8 @@ from parapet_data.models import (
     CellFillRecord,
     FormatBin,
     Language,
+    LanguageQuota,
+    LanguageQuotaMode,
     LengthBin,
     MirrorCell,
     MirrorSpec,
@@ -156,6 +158,17 @@ class TestMirrorCell:
                 length_distribution={LengthBin.MEDIUM: 1.0},
             )
 
+    def test_cell_id_is_deterministic(self) -> None:
+        cell_a = _cell(languages=[Language.ZH, Language.EN, Language.RU])
+        cell_b = _cell(languages=[Language.RU, Language.ZH, Language.EN])
+        assert cell_a.cell_id == cell_b.cell_id
+        assert cell_a.cell_id == "instruction_override__EN,RU,ZH"
+
+    def test_cell_id_distinguishes_language_set(self) -> None:
+        en_cell = _cell(languages=[Language.EN])
+        ru_cell = _cell(languages=[Language.RU])
+        assert en_cell.cell_id != ru_cell.cell_id
+
 
 # ---------------------------------------------------------------------------
 # MirrorSpec tests
@@ -262,6 +275,31 @@ class TestMirrorSpec:
         assert len(restored.cells) == len(spec.cells)
         assert restored.spec_hash() == spec.spec_hash()
 
+    def test_language_quota_profile_rejects_bad_sum(self) -> None:
+        with pytest.raises(ValueError, match="Language profile sums to"):
+            LanguageQuota(
+                mode=LanguageQuotaMode.BEST_EFFORT,
+                profile={Language.EN: 0.8, Language.RU: 0.1},
+            )
+
+    def test_language_quota_profile_accepts_valid_sum(self) -> None:
+        quota = LanguageQuota(
+            mode=LanguageQuotaMode.BEST_EFFORT,
+            profile={
+                Language.EN: 0.75,
+                Language.RU: 0.10,
+                Language.ZH: 0.08,
+                Language.AR: 0.07,
+            },
+        )
+        spec = MirrorSpec(
+            name="quota_ok",
+            version="0.1.0",
+            cells=_full_cells(),
+            language_quota=quota,
+        )
+        assert spec.language_quota is not None
+
 
 # ---------------------------------------------------------------------------
 # Semantic hash tests
@@ -304,6 +342,16 @@ class TestSemanticHash:
         assert compute_semantic_hash(hashes, fills_record) == compute_semantic_hash(
             hashes, fills_dict
         )
+
+
+class TestCellFillRecord:
+    def test_new_fields_have_defaults(self) -> None:
+        fill = CellFillRecord(target=10, actual=9, backfilled=1)
+        assert fill.by_format == {}
+        assert fill.by_length == {}
+        assert fill.by_language == {}
+        assert fill.degraded is False
+        assert fill.degraded_mode is None
 
 
 # ---------------------------------------------------------------------------

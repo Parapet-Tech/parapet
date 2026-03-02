@@ -67,6 +67,13 @@ class AttackReason(str, Enum):
     CONSTRAINT_BYPASS = "constraint_bypass"
 
 
+class LanguageQuotaMode(str, Enum):
+    """Language quota behavior for multi-language sampling."""
+
+    STRICT = "strict"
+    BEST_EFFORT = "best_effort"
+
+
 # ---------------------------------------------------------------------------
 # Source references
 # ---------------------------------------------------------------------------
@@ -139,6 +146,12 @@ class MirrorCell(BaseModel):
                 )
         return self
 
+    @property
+    def cell_id(self) -> str:
+        """Stable cell identifier including reason and language set."""
+        langs = ",".join(sorted({lang.value for lang in self.languages}))
+        return f"{self.reason.value}__{langs}"
+
 
 # ---------------------------------------------------------------------------
 # Backfill and supplements
@@ -152,9 +165,29 @@ class BackfillPolicy(BaseModel):
     use is logged in the manifest so the mirror's imperfections are visible.
     """
 
-    strategy: Literal["same_reason_any_language", "oversample", "fail"]
+    strategy: Literal[
+        "same_reason_any_language",
+        "oversample",
+        "fail",
+        "ngram_safe",
+        "mirror_reason_first",
+    ]
     max_oversample_ratio: float = 2.0
     log_gaps: bool = True
+
+
+class LanguageQuota(BaseModel):
+    """Global language budget profile applied per cell in multi-language specs."""
+
+    mode: LanguageQuotaMode = LanguageQuotaMode.BEST_EFFORT
+    profile: dict[Language, float]
+
+    @model_validator(mode="after")
+    def profile_sums_to_one(self) -> LanguageQuota:
+        total = sum(self.profile.values())
+        if abs(total - 1.0) > 0.01:
+            raise ValueError(f"Language profile sums to {total}, expected 1.0")
+        return self
 
 
 class Supplement(BaseModel):
@@ -204,6 +237,7 @@ class MirrorSpec(BaseModel):
     backfill: BackfillPolicy = Field(
         default_factory=lambda: BackfillPolicy(strategy="same_reason_any_language")
     )
+    language_quota: LanguageQuota | None = None
     seed: int = 42
     allow_partial_mirror: bool = False
     holdout_only_reasons: list[AttackReason] = Field(default_factory=list)
@@ -277,6 +311,7 @@ class CurationManifest(BaseModel):
     cell_fills: dict[str, CellFillRecord]
     gaps: list[str]
     cross_contamination_dropped: int
+    feature_coverage_warnings: list[str] = Field(default_factory=list)
     output_path: Path
 
 
@@ -287,6 +322,11 @@ class CellFillRecord(BaseModel):
     actual: int
     backfilled: int
     backfill_sources: list[str] = Field(default_factory=list)
+    by_format: dict[str, int] = Field(default_factory=dict)
+    by_length: dict[str, int] = Field(default_factory=dict)
+    by_language: dict[str, int] = Field(default_factory=dict)
+    degraded: bool = False
+    degraded_mode: str | None = None
 
 
 # ---------------------------------------------------------------------------
