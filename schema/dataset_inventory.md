@@ -55,6 +55,9 @@ Datasets fetched for L1 training but kept in `schema/eval/staging/` to avoid cha
 | notinject | [leolee99/NotInject](https://huggingface.co/datasets/leolee99/NotInject) | MIT | 339b | benign-only (hard negatives with trigger words) | `fetch_notinject.py` | `opensource_notinject_benign.yaml` |
 | wildguardmix | [allenai/wildguardmix](https://huggingface.co/datasets/allenai/wildguardmix) | Apache-2.0 (gated) | 2,000a + 2,000b | attack+benign | `fetch_wildguardmix.py` | `opensource_wildguardmix_{attacks,benign}.yaml` |
 | protectai-val | [protectai/prompt-injection-validation](https://huggingface.co/datasets/protectai/prompt-injection-validation) | Apache-2.0 | 1,365a + 1,762b | attack+benign (7 splits) | `fetch_protectai_validation.py` | `opensource_protectai_val_{attacks,benign}.yaml` |
+| octavio-multilingual | [Octavio-Santana/prompt-injection-attack-detection-multilingual](https://huggingface.co/datasets/Octavio-Santana/prompt-injection-attack-detection-multilingual) | GPL | 6,339 train + 1,585 test | attack+benign (multilingual) | `fetch_octavio_multilingual.py` | `thewall_prompt_injection_attack_detection_multilingual_{attacks,benign}.yaml` |
+| rikka-multilingual | [rikka-snow/prompt-injection-multilingual](https://huggingface.co/datasets/rikka-snow/prompt-injection-multilingual) | MIT | 6,006 train + 1,276 test | attack+benign (multilingual) | `fetch_rikka_multilingual.py` | `thewall_prompt_injection_multilingual_{attacks,benign}.yaml` |
+| sql-injection-zh | [Kaveny/sql-injection](https://huggingface.co/datasets/Kaveny/sql-injection) | Apache-2.0 | 10,105 conversations | attack-only (supplemental cyber/offense) | `fetch_sql_injection_zh.py` | `thewall_sql_injection_zh_attacks.yaml` |
 
 ### Removed
 
@@ -87,7 +90,7 @@ Datasets fetched for L1 training but kept in `schema/eval/staging/` to avoid cha
 
 ## Running Fetch Scripts
 
-All scripts write to `schema/eval/` and are run from the repo root:
+Scripts write to `schema/eval/` or `schema/eval/staging/` and are run from the repo root:
 
 ```bash
 cd parapet
@@ -102,6 +105,9 @@ python scripts/fetch_imoxto.py
 python scripts/fetch_notinject.py
 python scripts/fetch_wildguardmix.py        # requires HF_TOKEN (gated dataset)
 python scripts/fetch_protectai_validation.py
+python scripts/fetch_octavio_multilingual.py
+python scripts/fetch_rikka_multilingual.py
+python scripts/fetch_sql_injection_zh.py
 ```
 
 After fetching, verify with the eval harness:

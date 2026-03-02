@@ -50,13 +50,23 @@ schema/eval/t*
 schema/eval/attack_types/
 schema/eval/baseline/
 
+# Challenge sets (attack/benign data — reproducible via scripts/)
+schema/eval/challenges/
+
 # parapet-data generated outputs (do not commit attack/benign corpora)
 parapet-data/.coverage
 parapet-data/.pytest_cache/
 parapet-data/curated/
+parapet-data/curated_v2/
 parapet-data/curated_baseline/
+parapet-data/archive/curated/
+parapet-data/archive/curated_baseline/
+parapet-data/tests/.tmp_temp/
 
 # parapet-runner generated outputs (do not commit run artifacts/datasets)
 parapet-runner/.pytest_cache/
 parapet-runner/runs/
 parapet-runner/tests/.tmp_outputs/
+
+# Codex
+.codex/

@@ -79,7 +79,7 @@ def _build_manifest(
             },
         },
         cell_fills={
-            "instruction_override": {
+            "instruction_override__EN_benign": {
                 "target": 3,
                 "actual": 3,
                 "backfilled": 0,
@@ -317,11 +317,17 @@ def test_pg2_baseline_provider_runs_l2a_remap_on_holdout() -> None:
         holdout_source="holdout",
         dataset_dir=output_dir,
     )
-    result = provider.run(holdout=holdout, output_dir=output_dir)
+    result = provider.run(
+        holdout=holdout,
+        train_config=TrainConfig(mode="iteration", cv_folds=0, max_features=15_000),
+        output_dir=output_dir,
+    )
 
-    assert result.f1 == pytest.approx(0.8235)
-    assert result.false_positives == 1
-    assert result.false_negatives == 2
+    assert "pg2" in result.results
+    pg2 = result.results["pg2"]
+    assert pg2.f1 == pytest.approx(0.8235)
+    assert pg2.false_positives == 1
+    assert pg2.false_negatives == 2
 
     args, _ = executor.calls[0]
     assert "--remap-layer" in args

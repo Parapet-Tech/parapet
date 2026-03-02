@@ -5,11 +5,13 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import random as _random
+import shutil
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 import yaml
 from pydantic import BaseModel, Field
@@ -17,12 +19,19 @@ from pydantic import BaseModel, Field
 from .baseline import CommandExecutor, SubprocessCommandExecutor, parse_eval_result_json
 from .config import ThresholdPolicy, TrainConfig
 from .manifest import (
+    BaselineFamily,
     CurationManifest,
     EvalResult,
     RunManifest,
     RuntimeIdentity,
     compute_metric_delta,
     compute_semantic_parity_hash,
+)
+from .protectai import (
+    DEFAULT_PROTECTAI_RECIPE_SOURCES,
+    ProtectAIRecipeMaterialization,
+    ProtectAIRecipeSource,
+    materialize_protectai_recipe,
 )
 
 
@@ -36,6 +45,16 @@ class ResolvedSplits(BaseModel):
     dataset_dir: Path
     content_hashes: list[str] = Field(default_factory=list)
     per_cell_counts: dict[str, Any] = Field(default_factory=dict)
+
+
+class BaselineRun(BaseModel):
+    """All baseline metrics and optional dataset identity metadata."""
+
+    results: dict[str, EvalResult] = Field(default_factory=dict)
+    baseline_family: BaselineFamily | None = None
+    baseline_recipe_hash: str | None = None
+    baseline_data_hash: str | None = None
+    baseline_data_size: int | None = Field(default=None, ge=0)
 
 
 class SplitResolver(Protocol):
@@ -62,8 +81,27 @@ class Evaluator(Protocol):
 
 
 class BaselineProvider(Protocol):
-    def run(self, *, holdout: ResolvedSplits, output_dir: Path) -> EvalResult:
+    def run(
+        self,
+        *,
+        holdout: ResolvedSplits,
+        train_config: TrainConfig,
+        output_dir: Path,
+    ) -> BaselineRun:
         ...
+
+
+class NoopBaselineProvider:
+    """Baseline provider that emits no baseline results."""
+
+    def run(
+        self,
+        *,
+        holdout: ResolvedSplits,  # noqa: ARG002
+        train_config: TrainConfig,  # noqa: ARG002
+        output_dir: Path,  # noqa: ARG002
+    ) -> BaselineRun:
+        return BaselineRun(results={})
 
 
 class ErrorAnalyzer(Protocol):
@@ -71,7 +109,8 @@ class ErrorAnalyzer(Protocol):
         self,
         *,
         eval_result: EvalResult,
-        baseline_result: EvalResult | None,
+        baseline_results: Mapping[str, EvalResult],
+        baseline_deltas: Mapping[str, Mapping[str, float]],
         output_dir: Path,
     ) -> Path:
         ...
@@ -400,6 +439,39 @@ def _set_l1_threshold(config: Mapping[str, Any], threshold: float) -> dict[str, 
     return payload
 
 
+def _install_weights_and_rebuild(
+    *,
+    model_artifact: Path,
+    rust_crate_dir: Path,
+    weights_install_target: str,
+    last_installed_hash: str | None,
+    executor: CommandExecutor,
+) -> str:
+    """Copy trained weights to Rust source tree and rebuild if changed.
+
+    Returns the SHA-256 hash of the installed weights file.
+    Skips the copy + build when the hash matches ``last_installed_hash``.
+    """
+    current_hash = _sha256_file(model_artifact)
+    if current_hash == last_installed_hash:
+        return current_hash
+
+    install_path = rust_crate_dir / "src" / "layers" / weights_install_target
+    shutil.copy2(model_artifact, install_path)
+
+    result = executor.run(
+        ["cargo", "build", "--features", "eval", "--release"],
+        cwd=rust_crate_dir,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Cargo build failed after installing weights from {model_artifact}:\n"
+            f"stdout={result.stdout}\n"
+            f"stderr={result.stderr}"
+        )
+    return current_hash
+
+
 class ParapetEvalEvaluator:
     """Concrete evaluator adapter around parapet-eval for L1 model metrics."""
 
@@ -411,12 +483,17 @@ class ParapetEvalEvaluator:
         workspace_root: Path,
         command_executor: CommandExecutor | None = None,
         accepted_returncodes: Sequence[int] = (0, 1),
+        rust_crate_dir: Path | None = None,
+        weights_install_target: str = "l1_weights_generalist_clean_1to1_51042.rs",
     ) -> None:
         self._parapet_eval_bin = parapet_eval_bin
         self._eval_config = eval_config
         self._workspace_root = workspace_root
         self._executor = command_executor or SubprocessCommandExecutor()
         self._accepted_returncodes = set(accepted_returncodes)
+        self._rust_crate_dir = rust_crate_dir
+        self._weights_install_target = weights_install_target
+        self._last_installed_weights_hash: str | None = None
 
     def evaluate(
         self,
@@ -429,6 +506,15 @@ class ParapetEvalEvaluator:
     ) -> EvalResult:
         if not model_artifact.exists():
             raise FileNotFoundError(f"Model artifact not found: {model_artifact}")
+
+        if self._rust_crate_dir is not None:
+            self._last_installed_weights_hash = _install_weights_and_rebuild(
+                model_artifact=model_artifact,
+                rust_crate_dir=self._rust_crate_dir,
+                weights_install_target=self._weights_install_target,
+                last_installed_hash=self._last_installed_weights_hash,
+                executor=self._executor,
+            )
 
         run_dir = output_dir / f"_eval_{split_name}_{str(threshold).replace('.', 'p').replace('-', 'm')}"
         dataset_dir = run_dir / "dataset"
@@ -503,7 +589,13 @@ class ParapetEvalPG2BaselineProvider:
         self._executor = command_executor or SubprocessCommandExecutor()
         self._accepted_returncodes = set(accepted_returncodes)
 
-    def run(self, *, holdout: ResolvedSplits, output_dir: Path) -> EvalResult:
+    def run(
+        self,
+        *,
+        holdout: ResolvedSplits,
+        train_config: TrainConfig,  # noqa: ARG002
+        output_dir: Path,
+    ) -> BaselineRun:
         baseline_dir = output_dir / "_baseline_pg2"
         dataset_dir = baseline_dir / "dataset"
         source_name = holdout.holdout_source
@@ -548,7 +640,293 @@ class ParapetEvalPG2BaselineProvider:
             )
 
         payload = json.loads(output_json.read_text(encoding="utf-8"))
-        return parse_eval_result_json(payload, threshold_fallback=0.0)
+        return BaselineRun(
+            results={
+                "pg2": parse_eval_result_json(payload, threshold_fallback=0.0),
+            }
+        )
+
+
+class CompositeBaselineProvider:
+    """Run multiple baseline providers and merge outputs deterministically."""
+
+    def __init__(self, providers: Sequence[BaselineProvider]) -> None:
+        if not providers:
+            raise ValueError("providers cannot be empty")
+        self._providers = list(providers)
+
+    def run(
+        self,
+        *,
+        holdout: ResolvedSplits,
+        train_config: TrainConfig,
+        output_dir: Path,
+    ) -> BaselineRun:
+        merged_results: dict[str, EvalResult] = {}
+        metadata: dict[str, Any] = {
+            "baseline_family": None,
+            "baseline_recipe_hash": None,
+            "baseline_data_hash": None,
+            "baseline_data_size": None,
+        }
+
+        for provider in self._providers:
+            result = provider.run(
+                holdout=holdout,
+                train_config=train_config,
+                output_dir=output_dir,
+            )
+            for name, eval_result in result.results.items():
+                if name in merged_results:
+                    raise ValueError(f"Duplicate baseline result key: {name}")
+                merged_results[name] = eval_result
+
+            for key in metadata:
+                incoming = getattr(result, key)
+                current = metadata[key]
+                if incoming is None:
+                    continue
+                if current is None:
+                    metadata[key] = incoming
+                    continue
+                if current != incoming:
+                    raise ValueError(
+                        f"Conflicting baseline metadata '{key}': {current!r} vs {incoming!r}"
+                    )
+
+        return BaselineRun(
+            results=merged_results,
+            baseline_family=metadata["baseline_family"],
+            baseline_recipe_hash=metadata["baseline_recipe_hash"],
+            baseline_data_hash=metadata["baseline_data_hash"],
+            baseline_data_size=metadata["baseline_data_size"],
+        )
+
+
+class ProtectAIBaselineProvider:
+    """Materialize and evaluate ProtectAI recipe baselines."""
+
+    def __init__(
+        self,
+        *,
+        data_root: Path,
+        trainer: Trainer,
+        evaluator: Evaluator,
+        threshold_calibrator: ThresholdCalibrator | None = None,
+        baseline_family: Literal["protectai_repro", "protectai_size_matched"] = "protectai_size_matched",
+        target_size: int | None = None,
+        seed: int = 42,
+        recipe_sources: Sequence[ProtectAIRecipeSource] = DEFAULT_PROTECTAI_RECIPE_SOURCES,
+        contamination_denylist: Sequence[str] = (),
+    ) -> None:
+        self._data_root = data_root
+        self._trainer = trainer
+        self._evaluator = evaluator
+        self._threshold_calibrator = threshold_calibrator
+        self._baseline_family = baseline_family
+        self._target_size = target_size
+        self._seed = seed
+        self._recipe_sources = tuple(recipe_sources)
+        self._contamination_denylist = tuple(contamination_denylist)
+
+    def run(
+        self,
+        *,
+        holdout: ResolvedSplits,
+        train_config: TrainConfig,
+        output_dir: Path,
+    ) -> BaselineRun:
+        baseline_dir = output_dir / f"_baseline_{self._baseline_family}"
+        target_size = self._target_size
+        if self._baseline_family == "protectai_size_matched" and target_size is None:
+            target_size = len(holdout.content_hashes)
+
+        recipe: ProtectAIRecipeMaterialization = materialize_protectai_recipe(
+            data_root=self._data_root,
+            output_dir=baseline_dir / "data",
+            holdout_path=holdout.holdout_path,
+            baseline_family=self._baseline_family,
+            seed=self._seed,
+            target_size=target_size,
+            recipe_sources=self._recipe_sources,
+            contamination_denylist=self._contamination_denylist,
+        )
+
+        model_artifact = self._trainer.train(
+            train_split=recipe.train_path,
+            config=train_config,
+            output_dir=baseline_dir,
+        )
+
+        threshold = train_config.threshold_value
+        if train_config.threshold_policy == ThresholdPolicy.CALIBRATE_F1:
+            if self._threshold_calibrator is None:
+                raise ValueError("threshold_calibrator is required for CALIBRATE_F1 policy")
+            threshold = self._threshold_calibrator.calibrate(
+                evaluator=self._evaluator,
+                model_artifact=model_artifact,
+                val_split=recipe.val_path,
+                output_dir=baseline_dir,
+            )
+
+        eval_result = self._evaluator.evaluate(
+            model_artifact=model_artifact,
+            split_path=recipe.holdout_path,
+            threshold=threshold,
+            split_name="holdout",
+            output_dir=baseline_dir,
+        )
+
+        return BaselineRun(
+            results={recipe.baseline_family: eval_result},
+            baseline_family=recipe.baseline_family,
+            baseline_recipe_hash=recipe.baseline_recipe_hash,
+            baseline_data_hash=recipe.baseline_data_hash,
+            baseline_data_size=recipe.baseline_data_size,
+        )
+
+
+class RandomBaselineProvider:
+    """Train and evaluate a random-sample baseline from unstructured pools.
+
+    Mirrors the tier-0 methodology: shuffle attack + benign pools, sample to
+    target size, split train/val, train, evaluate on the candidate holdout.
+    """
+
+    def __init__(
+        self,
+        *,
+        attack_pool: Path,
+        benign_pool: Path,
+        trainer: Trainer,
+        evaluator: Evaluator,
+        threshold_calibrator: ThresholdCalibrator | None = None,
+        target_size: int | None = None,
+        seed: int = 42,
+    ) -> None:
+        self._attack_pool = attack_pool
+        self._benign_pool = benign_pool
+        self._trainer = trainer
+        self._evaluator = evaluator
+        self._threshold_calibrator = threshold_calibrator
+        self._target_size = target_size
+        self._seed = seed
+
+    def run(
+        self,
+        *,
+        holdout: ResolvedSplits,
+        train_config: TrainConfig,
+        output_dir: Path,
+    ) -> BaselineRun:
+        baseline_dir = output_dir / "_baseline_random"
+        data_dir = baseline_dir / "data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+
+        target_size = self._target_size
+        if target_size is None:
+            target_size = len(holdout.content_hashes)
+        half = target_size // 2
+
+        # Load pools
+        atk_rows = _load_labeled_entries(self._attack_pool)
+        ben_rows = _load_labeled_entries(self._benign_pool)
+
+        if len(atk_rows) < half:
+            raise ValueError(
+                f"Attack pool too small: {len(atk_rows)} available, {half} needed"
+            )
+        if len(ben_rows) < half:
+            raise ValueError(
+                f"Benign pool too small: {len(ben_rows)} available, {half} needed"
+            )
+
+        # Shuffle each pool deterministically
+        rng = _random.Random(self._seed)
+        rng.shuffle(atk_rows)
+        rng = _random.Random(self._seed + 1)
+        rng.shuffle(ben_rows)
+
+        # Sample
+        atk_sample = atk_rows[:half]
+        ben_sample = ben_rows[:half]
+
+        # Dedup against holdout
+        holdout_hashes = set(holdout.content_hashes)
+        combined = [
+            row for row in atk_sample + ben_sample
+            if _content_hash(row["content"]) not in holdout_hashes
+        ]
+
+        # Split 90/10 train/val
+        rng = _random.Random(self._seed + 2)
+        rng.shuffle(combined)
+        val_count = max(1, len(combined) // 10)
+        val_entries = combined[:val_count]
+        train_entries = combined[val_count:]
+
+        # Write splits
+        train_path = data_dir / "train.yaml"
+        val_path = data_dir / "val.yaml"
+        _write_yaml_entries(train_path, train_entries)
+        _write_yaml_entries(val_path, val_entries)
+
+        # Compute data hash for reproducibility
+        all_hashes = sorted(_content_hash(row["content"]) for row in combined)
+        data_hash = hashlib.sha256("\n".join(all_hashes).encode()).hexdigest()
+
+        # Write recipe manifest
+        recipe_manifest = {
+            "baseline_family": "random",
+            "baseline_data_hash": data_hash,
+            "baseline_data_size": len(combined),
+            "seed": self._seed,
+            "attack_pool": str(self._attack_pool),
+            "benign_pool": str(self._benign_pool),
+            "counts": {
+                "train": len(train_entries),
+                "val": len(val_entries),
+                "total": len(combined),
+                "deduped_against_holdout": (half * 2) - len(combined),
+            },
+        }
+        manifest_path = data_dir / "recipe_manifest.json"
+        manifest_path.write_text(
+            json.dumps(recipe_manifest, indent=2),
+            encoding="utf-8",
+        )
+
+        # Train
+        model_artifact = self._trainer.train(
+            train_split=train_path,
+            config=train_config,
+            output_dir=baseline_dir,
+        )
+
+        # Calibrate threshold
+        threshold = train_config.threshold_value
+        if train_config.threshold_policy == ThresholdPolicy.CALIBRATE_F1:
+            if self._threshold_calibrator is None:
+                raise ValueError("threshold_calibrator is required for CALIBRATE_F1 policy")
+            threshold = self._threshold_calibrator.calibrate(
+                evaluator=self._evaluator,
+                model_artifact=model_artifact,
+                val_split=val_path,
+                output_dir=baseline_dir,
+            )
+
+        # Evaluate on candidate holdout
+        eval_result = self._evaluator.evaluate(
+            model_artifact=model_artifact,
+            split_path=holdout.holdout_path,
+            threshold=threshold,
+            split_name="holdout",
+            output_dir=baseline_dir,
+        )
+
+        return BaselineRun(
+            results={"random": eval_result},
+        )
 
 
 class F1GridSearchCalibrator:
@@ -588,7 +966,8 @@ class YamlErrorAnalyzer:
         self,
         *,
         eval_result: EvalResult,
-        baseline_result: EvalResult | None,
+        baseline_results: Mapping[str, EvalResult],
+        baseline_deltas: Mapping[str, Mapping[str, float]],
         output_dir: Path,
     ) -> Path:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -604,17 +983,27 @@ class YamlErrorAnalyzer:
                 "holdout_size": eval_result.holdout_size,
             }
         }
-        if baseline_result is not None:
-            payload["baseline"] = {
-                "threshold": baseline_result.threshold,
-                "f1": baseline_result.f1,
-                "precision": baseline_result.precision,
-                "recall": baseline_result.recall,
-                "false_positives": baseline_result.false_positives,
-                "false_negatives": baseline_result.false_negatives,
-                "holdout_size": baseline_result.holdout_size,
+        if baseline_results:
+            payload["baselines"] = {
+                name: {
+                    "threshold": result.threshold,
+                    "f1": result.f1,
+                    "precision": result.precision,
+                    "recall": result.recall,
+                    "false_positives": result.false_positives,
+                    "false_negatives": result.false_negatives,
+                    "holdout_size": result.holdout_size,
+                }
+                for name, result in baseline_results.items()
             }
-            payload["delta"] = compute_metric_delta(eval_result, baseline_result)
+        if baseline_deltas:
+            payload["deltas"] = {name: dict(delta) for name, delta in baseline_deltas.items()}
+
+        # Legacy keys for PG2-only consumers.
+        pg2_result = baseline_results.get("pg2")
+        if pg2_result is not None:
+            payload["baseline"] = payload["baselines"]["pg2"]
+            payload["delta"] = compute_metric_delta(eval_result, pg2_result)
         out_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
         return out_path
 
@@ -763,10 +1152,21 @@ class ExperimentRunner:
             split_name="holdout",
             output_dir=output_dir,
         )
-        baseline_result = self._deps.baseline_provider.run(holdout=splits, output_dir=output_dir)
+        baseline_run = self._deps.baseline_provider.run(
+            holdout=splits,
+            train_config=train_config,
+            output_dir=output_dir,
+        )
+        baseline_deltas = {
+            name: compute_metric_delta(eval_result, result)
+            for name, result in baseline_run.results.items()
+        }
+        pg2_baseline = baseline_run.results.get("pg2")
+        pg2_delta = baseline_deltas.get("pg2")
         error_file = self._deps.error_analyzer.write(
             eval_result=eval_result,
-            baseline_result=baseline_result,
+            baseline_results=baseline_run.results,
+            baseline_deltas=baseline_deltas,
             output_dir=output_dir,
         )
 
@@ -783,8 +1183,14 @@ class ExperimentRunner:
             curation=curation_manifest,
             train_config=train_config,
             eval_result=eval_result,
-            pg2_baseline=baseline_result,
-            delta=compute_metric_delta(eval_result, baseline_result),
+            pg2_baseline=pg2_baseline,
+            delta=pg2_delta,
+            baseline_results=baseline_run.results,
+            baseline_deltas=baseline_deltas,
+            baseline_family=baseline_run.baseline_family,
+            baseline_recipe_hash=baseline_run.baseline_recipe_hash,
+            baseline_data_hash=baseline_run.baseline_data_hash,
+            baseline_data_size=baseline_run.baseline_data_size,
             error_file=error_file,
             semantic_parity_hash=semantic_hash,
         )
@@ -848,6 +1254,10 @@ def _cli_run(args: argparse.Namespace) -> int:
     parapet_eval_bin = _resolve_relative_path(Path(args.parapet_eval_bin), base_dir=workspace_root)
     l1_eval_config = _resolve_relative_path(Path(args.l1_eval_config), base_dir=workspace_root)
     pg2_eval_config = _resolve_relative_path(Path(args.pg2_eval_config), base_dir=workspace_root)
+    protectai_data_root = _resolve_relative_path(Path(args.protectai_data_root), base_dir=workspace_root)
+    rust_crate_dir: Path | None = None
+    if not args.skip_recompile:
+        rust_crate_dir = _resolve_relative_path(Path(args.rust_crate_dir), base_dir=workspace_root)
 
     curation_raw = _load_structured_file(curation_manifest_path)
     train_config_raw = _load_structured_file(train_config_path)
@@ -856,28 +1266,70 @@ def _cli_run(args: argparse.Namespace) -> int:
 
     thresholds = _parse_thresholds(args.calibration_thresholds)
     executor = SubprocessCommandExecutor()
+    trainer = TrainScriptTrainer(
+        trainer_script=trainer_script,
+        workspace_root=workspace_root,
+        command_executor=executor,
+        python_bin=args.python_bin,
+    )
+    evaluator = ParapetEvalEvaluator(
+        parapet_eval_bin=parapet_eval_bin,
+        eval_config=l1_eval_config,
+        workspace_root=workspace_root,
+        command_executor=executor,
+        rust_crate_dir=rust_crate_dir,
+        weights_install_target=args.weights_install_target,
+    )
+    threshold_calibrator = F1GridSearchCalibrator(thresholds=thresholds)
+
+    baseline_providers: list[BaselineProvider] = []
+    if args.pg2_mode == "on":
+        baseline_providers.append(
+            ParapetEvalPG2BaselineProvider(
+                parapet_eval_bin=parapet_eval_bin,
+                eval_config=pg2_eval_config,
+                workspace_root=workspace_root,
+                command_executor=executor,
+            )
+        )
+    if args.protectai_mode != "off":
+        baseline_providers.append(
+            ProtectAIBaselineProvider(
+                data_root=protectai_data_root,
+                trainer=trainer,
+                evaluator=evaluator,
+                threshold_calibrator=threshold_calibrator,
+                baseline_family=args.protectai_mode,
+                target_size=args.protectai_target_size,
+                seed=train_config.seed,
+            )
+        )
+    if args.random_mode == "on":
+        random_attack_pool = _resolve_relative_path(Path(args.random_attack_pool), base_dir=workspace_root)
+        random_benign_pool = _resolve_relative_path(Path(args.random_benign_pool), base_dir=workspace_root)
+        baseline_providers.append(
+            RandomBaselineProvider(
+                attack_pool=random_attack_pool,
+                benign_pool=random_benign_pool,
+                trainer=trainer,
+                evaluator=evaluator,
+                threshold_calibrator=threshold_calibrator,
+                target_size=args.protectai_target_size,  # same size-matched target
+                seed=train_config.seed,
+            )
+        )
+
     deps = ExperimentDependencies(
         split_resolver=ManifestSplitResolver(
             root_dir=curation_manifest_path.parent,
             verify_content_hashes=not args.skip_split_hash_verify,
         ),
-        trainer=TrainScriptTrainer(
-            trainer_script=trainer_script,
-            workspace_root=workspace_root,
-            command_executor=executor,
-            python_bin=args.python_bin,
-        ),
-        evaluator=ParapetEvalEvaluator(
-            parapet_eval_bin=parapet_eval_bin,
-            eval_config=l1_eval_config,
-            workspace_root=workspace_root,
-            command_executor=executor,
-        ),
-        baseline_provider=ParapetEvalPG2BaselineProvider(
-            parapet_eval_bin=parapet_eval_bin,
-            eval_config=pg2_eval_config,
-            workspace_root=workspace_root,
-            command_executor=executor,
+        trainer=trainer,
+        evaluator=evaluator,
+        baseline_provider=(
+            CompositeBaselineProvider(baseline_providers)
+            if baseline_providers
+            else NoopBaselineProvider()
         ),
         error_analyzer=YamlErrorAnalyzer(),
         runtime_identity_provider=RuntimeIdentityCollector(
@@ -888,7 +1340,7 @@ def _cli_run(args: argparse.Namespace) -> int:
             eval_config=l1_eval_config,
             command_executor=executor,
         ),
-        threshold_calibrator=F1GridSearchCalibrator(thresholds=thresholds),
+        threshold_calibrator=threshold_calibrator,
         artifact_verifier=(
             None
             if args.skip_output_hash_verify
@@ -929,6 +1381,51 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--l1-eval-config", type=Path, default=Path("schema/eval/eval_config_l1_only.yaml"))
     run.add_argument("--pg2-eval-config", type=Path, default=Path("schema/eval/eval_config_l2a_only.yaml"))
     run.add_argument("--pg2-model-id", type=str, default="pg2-22m")
+    run.add_argument(
+        "--pg2-mode",
+        type=str,
+        choices=["off", "on"],
+        default="off",
+        help="Enable PG2/L2A baseline provider (off by default for L1 runs)",
+    )
+    run.add_argument(
+        "--protectai-mode",
+        type=str,
+        choices=["off", "protectai_repro", "protectai_size_matched"],
+        default="off",
+        help="Enable ProtectAI baseline provider mode (off by default)",
+    )
+    run.add_argument(
+        "--protectai-data-root",
+        type=Path,
+        default=Path("schema/eval"),
+        help="Base directory for ProtectAI recipe sources",
+    )
+    run.add_argument(
+        "--protectai-target-size",
+        type=int,
+        default=None,
+        help="Optional target size for protectai_size_matched; defaults to current run size",
+    )
+    run.add_argument(
+        "--random-mode",
+        type=str,
+        choices=["off", "on"],
+        default="off",
+        help="Enable random-sample baseline provider",
+    )
+    run.add_argument(
+        "--random-attack-pool",
+        type=Path,
+        default=Path("schema/eval/t3/attacks49521.yaml"),
+        help="Attack pool YAML for random baseline",
+    )
+    run.add_argument(
+        "--random-benign-pool",
+        type=Path,
+        default=Path("schema/eval/t3/global_benign_curated_100k.yaml"),
+        help="Benign pool YAML for random baseline",
+    )
     run.add_argument("--python-bin", type=str, default="python")
     run.add_argument(
         "--calibration-thresholds",
@@ -945,6 +1442,23 @@ def _build_parser() -> argparse.ArgumentParser:
         "--skip-split-hash-verify",
         action="store_true",
         help="Skip split content-hash verification against CurationManifest",
+    )
+    run.add_argument(
+        "--rust-crate-dir",
+        type=Path,
+        default=Path("parapet"),
+        help="Path to the Rust crate for weight installation and cargo rebuild (relative to workspace root)",
+    )
+    run.add_argument(
+        "--weights-install-target",
+        type=str,
+        default="l1_weights_generalist_clean_1to1_51042.rs",
+        help="Filename in Rust crate's src/layers/ to overwrite with trained weights",
+    )
+    run.add_argument(
+        "--skip-recompile",
+        action="store_true",
+        help="Skip automatic Rust binary recompilation after weight training",
     )
 
     semantic_hash = subparsers.add_parser(

@@ -67,7 +67,7 @@ def main():
             "content": text,
         })
 
-    path = "schema/eval/opensource_gandalf_attacks.yaml"
+    path = "schema/eval/staging/opensource_gandalf_attacks.yaml"
     with open(path, "w", encoding="utf-8") as f:
         f.write(
             "# Lakera/gandalf_ignore_instructions — injection cases\n"

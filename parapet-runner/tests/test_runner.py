@@ -7,12 +7,16 @@ import pytest
 
 from parapet_runner.config import ThresholdPolicy, TrainConfig
 from parapet_runner.manifest import CurationManifest, EvalResult, RuntimeIdentity
+from parapet_runner.baseline import CommandResult
 from parapet_runner.runner import (
+    BaselineRun,
     ExperimentDependencies,
     ExperimentRunner,
     F1GridSearchCalibrator,
     OutputHashVerifier,
+    RandomBaselineProvider,
     ResolvedSplits,
+    _install_weights_and_rebuild,
     assert_no_leakage,
 )
 
@@ -26,7 +30,7 @@ class FakeSplitResolver:
             holdout_source="holdout",
             dataset_dir=Path("."),
             content_hashes=["h2", "h1"],
-            per_cell_counts={"roleplay_jailbreak": {"target": 100, "actual": 98, "backfilled": 2}},
+            per_cell_counts={"roleplay_jailbreak__EN_benign": {"target": 100, "actual": 98, "backfilled": 2}},
         )
 
 
@@ -79,16 +83,26 @@ class FakeBaseline:
     def __init__(self, calls: list[str]) -> None:
         self._calls = calls
 
-    def run(self, *, holdout: ResolvedSplits, output_dir: Path) -> EvalResult:  # noqa: ARG002
+    def run(
+        self,
+        *,
+        holdout: ResolvedSplits,  # noqa: ARG002
+        train_config: TrainConfig,  # noqa: ARG002
+        output_dir: Path,  # noqa: ARG002
+    ) -> BaselineRun:
         self._calls.append("baseline")
-        return EvalResult(
-            f1=0.78,
-            precision=0.79,
-            recall=0.77,
-            false_positives=8,
-            false_negatives=10,
-            threshold=0.0,
-            holdout_size=100,
+        return BaselineRun(
+            results={
+                "pg2": EvalResult(
+                    f1=0.78,
+                    precision=0.79,
+                    recall=0.77,
+                    false_positives=8,
+                    false_negatives=10,
+                    threshold=0.0,
+                    holdout_size=100,
+                )
+            }
         )
 
 
@@ -97,7 +111,8 @@ class FakeErrorAnalyzer:
         self,
         *,
         eval_result: EvalResult,  # noqa: ARG002
-        baseline_result: EvalResult | None,  # noqa: ARG002
+        baseline_results: dict[str, EvalResult],  # noqa: ARG002
+        baseline_deltas: dict[str, dict[str, float]],  # noqa: ARG002
         output_dir: Path,
     ) -> Path:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -153,7 +168,7 @@ def _make_manifest() -> CurationManifest:
             },
         },
         cell_fills={
-            "roleplay_jailbreak": {
+            "roleplay_jailbreak__EN_benign": {
                 "target": 100,
                 "actual": 98,
                 "backfilled": 4,
@@ -201,6 +216,8 @@ def test_runner_calibrates_on_val_then_evaluates_holdout() -> None:
     assert run_manifest.eval_result.threshold == 0.2
     assert run_manifest.delta is not None
     assert run_manifest.delta["f1_delta"] == pytest.approx(0.04)
+    assert "pg2" in run_manifest.baseline_results
+    assert "pg2" in run_manifest.baseline_deltas
     assert run_manifest.semantic_parity_hash is not None
     assert calls == [
         "train:train.jsonl",
@@ -240,6 +257,8 @@ def test_runner_uses_fixed_threshold_without_calibration() -> None:
     )
 
     assert run_manifest.eval_result.threshold == -0.7
+    assert run_manifest.delta is not None
+    assert run_manifest.baseline_results["pg2"].f1 == pytest.approx(0.78)
     assert calls == [
         "train:train.jsonl",
         "eval:holdout:-0.7",
@@ -281,3 +300,218 @@ def test_assert_no_leakage_reports_overlap_count() -> None:
     eval_set = {"b", "d"}
     with pytest.raises(ValueError, match=r"2.*of.*5.*train samples.*40\.0%"):
         assert_no_leakage(train, eval_set)
+
+
+class _RecordingExecutor:
+    """Captures all commands run via the executor."""
+
+    def __init__(self) -> None:
+        self.commands: list[tuple[str, ...]] = []
+
+    def run(self, args, *, cwd=None):  # noqa: ARG002
+        self.commands.append(tuple(str(a) for a in args))
+        return CommandResult(args=tuple(str(a) for a in args), returncode=0, stdout="", stderr="")
+
+
+def test_install_weights_copies_and_rebuilds() -> None:
+    base = _new_output_dir("recompile_copy")
+    rust_crate = base / "parapet"
+    layers_dir = rust_crate / "src" / "layers"
+    layers_dir.mkdir(parents=True)
+
+    weights = base / "model" / "l1_weights_generalist.rs"
+    weights.parent.mkdir(parents=True)
+    weights.write_text("pub const BIAS: f64 = -0.5;\n", encoding="utf-8")
+
+    executor = _RecordingExecutor()
+    target = "l1_weights_test.rs"
+
+    h1 = _install_weights_and_rebuild(
+        model_artifact=weights,
+        rust_crate_dir=rust_crate,
+        weights_install_target=target,
+        last_installed_hash=None,
+        executor=executor,
+    )
+
+    installed = layers_dir / target
+    assert installed.exists()
+    assert installed.read_text(encoding="utf-8") == "pub const BIAS: f64 = -0.5;\n"
+    assert len(executor.commands) == 1
+    assert "cargo" in executor.commands[0][0]
+    assert "--features" in executor.commands[0]
+    assert "eval" in executor.commands[0]
+
+
+def test_install_weights_skips_rebuild_when_hash_matches() -> None:
+    base = _new_output_dir("recompile_skip")
+    rust_crate = base / "parapet"
+    (rust_crate / "src" / "layers").mkdir(parents=True)
+
+    weights = base / "model" / "l1_weights_generalist.rs"
+    weights.parent.mkdir(parents=True)
+    weights.write_text("pub const BIAS: f64 = -0.5;\n", encoding="utf-8")
+
+    executor = _RecordingExecutor()
+
+    h1 = _install_weights_and_rebuild(
+        model_artifact=weights,
+        rust_crate_dir=rust_crate,
+        weights_install_target="test.rs",
+        last_installed_hash=None,
+        executor=executor,
+    )
+    assert len(executor.commands) == 1
+
+    executor.commands.clear()
+    h2 = _install_weights_and_rebuild(
+        model_artifact=weights,
+        rust_crate_dir=rust_crate,
+        weights_install_target="test.rs",
+        last_installed_hash=h1,
+        executor=executor,
+    )
+
+    assert h2 == h1
+    assert len(executor.commands) == 0  # no rebuild
+
+
+def test_install_weights_rebuilds_on_new_weights() -> None:
+    base = _new_output_dir("recompile_new")
+    rust_crate = base / "parapet"
+    layers_dir = rust_crate / "src" / "layers"
+    layers_dir.mkdir(parents=True)
+
+    weights = base / "model" / "l1_weights_generalist.rs"
+    weights.parent.mkdir(parents=True)
+    weights.write_text("pub const BIAS: f64 = -0.5;\n", encoding="utf-8")
+
+    executor = _RecordingExecutor()
+    target = "test.rs"
+
+    h1 = _install_weights_and_rebuild(
+        model_artifact=weights,
+        rust_crate_dir=rust_crate,
+        weights_install_target=target,
+        last_installed_hash=None,
+        executor=executor,
+    )
+
+    # Change weights
+    weights.write_text("pub const BIAS: f64 = -1.0;\n", encoding="utf-8")
+    executor.commands.clear()
+
+    h2 = _install_weights_and_rebuild(
+        model_artifact=weights,
+        rust_crate_dir=rust_crate,
+        weights_install_target=target,
+        last_installed_hash=h1,
+        executor=executor,
+    )
+
+    assert h2 != h1
+    assert len(executor.commands) == 1  # rebuilt
+    assert (layers_dir / target).read_text(encoding="utf-8") == "pub const BIAS: f64 = -1.0;\n"
+
+
+def test_install_weights_raises_on_cargo_failure() -> None:
+    base = _new_output_dir("recompile_fail")
+    rust_crate = base / "parapet"
+    (rust_crate / "src" / "layers").mkdir(parents=True)
+
+    weights = base / "model" / "l1_weights_generalist.rs"
+    weights.parent.mkdir(parents=True)
+    weights.write_text("broken", encoding="utf-8")
+
+    class FailingExecutor:
+        def run(self, args, *, cwd=None):  # noqa: ARG002
+            return CommandResult(
+                args=tuple(str(a) for a in args),
+                returncode=101,
+                stdout="",
+                stderr="error: could not compile",
+            )
+
+    with pytest.raises(RuntimeError, match="Cargo build failed"):
+        _install_weights_and_rebuild(
+            model_artifact=weights,
+            rust_crate_dir=rust_crate,
+            weights_install_target="test.rs",
+            last_installed_hash=None,
+            executor=FailingExecutor(),
+        )
+
+
+def _write_pool(path: Path, entries: list[dict]) -> None:
+    """Write a YAML pool file for testing."""
+    import yaml
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        yaml.safe_dump(entries, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+
+
+def test_random_baseline_provider_trains_and_evaluates() -> None:
+    base = _new_output_dir("random_baseline")
+
+    # Create attack pool (20 entries)
+    atk_entries = [
+        {"content": f"attack payload {i}", "label": "malicious", "id": f"atk-{i}"}
+        for i in range(20)
+    ]
+    atk_pool = base / "pools" / "attacks.yaml"
+    _write_pool(atk_pool, atk_entries)
+
+    # Create benign pool (20 entries)
+    ben_entries = [
+        {"content": f"benign text {i}", "label": "benign", "id": f"ben-{i}"}
+        for i in range(20)
+    ]
+    ben_pool = base / "pools" / "benign.yaml"
+    _write_pool(ben_pool, ben_entries)
+
+    calls: list[str] = []
+    provider = RandomBaselineProvider(
+        attack_pool=atk_pool,
+        benign_pool=ben_pool,
+        trainer=FakeTrainer(calls),
+        evaluator=FakeEvaluator(calls),
+        target_size=20,  # 10 attack + 10 benign
+        seed=42,
+    )
+
+    holdout = ResolvedSplits(
+        train_path=Path("train.yaml"),
+        val_path=Path("val.yaml"),
+        holdout_path=Path("holdout.yaml"),
+        holdout_source="holdout",
+        dataset_dir=Path("."),
+        content_hashes=["unrelated_hash"],
+        per_cell_counts={},
+    )
+
+    config = TrainConfig(
+        mode="iteration",
+        cv_folds=0,
+        max_features=15_000,
+        threshold_policy=ThresholdPolicy.FIXED,
+        threshold_value=-0.5,
+    )
+
+    result = provider.run(
+        holdout=holdout,
+        train_config=config,
+        output_dir=base / "output",
+    )
+
+    assert "random" in result.results
+    assert result.results["random"].f1 > 0
+    # Should have trained and evaluated
+    assert any("train:" in c for c in calls)
+    assert any("eval:holdout" in c for c in calls)
+
+    # Recipe manifest should exist
+    manifest_path = base / "output" / "_baseline_random" / "data" / "recipe_manifest.json"
+    assert manifest_path.exists()

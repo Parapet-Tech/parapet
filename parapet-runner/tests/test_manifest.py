@@ -1,8 +1,18 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
-from parapet_runner.manifest import EvalResult, compute_metric_delta, compute_semantic_parity_hash
+from parapet_runner.config import TrainConfig
+from parapet_runner.manifest import (
+    CurationManifest,
+    EvalResult,
+    RunManifest,
+    RuntimeIdentity,
+    compute_metric_delta,
+    compute_semantic_parity_hash,
+)
 
 try:
     from parapet_data.models import CellFillRecord, compute_semantic_hash as compute_data_semantic_hash
@@ -93,12 +103,28 @@ def test_semantic_hash_rejects_missing_required_cell_fill_keys() -> None:
         )
 
 
-def test_semantic_hash_rejects_unknown_cell_fill_keys() -> None:
-    with pytest.raises(ValueError, match="unknown keys"):
-        compute_semantic_parity_hash(
-            ["a"],
-            {"instruction_override": {"target": 10, "actual": 9, "backfilled": 1, "oops": 123}},
-        )
+def test_semantic_hash_ignores_unknown_cell_fill_keys() -> None:
+    base = compute_semantic_parity_hash(
+        ["a"],
+        {"instruction_override": {"target": 10, "actual": 9, "backfilled": 1}},
+    )
+    with_extra = compute_semantic_parity_hash(
+        ["a"],
+        {
+            "instruction_override": {
+                "target": 10,
+                "actual": 9,
+                "backfilled": 1,
+                "by_format": {"prose": 9},
+                "by_length": {"short": 5, "medium": 4},
+                "by_language": {"EN": 9},
+                "degraded": False,
+                "degraded_mode": None,
+                "oops": 123,
+            }
+        },
+    )
+    assert with_extra == base
 
 
 def test_semantic_hash_rejects_string_backfill_sources() -> None:
@@ -114,3 +140,94 @@ def test_semantic_hash_rejects_string_backfill_sources() -> None:
                 }
             },
         )
+
+
+def _curation_manifest() -> CurationManifest:
+    return CurationManifest(
+        spec_name="mirror_v1",
+        spec_version="1.0.0",
+        spec_hash="spec-hash",
+        seed=42,
+        timestamp="2026-03-01T00:00:00Z",
+        source_hashes={"a": "b"},
+        output_path=Path("curated.jsonl"),
+        output_hash="deadbeef",
+        semantic_hash="seeded",
+        total_samples=100,
+        attack_samples=50,
+        benign_samples=50,
+        splits={
+            "train": {
+                "name": "train",
+                "sample_count": 80,
+                "content_hashes": ["h1"],
+                "artifact_path": Path("train.jsonl"),
+            },
+            "val": {
+                "name": "val",
+                "sample_count": 10,
+                "content_hashes": ["h2"],
+                "artifact_path": Path("val.jsonl"),
+            },
+            "holdout": {
+                "name": "holdout",
+                "sample_count": 10,
+                "content_hashes": ["h3"],
+                "artifact_path": Path("holdout.jsonl"),
+            },
+        },
+        cell_fills={},
+        gaps=[],
+        cross_contamination_dropped=0,
+    )
+
+
+def _runtime_identity() -> RuntimeIdentity:
+    return RuntimeIdentity(
+        git_sha="abc",
+        trainer_script_hash="trainer",
+        parapet_eval_hash="eval",
+        pg2_model_id="pg2",
+        eval_config_hash="cfg",
+        env_hash="env",
+    )
+
+
+def _eval_result() -> EvalResult:
+    return EvalResult(
+        f1=0.8,
+        precision=0.8,
+        recall=0.8,
+        false_positives=1,
+        false_negatives=2,
+        threshold=-0.5,
+        holdout_size=10,
+    )
+
+
+def test_run_manifest_rejects_partial_baseline_identity() -> None:
+    with pytest.raises(ValueError, match="must be set together"):
+        RunManifest(
+            run_id="run-1",
+            runtime=_runtime_identity(),
+            curation=_curation_manifest(),
+            train_config=TrainConfig(mode="iteration", cv_folds=0, max_features=15_000),
+            eval_result=_eval_result(),
+            baseline_family="protectai_size_matched",
+        )
+
+
+def test_run_manifest_accepts_complete_baseline_identity() -> None:
+    manifest = RunManifest(
+        run_id="run-2",
+        runtime=_runtime_identity(),
+        curation=_curation_manifest(),
+        train_config=TrainConfig(mode="iteration", cv_folds=0, max_features=15_000),
+        eval_result=_eval_result(),
+        baseline_family="protectai_size_matched",
+        baseline_recipe_hash="r" * 64,
+        baseline_data_hash="d" * 64,
+        baseline_data_size=24000,
+    )
+    assert manifest.baseline_family == "protectai_size_matched"
+    assert manifest.baseline_data_size == 24000

@@ -2,6 +2,7 @@
 
 from .config import ThresholdPolicy, TrainConfig
 from .manifest import (
+    BaselineFamily,
     CurationManifest,
     EvalResult,
     RunManifest,
@@ -10,6 +11,8 @@ from .manifest import (
     compute_semantic_parity_hash,
 )
 from .runner import (
+    BaselineRun,
+    CompositeBaselineProvider,
     ExperimentDependencies,
     ExperimentRunner,
     F1GridSearchCalibrator,
@@ -17,6 +20,7 @@ from .runner import (
     OutputHashVerifier,
     ParapetEvalEvaluator,
     ParapetEvalPG2BaselineProvider,
+    ProtectAIBaselineProvider,
     ResolvedSplits,
     RuntimeIdentityCollector,
     StaticSplitResolver,
@@ -25,6 +29,9 @@ from .runner import (
 )
 
 __all__ = [
+    "BaselineFamily",
+    "BaselineRun",
+    "CompositeBaselineProvider",
     "CurationManifest",
     "EvalResult",
     "ExperimentDependencies",
@@ -34,6 +41,7 @@ __all__ = [
     "OutputHashVerifier",
     "ParapetEvalEvaluator",
     "ParapetEvalPG2BaselineProvider",
+    "ProtectAIBaselineProvider",
     "ResolvedSplits",
     "RunManifest",
     "RuntimeIdentity",
