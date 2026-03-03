@@ -4,6 +4,8 @@ CLI entry point for parapet-data.
 Usage:
     python -m parapet_data curate --spec mirror_v1.json --output ./curated/
     python -m parapet_data curate --spec mirror_v1.json --output ./curated/ --base-dir /data
+    python -m parapet_data stage --index ../TheWall/INDEX.yaml --output schema/eval/staging/ \
+        --holdout-sets schema/eval/l1_holdout.yaml
 """
 
 from __future__ import annotations
@@ -120,6 +122,39 @@ def cmd_curate(args: argparse.Namespace) -> None:
             print(f"    - {warning}", file=sys.stderr)
 
 
+def cmd_stage(args: argparse.Namespace) -> None:
+    """Run the TheWall staging pipeline."""
+    from .staging import stage_all
+
+    index_path = Path(args.index)
+    output_dir = Path(args.output)
+    holdout_paths = [Path(p) for p in args.holdout_sets]
+
+    print(f"Index: {index_path}", file=sys.stderr)
+    print(f"Output: {output_dir}", file=sys.stderr)
+    print(f"Holdout sets: {len(holdout_paths)}", file=sys.stderr)
+    if args.datasets:
+        print(f"Filter: {args.datasets}", file=sys.stderr)
+
+    manifest = stage_all(
+        index_path=index_path,
+        output_dir=output_dir,
+        holdout_paths=holdout_paths,
+        dataset_filter=args.datasets or None,
+    )
+
+    print(f"\nStaged: {manifest['total_staged']:,}", file=sys.stderr)
+    print(f"Rejected: {manifest['total_rejected']:,}", file=sys.stderr)
+    for ds in manifest["datasets_processed"]:
+        print(
+            f"  {ds['name']}: {ds['rows_staged']}/{ds['rows_read']} staged",
+            file=sys.stderr,
+        )
+        if ds["rejection_reasons"]:
+            for gate, count in sorted(ds["rejection_reasons"].items()):
+                print(f"    {gate}: {count}", file=sys.stderr)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="parapet-data",
@@ -165,11 +200,39 @@ def main() -> None:
         help="Vectorizer max_features for feature-coverage guardrails",
     )
 
+    stage_parser = subparsers.add_parser(
+        "stage", help="Stage TheWall datasets through quality gates"
+    )
+    stage_parser.add_argument(
+        "--index",
+        required=True,
+        help="Path to TheWall INDEX.yaml",
+    )
+    stage_parser.add_argument(
+        "--output",
+        required=True,
+        help="Output directory for staged YAMLs and manifest",
+    )
+    stage_parser.add_argument(
+        "--holdout-sets",
+        nargs="+",
+        required=True,
+        help="Eval/tough YAML files to exclude (holdout-leakage protection)",
+    )
+    stage_parser.add_argument(
+        "--datasets",
+        nargs="+",
+        default=None,
+        help="Only process these dataset names (for pilot runs)",
+    )
+
     args = parser.parse_args()
     _setup_logging(args.verbose)
 
     if args.command == "curate":
         cmd_curate(args)
+    elif args.command == "stage":
+        cmd_stage(args)
     else:
         parser.print_help()
         sys.exit(1)
