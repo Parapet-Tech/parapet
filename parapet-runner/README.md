@@ -109,6 +109,23 @@ python -m pytest -q
 
 23 passed.
 
+## Checkpointed ablations
+
+Long-running mix ablations can be run with incremental checkpointing:
+
+```
+cd parapet
+python parapet-runner/scripts/v2_mix_ablation.py \
+  --ratios 100:0,70:30,50:50,30:70,0:100 \
+  --seeds 42,43,44 \
+  --threshold -0.5 \
+  --continue-on-error
+```
+
+Artifacts are written incrementally under `parapet-runner/runs/mirror_v2_mix_ablation/`:
+- one folder per cell (`m{mirror}_n{non}_s{seed}`) with `status.json`, logs, and `result.json`
+- aggregate files regenerated after every completed cell: `results.jsonl`, `summary.csv`, `summary.md`
+
 ## What's next
 
 1. **Run a full experiment** -- `python -m parapet_runner.runner run --curation-manifest manifest.json --train-config train.json --output-dir ./runs/`

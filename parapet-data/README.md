@@ -74,6 +74,36 @@ python -m parapet_data curate --spec SPEC --output OUTPUT [--base-dir BASE_DIR] 
 | `--base-dir` | no | Root for resolving relative source paths (default: spec's parent dir) |
 | `-v` | no | Verbose logging |
 
+## TheWall staging pipeline
+
+Use `stage` to convert raw TheWall datasets (JSON/JSONL/Parquet/CSV/TSV) into mirror-ready YAML sources under `schema/eval/staging/`.
+
+Run from `parapet/`:
+
+```bash
+python -m parapet_data stage \
+  --index ../TheWall/INDEX.yaml \
+  --output schema/eval/staging/ \
+  --holdout-sets schema/eval/l1_holdout.yaml \
+                 schema/eval/t3/l1_holdout_generalist_curated_100k.yaml \
+                 schema/eval/challenges/tough_attack_v1/tough_attack_mirror_v2_novel.yaml \
+                 schema/eval/challenges/tough_neutral_v1/tough_neutral_mirror_v2_novel.yaml
+```
+
+| Flag | Required | Description |
+|------|----------|-------------|
+| `--index` | yes | Path to TheWall `INDEX.yaml` |
+| `--output` | yes | Staging output directory (YAMLs, manifest, logs) |
+| `--holdout-sets` | yes | Eval/tough YAML files used for holdout-leakage exclusion |
+| `--datasets` | no | Optional dataset-name filter for pilot runs |
+
+Notes:
+- `--holdout-sets` is required. The command fails closed if omitted.
+- Manifest accumulation is enabled: each run updates `staging_manifest.json` instead of replacing it.
+- Holdout hash sidecars (`*.hashes`) are written/used for fast reloads.
+
+See [`schema/eval/staging/README.md`](../schema/eval/staging/README.md) for staged artifact schema and manifest contract.
+
 ## Available options
 
 ### Attack reasons

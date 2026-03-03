@@ -259,6 +259,14 @@ cargo run --features eval --bin parapet-eval -- \
 
 Test cases across L1 classifier, L3 single-turn, and L4 multi-turn evaluations, sourced from WildJailbreak, WildChat, deepset, Giskard, Gandalf, Mosscap, JailbreakBench, HackAPrompt, imoxto, jailbreak-classification, NotInject, WildGuardMix, ProtectAI recipe datasets, hand-crafted sequences, and various other sources. Scripts to reproduce in `scripts/fetch_*.py`.
 
+## Data pipeline docs
+
+For corpus curation and staging docs:
+
+- `parapet-data/README.md` -- `curate` and `stage` CLI usage
+- `schema/eval/staging/README.md` -- staged row schema, manifest contract, and artifact semantics
+- `strategy/staging_pipeline_plan.md` -- architecture decisions, quality gates, and rollout phases
+
 Run L1-only eval:
 
 ```bash
