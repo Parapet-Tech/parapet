@@ -112,6 +112,12 @@ pub struct EvalResult {
     /// Evidence pattern categories that matched (from x-parapet-evidence-categories header).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub evidence_categories: Vec<String>,
+    /// L2a fused score (max across segments). Enables offline threshold sweeps.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub l2a_score: Option<f32>,
+    /// L2a raw PG2 model score before fusion (max across segments).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub l2a_pg_score: Option<f32>,
     /// Wall-clock time for this case (engine.forward + response read), in milliseconds.
     pub duration_ms: f64,
 }
@@ -411,6 +417,8 @@ pub async fn run_eval(
                     detail: format!("engine error: {e}"),
                     evidence_count: 0,
                     evidence_categories: Vec::new(),
+                    l2a_score: None,
+                    l2a_pg_score: None,
                     duration_ms,
                 });
                 continue;
@@ -426,6 +434,8 @@ pub async fn run_eval(
         // Extract evidence signals from response headers
         let evidence_count = parse_evidence_count(&headers);
         let evidence_categories = parse_evidence_categories(&headers);
+        let l2a_score = parse_l2a_score(&headers);
+        let l2a_pg_score = parse_l2a_pg_score(&headers);
 
         results.push(EvalResult {
             case_id: case.id.clone(),
@@ -438,6 +448,8 @@ pub async fn run_eval(
             detail,
             evidence_count,
             evidence_categories,
+            l2a_score,
+            l2a_pg_score,
             duration_ms,
         });
     }
@@ -854,6 +866,20 @@ fn parse_evidence_categories(headers: &HeaderMap) -> Vec<String> {
         .and_then(|v| v.to_str().ok())
         .map(|s| s.split(',').map(|c| c.trim().to_string()).collect())
         .unwrap_or_default()
+}
+
+fn parse_l2a_score(headers: &HeaderMap) -> Option<f32> {
+    headers
+        .get("x-parapet-l2a-score")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok())
+}
+
+fn parse_l2a_pg_score(headers: &HeaderMap) -> Option<f32> {
+    headers
+        .get("x-parapet-l2a-pg-score")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok())
 }
 
 fn determine_verdict(
@@ -1542,6 +1568,8 @@ layers:
                 detail: String::new(),
                 evidence_count: 0,
                 evidence_categories: Vec::new(),
+                l2a_score: None,
+                l2a_pg_score: None,
                 duration_ms: 1.0,
             },
             EvalResult {
@@ -1555,6 +1583,8 @@ layers:
                 detail: String::new(),
                 evidence_count: 0,
                 evidence_categories: Vec::new(),
+                l2a_score: None,
+                l2a_pg_score: None,
                 duration_ms: 2.0,
             },
             EvalResult {
@@ -1568,6 +1598,8 @@ layers:
                 detail: String::new(),
                 evidence_count: 0,
                 evidence_categories: Vec::new(),
+                l2a_score: None,
+                l2a_pg_score: None,
                 duration_ms: 3.0,
             },
         ];

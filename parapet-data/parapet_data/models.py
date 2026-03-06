@@ -205,6 +205,26 @@ class Supplement(BaseModel):
     max_samples: int  # hard cap per side
 
 
+class BackgroundLane(BaseModel):
+    """Benign-only background samples outside the mirror.
+
+    Background samples don't match any attack reason by surface similarity.
+    They represent the true prior of benign traffic, anchoring the classifier's
+    decision boundary so it doesn't overfit to mirror edge-cases.
+
+    Budget comes from the benign allocation — mirror cells receive slightly
+    less benign to make room for background, keeping total_target unchanged.
+    """
+
+    sources: list[SourceRef]
+    budget_fraction: float = Field(
+        default=0.15,
+        ge=0.0,
+        le=0.5,
+        description="Fraction of total benign budget allocated to background",
+    )
+
+
 # ---------------------------------------------------------------------------
 # MirrorSpec — the experiment's data contract
 # ---------------------------------------------------------------------------
@@ -238,6 +258,7 @@ class MirrorSpec(BaseModel):
         default_factory=lambda: BackfillPolicy(strategy="same_reason_any_language")
     )
     language_quota: LanguageQuota | None = None
+    background: BackgroundLane | None = None
     seed: int = 42
     allow_partial_mirror: bool = False
     holdout_only_reasons: list[AttackReason] = Field(default_factory=list)
@@ -311,6 +332,8 @@ class CurationManifest(BaseModel):
     cell_fills: dict[str, CellFillRecord]
     gaps: list[str]
     cross_contamination_dropped: int
+    background_requested: int = 0
+    background_actual: int = 0
     feature_coverage_warnings: list[str] = Field(default_factory=list)
     output_path: Path
 

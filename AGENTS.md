@@ -39,6 +39,16 @@ parapet/
       staging/              # Datasets not yet in eval baseline (used for training only)
 ```
 
+## Public Repo Boundary
+
+`parapet/` is the public GitHub repository.
+
+- Never commit private/raw/generated corpora.
+- Treat all TheWall-derived data as local-only unless explicitly approved for publication.
+- Keep staged/curated/run artifacts out of git (for example under `schema/eval/staging/`, `schema/eval/{benign,malicious,training,challenges}/`, `parapet-data/curated*`, `parapet-runner/runs/`).
+- Prefer committing reproducible scripts/configs/docs instead of data files.
+- Before commit/push, run: `python scripts/check_no_data_commit.py`.
+
 ## Key Files
 
 | File | Purpose |

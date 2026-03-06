@@ -28,6 +28,7 @@ from .filters import ContentDeduplicator, looks_like_attack, passes_label_filter
 from .models import (
     AttackReason,
     BackfillPolicy,
+    BackgroundLane,
     CellFillRecord,
     FormatBin,
     Language,
@@ -167,6 +168,7 @@ def extract_samples_from_source(
     extractor = get_extractor(source.extractor)
     samples: list[Sample] = []
 
+    max_samples = source.max_samples
     for row in rows:
         # Apply label filter if configured
         if not passes_label_filter(row, source.label_filter):
@@ -188,8 +190,13 @@ def extract_samples_from_source(
             length_bin=classify_length(text).value,
         ))
 
-    if source.max_samples and len(samples) > source.max_samples:
-        samples = samples[:source.max_samples]
+        # Stop early when a source-level cap is set so repeated cell passes
+        # don't traverse the entire source.
+        if max_samples is not None and len(samples) >= max_samples:
+            break
+
+    if max_samples and len(samples) > max_samples:
+        samples = samples[:max_samples]
 
     return samples
 
@@ -630,6 +637,8 @@ class SamplingResult:
     cell_fills: dict[str, CellFillRecord]
     gaps: list[str]
     cross_contamination_dropped: int
+    background_requested: int = 0
+    background_actual: int = 0
 
 
 def _language_targets_for_cell(
@@ -695,6 +704,7 @@ def sample_spec(
     dedup = ContentDeduplicator()
 
     # Calculate per-cell budget
+    background_budget = 0
     if spec.total_target:
         supplement_budget = int(spec.total_target * spec.supplement_ratio)
         mirror_budget = spec.total_target - supplement_budget
@@ -703,6 +713,12 @@ def sample_spec(
         # ratio = benign:malicious, so per_side = total / (1 + ratio)
         per_cell_attack = int(per_cell_total / (1 + spec.ratio))
         per_cell_benign = per_cell_total - per_cell_attack
+        # Carve background from benign budget to keep total_target unchanged
+        if spec.background:
+            total_benign = n_cells * per_cell_benign
+            background_budget = int(total_benign * spec.background.budget_fraction)
+            mirror_benign = total_benign - background_budget
+            per_cell_benign = mirror_benign // n_cells if n_cells else 0
     else:
         per_cell_attack = None
         per_cell_benign = None
@@ -997,10 +1013,43 @@ def sample_spec(
                 else:
                     all_benign.extend(supp_samples)
 
+    # Phase 6: Background benign lane
+    background_actual = 0
+    if spec.background and background_budget > 0:
+        bg_candidates: list[Sample] = []
+        for source in spec.background.sources:
+            extracted = extract_samples_from_source(
+                source,
+                label="benign",
+                reason="background",
+                base_dir=base_dir,
+            )
+            for sample in extracted:
+                if looks_like_attack(sample.content):
+                    continue
+                if dedup.check(sample.content):
+                    bg_candidates.append(sample)
+        if len(bg_candidates) > background_budget:
+            bg_candidates = rng.sample(bg_candidates, background_budget)
+        all_benign.extend(bg_candidates)
+        background_actual = len(bg_candidates)
+        logger.info(
+            "background lane: requested=%d actual=%d",
+            background_budget,
+            background_actual,
+        )
+        if background_actual < background_budget:
+            all_gaps.append(
+                f"background: requested {background_budget}, "
+                f"got {background_actual} (-{background_budget - background_actual})"
+            )
+
     return SamplingResult(
         attack_samples=all_attack,
         benign_samples=all_benign,
         cell_fills=cell_fills,
         gaps=all_gaps,
         cross_contamination_dropped=dedup.cross_contamination_dropped,
+        background_requested=background_budget,
+        background_actual=background_actual,
     )

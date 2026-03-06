@@ -257,7 +257,7 @@ def _content_hash(text: str) -> str:
 def load_yaml_entries(filepaths: list[str], label_filter: str | None = None) -> list[dict]:
     """Load entries from YAML files, optionally filtering by label.
 
-    Returns list of dicts with id, content, label, source.
+    Returns list of dicts with normalized label plus provenance fields.
     Skips entries with empty content or missing label.
     """
     entries = []
@@ -309,7 +309,15 @@ def load_yaml_entries(filepaths: list[str], label_filter: str | None = None) -> 
                 "content": content,
                 "label": label,
                 "description": entry.get("description", ""),
-                "source": fname,
+                # Preserve upstream source provenance when present.
+                "source": entry.get("source", fname),
+                # Keep the immediate file as an additional breadcrumb.
+                "source_file": fname,
+                "reason": entry.get("reason", ""),
+                "language": entry.get("language", ""),
+                "format_bin": entry.get("format_bin", ""),
+                "length_bin": entry.get("length_bin", ""),
+                "content_hash": entry.get("content_hash", _content_hash(content)),
             })
             count += 1
             if raw_total >= 200_000 and idx % 50_000 == 0:
@@ -520,6 +528,12 @@ def save_errors(holdout_entries, raw_scores, labels, specialist, out_dir):
             "raw_score": round(float(score), 4),
             "label": entry["label"],
             "source": entry.get("source", ""),
+            "source_file": entry.get("source_file", ""),
+            "reason": entry.get("reason", ""),
+            "language": entry.get("language", ""),
+            "format_bin": entry.get("format_bin", ""),
+            "length_bin": entry.get("length_bin", ""),
+            "content_hash": entry.get("content_hash", _content_hash(entry["content"])),
             "description": entry["description"],
             "content": entry["content"],
         })

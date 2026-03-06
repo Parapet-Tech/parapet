@@ -2085,6 +2085,7 @@ fn l2a_signal(score: f32, category: &str) -> Signal {
         category: Some(category.to_string()),
         message_index: Some(0),
         segment_id: None,
+        raw_model_score: None,
     }
 }
 

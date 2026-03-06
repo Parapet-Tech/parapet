@@ -526,6 +526,7 @@ impl L2aScanner for DefaultL2aScanner {
                 );
                 signal.message_index = Some(seg.message_index);
                 signal.segment_id = Some(seg_id);
+                signal.raw_model_score = Some(pg_score);
                 signals.push(signal);
             } else {
                 // One signal per category.
@@ -539,6 +540,7 @@ impl L2aScanner for DefaultL2aScanner {
                     );
                     signal.message_index = Some(seg.message_index);
                     signal.segment_id = Some(seg_id.clone());
+                    signal.raw_model_score = Some(pg_score);
                     signals.push(signal);
                 }
             }
