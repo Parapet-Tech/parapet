@@ -135,12 +135,21 @@ def cmd_stage(args: argparse.Namespace) -> None:
     print(f"Holdout sets: {len(holdout_paths)}", file=sys.stderr)
     if args.datasets:
         print(f"Filter: {args.datasets}", file=sys.stderr)
+    if args.max_rows_per_dataset is not None:
+        print(f"Row limit per dataset: {args.max_rows_per_dataset}", file=sys.stderr)
+    if args.checkpoint_every_rows:
+        print(f"Checkpoint every rows: {args.checkpoint_every_rows}", file=sys.stderr)
+    if args.checkpoint_dir:
+        print(f"Checkpoint dir: {args.checkpoint_dir}", file=sys.stderr)
 
     manifest = stage_all(
         index_path=index_path,
         output_dir=output_dir,
         holdout_paths=holdout_paths,
         dataset_filter=args.datasets or None,
+        max_rows_per_dataset=args.max_rows_per_dataset,
+        checkpoint_every_rows=args.checkpoint_every_rows,
+        checkpoint_dir=Path(args.checkpoint_dir) if args.checkpoint_dir else None,
     )
 
     print(f"\nStaged: {manifest['total_staged']:,}", file=sys.stderr)
@@ -224,6 +233,23 @@ def main() -> None:
         nargs="+",
         default=None,
         help="Only process these dataset names (for pilot runs)",
+    )
+    stage_parser.add_argument(
+        "--max-rows-per-dataset",
+        type=int,
+        default=None,
+        help="Optional hard cap on rows processed per dataset (for fast pilots)",
+    )
+    stage_parser.add_argument(
+        "--checkpoint-every-rows",
+        type=int,
+        default=5000,
+        help="Write progress checkpoints every N rows (default: 5000, 0 disables periodic updates)",
+    )
+    stage_parser.add_argument(
+        "--checkpoint-dir",
+        default=None,
+        help="Optional directory for partial checkpoint files (default: --output)",
     )
 
     args = parser.parse_args()

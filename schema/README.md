@@ -2,6 +2,23 @@
 
 This directory contains data produced by `python -m parapet_data stage`.
 
+## Policy
+
+Do not commit staged/eval corpora to GitHub.
+
+- `schema/eval/staging/*` is intentionally gitignored.
+- If you need to verify a commit/push, run:
+
+```bash
+python scripts/check_no_data_commit.py
+```
+
+To audit the current tracked tree:
+
+```bash
+python scripts/check_no_data_commit.py --all
+```
+
 Run from `parapet/`:
 
 ```bash

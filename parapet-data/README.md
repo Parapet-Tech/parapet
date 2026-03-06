@@ -74,6 +74,49 @@ python -m parapet_data curate --spec SPEC --output OUTPUT [--base-dir BASE_DIR] 
 | `--base-dir` | no | Root for resolving relative source paths (default: spec's parent dir) |
 | `-v` | no | Verbose logging |
 
+## Spec generator
+
+Full MirrorSpec YAMLs are 1000+ lines of repetitive source references. The compact format defines source pools once and per-cell overrides only (~140 lines), then `generate_spec.py` expands it.
+
+### Usage
+
+```bash
+# Generate the full 96K spec
+python generate_spec.py mirror_v3.compact.yaml -o mirror_spec_v3.yaml
+
+# Generate a 19K control (same mirrors, reduced scale)
+python generate_spec.py mirror_v3.compact.yaml --total-target 19200 -o mirror_spec_v3_19k.yaml
+
+# Scale ladder for ablation
+python generate_spec.py mirror_v3.compact.yaml --total-target 40000 -o mirror_spec_v3_40k.yaml
+python generate_spec.py mirror_v3.compact.yaml --total-target 60000 -o mirror_spec_v3_60k.yaml
+
+# Preview without writing
+python generate_spec.py mirror_v3.compact.yaml --total-target 19200 --dry-run
+
+# Override name/version
+python generate_spec.py mirror_v3.compact.yaml --total-target 19200 --name my_experiment --version 3.1.0
+```
+
+`--total-target` auto-generates a name suffix and version tag (e.g. `mirror_v3_19k_control`, `3.0.0-19k`).
+
+### Compact format
+
+The compact YAML has these sections:
+
+| Section | Purpose |
+|---------|---------|
+| Top-level | `name`, `version`, `seed`, `ratio`, `total_target`, `backfill`, `language_quota` |
+| `base_attack_sources` | Attack sources shared by all cells (merged corpora, multilingual) |
+| `base_benign_sources` | Benign sources shared by all cells (curated, wikipedia, xquad) |
+| `staged_attacks` | Staged attack sources with `reasons` filter (auto-expanded per matching cell) |
+| `staged_benign_en` | EN staged benign datasets with `reasons` filter (one source per reason per dataset) |
+| `staged_benign_multilingual` | Non-EN staged benign with `reasons` filter |
+| `background` | Background lane sources (benign-only, no mirror) |
+| `cells` | Per-reason config: `teaching_goal`, `format`, `length`, optional `extra_attack_sources`/`extra_benign_sources` |
+
+See `mirror_v3.compact.yaml` for the complete annotated example.
+
 ## TheWall staging pipeline
 
 Use `stage` to convert raw TheWall datasets (JSON/JSONL/Parquet/CSV/TSV) into mirror-ready YAML sources under `schema/eval/staging/`.
@@ -96,11 +139,19 @@ python -m parapet_data stage \
 | `--output` | yes | Staging output directory (YAMLs, manifest, logs) |
 | `--holdout-sets` | yes | Eval/tough YAML files used for holdout-leakage exclusion |
 | `--datasets` | no | Optional dataset-name filter for pilot runs |
+| `--max-rows-per-dataset` | no | Hard cap rows read per dataset (fast subset/pilot ingest) |
+| `--checkpoint-every-rows` | no | Progress checkpoint interval (default `5000`, set `0` to disable periodic updates) |
+| `--checkpoint-dir` | no | Directory for partial checkpoint files (default: `--output`) |
 
 Notes:
 - `--holdout-sets` is required. The command fails closed if omitted.
 - Manifest accumulation is enabled: each run updates `staging_manifest.json` instead of replacing it.
 - Holdout hash sidecars (`*.hashes`) are written/used for fast reloads.
+- During long runs, partial checkpoint files are written:
+  - `*_attacks_staged.partial.jsonl`
+  - `*_benign_staged.partial.jsonl`
+  - `<dataset>_progress.json`
+  These preserve progress if a run is interrupted before final YAML write.
 
 See [`schema/eval/staging/README.md`](../schema/eval/staging/README.md) for staged artifact schema and manifest contract.
 

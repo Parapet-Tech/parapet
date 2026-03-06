@@ -1,4 +1,4 @@
-# MirrorSpec v3 — v2 + TheWall staged sources (pilot)
+﻿# MirrorSpec v3 (19k control) - same sources/routing as v3, reduced scale
 #
 # Delta from v2:
 #   - RU attacks: +17K from russian_prompt_injections (4 reasons)
@@ -10,15 +10,19 @@
 # Staged sources use label_filter on "reason" column to route to correct cells.
 # Sources without staged data for a reason are unchanged from v2.
 #
+#
+# Purpose:
+#   Control for scale vs v2 (~19k), while keeping v3 mirror curation identical.
+#   Use this for the first rung in the 19k/40k/60k/96k ladder.
 # Usage:
-#   python -m parapet_data curate --spec mirror_spec_v3.yaml --output ../schema/eval/t_mirror/v3/ --base-dir ..
+#   python -m parapet_data curate --spec mirror_spec_v3_19k.yaml --output ../schema/eval/t_mirror/v3_19k/ --base-dir ..
 
-name: mirror_v3
-version: "3.0.0"
+name: mirror_v3_19k_control
+version: "3.0.0-19k"
 seed: 42
 
 ratio: 1.0
-total_target: 96000
+total_target: 19200
 
 backfill:
   strategy: ngram_safe
@@ -59,7 +63,7 @@ background:
 # ---------------------------------------------------------------------------
 #
 # Attack sources per language:
-#   EN: attacks_121624.yaml (108K EN) — the merged corpus
+#   EN: attacks_121624.yaml (108K EN) â€” the merged corpus
 #   ZH: attacks_121624_zh.yaml (1K) + zh_attacks.yaml (34K)
 #   AR: attacks_121624_ar.yaml (988) + ar_attacks.yaml (293)
 #   RU: attacks_121624_ru.yaml (5.5K) + ru_attacks.yaml (2.8K)
@@ -94,6 +98,7 @@ cells:
         path: schema/eval/malicious/attacks_121624.yaml
         language: EN
         extractor: col_content
+        max_samples: 20000
         label_filter:
           column: label
           allowed: [malicious]
@@ -127,6 +132,7 @@ cells:
         extractor: col_content
       # v3 staged
       - name: ru_staged_attacks_instruction_override
+        max_samples: 20000
         path: schema/eval/staging/ru_russian_prompt_injections_attacks_staged.yaml
         language: RU
         extractor: col_content
@@ -138,6 +144,7 @@ cells:
         path: schema/eval/training/global_benign_curated.yaml
         language: EN
         extractor: col_content
+        max_samples: 20000
       - name: zh_benign_wikipedia
         path: schema/eval/benign/opensource_wikipedia_zh_benign.yaml
         language: ZH
@@ -164,6 +171,7 @@ cells:
         extractor: col_content
       # v3 staged
       - name: ru_staged_benign_instruction_override
+        max_samples: 20000
         path: schema/eval/staging/ru_ru_turbo_saiga_benign_staged.yaml
         language: RU
         extractor: col_content
@@ -171,6 +179,7 @@ cells:
           column: reason
           allowed: [instruction_override]
       - name: zh_staged_benign_instruction_override
+        max_samples: 20000
         path: schema/eval/staging/zh_stem_zh_instruction_benign_staged.yaml
         language: ZH
         extractor: col_content
@@ -201,6 +210,7 @@ cells:
         path: schema/eval/malicious/attacks_121624.yaml
         language: EN
         extractor: col_content
+        max_samples: 20000
         label_filter:
           column: label
           allowed: [malicious]
@@ -234,6 +244,7 @@ cells:
         extractor: col_content
       # v3 staged
       - name: ru_staged_attacks_roleplay_jailbreak
+        max_samples: 20000
         path: schema/eval/staging/ru_russian_prompt_injections_attacks_staged.yaml
         language: RU
         extractor: col_content
@@ -245,6 +256,7 @@ cells:
         path: schema/eval/training/global_benign_curated.yaml
         language: EN
         extractor: col_content
+        max_samples: 20000
       - name: zh_benign_wikipedia
         path: schema/eval/benign/opensource_wikipedia_zh_benign.yaml
         language: ZH
@@ -271,6 +283,7 @@ cells:
         extractor: col_content
       # v3 staged
       - name: ru_staged_benign_roleplay_jailbreak
+        max_samples: 20000
         path: schema/eval/staging/ru_ru_turbo_saiga_benign_staged.yaml
         language: RU
         extractor: col_content
@@ -337,6 +350,7 @@ cells:
         path: schema/eval/malicious/attacks_121624.yaml
         language: EN
         extractor: col_content
+        max_samples: 20000
         label_filter:
           column: label
           allowed: [malicious]
@@ -373,6 +387,7 @@ cells:
         path: schema/eval/training/global_benign_curated.yaml
         language: EN
         extractor: col_content
+        max_samples: 20000
       - name: zh_benign_wikipedia
         path: schema/eval/benign/opensource_wikipedia_zh_benign.yaml
         language: ZH
@@ -399,6 +414,7 @@ cells:
         extractor: col_content
       # v3 staged
       - name: ru_staged_benign_meta_probe
+        max_samples: 20000
         path: schema/eval/staging/ru_ru_turbo_saiga_benign_staged.yaml
         language: RU
         extractor: col_content
@@ -406,6 +422,7 @@ cells:
           column: reason
           allowed: [meta_probe]
       - name: zh_staged_benign_meta_probe
+        max_samples: 20000
         path: schema/eval/staging/zh_stem_zh_instruction_benign_staged.yaml
         language: ZH
         extractor: col_content
@@ -472,6 +489,7 @@ cells:
         path: schema/eval/malicious/attacks_121624.yaml
         language: EN
         extractor: col_content
+        max_samples: 20000
         label_filter:
           column: label
           allowed: [malicious]
@@ -508,6 +526,7 @@ cells:
         path: schema/eval/training/global_benign_curated.yaml
         language: EN
         extractor: col_content
+        max_samples: 20000
       - name: zh_benign_wikipedia
         path: schema/eval/benign/opensource_wikipedia_zh_benign.yaml
         language: ZH
@@ -585,6 +604,7 @@ cells:
         path: schema/eval/malicious/attacks_121624.yaml
         language: EN
         extractor: col_content
+        max_samples: 20000
         label_filter:
           column: label
           allowed: [malicious]
@@ -614,6 +634,7 @@ cells:
         extractor: col_content
       # v3 staged
       - name: ru_staged_attacks_adversarial_suffix
+        max_samples: 20000
         path: schema/eval/staging/ru_russian_prompt_injections_attacks_staged.yaml
         language: RU
         extractor: col_content
@@ -625,6 +646,7 @@ cells:
         path: schema/eval/training/global_benign_curated.yaml
         language: EN
         extractor: col_content
+        max_samples: 20000
       - name: en_benign_code
         path: schema/eval/benign/code_samples.yaml
         language: EN
@@ -706,6 +728,7 @@ cells:
         path: schema/eval/malicious/attacks_121624.yaml
         language: EN
         extractor: col_content
+        max_samples: 20000
         label_filter:
           column: label
           allowed: [malicious]
@@ -738,6 +761,7 @@ cells:
         path: schema/eval/training/global_benign_curated.yaml
         language: EN
         extractor: col_content
+        max_samples: 20000
       - name: zh_benign_wikipedia
         path: schema/eval/benign/opensource_wikipedia_zh_benign.yaml
         language: ZH
@@ -815,6 +839,7 @@ cells:
         path: schema/eval/malicious/attacks_121624.yaml
         language: EN
         extractor: col_content
+        max_samples: 20000
         label_filter:
           column: label
           allowed: [malicious]
@@ -848,6 +873,7 @@ cells:
         extractor: col_content
       # v3 staged
       - name: ru_staged_attacks_obfuscation
+        max_samples: 20000
         path: schema/eval/staging/ru_russian_prompt_injections_attacks_staged.yaml
         language: RU
         extractor: col_content
@@ -859,6 +885,7 @@ cells:
         path: schema/eval/training/global_benign_curated.yaml
         language: EN
         extractor: col_content
+        max_samples: 20000
       - name: zh_benign_wikipedia
         path: schema/eval/benign/opensource_wikipedia_zh_benign.yaml
         language: ZH
@@ -936,6 +963,7 @@ cells:
         path: schema/eval/malicious/attacks_121624.yaml
         language: EN
         extractor: col_content
+        max_samples: 20000
         label_filter:
           column: label
           allowed: [malicious]
@@ -972,6 +1000,7 @@ cells:
         path: schema/eval/training/global_benign_curated.yaml
         language: EN
         extractor: col_content
+        max_samples: 20000
       - name: zh_benign_wikipedia
         path: schema/eval/benign/opensource_wikipedia_zh_benign.yaml
         language: ZH
@@ -1032,3 +1061,5 @@ cells:
         label_filter:
           column: reason
           allowed: [constraint_bypass]
+
+

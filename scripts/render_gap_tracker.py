@@ -3,7 +3,7 @@
 Usage:
   cd parapet
   python scripts/render_gap_tracker.py \
-    --manifest parapet-data/curated_v2/manifest.json \
+    --manifest schema/eval/t_mirror/v3/manifest.json \
     --out strategy/v3_gap_tracker.md
 """
 
@@ -53,6 +53,23 @@ def fmt_pct(numer: int, denom: int) -> float:
     return (100.0 * numer) / denom
 
 
+def allocate_expected(total: int, ratios: dict[str, float]) -> dict[str, int]:
+    """Allocate integer per-language expected counts that sum to total."""
+    raw = {lang: total * ratios[lang] for lang in LANG_ORDER}
+    base = {lang: int(raw[lang]) for lang in LANG_ORDER}
+    remainder = total - sum(base.values())
+    if remainder <= 0:
+        return base
+    order = sorted(
+        LANG_ORDER,
+        key=lambda lang: (raw[lang] - base[lang], -LANG_ORDER.index(lang)),
+        reverse=True,
+    )
+    for i in range(remainder):
+        base[order[i % len(order)]] += 1
+    return base
+
+
 def pct_bar(pct: float, width: int = 20) -> str:
     clamped = min(max(pct, 0.0), 100.0)
     filled = int(round((clamped / 100.0) * width))
@@ -74,13 +91,20 @@ def build_report(manifest: dict, *, expected: dict[str, int], manifest_rel: str)
     cell_fills = manifest["cell_fills"]
     reasons = sorted({parse_reason_label(k)[0] for k in cell_fills})
     reason_count = len(reasons)
+    expected_total = sum(expected[lang] for lang in LANG_ORDER)
+    if expected_total <= 0:
+        raise ValueError("expected language totals must sum to > 0")
+    expected_ratios = {lang: expected[lang] / expected_total for lang in LANG_ORDER}
 
     rows: dict[tuple[str, str], dict] = {}
     for key, value in cell_fills.items():
         reason, label = parse_reason_label(key)
+        target = int(value.get("target") or 0)
+        exp_by_lang = allocate_expected(target, expected_ratios)
         by_lang = {lang: int((value.get("by_language") or {}).get(lang, 0)) for lang in LANG_ORDER}
         rows[(reason, label)] = {
             "by_lang": by_lang,
+            "exp_by_lang": exp_by_lang,
             "backfilled": int(value.get("backfilled") or 0),
             "degraded": bool(value.get("degraded")),
             "degraded_mode": value.get("degraded_mode") or "",
@@ -94,7 +118,7 @@ def build_report(manifest: dict, *, expected: dict[str, int], manifest_rel: str)
             row = rows[(reason, label)]
             for lang in LANG_ORDER:
                 actual = row["by_lang"][lang]
-                exp = expected[lang]
+                exp = row["exp_by_lang"][lang]
                 gap = exp - actual
                 aggregate_actual[(label, lang)] += actual
                 aggregate_expected[(label, lang)] += exp
@@ -149,7 +173,7 @@ def build_report(manifest: dict, *, expected: dict[str, int], manifest_rel: str)
         vals = []
         for lang in LANG_ORDER:
             actual = row["by_lang"][lang]
-            exp = expected[lang]
+            exp = row["exp_by_lang"][lang]
             vals.append(f"{actual}/{exp} ({exp - actual:+d})")
         out.append(
             f"| {reason} | {vals[0]} | {vals[1]} | {vals[2]} | {vals[3]} | "
@@ -165,7 +189,7 @@ def build_report(manifest: dict, *, expected: dict[str, int], manifest_rel: str)
         vals = []
         for lang in LANG_ORDER:
             actual = row["by_lang"][lang]
-            exp = expected[lang]
+            exp = row["exp_by_lang"][lang]
             vals.append(f"{actual}/{exp} ({exp - actual:+d})")
         out.append(
             f"| {reason} | {vals[0]} | {vals[1]} | {vals[2]} | {vals[3]} | "
@@ -208,7 +232,7 @@ def build_report(manifest: dict, *, expected: dict[str, int], manifest_rel: str)
     out.append("```bash")
     out.append("cd parapet")
     out.append("python scripts/render_gap_tracker.py \\")
-    out.append("  --manifest parapet-data/curated_v2/manifest.json \\")
+    out.append("  --manifest schema/eval/t_mirror/v3/manifest.json \\")
     out.append("  --out strategy/v3_gap_tracker.md")
     out.append("```")
     out.append("")
@@ -221,8 +245,8 @@ def main() -> int:
     parser.add_argument("--out", type=Path, required=True, help="Output markdown file")
     parser.add_argument(
         "--expected",
-        default="EN=1125,RU=150,ZH=120,AR=105",
-        help="Expected per-cell language counts, comma-separated (default: EN=1125,RU=150,ZH=120,AR=105)",
+        default="EN=4500,RU=600,ZH=480,AR=420",
+        help="Base per-cell language counts used to derive language ratios (default: EN=4500,RU=600,ZH=480,AR=420)",
     )
     args = parser.parse_args()
 

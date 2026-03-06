@@ -648,7 +648,12 @@ impl UpstreamClient for EngineUpstreamClient {
             } // if let Some(ref l4_result)
         }
 
-        // 5.5) Verdict processor (shadow — log only, no behavioral change).
+        // 5.5) Capture L2a score headers before signals are moved into the combiner.
+        let l2a_max_fused = l2a_signals.iter().map(|s| s.score).fold(0.0f32, f32::max);
+        let l2a_max_raw = l2a_signals.iter().filter_map(|s| s.raw_model_score).fold(0.0f32, f32::max);
+        let l2a_has_scores = !l2a_signals.is_empty();
+
+        // Verdict processor (shadow — log only, no behavioral change).
         {
             let mut signals = Vec::new();
             if let Some(ref l1r) = l1_result_opt {
@@ -678,6 +683,7 @@ impl UpstreamClient for EngineUpstreamClient {
         // All layers have run and logged their signals — the first blocker wins.
         if let Some(mut resp) = pending_block {
             attach_evidence_headers(&mut resp.headers, evidence_count, &evidence_categories);
+            attach_l2a_score_headers(&mut resp.headers, l2a_has_scores, l2a_max_fused, l2a_max_raw);
             return Ok(resp);
         }
 
@@ -719,6 +725,7 @@ impl UpstreamClient for EngineUpstreamClient {
         if stream {
             let mut resp = self.handle_streaming_response(provider, upstream, &ctx);
             attach_evidence_headers(&mut resp.headers, evidence_count, &evidence_categories);
+            attach_l2a_score_headers(&mut resp.headers, l2a_has_scores, l2a_max_fused, l2a_max_raw);
             return Ok(resp);
         }
 
@@ -757,6 +764,7 @@ impl UpstreamClient for EngineUpstreamClient {
         resp_headers.remove(reqwest::header::TRANSFER_ENCODING);
 
         attach_evidence_headers(&mut resp_headers, evidence_count, &evidence_categories);
+        attach_l2a_score_headers(&mut resp_headers, l2a_has_scores, l2a_max_fused, l2a_max_raw);
         if let Some(extra) = processed.extra_headers {
             for (key, value) in extra.iter() {
                 resp_headers.insert(key, value.clone());
@@ -1469,6 +1477,22 @@ fn attach_evidence_headers(headers: &mut HeaderMap, evidence_count: usize, evide
         if let Ok(val) = evidence_categories.join(",").parse() {
             headers.insert("x-parapet-evidence-categories", val);
         }
+    }
+}
+
+/// Attach L2a score headers for offline threshold sweeps.
+///
+/// Emits both the fused score (what the threshold applies to) and the raw
+/// model score (pre-fusion PG2 softmax) so sweeps can target either.
+fn attach_l2a_score_headers(headers: &mut HeaderMap, has_scores: bool, max_fused: f32, max_raw: f32) {
+    if !has_scores {
+        return;
+    }
+    if let Ok(val) = format!("{max_fused:.6}").parse() {
+        headers.insert("x-parapet-l2a-score", val);
+    }
+    if let Ok(val) = format!("{max_raw:.6}").parse() {
+        headers.insert("x-parapet-l2a-pg-score", val);
     }
 }
 

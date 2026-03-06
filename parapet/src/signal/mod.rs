@@ -71,6 +71,9 @@ pub struct Signal {
     pub message_index: Option<usize>,
     /// Segment-level attribution (L2a-specific detail).
     pub segment_id: Option<SegmentId>,
+    /// Raw pre-fusion score from the underlying model (e.g. PG2 softmax).
+    /// Present only for layers that perform sensor fusion (L2a).
+    pub raw_model_score: Option<f32>,
 }
 
 impl Signal {
@@ -93,6 +96,7 @@ impl Signal {
             confidence: clamp_f32(confidence),
             message_index: None,
             segment_id: None,
+            raw_model_score: None,
         }
     }
 }

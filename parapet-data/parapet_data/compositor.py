@@ -352,6 +352,8 @@ def compose(
         cell_fills=sampling_result.cell_fills,
         gaps=sampling_result.gaps,
         cross_contamination_dropped=sampling_result.cross_contamination_dropped,
+        background_requested=sampling_result.background_requested,
+        background_actual=sampling_result.background_actual,
         feature_coverage_warnings=feature_coverage_warnings,
     )
 

@@ -20,11 +20,17 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, Sequence
+from typing import Any, Iterator, Sequence, TextIO
 
 import yaml
 
-from .classifiers import CONFIDENCE_FLOOR, ReasonClassification, classify_reason
+from .classifiers import (
+    BENIGN_CONFIDENCE_FLOOR,
+    CONFIDENCE_FLOOR,
+    ReasonClassification,
+    classify_benign_reason,
+    classify_reason,
+)
 from .extractors import clean_text
 from .filters import ContentDeduplicator, content_hash, looks_like_attack
 from .models import AttackReason, Language
@@ -59,6 +65,16 @@ LABEL_ALIASES: dict[str, str] = {
     "injection": "malicious",
     "yes": "malicious",
     "no": "benign",
+    # WildJailbreak / similar compound labels
+    "vanilla_harmful": "malicious",
+    "adversarial_harmful": "malicious",
+    "vanilla_benign": "benign",
+    "adversarial_benign": "benign",
+    # Common class/group labels in jailbreak corpora
+    "jailbreak": "malicious",
+    "prompt injection": "malicious",
+    "prompt_injection": "malicious",
+    "prompt-injection": "malicious",
 }
 
 DATASET_LEVEL_LABELS: dict[str, str] = {
@@ -86,6 +102,8 @@ class DatasetConfig:
     label_map: dict[str, str] | None = None
     # For benign: which mirror reason(s) this source routes to
     benign_reasons: list[str] | None = None
+    # For attacks: dataset-level reason routing when classifier can't label
+    specialist_routing: list[str] | None = None
     language_mode: str = "strict"  # "strict" or "best_effort"
 
 
@@ -126,6 +144,7 @@ class DatasetResult:
 
     name: str
     rows_read: int
+    row_limit_hit: bool = False
     staged: list[StagedSample] = field(default_factory=list)
     rejected: list[RejectionRecord] = field(default_factory=list)
     quarantined: list[QuarantineRecord] = field(default_factory=list)
@@ -212,6 +231,7 @@ def _parse_entry(entry: dict[str, Any], section: str) -> DatasetConfig | None:
         staging_status=status,
         label_map=entry.get("label_map"),
         benign_reasons=entry.get("benign_reasons"),
+        specialist_routing=entry.get("specialist_routing"),
         language_mode=entry.get("language_mode", "strict"),
     )
 
@@ -318,6 +338,17 @@ def iter_records(path: Path) -> Iterator[dict[str, Any]]:
                 if isinstance(payload.get(key), list):
                     yield from payload[key]
                     return
+            # Some datasets use {<text>: {...metadata...}} keyed records.
+            # Expand these into row dicts with `content` for extraction.
+            if _looks_like_keyed_records(payload):
+                for record_key, record_val in payload.items():
+                    row: dict[str, Any] = {"content": str(record_key), "_record_key": str(record_key)}
+                    if isinstance(record_val, dict):
+                        row.update(record_val)
+                    else:
+                        row["value"] = record_val
+                    yield row
+                return
             yield payload
 
 
@@ -340,12 +371,13 @@ def extract_text(row: dict[str, Any], config: DatasetConfig) -> str:
     if len(columns) == 1:
         col = columns[0]
         val = row.get(col)
-        if val is None:
-            return ""
+        if val is None or (isinstance(val, str) and not val.strip()):
+            fallback = _extract_text_fallback(row)
+            return clean_text(fallback) if fallback else ""
 
-        # Conversation format (list of {role, content} dicts)
-        if isinstance(val, list) and val and isinstance(val[0], dict):
-            return _extract_conversation(val)
+        # Conversation format (list/array of {role, content} dicts)
+        if hasattr(val, '__len__') and not isinstance(val, str) and len(val) and isinstance(val[0], dict):
+            return _extract_conversation(list(val))
 
         text = str(val)
 
@@ -362,6 +394,51 @@ def extract_text(row: dict[str, Any], config: DatasetConfig) -> str:
         if val and str(val).strip():
             parts.append(str(val).strip())
     return clean_text("\n".join(parts))
+
+
+def _extract_text_fallback(row: dict[str, Any]) -> str:
+    """Best-effort extraction when the declared text column is missing/empty."""
+    # Common email/message schema: subject + body
+    subject = row.get("subject")
+    body = row.get("body")
+    parts: list[str] = []
+    if subject and str(subject).strip():
+        parts.append(str(subject).strip())
+    if body and str(body).strip():
+        parts.append(str(body).strip())
+    if parts:
+        return "\n".join(parts)
+
+    # Common benchmark schema: pre/attack/post prompt template
+    pre = row.get("pre_prompt")
+    attack = row.get("attack")
+    post = row.get("post_prompt")
+    parts = []
+    for val in (pre, attack, post):
+        if val and str(val).strip():
+            parts.append(str(val).strip())
+    if parts:
+        return "\n".join(parts)
+
+    # Generic fallback keys
+    for key in (
+        "content",
+        "prompt",
+        "text",
+        "adversarial",
+        "vanilla",
+        "completion",
+        "user_input",
+        "input",
+        "instruction",
+        "question",
+        "query",
+        "attack",
+    ):
+        val = row.get(key)
+        if val and str(val).strip():
+            return str(val)
+    return ""
 
 
 def _extract_conversation(messages: list[dict]) -> str:
@@ -432,6 +509,24 @@ def resolve_label(
     # Pattern C
     raw = row.get(config.label_column)
     if raw is None:
+        # Best-effort fallback for mislabeled/missing label columns in some corpora
+        for alt in (
+            "label",
+            "class",
+            "attack_attempt",
+            "is_attack",
+            "is_prompt_injection",
+            "group",
+            "data_type",
+            "prompt injection",
+            "Prompt injection",
+        ):
+            if alt == config.label_column:
+                continue
+            raw = row.get(alt)
+            if raw is not None:
+                break
+    if raw is None:
         raise ValueError(
             f"{config.name}: missing label column {config.label_column!r}"
         )
@@ -442,6 +537,16 @@ def resolve_label(
         return config.label_map[raw_str]
 
     return normalize_label(raw_str)
+
+
+def _looks_like_keyed_records(payload: dict[str, Any]) -> bool:
+    """Heuristic: dict where many values are per-record objects keyed by content."""
+    if not payload:
+        return False
+    if not all(isinstance(k, str) for k in payload):
+        return False
+    # Treat as keyed records when all values are mappings/scalars (not list blobs)
+    return all(not isinstance(v, list) for v in payload.values())
 
 
 # ---------------------------------------------------------------------------
@@ -525,7 +630,8 @@ def resolve_reason(
                 confidence=1.0,
                 signals=("source_level_routing", f"hash_bucket:{bucket}/{len(reasons)}"),
             )
-        return None  # No routing → reject to review queue
+        # Fallback: classify by surface similarity to attack categories
+        return classify_benign_reason(text)
 
     # Attack sample
     # Try dataset's reason_map against the declared reason_column
@@ -546,7 +652,31 @@ def resolve_reason(
                     )
 
     # Fallback: heuristic classifier
-    return classify_reason(text)
+    result = classify_reason(text)
+    if result is not None:
+        return result
+
+    # Last resort: dataset-level specialist_routing from INDEX.yaml
+    if config.specialist_routing:
+        reasons = []
+        for r in config.specialist_routing:
+            try:
+                reasons.append(AttackReason(r))
+            except ValueError:
+                continue
+        if reasons:
+            bucket = int(content_hash(text)[:8], 16) % len(reasons)
+            return ReasonClassification(
+                reason=reasons[bucket],
+                confidence=CONFIDENCE_FLOOR,
+                signals=(
+                    "specialist_routing_fallback",
+                    f"dataset:{config.name}",
+                    f"hash_bucket:{bucket}/{len(reasons)}",
+                ),
+            )
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -647,6 +777,10 @@ def stage_dataset(
     thewall_root: Path,
     dedup: ContentDeduplicator,
     holdout_sets: dict[str, set[str]],
+    *,
+    max_rows_per_dataset: int | None = None,
+    checkpoint_dir: Path | None = None,
+    checkpoint_every_rows: int = 5000,
 ) -> DatasetResult:
     """Stage one dataset through all quality gates.
 
@@ -680,6 +814,47 @@ def stage_dataset(
         )
         return result
 
+    checkpoint_attacks: TextIO | None = None
+    checkpoint_benign: TextIO | None = None
+    checkpoint_progress_path: Path | None = None
+    row_limit_hit = False
+
+    if checkpoint_dir is not None:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        lang = language.value.lower()
+        attacks_path = checkpoint_dir / f"{lang}_{config.name}_attacks_staged.partial.jsonl"
+        benign_path = checkpoint_dir / f"{lang}_{config.name}_benign_staged.partial.jsonl"
+        checkpoint_progress_path = checkpoint_dir / f"{config.name}_progress.json"
+
+        for p in (attacks_path, benign_path, checkpoint_progress_path):
+            if p.exists():
+                p.unlink()
+
+        checkpoint_attacks = open(attacks_path, "a", encoding="utf-8")
+        checkpoint_benign = open(benign_path, "a", encoding="utf-8")
+
+    def _checkpoint_progress() -> None:
+        if checkpoint_progress_path is None:
+            return
+        payload = {
+            "dataset": config.name,
+            "language": language.value,
+            "rows_read": result.rows_read,
+            "rows_staged": len(result.staged),
+            "rows_rejected": len(result.rejected),
+            "rows_quarantined": len(result.quarantined),
+            "row_limit_hit": row_limit_hit,
+            "max_rows_per_dataset": max_rows_per_dataset,
+            "rejection_reasons": result.rejection_counts,
+            "by_reason": result.by_reason,
+            "by_language": result.by_language,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        checkpoint_progress_path.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
     def _reject(gate: str, detail: str, preview: str = "") -> None:
         result.rejected.append(
             RejectionRecord(
@@ -690,90 +865,113 @@ def stage_dataset(
             )
         )
 
-    for data_file in files:
-        log.info("reading %s / %s", config.name, data_file.name)
-        for row in iter_records(data_file):
-            result.rows_read += 1
-            if result.rows_read % 5000 == 0:
-                log.info(
-                    "%s: %d read, %d staged, %d rejected so far",
-                    config.name, result.rows_read, len(result.staged), len(result.rejected),
-                )
+    try:
+        for data_file in files:
+            log.info("reading %s / %s", config.name, data_file.name)
+            for row in iter_records(data_file):
+                if (
+                    max_rows_per_dataset is not None
+                    and result.rows_read >= max_rows_per_dataset
+                ):
+                    row_limit_hit = True
+                    break
 
-            # Gate 1: Label resolution
-            try:
-                label = resolve_label(row, config)
-            except ValueError as exc:
-                _reject("label_resolution", str(exc))
-                continue
-
-            # Text extraction
-            text = extract_text(row, config)
-            if not text:
-                _reject("text_extraction", "empty after extraction")
-                continue
-
-            # Gate 6: Content validation (run early)
-            try:
-                text = validate_content(text)
-            except ValueError as exc:
-                _reject("content_too_short", str(exc), text)
-                continue
-
-            # Gate 2: Script validation (reject pure-Latin in non-EN datasets)
-            if not validate_script(text, language):
-                _reject("script_mismatch", f"no {language.value} script chars", text)
-                continue
-
-            # Gate 4: Cross-contamination + dedup
-            if not dedup.check(text):
-                if dedup.cross_contamination_dropped > 0:
-                    _reject("cross_contamination", "matches known attack hash", text)
-                else:
-                    _reject("duplicate", "already seen", text)
-                continue
-
-            # Gate 7: Holdout-leakage
-            leaked_from = check_holdout_leakage(text, holdout_sets)
-            if leaked_from:
-                _reject("holdout_leakage", f"matches {leaked_from}", text)
-                continue
-
-            # Gate 5: Attack signature on benign (quarantine, not hard-reject)
-            if label == "benign" and looks_like_attack(text):
-                result.quarantined.append(
-                    QuarantineRecord(
-                        content=text,
-                        source=config.name,
-                        reason="attack_signature_in_benign",
+                result.rows_read += 1
+                if result.rows_read % 5000 == 0:
+                    log.info(
+                        "%s: %d read, %d staged, %d rejected so far",
+                        config.name, result.rows_read, len(result.staged), len(result.rejected),
                     )
-                )
-                continue
 
-            # Gate 3: Reason classification + confidence floor
-            classification = resolve_reason(text, label, config, row)
+                if checkpoint_every_rows > 0 and result.rows_read % checkpoint_every_rows == 0:
+                    if checkpoint_attacks is not None:
+                        checkpoint_attacks.flush()
+                    if checkpoint_benign is not None:
+                        checkpoint_benign.flush()
+                    _checkpoint_progress()
 
-            if label == "malicious":
-                if classification is None:
-                    _reject("low_confidence", "no reason scored above floor", text)
-                    continue
-                if classification.confidence < CONFIDENCE_FLOOR:
+                # Reader hardening: some JSON/JSONL payloads can yield scalars.
+                # Reject and continue instead of crashing the entire dataset run.
+                if not isinstance(row, dict):
                     _reject(
-                        "low_confidence",
-                        f"{classification.reason.value}={classification.confidence:.2f}",
-                        text,
+                        "row_type",
+                        f"expected mapping row, got {type(row).__name__}",
                     )
                     continue
-                reason_value = classification.reason.value
-            else:
-                # Benign without reason routing → reject to review
-                if classification is None:
-                    _reject("benign_no_reason_mapping", "no source-level routing", text)
-                    continue
-                reason_value = classification.reason.value
 
-            result.staged.append(
-                StagedSample(
+                # Gate 1: Label resolution
+                try:
+                    label = resolve_label(row, config)
+                except ValueError as exc:
+                    _reject("label_resolution", str(exc))
+                    continue
+
+                # Text extraction
+                text = extract_text(row, config)
+                if not text:
+                    _reject("text_extraction", "empty after extraction")
+                    continue
+
+                # Gate 6: Content validation (run early)
+                try:
+                    text = validate_content(text)
+                except ValueError as exc:
+                    _reject("content_too_short", str(exc), text)
+                    continue
+
+                # Gate 2: Script validation (reject pure-Latin in non-EN datasets)
+                if not validate_script(text, language):
+                    _reject("script_mismatch", f"no {language.value} script chars", text)
+                    continue
+
+                # Gate 4: Cross-contamination + dedup
+                if not dedup.check(text):
+                    if dedup.cross_contamination_dropped > 0:
+                        _reject("cross_contamination", "matches known attack hash", text)
+                    else:
+                        _reject("duplicate", "already seen", text)
+                    continue
+
+                # Gate 7: Holdout-leakage
+                leaked_from = check_holdout_leakage(text, holdout_sets)
+                if leaked_from:
+                    _reject("holdout_leakage", f"matches {leaked_from}", text)
+                    continue
+
+                # Gate 5: Attack signature on benign (quarantine, not hard-reject)
+                if label == "benign" and looks_like_attack(text):
+                    result.quarantined.append(
+                        QuarantineRecord(
+                            content=text,
+                            source=config.name,
+                            reason="attack_signature_in_benign",
+                        )
+                    )
+                    continue
+
+                # Gate 3: Reason classification + confidence floor
+                classification = resolve_reason(text, label, config, row)
+
+                if label == "malicious":
+                    if classification is None:
+                        _reject("low_confidence", "no reason scored above floor", text)
+                        continue
+                    if classification.confidence < CONFIDENCE_FLOOR:
+                        _reject(
+                            "low_confidence",
+                            f"{classification.reason.value}={classification.confidence:.2f}",
+                            text,
+                        )
+                        continue
+                    reason_value = classification.reason.value
+                else:
+                    # Benign: surface classifier or source routing; unmatched → background lane
+                    if classification is None:
+                        reason_value = None
+                    else:
+                        reason_value = classification.reason.value
+
+                sample = StagedSample(
                     content=text,
                     label=label,
                     language=language.value,
@@ -781,7 +979,42 @@ def stage_dataset(
                     reason=reason_value,
                     content_hash=content_hash(text),
                 )
-            )
+                result.staged.append(sample)
+
+                if checkpoint_attacks is not None and checkpoint_benign is not None:
+                    target = checkpoint_attacks if sample.label == "malicious" else checkpoint_benign
+                    json.dump(
+                        {
+                            "content": sample.content,
+                            "label": sample.label,
+                            "language": sample.language,
+                            "source": sample.source,
+                            "reason": sample.reason,
+                            "content_hash": sample.content_hash,
+                        },
+                        target,
+                        ensure_ascii=False,
+                    )
+                    target.write("\n")
+
+            if row_limit_hit:
+                break
+    finally:
+        if checkpoint_attacks is not None:
+            checkpoint_attacks.flush()
+            checkpoint_attacks.close()
+        if checkpoint_benign is not None:
+            checkpoint_benign.flush()
+            checkpoint_benign.close()
+        _checkpoint_progress()
+
+    result.row_limit_hit = row_limit_hit
+    if row_limit_hit:
+        log.info(
+            "%s: reached row limit (%d), stopping early",
+            config.name,
+            max_rows_per_dataset,
+        )
 
     log.info(
         "%s: read=%d staged=%d rejected=%d quarantined=%d",
@@ -845,6 +1078,7 @@ def build_manifest(
             {
                 "name": r.name,
                 "rows_read": r.rows_read,
+                "row_limit_hit": r.row_limit_hit,
                 "rows_staged": len(r.staged),
                 "rows_rejected": len(r.rejected),
                 "rows_quarantined": len(r.quarantined),
@@ -913,6 +1147,10 @@ def stage_all(
     output_dir: Path,
     holdout_paths: list[Path],
     dataset_filter: list[str] | None = None,
+    *,
+    max_rows_per_dataset: int | None = None,
+    checkpoint_every_rows: int = 5000,
+    checkpoint_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Run the full staging pipeline.
 
@@ -921,6 +1159,9 @@ def stage_all(
         output_dir: Where to write staged YAMLs and manifest.
         holdout_paths: Eval/tough sets to exclude (required).
         dataset_filter: If set, only process these dataset names (for pilot).
+        max_rows_per_dataset: Optional hard cap on rows processed per dataset.
+        checkpoint_every_rows: Write progress checkpoints every N rows.
+        checkpoint_dir: Directory for partial checkpoint outputs (default: output_dir).
 
     Returns:
         The staging manifest dict.
@@ -930,6 +1171,10 @@ def stage_all(
             "holdout_paths is required. Staging without holdout-leakage "
             "protection is not allowed. Pass --holdout-sets on the CLI."
         )
+    if max_rows_per_dataset is not None and max_rows_per_dataset <= 0:
+        raise ValueError("max_rows_per_dataset must be > 0 when set")
+    if checkpoint_every_rows < 0:
+        raise ValueError("checkpoint_every_rows must be >= 0")
 
     thewall_root = index_path.parent
     configs = parse_index(index_path)
@@ -946,6 +1191,7 @@ def stage_all(
 
     # Pre-load holdout hashes
     holdout_sets = load_holdout_hashes(holdout_paths)
+    checkpoint_root = checkpoint_dir or output_dir
 
     # Index hash for provenance
     index_hash = hashlib.sha256(index_path.read_bytes()).hexdigest()
@@ -961,8 +1207,33 @@ def stage_all(
             log.info("skipping %s (status=%s)", config.name, config.staging_status)
             continue
 
-        result = stage_dataset(config, thewall_root, dedup, holdout_sets)
+        result = stage_dataset(
+            config,
+            thewall_root,
+            dedup,
+            holdout_sets,
+            max_rows_per_dataset=max_rows_per_dataset,
+            checkpoint_dir=checkpoint_root,
+            checkpoint_every_rows=checkpoint_every_rows,
+        )
         results.append(result)
+
+        progress_path = checkpoint_root / f"{config.name}_progress.json"
+        if progress_path.exists():
+            progress_path.unlink()
+
+        checkpoint_lang = result.staged[0].language.lower() if result.staged else None
+        if checkpoint_lang is None:
+            resolved = resolve_language(config)
+            checkpoint_lang = resolved.value.lower() if resolved is not None else None
+
+        if checkpoint_lang is not None:
+            for p in (
+                checkpoint_root / f"{checkpoint_lang}_{config.name}_attacks_staged.partial.jsonl",
+                checkpoint_root / f"{checkpoint_lang}_{config.name}_benign_staged.partial.jsonl",
+            ):
+                if p.exists():
+                    p.unlink()
 
         if not result.staged:
             continue
@@ -980,10 +1251,18 @@ def stage_all(
             log.info("wrote %d attacks → %s", len(attacks), fname)
 
         if benign:
-            fname = f"{lang}_{config.name}_benign_staged.yaml"
-            h = write_staged_yaml(benign, output_dir / fname)
-            output_hashes[fname] = h
-            log.info("wrote %d benign → %s", len(benign), fname)
+            routed = [s for s in benign if s.reason is not None]
+            background = [s for s in benign if s.reason is None]
+            if routed:
+                fname = f"{lang}_{config.name}_benign_staged.yaml"
+                h = write_staged_yaml(routed, output_dir / fname)
+                output_hashes[fname] = h
+                log.info("wrote %d benign (routed) → %s", len(routed), fname)
+            if background:
+                fname = f"{lang}_{config.name}_benign_background_staged.yaml"
+                h = write_staged_yaml(background, output_dir / fname)
+                output_hashes[fname] = h
+                log.info("wrote %d benign (background) → %s", len(background), fname)
 
         # Write quarantine if any
         if result.quarantined:
