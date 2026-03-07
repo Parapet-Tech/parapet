@@ -179,10 +179,16 @@ mod onnx_impl {
             // Load tokenizer. Disable built-in padding (gravitee-io exports
             // default to Fixed(512)) — we pad dynamically to the actual max
             // length in classify_batch, so short inputs stay short.
+            // Truncate at 512 tokens (PG2 DeBERTa max position embeddings).
+            // Without this, long inputs produce huge tensors that cause ONNX
+            // timeouts and cascade into semaphore exhaustion.
             let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
                 .map_err(|e| ModelInitError::OnnxError(format!("tokenizer: {e}")))?;
             tokenizer.with_padding(None);
-            tokenizer.with_truncation(None)
+            tokenizer.with_truncation(Some(tokenizers::TruncationParams {
+                    max_length: 512,
+                    ..Default::default()
+                }))
                 .map_err(|e| ModelInitError::OnnxError(format!("truncation config: {e}")))?;
 
             let pg = Self { session: Mutex::new(session), tokenizer };

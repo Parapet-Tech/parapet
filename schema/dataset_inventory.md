@@ -3,6 +3,33 @@
 Canonical registry of all datasets used by `parapet-eval`.
 Versioned alongside eval configs and YAML files in `schema/eval/`.
 
+This inventory tracks source datasets and durable derived source files.
+It does not track local curated/run artifacts under `parapet-data/curated*`
+or `parapet-runner/runs/`.
+
+## Processing layers
+
+Current data flow is:
+
+1. `schema/eval/`
+   Stable eval and source YAMLs used directly by the engine/eval harness.
+2. `schema/eval/staging/`
+   Mechanically extracted and normalized training candidates.
+3. `schema/eval/verified/`
+   Ledger-applied projection of staged sources used for provenance-checked
+   training/corpus review.
+4. `parapet-data/`
+   Mirror specs and curation tooling, including:
+   - `mirror_v3.compact.yaml`
+   - `mirror_v4.compact.yaml`
+   - `mirror_spec_v3_19k.yaml`
+   - `mirror_spec_v4_19k.yaml`
+
+Notes:
+- `verified/` is derived from `staging/` plus the local adjudication ledger.
+- Mirror specs live in `parapet-data/`, not under `schema/eval/`.
+- Local adjudication ledgers are not versioned.
+
 ## Datasets
 
 ### Existing (fetched and wired)
@@ -46,15 +73,20 @@ Versioned alongside eval configs and YAML files in `schema/eval/`.
 | geekyrakshit | [geekyrakshit/prompt-injection-dataset](https://huggingface.co/datasets/geekyrakshit/prompt-injection-dataset) | Not declared | 534,434 | 500 (mixed) | test | attack+benign | `prompt` | `label` 0/1 | `fetch_geekyrakshit.py` | `opensource_geekyrakshit_{attacks,benign}.yaml` |
 | safeguard | [xTRam1/safe-guard-prompt-injection](https://huggingface.co/datasets/xTRam1/safe-guard-prompt-injection) | Not declared | 10,296 | 2,060 (full test) | test | attack+benign | `text` | `label` 0/1 | `fetch_safeguard.py` | `opensource_safeguard_{attacks,benign}.yaml` |
 
-### V4-10B new datasets (staging/)
+### Training-only staged datasets
 
-Datasets fetched for L1 training but kept in `schema/eval/staging/` to avoid changing the eval baseline.
+Datasets fetched for L1 training but kept in `schema/eval/staging/` to avoid
+changing the eval baseline. When adjudication is applied, inspected projections
+of these staged sources may also appear under `schema/eval/verified/`.
 
 | ID | Source | License | Rows | Type | Script | Output (staging/) |
 |----|--------|---------|------|------|--------|-------------------|
 | notinject | [leolee99/NotInject](https://huggingface.co/datasets/leolee99/NotInject) | MIT | 339b | benign-only (hard negatives with trigger words) | `fetch_notinject.py` | `opensource_notinject_benign.yaml` |
 | wildguardmix | [allenai/wildguardmix](https://huggingface.co/datasets/allenai/wildguardmix) | Apache-2.0 (gated) | 2,000a + 2,000b | attack+benign | `fetch_wildguardmix.py` | `opensource_wildguardmix_{attacks,benign}.yaml` |
 | protectai-val | [protectai/prompt-injection-validation](https://huggingface.co/datasets/protectai/prompt-injection-validation) | Apache-2.0 | 1,365a + 1,762b | attack+benign (7 splits) | `fetch_protectai_validation.py` | `opensource_protectai_val_{attacks,benign}.yaml` |
+| octavio-multilingual | [Octavio-Santana/prompt-injection-attack-detection-multilingual](https://huggingface.co/datasets/Octavio-Santana/prompt-injection-attack-detection-multilingual) | GPL | 6,339 train + 1,585 test | attack+benign (multilingual) | `fetch_octavio_multilingual.py` | `thewall_prompt_injection_attack_detection_multilingual_{attacks,benign}.yaml` |
+| rikka-multilingual | [rikka-snow/prompt-injection-multilingual](https://huggingface.co/datasets/rikka-snow/prompt-injection-multilingual) | MIT | 6,006 train + 1,276 test | attack+benign (multilingual) | `fetch_rikka_multilingual.py` | `thewall_prompt_injection_multilingual_{attacks,benign}.yaml` |
+| sql-injection-zh | [Kaveny/sql-injection](https://huggingface.co/datasets/Kaveny/sql-injection) | Apache-2.0 | 10,105 conversations | attack-only (supplemental cyber/offense) | `fetch_sql_injection_zh.py` | `thewall_sql_injection_zh_attacks.yaml` |
 
 ### Removed
 
@@ -87,21 +119,36 @@ Datasets fetched for L1 training but kept in `schema/eval/staging/` to avoid cha
 
 ## Running Fetch Scripts
 
-All scripts write to `schema/eval/` and are run from the repo root:
+Fetch scripts now live under `scripts/sources/`. They write source YAMLs to
+`schema/eval/` or `schema/eval/staging/` and are typically run from the
+`DefenseSector/` workspace root:
 
 ```bash
 cd parapet
-python scripts/fetch_bipia.py
-python scripts/fetch_jailbreakv.py
-python scripts/fetch_jbb_paraphrase.py
-python scripts/fetch_llmail.py
-python scripts/fetch_promptshield.py
-python scripts/fetch_geekyrakshit.py
-python scripts/fetch_safeguard.py
-python scripts/fetch_imoxto.py
-python scripts/fetch_notinject.py
-python scripts/fetch_wildguardmix.py        # requires HF_TOKEN (gated dataset)
-python scripts/fetch_protectai_validation.py
+python scripts/sources/fetch_bipia.py
+python scripts/sources/fetch_jailbreakv.py
+python scripts/sources/fetch_jbb_paraphrase.py
+python scripts/sources/fetch_llmail.py
+python scripts/sources/fetch_promptshield.py
+python scripts/sources/fetch_geekyrakshit.py
+python scripts/sources/fetch_safeguard.py
+python scripts/sources/fetch_imoxto.py
+python scripts/sources/fetch_notinject.py
+python scripts/sources/fetch_wildguardmix.py        # requires HF_TOKEN (gated dataset)
+python scripts/sources/fetch_protectai_validation.py
+python scripts/sources/fetch_octavio_multilingual.py
+python scripts/sources/fetch_rikka_multilingual.py
+python scripts/sources/fetch_sql_injection_zh.py
+```
+
+To materialize provenance-checked staged sources:
+
+```bash
+cd parapet/parapet-data
+python -m parapet_data verified-sync \
+  --staging-dir ../schema/eval/staging \
+  --verified-dir ../schema/eval/verified \
+  --ledger adjudication/ledger.yaml
 ```
 
 After fetching, verify with the eval harness:

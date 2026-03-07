@@ -43,7 +43,7 @@ impl SignalExtractor for DefaultSignalExtractor {
                 Signal::new(
                     LayerId::L1,
                     SignalKind::Evidence,
-                    None,
+                    m.specialist_name.clone(),
                     m.calibrated,
                     1.0, // L1 is calibrated; fixed constant
                 )
@@ -150,9 +150,9 @@ mod tests {
         let result = L1Result {
             verdict: L1Verdict::Allow,
             per_message_scores: vec![
-                L1MessageScore { message_index: 0, role: Role::User, score: -1.0, calibrated: 0.0 },
-                L1MessageScore { message_index: 1, role: Role::User, score: 0.5, calibrated: 0.4 },
-                L1MessageScore { message_index: 2, role: Role::User, score: 2.0, calibrated: 0.8 },
+                L1MessageScore { message_index: 0, role: Role::User, score: -1.0, calibrated: 0.0, specialist_name: None },
+                L1MessageScore { message_index: 1, role: Role::User, score: 0.5, calibrated: 0.4, specialist_name: None },
+                L1MessageScore { message_index: 2, role: Role::User, score: 2.0, calibrated: 0.8, specialist_name: None },
             ],
         };
         let signals = extractor.extract_l1(&result);

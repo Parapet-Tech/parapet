@@ -61,6 +61,16 @@ environment: "internal"
 
 layers:
   L0: { mode: sanitize }
+  L1:
+    mode: block
+    threshold: 0.0
+    specialists:
+      exfiltration:        { threshold: 0.5 }
+      adversarial_suffix:  { threshold: 0.5 }
+      indirect_injection:  { threshold: 1.0 }
+      meta_probe:          { threshold: 1.0 }
+      instruction_override: { threshold: 1.0 }
+      roleplay_jailbreak:  { threshold: 0.5 }
   L3_inbound: { mode: block }
   L3_outbound: { mode: block, block_action: rewrite }
   L5a: { mode: redact }

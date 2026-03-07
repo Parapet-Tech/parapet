@@ -7,8 +7,9 @@
 // 2. We do variable interpolation and regex compilation between raw and public
 // 3. Keeps the public API clean
 
-use serde::Deserialize;
 use std::collections::HashMap;
+
+use serde::Deserialize;
 
 /// A block pattern can be a plain regex string or an object with metadata.
 ///
@@ -166,6 +167,28 @@ pub struct RawL1Config {
     pub mode: String,
     #[serde(default = "default_l1_threshold")]
     pub threshold: f64,
+    /// Minimum number of specialists that must breach threshold to block.
+    /// Default 2 (consensus/AND logic). Set to 1 for OR logic.
+    /// Ignored when `generalist_solo_threshold` is set (asymmetric routing).
+    #[serde(default = "default_l1_min_agree")]
+    pub min_agree: usize,
+    /// Generalist solo-block threshold for asymmetric routing.
+    /// When set, enables asymmetric routing:
+    ///   Rule 1: generalist >= solo_threshold -> Block (no corroboration)
+    ///   Rule 2: generalist >= gen.threshold AND any specialist >= its threshold -> Block
+    ///   Rule 3: else -> Pass
+    /// When absent, falls back to flat min_agree consensus.
+    #[serde(default)]
+    pub generalist_solo_threshold: Option<f64>,
+    /// Per-specialist threshold overrides. Key = specialist name.
+    #[serde(default)]
+    pub specialists: HashMap<String, RawL1SpecialistConfig>,
+}
+
+/// Per-specialist configuration in L1 ensemble.
+#[derive(Debug, Deserialize)]
+pub struct RawL1SpecialistConfig {
+    pub threshold: f64,
 }
 
 fn default_l1_mode() -> String {
@@ -174,6 +197,10 @@ fn default_l1_mode() -> String {
 
 fn default_l1_threshold() -> f64 {
     0.5
+}
+
+fn default_l1_min_agree() -> usize {
+    2
 }
 
 #[derive(Debug, Deserialize)]

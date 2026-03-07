@@ -135,8 +135,8 @@ pub fn default_l4_patterns() -> Vec<L4PatternCategory> {
         .collect()
 }
 
-/// Default layer configs: all 4 layers active with sensible modes.
-/// A firewall should be ON by default.
+/// Default layer configs: core layers active with sensible modes.
+/// L2a remains explicit opt-in because it requires model provisioning.
 pub fn default_layer_configs() -> LayerConfigs {
     LayerConfigs {
         l0: Some(LayerConfig {
@@ -147,6 +147,9 @@ pub fn default_layer_configs() -> LayerConfigs {
         l1: Some(L1Config {
             mode: L1Mode::Block,
             threshold: 0.0,
+            min_agree: 2,
+            generalist_solo_threshold: None,
+            specialists: std::collections::HashMap::new(),
         }),
         l2a: None, // L2a requires explicit opt-in (model download + config)
         l3_inbound: Some(LayerConfig {
@@ -359,6 +362,10 @@ mod tests {
     fn default_layer_configs_all_active() {
         let layers = default_layer_configs();
         assert_eq!(layers.l0.as_ref().unwrap().mode, "sanitize");
+        let l1 = layers.l1.as_ref().unwrap();
+        assert_eq!(l1.mode, L1Mode::Block);
+        assert_eq!(l1.threshold, 0.0);
+        assert!(l1.specialists.is_empty(), "default L1 should be plain generalist");
         assert_eq!(layers.l3_inbound.as_ref().unwrap().mode, "block");
         assert_eq!(layers.l3_outbound.as_ref().unwrap().mode, "block");
         assert_eq!(layers.l5a.as_ref().unwrap().mode, "redact");

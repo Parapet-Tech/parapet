@@ -274,6 +274,26 @@ pub enum L1Mode {
 pub struct L1Config {
     /// Operating mode: shadow (log-only) or block (enforce).
     pub mode: L1Mode,
-    /// Score threshold for blocking. score >= threshold → block.
+    /// Score threshold for blocking (generalist). score >= threshold -> block.
+    pub threshold: f64,
+    /// Minimum number of specialists that must breach threshold to block.
+    /// 1 = OR logic (any specialist triggers block).
+    /// 2+ = consensus/AND logic (multiple must agree).
+    /// Ignored when `generalist_solo_threshold` is set.
+    pub min_agree: usize,
+    /// Generalist solo-block threshold for asymmetric routing.
+    /// When Some: asymmetric routing (generalist solo at high confidence,
+    /// specialist corroboration in gray zone).
+    /// When None: flat min_agree consensus.
+    pub generalist_solo_threshold: Option<f64>,
+    /// Per-specialist threshold overrides. Key = specialist name.
+    /// If present, the ensemble scanner activates.
+    pub specialists: HashMap<String, L1SpecialistConfig>,
+}
+
+/// Per-specialist configuration for the L1 ensemble.
+#[derive(Debug, Clone)]
+pub struct L1SpecialistConfig {
+    /// Score threshold in raw SVM margin space.
     pub threshold: f64,
 }
