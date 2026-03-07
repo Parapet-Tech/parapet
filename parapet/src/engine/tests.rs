@@ -2085,6 +2085,7 @@ fn l2a_signal(score: f32, category: &str) -> Signal {
         category: Some(category.to_string()),
         message_index: Some(0),
         segment_id: None,
+        raw_model_score: None,
     }
 }
 
@@ -2166,6 +2167,21 @@ fn handle_layer_error_open_returns_none() {
     let adapter = adapter_for(ProviderType::OpenAi);
     let resp = handle_layer_error(&FailureMode::Open, adapter.as_ref(), "L1", "scanner_panic", "test error", "req-1");
     assert!(resp.is_none());
+}
+
+#[test]
+fn request_id_from_headers_uses_incoming_header() {
+    let mut headers = HeaderMap::new();
+    headers.insert("x-request-id", "eval:test-case-42".parse().unwrap());
+    assert_eq!(request_id_from_headers(&headers), "eval:test-case-42");
+}
+
+#[test]
+fn request_id_from_headers_falls_back_to_uuid() {
+    let headers = HeaderMap::new();
+    let request_id = request_id_from_headers(&headers);
+    assert!(!request_id.is_empty());
+    assert!(uuid::Uuid::parse_str(&request_id).is_ok());
 }
 
 // -------------------------------------------------------------------

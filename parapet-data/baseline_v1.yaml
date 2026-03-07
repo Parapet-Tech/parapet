@@ -1,0 +1,42 @@
+# Baseline spec — random subsample from unstructured 50K/100K pools
+#
+# Control group for mirror_v1. Same pipeline, no mirror structure.
+# Pre-sampled via scripts/sample_baseline.py (shuffle, every Nth).
+# 337 attack + 337 benign = 674 total.
+#
+# Usage:
+#   python -m parapet_data curate --spec baseline_v1.yaml --output ./curated_baseline/ --base-dir ..
+
+name: baseline_v1
+version: "1.0.0"
+seed: 42
+ratio: 1.0
+
+backfill:
+  strategy: fail
+  log_gaps: true
+
+allow_partial_mirror: true
+
+cells:
+  - reason: instruction_override
+    teaching_goal: "Baseline — random sample, no mirror structure"
+    languages: [EN]
+    format_distribution:
+      prose: 0.7
+      structured: 0.2
+      code: 0.1
+    length_distribution:
+      short: 0.4
+      medium: 0.4
+      long: 0.2
+    attack_sources:
+      - name: baseline_attacks
+        path: schema/eval/baseline/baseline_attacks.yaml
+        language: EN
+        extractor: col_content
+    benign_sources:
+      - name: baseline_benign
+        path: schema/eval/baseline/baseline_benign.yaml
+        language: EN
+        extractor: col_content

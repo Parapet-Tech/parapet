@@ -1,0 +1,1065 @@
+﻿# MirrorSpec v3 (19k control) - same sources/routing as v3, reduced scale
+#
+# Delta from v2:
+#   - RU attacks: +17K from russian_prompt_injections (4 reasons)
+#   - RU benign: +37K from ru_turbo_saiga (3 reasons)
+#   - ZH benign: +256K from stem_zh_instruction (2 reasons)
+#   - AR benign: +10K from arabic-fine-tuning-chatML (3 reasons)
+#   - EN benign (staged): +35K from 6 datasets routed by surface classifier
+#
+# Staged sources use label_filter on "reason" column to route to correct cells.
+# Sources without staged data for a reason are unchanged from v2.
+#
+#
+# Purpose:
+#   Control for scale vs v2 (~19k), while keeping v3 mirror curation identical.
+#   Use this for the first rung in the 19k/40k/60k/96k ladder.
+# Usage:
+#   python -m parapet_data curate --spec mirror_spec_v3_19k.yaml --output ../schema/eval/t_mirror/v3_19k/ --base-dir ..
+
+name: mirror_v3_19k_control
+version: "3.0.0-19k"
+seed: 42
+
+ratio: 1.0
+total_target: 19200
+
+backfill:
+  strategy: ngram_safe
+  log_gaps: true
+
+language_quota:
+  mode: best_effort
+  profile:
+    EN: 0.75
+    RU: 0.10
+    ZH: 0.08
+    AR: 0.07
+
+allow_partial_mirror: false
+
+background:
+  budget_fraction: 0.15
+  sources:
+    - name: en_background_trivia_qa
+      path: schema/eval/staging/en_trivia-qa_benign_background_staged.yaml
+      language: EN
+      extractor: col_content
+    - name: en_background_wildchat
+      path: schema/eval/staging/en_WildChat-1M_benign_background_staged.yaml
+      language: EN
+      extractor: col_content
+    - name: en_background_writingprompts
+      path: schema/eval/staging/en_writingprompts_benign_background_staged.yaml
+      language: EN
+      extractor: col_content
+    - name: ar_background_arabguard
+      path: schema/eval/staging/ar_ArabGuard-Egyptian-V1_benign_background_staged.yaml
+      language: AR
+      extractor: col_content
+
+# ---------------------------------------------------------------------------
+# Source inventory (v2 + staged)
+# ---------------------------------------------------------------------------
+#
+# Attack sources per language:
+#   EN: attacks_121624.yaml (108K EN) â€” the merged corpus
+#   ZH: attacks_121624_zh.yaml (1K) + zh_attacks.yaml (34K)
+#   AR: attacks_121624_ar.yaml (988) + ar_attacks.yaml (293)
+#   RU: attacks_121624_ru.yaml (5.5K) + ru_attacks.yaml (2.8K)
+#   RU (staged): ru_russian_prompt_injections_attacks_staged.yaml (17K, 4 reasons)
+#
+# Benign sources per language:
+#   EN: global_benign_curated.yaml (200K)
+#   EN (staged): dolly (1K) + codealpaca (16K) + writingprompts (10K) +
+#                trivia-qa (5K) + WildChat (3K) + chatbot_arena (0.4K) = ~35K
+#   ZH: wikipedia_zh (1.4K) + xquad_zh (240)
+#   ZH (staged): zh_stem_zh_instruction_benign_staged.yaml (256K, 2 reasons)
+#   AR: wikipedia_ar (1.3K) + xquad_ar (210)
+#   AR (staged): ar_arabic-fine-tuning-chatML_benign_staged.yaml (10K, 3 reasons)
+#   RU: wikipedia_ru (2K) + xquad_ru (300)
+#   RU (staged): ru_ru_turbo_saiga_benign_staged.yaml (37K, 3 reasons)
+# ---------------------------------------------------------------------------
+
+cells:
+  - reason: instruction_override
+    teaching_goal: "Neutralize 'text mentioning instructions = attack' correlation across EN/RU/ZH/AR"
+    languages: [EN, RU, ZH, AR]
+    format_distribution:
+      prose: 0.7
+      structured: 0.2
+      code: 0.1
+    length_distribution:
+      short: 0.5
+      medium: 0.3
+      long: 0.2
+    attack_sources:
+      - name: en_attacks_merged
+        path: schema/eval/malicious/attacks_121624.yaml
+        language: EN
+        extractor: col_content
+        max_samples: 20000
+        label_filter:
+          column: label
+          allowed: [malicious]
+      - name: en_instruction_override
+        path: schema/eval/malicious/instruction_override_attacks.yaml
+        language: EN
+        extractor: col_content
+      - name: zh_attacks_corpus
+        path: schema/eval/training/multilingual/attacks_121624_zh.yaml
+        language: ZH
+        extractor: col_content
+      - name: zh_attacks_novel
+        path: schema/eval/training/multilingual/zh_attacks.yaml
+        language: ZH
+        extractor: col_content
+      - name: ar_attacks_corpus
+        path: schema/eval/training/multilingual/attacks_121624_ar.yaml
+        language: AR
+        extractor: col_content
+      - name: ar_attacks_novel
+        path: schema/eval/training/multilingual/ar_attacks.yaml
+        language: AR
+        extractor: col_content
+      - name: ru_attacks_corpus
+        path: schema/eval/training/multilingual/attacks_121624_ru.yaml
+        language: RU
+        extractor: col_content
+      - name: ru_attacks_novel
+        path: schema/eval/training/multilingual/ru_attacks.yaml
+        language: RU
+        extractor: col_content
+      # v3 staged
+      - name: ru_staged_attacks_instruction_override
+        max_samples: 20000
+        path: schema/eval/staging/ru_russian_prompt_injections_attacks_staged.yaml
+        language: RU
+        extractor: col_content
+        label_filter:
+          column: reason
+          allowed: [instruction_override]
+    benign_sources:
+      - name: en_benign_curated
+        path: schema/eval/training/global_benign_curated.yaml
+        language: EN
+        extractor: col_content
+        max_samples: 20000
+      - name: zh_benign_wikipedia
+        path: schema/eval/benign/opensource_wikipedia_zh_benign.yaml
+        language: ZH
+        extractor: col_content
+      - name: zh_benign_xquad
+        path: schema/eval/benign/opensource_xquad_zh_benign.yaml
+        language: ZH
+        extractor: col_content
+      - name: ar_benign_wikipedia
+        path: schema/eval/benign/opensource_wikipedia_ar_benign.yaml
+        language: AR
+        extractor: col_content
+      - name: ar_benign_xquad
+        path: schema/eval/benign/opensource_xquad_ar_benign.yaml
+        language: AR
+        extractor: col_content
+      - name: ru_benign_wikipedia
+        path: schema/eval/benign/opensource_wikipedia_ru_benign.yaml
+        language: RU
+        extractor: col_content
+      - name: ru_benign_xquad
+        path: schema/eval/benign/opensource_xquad_ru_benign.yaml
+        language: RU
+        extractor: col_content
+      # v3 staged
+      - name: ru_staged_benign_instruction_override
+        max_samples: 20000
+        path: schema/eval/staging/ru_ru_turbo_saiga_benign_staged.yaml
+        language: RU
+        extractor: col_content
+        label_filter:
+          column: reason
+          allowed: [instruction_override]
+      - name: zh_staged_benign_instruction_override
+        max_samples: 20000
+        path: schema/eval/staging/zh_stem_zh_instruction_benign_staged.yaml
+        language: ZH
+        extractor: col_content
+        label_filter:
+          column: reason
+          allowed: [instruction_override]
+      - name: ar_staged_benign_instruction_override
+        path: schema/eval/staging/ar_arabic-fine-tuning-chatML_benign_staged.yaml
+        language: AR
+        extractor: col_content
+        label_filter:
+          column: reason
+          allowed: [instruction_override]
+
+  - reason: roleplay_jailbreak
+    teaching_goal: "Neutralize 'roleplay/character language = attack' correlation across EN/RU/ZH/AR"
+    languages: [EN, RU, ZH, AR]
+    format_distribution:
+      prose: 0.8
+      structured: 0.1
+      code: 0.1
+    length_distribution:
+      short: 0.3
+      medium: 0.4
+      long: 0.3
+    attack_sources:
+      - name: en_attacks_merged
+        path: schema/eval/malicious/attacks_121624.yaml
+        language: EN
+        extractor: col_content
+        max_samples: 20000
+        label_filter:
+          column: label
+          allowed: [malicious]
+      - name: en_roleplay_jailbreak
+        path: schema/eval/malicious/roleplay_jailbreak_attacks.yaml
+        language: EN
+        extractor: col_content
+      - name: zh_attacks_corpus
+        path: schema/eval/training/multilingual/attacks_121624_zh.yaml
+        language: ZH
+        extractor: col_content
+      - name: zh_attacks_novel
+        path: schema/eval/training/multilingual/zh_attacks.yaml
+        language: ZH
+        extractor: col_content
+      - name: ar_attacks_corpus
+        path: schema/eval/training/multilingual/attacks_121624_ar.yaml
+        language: AR
+        extractor: col_content
+      - name: ar_attacks_novel
+        path: schema/eval/training/multilingual/ar_attacks.yaml
+        language: AR
+        extractor: col_content
+      - name: ru_attacks_corpus
+        path: schema/eval/training/multilingual/attacks_121624_ru.yaml
+        language: RU
+        extractor: col_content
+      - name: ru_attacks_novel
+        path: schema/eval/training/multilingual/ru_attacks.yaml
+        language: RU
+        extractor: col_content
+      # v3 staged
+      - name: ru_staged_attacks_roleplay_jailbreak
+        max_samples: 20000
+        path: schema/eval/staging/ru_russian_prompt_injections_attacks_staged.yaml
+        language: RU
+        extractor: col_content
+        label_filter:
+          column: reason
+          allowed: [roleplay_jailbreak]
+    benign_sources:
+      - name: en_benign_curated
+        path: schema/eval/training/global_benign_curated.yaml
+        language: EN
+        extractor: col_content
+        max_samples: 20000
+      - name: zh_benign_wikipedia
+        path: schema/eval/benign/opensource_wikipedia_zh_benign.yaml
+        language: ZH
+        extractor: col_content
+      - name: zh_benign_xquad
+        path: schema/eval/benign/opensource_xquad_zh_benign.yaml
+        language: ZH
+        extractor: col_content
+      - name: ar_benign_wikipedia
+        path: schema/eval/benign/opensource_wikipedia_ar_benign.yaml
+        language: AR
+        extractor: col_content
+      - name: ar_benign_xquad
+        path: schema/eval/benign/opensource_xquad_ar_benign.yaml
+        language: AR
+        extractor: col_content
+      - name: ru_benign_wikipedia
+        path: schema/eval/benign/opensource_wikipedia_ru_benign.yaml
+        language: RU
+        extractor: col_content
+      - name: ru_benign_xquad
+        path: schema/eval/benign/opensource_xquad_ru_benign.yaml
+        language: RU
+        extractor: col_content
+      # v3 staged
+      - name: ru_staged_benign_roleplay_jailbreak
+        max_samples: 20000
+        path: schema/eval/staging/ru_ru_turbo_saiga_benign_staged.yaml
+        language: RU
+        extractor: col_content
+        label_filter:
+          column: reason
+          allowed: [roleplay_jailbreak]
+      - name: ar_staged_benign_roleplay_jailbreak
+        path: schema/eval/staging/ar_arabic-fine-tuning-chatML_benign_staged.yaml
+        language: AR
+        extractor: col_content
+        label_filter:
+          column: reason
+          allowed: [roleplay_jailbreak]
+      # v3 staged EN
+      - name: en_staged_dolly_roleplay_jailbreak
+        path: schema/eval/staging/en_databricks-dolly-15k_benign_staged.yaml
+        language: EN
+        extractor: col_content
+        label_filter:
+          column: reason
+          allowed: [roleplay_jailbreak]
+      - name: en_staged_codealpaca_roleplay_jailbreak
+        path: schema/eval/staging/en_evol-codealpaca-v1_benign_staged.yaml
+        language: EN
+        extractor: col_content
+        label_filter:
+          column: reason
+          allowed: [roleplay_jailbreak]
+      - name: en_staged_writingprompts_roleplay_jailbreak
+        path: schema/eval/staging/en_writingprompts_benign_staged.yaml
+        language: EN
+        extractor: col_content
+        label_filter:
+          column: reason
+          allowed: [roleplay_jailbreak]
+      - name: en_staged_wildchat_roleplay_jailbreak
+        path: schema/eval/staging/en_WildChat-1M_benign_staged.yaml
+        language: EN
+        extractor: col_content
+        label_filter:
+          column: reason
+          allowed: [roleplay_jailbreak]
+      - name: en_staged_chatbot_arena_roleplay_jailbreak
+        path: schema/eval/staging/en_chatbot_arena_conversations_benign_staged.yaml
+        language: EN
+        extractor: col_content
+        label_filter:
+          column: reason
+          allowed: [roleplay_jailbreak]
+
+  - reason: meta_probe
+    teaching_goal: "Neutralize 'questions about the system = attack' correlation across EN/RU/ZH/AR"
+    languages: [EN, RU, ZH, AR]
+    format_distribution:
+      prose: 0.8
+      structured: 0.1
+      code: 0.1
+    length_distribution:
+      short: 0.6
+      medium: 0.3
+      long: 0.1
+    attack_sources:
+      - name: en_attacks_merged
+        path: schema/eval/malicious/attacks_121624.yaml
+        language: EN
+        extractor: col_content
+        max_samples: 20000
+        label_filter:
+          column: label
+          allowed: [malicious]
+      - name: en_meta_probe
+        path: schema/eval/malicious/meta_probe_attacks.yaml
+        language: EN
+        extractor: col_content
+      - name: zh_attacks_corpus
+        path: schema/eval/training/multilingual/attacks_121624_zh.yaml
+        language: ZH
+        extractor: col_content
+      - name: zh_attacks_novel
+        path: schema/eval/training/multilingual/zh_attacks.yaml
+        language: ZH
+        extractor: col_content
+      - name: ar_attacks_corpus
+        path: schema/eval/training/multilingual/attacks_121624_ar.yaml
+        language: AR
+        extractor: col_content
+      - name: ar_attacks_novel
+        path: schema/eval/training/multilingual/ar_attacks.yaml
+        language: AR
+        extractor: col_content
+      - name: ru_attacks_corpus
+        path: schema/eval/training/multilingual/attacks_121624_ru.yaml
+        language: RU
+        extractor: col_content
+      - name: ru_attacks_novel
+        path: schema/eval/training/multilingual/ru_attacks.yaml
+        language: RU
+        extractor: col_content
+    benign_sources:
+      - name: en_benign_curated
+        path: schema/eval/training/global_benign_curated.yaml
+        language: EN
+        extractor: col_content
+        max_samples: 20000
+      - name: zh_benign_wikipedia
+        path: schema/eval/benign/opensource_wikipedia_zh_benign.yaml
+        language: ZH
+        extractor: col_content
+      - name: zh_benign_xquad
+        path: schema/eval/benign/opensource_xquad_zh_benign.yaml
+        language: ZH
+        extractor: col_content
+      - name: ar_benign_wikipedia
+        path: schema/eval/benign/opensource_wikipedia_ar_benign.yaml
+        language: AR
+        extractor: col_content
+      - name: ar_benign_xquad
+        path: schema/eval/benign/opensource_xquad_ar_benign.yaml
+        language: AR
+        extractor: col_content
+      - name: ru_benign_wikipedia
+        path: schema/eval/benign/opensource_wikipedia_ru_benign.yaml
+        language: RU
+        extractor: col_content
+      - name: ru_benign_xquad
+        path: schema/eval/benign/opensource_xquad_ru_benign.yaml
+        language: RU
+        extractor: col_content
+      # v3 staged
+      - name: ru_staged_benign_meta_probe
+        max_samples: 20000
+        path: schema/eval/staging/ru_ru_turbo_saiga_benign_staged.yaml
+        language: RU
+        extractor: col_content
+        label_filter:
+          column: reason
+          allowed: [meta_probe]
+      - name: zh_staged_benign_meta_probe
+        max_samples: 20000
+        path: schema/eval/staging/zh_stem_zh_instruction_benign_staged.yaml
+        language: ZH
+        extractor: col_content
+        label_filter:
+          column: reason
+          allowed: [meta_probe]
+      - name: ar_staged_benign_meta_probe
+        path: schema/eval/staging/ar_arabic-fine-tuning-chatML_benign_staged.yaml
+        language: AR
+        extractor: col_content
+        label_filter:
+          column: reason
+          allowed: [meta_probe]
+      # v3 staged EN
+      - name: en_staged_dolly_meta_probe
+        path: schema/eval/staging/en_databricks-dolly-15k_benign_staged.yaml
+        language: EN
+        extractor: col_content
+        label_filter:
+          column: reason
+          allowed: [meta_probe]
+      - name: en_staged_codealpaca_meta_probe
+        path: schema/eval/staging/en_evol-codealpaca-v1_benign_staged.yaml
+        language: EN
+        extractor: col_content
+        label_filter:
+          column: reason
+          allowed: [meta_probe]
+      - name: en_staged_writingprompts_meta_probe
+        path: schema/eval/staging/en_writingprompts_benign_staged.yaml
+        language: EN
+        extractor: col_content
+        label_filter:
+          column: reason
+          allowed: [meta_probe]
+      - name: en_staged_wildchat_meta_probe
+        path: schema/eval/staging/en_WildChat-1M_benign_staged.yaml
+        language: EN
+        extractor: col_content
+        label_filter:
+          column: reason
+          allowed: [meta_probe]
+      - name: en_staged_chatbot_arena_meta_probe
+        path: schema/eval/staging/en_chatbot_arena_conversations_benign_staged.yaml
+        language: EN
+        extractor: col_content
+        label_filter:
+          column: reason
+          allowed: [meta_probe]
+
+  - reason: exfiltration
+    teaching_goal: "Neutralize 'requesting data output = attack' correlation across EN/RU/ZH/AR"
+    languages: [EN, RU, ZH, AR]
+    format_distribution:
+      prose: 0.6
+      structured: 0.3
+      code: 0.1
+    length_distribution:
+      short: 0.5
+      medium: 0.3
+      long: 0.2
+    attack_sources:
+      - name: en_attacks_merged
+        path: schema/eval/malicious/attacks_121624.yaml
+        language: EN
+        extractor: col_content
+        max_samples: 20000
+        label_filter:
+          column: label
+          allowed: [malicious]
+      - name: en_exfiltration
+        path: schema/eval/malicious/exfiltration_attacks.yaml
+        language: EN
+        extractor: col_content
+      - name: zh_attacks_corpus
+        path: schema/eval/training/multilingual/attacks_121624_zh.yaml
+        language: ZH
+        extractor: col_content
+      - name: zh_attacks_novel
+        path: schema/eval/training/multilingual/zh_attacks.yaml
+        language: ZH
+        extractor: col_content
+      - name: ar_attacks_corpus
+        path: schema/eval/training/multilingual/attacks_121624_ar.yaml
+        language: AR
+        extractor: col_content
+      - name: ar_attacks_novel
+        path: schema/eval/training/multilingual/ar_attacks.yaml
+        language: AR
+        extractor: col_content
+      - name: ru_attacks_corpus
+        path: schema/eval/training/multilingual/attacks_121624_ru.yaml
+        language: RU
+        extractor: col_content
+      - name: ru_attacks_novel
+        path: schema/eval/training/multilingual/ru_attacks.yaml
+        language: RU
+        extractor: col_content
+    benign_sources:
+      - name: en_benign_curated
+        path: schema/eval/training/global_benign_curated.yaml
+        language: EN
+        extractor: col_content
+        max_samples: 20000
+      - name: zh_benign_wikipedia
+        path: schema/eval/benign/opensource_wikipedia_zh_benign.yaml
+        language: ZH
+        extractor: col_content
+      - name: zh_benign_xquad
+        path: schema/eval/benign/opensource_xquad_zh_benign.yaml
+        language: ZH
+        extractor: col_content
+      - name: ar_benign_wikipedia
+        path: schema/eval/benign/opensource_wikipedia_ar_benign.yaml
+        language: AR
+        extractor: col_content
+      - name: ar_benign_xquad
+        path: schema/eval/benign/opensource_xquad_ar_benign.yaml
+        language: AR
+        extractor: col_content
+      - name: ru_benign_wikipedia
+        path: schema/eval/benign/opensource_wikipedia_ru_benign.yaml
+        language: RU
+        extractor: col_content
+      - name: ru_benign_xquad
+        path: schema/eval/benign/opensource_xquad_ru_benign.yaml
+        language: RU
+        extractor: col_content
+      # v3 staged EN
+      - name: en_staged_dolly_exfiltration
+        path: schema/eval/staging/en_databricks-dolly-15k_benign_staged.yaml
+        language: EN
+        extractor: col_content
+        label_filter:
+          column: reason
+          allowed: [exfiltration]
+      - name: en_staged_codealpaca_exfiltration
+        path: schema/eval/staging/en_evol-codealpaca-v1_benign_staged.yaml
+        language: EN
+        extractor: col_content
+        label_filter:
+          column: reason
+          allowed: [exfiltration]
+      - name: en_staged_writingprompts_exfiltration
+        path: schema/eval/staging/en_writingprompts_benign_staged.yaml
+        language: EN
+        extractor: col_content
+        label_filter:
+          column: reason
+          allowed: [exfiltration]
+      - name: en_staged_wildchat_exfiltration
+        path: schema/eval/staging/en_WildChat-1M_benign_staged.yaml
+        language: EN
+        extractor: col_content
+        label_filter:
+          column: reason
+          allowed: [exfiltration]
+      - name: en_staged_chatbot_arena_exfiltration
+        path: schema/eval/staging/en_chatbot_arena_conversations_benign_staged.yaml
+        language: EN
+        extractor: col_content
+        label_filter:
+          column: reason
+          allowed: [exfiltration]
+
+  - reason: adversarial_suffix
+    teaching_goal: "Neutralize 'high-entropy/garbled text = attack' correlation across EN/RU/ZH/AR"
+    languages: [EN, RU, ZH, AR]
+    format_distribution:
+      prose: 0.4
+      structured: 0.2
+      code: 0.4
+    length_distribution:
+      short: 0.3
+      medium: 0.4
+      long: 0.3
+    attack_sources:
+      - name: en_attacks_merged
+        path: schema/eval/malicious/attacks_121624.yaml
+        language: EN
+        extractor: col_content
+        max_samples: 20000
+        label_filter:
+          column: label
+          allowed: [malicious]
+      - name: zh_attacks_corpus
+        path: schema/eval/training/multilingual/attacks_121624_zh.yaml
+        language: ZH
+        extractor: col_content
+      - name: zh_attacks_novel
+        path: schema/eval/training/multilingual/zh_attacks.yaml
+        language: ZH
+        extractor: col_content
+      - name: ar_attacks_corpus
+        path: schema/eval/training/multilingual/attacks_121624_ar.yaml
+        language: AR
+        extractor: col_content
+      - name: ar_attacks_novel
+        path: schema/eval/training/multilingual/ar_attacks.yaml
+        language: AR
+        extractor: col_content
+      - name: ru_attacks_corpus
+        path: schema/eval/training/multilingual/attacks_121624_ru.yaml
+        language: RU
+        extractor: col_content
+      - name: ru_attacks_novel
+        path: schema/eval/training/multilingual/ru_attacks.yaml
+        language: RU
+        extractor: col_content
+      # v3 staged
+      - name: ru_staged_attacks_adversarial_suffix
+        max_samples: 20000
+        path: schema/eval/staging/ru_russian_prompt_injections_attacks_staged.yaml
+        language: RU
+        extractor: col_content
+        label_filter:
+          column: reason
+          allowed: [adversarial_suffix]
+    benign_sources:
+      - name: en_benign_curated
+        path: schema/eval/training/global_benign_curated.yaml
+        language: EN
+        extractor: col_content
+        max_samples: 20000
+      - name: en_benign_code
+        path: schema/eval/benign/code_samples.yaml
+        language: EN
+        extractor: col_content
+      - name: zh_benign_wikipedia
+        path: schema/eval/benign/opensource_wikipedia_zh_benign.yaml
+        language: ZH
+        extractor: col_content
+      - name: zh_benign_xquad
+        path: schema/eval/benign/opensource_xquad_zh_benign.yaml
+        language: ZH
+        extractor: col_content
+      - name: ar_benign_wikipedia
+        path: schema/eval/benign/opensource_wikipedia_ar_benign.yaml
+        language: AR
+        extractor: col_content
+      - name: ar_benign_xquad
+        path: schema/eval/benign/opensource_xquad_ar_benign.yaml
+        language: AR
+        extractor: col_content
+      - name: ru_benign_wikipedia
+        path: schema/eval/benign/opensource_wikipedia_ru_benign.yaml
+        language: RU
+        extractor: col_content
+      - name: ru_benign_xquad
+        path: schema/eval/benign/opensource_xquad_ru_benign.yaml
+        language: RU
+        extractor: col_content
+      # v3 staged EN
+      - name: en_staged_dolly_adversarial_suffix
+        path: schema/eval/staging/en_databricks-dolly-15k_benign_staged.yaml
+        language: EN
+        extractor: col_content
+        label_filter:
+          column: reason
+          allowed: [adversarial_suffix]
+      - name: en_staged_codealpaca_adversarial_suffix
+        path: schema/eval/staging/en_evol-codealpaca-v1_benign_staged.yaml
+        language: EN
+        extractor: col_content
+        label_filter:
+          column: reason
+          allowed: [adversarial_suffix]
+      - name: en_staged_writingprompts_adversarial_suffix
+        path: schema/eval/staging/en_writingprompts_benign_staged.yaml
+        language: EN
+        extractor: col_content
+        label_filter:
+          column: reason
+          allowed: [adversarial_suffix]
+      - name: en_staged_wildchat_adversarial_suffix
+        path: schema/eval/staging/en_WildChat-1M_benign_staged.yaml
+        language: EN
+        extractor: col_content
+        label_filter:
+          column: reason
+          allowed: [adversarial_suffix]
+      - name: en_staged_chatbot_arena_adversarial_suffix
+        path: schema/eval/staging/en_chatbot_arena_conversations_benign_staged.yaml
+        language: EN
+        extractor: col_content
+        label_filter:
+          column: reason
+          allowed: [adversarial_suffix]
+
+  - reason: indirect_injection
+    teaching_goal: "Neutralize 'embedded instructions in context = attack' correlation across EN/RU/ZH/AR"
+    languages: [EN, RU, ZH, AR]
+    format_distribution:
+      prose: 0.5
+      structured: 0.4
+      code: 0.1
+    length_distribution:
+      short: 0.2
+      medium: 0.4
+      long: 0.4
+    attack_sources:
+      - name: en_attacks_merged
+        path: schema/eval/malicious/attacks_121624.yaml
+        language: EN
+        extractor: col_content
+        max_samples: 20000
+        label_filter:
+          column: label
+          allowed: [malicious]
+      - name: zh_attacks_corpus
+        path: schema/eval/training/multilingual/attacks_121624_zh.yaml
+        language: ZH
+        extractor: col_content
+      - name: zh_attacks_novel
+        path: schema/eval/training/multilingual/zh_attacks.yaml
+        language: ZH
+        extractor: col_content
+      - name: ar_attacks_corpus
+        path: schema/eval/training/multilingual/attacks_121624_ar.yaml
+        language: AR
+        extractor: col_content
+      - name: ar_attacks_novel
+        path: schema/eval/training/multilingual/ar_attacks.yaml
+        language: AR
+        extractor: col_content
+      - name: ru_attacks_corpus
+        path: schema/eval/training/multilingual/attacks_121624_ru.yaml
+        language: RU
+        extractor: col_content
+      - name: ru_attacks_novel
+        path: schema/eval/training/multilingual/ru_attacks.yaml
+        language: RU
+        extractor: col_content
+    benign_sources:
+      - name: en_benign_curated
+        path: schema/eval/training/global_benign_curated.yaml
+        language: EN
+        extractor: col_content
+        max_samples: 20000
+      - name: zh_benign_wikipedia
+        path: schema/eval/benign/opensource_wikipedia_zh_benign.yaml
+        language: ZH
+        extractor: col_content
+      - name: zh_benign_xquad
+        path: schema/eval/benign/opensource_xquad_zh_benign.yaml
+        language: ZH
+        extractor: col_content
+      - name: ar_benign_wikipedia
+        path: schema/eval/benign/opensource_wikipedia_ar_benign.yaml
+        language: AR
+        extractor: col_content
+      - name: ar_benign_xquad
+        path: schema/eval/benign/opensource_xquad_ar_benign.yaml
+        language: AR
+        extractor: col_content
+      - name: ru_benign_wikipedia
+        path: schema/eval/benign/opensource_wikipedia_ru_benign.yaml
+        language: RU
+        extractor: col_content
+      - name: ru_benign_xquad
+        path: schema/eval/benign/opensource_xquad_ru_benign.yaml
+        language: RU
+        extractor: col_content
+      # v3 staged EN
+      - name: en_staged_dolly_indirect_injection
+        path: schema/eval/staging/en_databricks-dolly-15k_benign_staged.yaml
+        language: EN
+        extractor: col_content
+        label_filter:
+          column: reason
+          allowed: [indirect_injection]
+      - name: en_staged_codealpaca_indirect_injection
+        path: schema/eval/staging/en_evol-codealpaca-v1_benign_staged.yaml
+        language: EN
+        extractor: col_content
+        label_filter:
+          column: reason
+          allowed: [indirect_injection]
+      - name: en_staged_writingprompts_indirect_injection
+        path: schema/eval/staging/en_writingprompts_benign_staged.yaml
+        language: EN
+        extractor: col_content
+        label_filter:
+          column: reason
+          allowed: [indirect_injection]
+      - name: en_staged_wildchat_indirect_injection
+        path: schema/eval/staging/en_WildChat-1M_benign_staged.yaml
+        language: EN
+        extractor: col_content
+        label_filter:
+          column: reason
+          allowed: [indirect_injection]
+      - name: en_staged_chatbot_arena_indirect_injection
+        path: schema/eval/staging/en_chatbot_arena_conversations_benign_staged.yaml
+        language: EN
+        extractor: col_content
+        label_filter:
+          column: reason
+          allowed: [indirect_injection]
+
+  - reason: obfuscation
+    teaching_goal: "Neutralize 'base64/ROT13/encoded text = attack' correlation across EN/RU/ZH/AR"
+    languages: [EN, RU, ZH, AR]
+    format_distribution:
+      prose: 0.3
+      structured: 0.4
+      code: 0.3
+    length_distribution:
+      short: 0.4
+      medium: 0.4
+      long: 0.2
+    attack_sources:
+      - name: en_attacks_merged
+        path: schema/eval/malicious/attacks_121624.yaml
+        language: EN
+        extractor: col_content
+        max_samples: 20000
+        label_filter:
+          column: label
+          allowed: [malicious]
+      - name: en_obfuscation
+        path: schema/eval/malicious/obfuscation_attacks.yaml
+        language: EN
+        extractor: col_content
+      - name: zh_attacks_corpus
+        path: schema/eval/training/multilingual/attacks_121624_zh.yaml
+        language: ZH
+        extractor: col_content
+      - name: zh_attacks_novel
+        path: schema/eval/training/multilingual/zh_attacks.yaml
+        language: ZH
+        extractor: col_content
+      - name: ar_attacks_corpus
+        path: schema/eval/training/multilingual/attacks_121624_ar.yaml
+        language: AR
+        extractor: col_content
+      - name: ar_attacks_novel
+        path: schema/eval/training/multilingual/ar_attacks.yaml
+        language: AR
+        extractor: col_content
+      - name: ru_attacks_corpus
+        path: schema/eval/training/multilingual/attacks_121624_ru.yaml
+        language: RU
+        extractor: col_content
+      - name: ru_attacks_novel
+        path: schema/eval/training/multilingual/ru_attacks.yaml
+        language: RU
+        extractor: col_content
+      # v3 staged
+      - name: ru_staged_attacks_obfuscation
+        max_samples: 20000
+        path: schema/eval/staging/ru_russian_prompt_injections_attacks_staged.yaml
+        language: RU
+        extractor: col_content
+        label_filter:
+          column: reason
+          allowed: [obfuscation]
+    benign_sources:
+      - name: en_benign_curated
+        path: schema/eval/training/global_benign_curated.yaml
+        language: EN
+        extractor: col_content
+        max_samples: 20000
+      - name: zh_benign_wikipedia
+        path: schema/eval/benign/opensource_wikipedia_zh_benign.yaml
+        language: ZH
+        extractor: col_content
+      - name: zh_benign_xquad
+        path: schema/eval/benign/opensource_xquad_zh_benign.yaml
+        language: ZH
+        extractor: col_content
+      - name: ar_benign_wikipedia
+        path: schema/eval/benign/opensource_wikipedia_ar_benign.yaml
+        language: AR
+        extractor: col_content
+      - name: ar_benign_xquad
+        path: schema/eval/benign/opensource_xquad_ar_benign.yaml
+        language: AR
+        extractor: col_content
+      - name: ru_benign_wikipedia
+        path: schema/eval/benign/opensource_wikipedia_ru_benign.yaml
+        language: RU
+        extractor: col_content
+      - name: ru_benign_xquad
+        path: schema/eval/benign/opensource_xquad_ru_benign.yaml
+        language: RU
+        extractor: col_content
+      # v3 staged EN
+      - name: en_staged_dolly_obfuscation
+        path: schema/eval/staging/en_databricks-dolly-15k_benign_staged.yaml
+        language: EN
+        extractor: col_content
+        label_filter:
+          column: reason
+          allowed: [obfuscation]
+      - name: en_staged_codealpaca_obfuscation
+        path: schema/eval/staging/en_evol-codealpaca-v1_benign_staged.yaml
+        language: EN
+        extractor: col_content
+        label_filter:
+          column: reason
+          allowed: [obfuscation]
+      - name: en_staged_writingprompts_obfuscation
+        path: schema/eval/staging/en_writingprompts_benign_staged.yaml
+        language: EN
+        extractor: col_content
+        label_filter:
+          column: reason
+          allowed: [obfuscation]
+      - name: en_staged_wildchat_obfuscation
+        path: schema/eval/staging/en_WildChat-1M_benign_staged.yaml
+        language: EN
+        extractor: col_content
+        label_filter:
+          column: reason
+          allowed: [obfuscation]
+      - name: en_staged_chatbot_arena_obfuscation
+        path: schema/eval/staging/en_chatbot_arena_conversations_benign_staged.yaml
+        language: EN
+        extractor: col_content
+        label_filter:
+          column: reason
+          allowed: [obfuscation]
+
+  - reason: constraint_bypass
+    teaching_goal: "Neutralize 'requests to ignore rules = attack' correlation across EN/RU/ZH/AR"
+    languages: [EN, RU, ZH, AR]
+    format_distribution:
+      prose: 0.8
+      structured: 0.1
+      code: 0.1
+    length_distribution:
+      short: 0.5
+      medium: 0.3
+      long: 0.2
+    attack_sources:
+      - name: en_attacks_merged
+        path: schema/eval/malicious/attacks_121624.yaml
+        language: EN
+        extractor: col_content
+        max_samples: 20000
+        label_filter:
+          column: label
+          allowed: [malicious]
+      - name: en_constraint_bypass
+        path: schema/eval/malicious/constraint_bypass_attacks.yaml
+        language: EN
+        extractor: col_content
+      - name: zh_attacks_corpus
+        path: schema/eval/training/multilingual/attacks_121624_zh.yaml
+        language: ZH
+        extractor: col_content
+      - name: zh_attacks_novel
+        path: schema/eval/training/multilingual/zh_attacks.yaml
+        language: ZH
+        extractor: col_content
+      - name: ar_attacks_corpus
+        path: schema/eval/training/multilingual/attacks_121624_ar.yaml
+        language: AR
+        extractor: col_content
+      - name: ar_attacks_novel
+        path: schema/eval/training/multilingual/ar_attacks.yaml
+        language: AR
+        extractor: col_content
+      - name: ru_attacks_corpus
+        path: schema/eval/training/multilingual/attacks_121624_ru.yaml
+        language: RU
+        extractor: col_content
+      - name: ru_attacks_novel
+        path: schema/eval/training/multilingual/ru_attacks.yaml
+        language: RU
+        extractor: col_content
+    benign_sources:
+      - name: en_benign_curated
+        path: schema/eval/training/global_benign_curated.yaml
+        language: EN
+        extractor: col_content
+        max_samples: 20000
+      - name: zh_benign_wikipedia
+        path: schema/eval/benign/opensource_wikipedia_zh_benign.yaml
+        language: ZH
+        extractor: col_content
+      - name: zh_benign_xquad
+        path: schema/eval/benign/opensource_xquad_zh_benign.yaml
+        language: ZH
+        extractor: col_content
+      - name: ar_benign_wikipedia
+        path: schema/eval/benign/opensource_wikipedia_ar_benign.yaml
+        language: AR
+        extractor: col_content
+      - name: ar_benign_xquad
+        path: schema/eval/benign/opensource_xquad_ar_benign.yaml
+        language: AR
+        extractor: col_content
+      - name: ru_benign_wikipedia
+        path: schema/eval/benign/opensource_wikipedia_ru_benign.yaml
+        language: RU
+        extractor: col_content
+      - name: ru_benign_xquad
+        path: schema/eval/benign/opensource_xquad_ru_benign.yaml
+        language: RU
+        extractor: col_content
+      # v3 staged EN
+      - name: en_staged_dolly_constraint_bypass
+        path: schema/eval/staging/en_databricks-dolly-15k_benign_staged.yaml
+        language: EN
+        extractor: col_content
+        label_filter:
+          column: reason
+          allowed: [constraint_bypass]
+      - name: en_staged_codealpaca_constraint_bypass
+        path: schema/eval/staging/en_evol-codealpaca-v1_benign_staged.yaml
+        language: EN
+        extractor: col_content
+        label_filter:
+          column: reason
+          allowed: [constraint_bypass]
+      - name: en_staged_writingprompts_constraint_bypass
+        path: schema/eval/staging/en_writingprompts_benign_staged.yaml
+        language: EN
+        extractor: col_content
+        label_filter:
+          column: reason
+          allowed: [constraint_bypass]
+      - name: en_staged_wildchat_constraint_bypass
+        path: schema/eval/staging/en_WildChat-1M_benign_staged.yaml
+        language: EN
+        extractor: col_content
+        label_filter:
+          column: reason
+          allowed: [constraint_bypass]
+      - name: en_staged_chatbot_arena_constraint_bypass
+        path: schema/eval/staging/en_chatbot_arena_conversations_benign_staged.yaml
+        language: EN
+        extractor: col_content
+        label_filter:
+          column: reason
+          allowed: [constraint_bypass]
+
+

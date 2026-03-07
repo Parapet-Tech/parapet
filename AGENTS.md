@@ -4,6 +4,8 @@
 
 ```
 parapet/
+  parapet-data/             # Mirror specs, curation, verified-sync, adjudication plumbing
+  parapet-runner/           # Training/eval runner, manifests, reproducible experiment outputs
   parapet/                  # Rust engine (cargo workspace root)
     src/
       main.rs               # HTTP proxy entrypoint (axum)
@@ -31,13 +33,30 @@ parapet/
       trust.ts              # Trust metadata helpers
     test/                   # Vitest coverage for transport/header/context/trust
   strategy/                 # Layer docs, configs, and eval snapshots
-  scripts/                  # Dataset fetch/convert/analyze/training scripts
+  scripts/                  # Analysis/training scripts
+    sources/                # Dataset fetch/source-ingest scripts
   schema/                   # Config schema + eval datasets/configs/results
     parapet.schema.json
     examples/
     eval/
-      staging/              # Datasets not yet in eval baseline (used for training only)
+      staging/              # Mechanically staged training candidates
+      verified/             # Ledger-applied staged projections for provenance-checked training/review
 ```
+
+## Public Repo Boundary
+
+`parapet/` is the public GitHub repository.
+
+- Never commit private/raw/generated corpora.
+- Treat all TheWall-derived data as local-only unless explicitly approved for publication.
+- Keep local-only derived artifacts out of git:
+  - adjudication ledgers and review exports
+  - local verified projections and sync receipts
+  - curated outputs under `parapet-data/curated*`
+  - runner outputs under `parapet-runner/runs/`
+- Version reproducible public assets only: code, docs, specs, manifests, and publishable source YAMLs.
+- Prefer committing reproducible scripts/configs/docs instead of data files.
+- Before commit/push, run: `python scripts/check_no_data_commit.py`.
 
 ## Key Files
 
@@ -62,12 +81,78 @@ parapet/
 | `parapet-py/parapet/header.py` | W3C Baggage serialization |
 | `parapet-ts/src/transport.ts` | TypeScript fetch wrapper for OpenAI/fetch clients |
 | `strategy/layers.md` | Canonical layer pipeline guide + links to per-layer docs |
-| `parapet/src/layers/l1_weights.rs` | Auto-generated L1 classifier weights (phf_map, 2,217 features) |
+| `parapet/src/layers/l1_weights.rs` | Auto-generated default L1 classifier weights (feature count varies by run) |
 | `schema/eval/l1_holdout.yaml` | Auto-generated L1 holdout eval set |
 | `scripts/train_l1.py` | Retrains L1 classifier and regenerates `l1_weights.rs` + `l1_holdout.yaml` |
-| `scripts/fetch_*.py` | Pulls open-source eval/training datasets |
+| `scripts/train_l1_specialist.py` | Current curated mirror/generalist training path used for source-locked L1 runs |
+| `scripts/sources/fetch_*.py` | Pulls open-source eval/training datasets |
+| `parapet-data/generate_spec.py` | Expands compact mirror specs into full curation specs |
+| `parapet-data/parapet_data/ledger.py` | Hash-based adjudication actions applied during verified-sync/curation |
+| `parapet-data/parapet_data/verified.py` | Materializes `schema/eval/verified/` from staged sources + ledger |
 | `schema/eval/eval_config.yaml` | Default eval harness config |
 | `schema/parapet.schema.json` | JSON Schema for config validation |
+
+## L1 Classifier (Current Work)
+
+Current default direction:
+- Treat the cleaned mirror generalist as the default L1 path.
+- Keep ensemble work experimental and opt-in only unless the user explicitly asks for it.
+- Keep `l2a` opt-in/off by default.
+
+### Architecture
+L1 is a char n-gram SVM (`CountVectorizer` + `LinearSVC`) compiled to Rust `phf_map` weights for very low-latency inference. Runtime scoring uses:
+
+1. raw text pass
+2. squashed alphanumeric-only pass
+3. max(raw, squashed)
+
+### Training Pipeline
+Run from `parapet/`:
+
+1. Build or update mirror specs in `parapet-data/` when changing corpus composition
+2. Use `parapet-data` to curate source-locked corpora, optionally with `--ledger` and `verified-sync`
+3. `scripts/train_l1_specialist.py` - train/eval/codegen
+4. `cargo build && cargo test -- l1` - compile and validate generated weights
+
+### Key Flags
+- `--apply-l0-transform` - align train preprocessing with runtime L0
+- `--squash-augment` - augment train set with squashed variants
+- `--analyzer char_wb` - default analyzer for L1 (do not switch casually)
+
+### Current Data Notes
+- Attack training set: `schema/eval/training/attacks51042.yaml` (~51k)
+- Current source-locked cleaned mirror baseline lives in `parapet-data/mirror_v4.compact.yaml` and `parapet-data/mirror_spec_v4_19k.yaml`
+- Mirror-based curation via `parapet-data/` is the active workflow for L1 corpus work
+- Adjudication ledgers are local-only; keep the machinery versioned, not the live ledger
+- Benign composition target:
+  - categories: instructions/chat/creative/code/hard-negatives/knowledge/system-prompts
+  - languages: EN 75, RU 10, ZH 8, AR 7
+  - lengths: short 25, medium 40, long 25, structured 10
+
+### Known Issues
+- `pi-cleaned-v2` negative class has attack contamination
+- whitespace artifacts can leak into n-gram features
+- LinearSVC scaling past ~60k-150k total samples is compute-sensitive
+- older 96.2% F1 numbers were invalid due to eval contamination
+
+### Clean Holdout Baselines
+| Config | F1 | Recall | Precision |
+|--------|----|--------|-----------|
+| 51k attack + 25k benign (clean) | 0.937 | 0.945 | 0.929 |
+| 51k attack + 51k benign (1:1) | 0.931 | 0.911 | 0.952 |
+
+### What Does Not Work Well for L1
+- kernel SVM (support vector cost too high for L1 latency budget)
+- neural models at L1 gate latency target
+- RL framing for one-shot binary classification
+- scaling data volume without curation quality controls
+
+## Experiment Conventions
+- Training experiments: `schema/eval/t2/`
+- Strategy docs: `strategy/`
+- Run scripts from `parapet/` so relative paths resolve correctly
+- Always review top features and FP/FN outputs after training
+- If a required command is blocked by sandbox/permissions/timeouts, stop and ask the user to run it or approve escalation; do not change the experiment definition as a workaround
 
 ## Building & Running
 
@@ -86,9 +171,12 @@ cd parapet && cargo run --features eval --bin parapet-eval -- \
   --json \
   --output ../schema/eval/results/output.json
 
-# L1 retrain (regenerates l1_weights.rs + l1_holdout.yaml)
+# L1 retrain (baseline path)
 python scripts/train_l1.py --data-dir schema/eval
 cd parapet && cargo build && cargo test -- l1
+
+# L1 retrain (current curated mirror path)
+python scripts/train_l1_specialist.py --help
 
 # Python SDK
 cd parapet-py

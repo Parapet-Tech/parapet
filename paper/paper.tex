@@ -24,9 +24,13 @@
 
 \title{Peak + Accumulation: A Proxy-Level Scoring Formula\\for Multi-Turn LLM Attack Detection}
 
-\author{
-  The Parapet Project \\
-  \url{https://github.com/Parapet-Tech/parapet}
+\IfFileExists{local_author.tex}{
+  \input{local_author.tex}
+}{
+  \author{
+    The Parapet Project \\
+    \url{https://github.com/Parapet-Tech/parapet}
+  }
 }
 
 \date{\today}
@@ -42,9 +46,10 @@
 Multi-turn prompt injection attacks distribute malicious intent across
 multiple conversation turns, exploiting the assumption that each turn is
 evaluated independently. While single-turn detection has been extensively
-studied, no published formula exists for aggregating per-turn pattern
-scores into a conversation-level risk score at the proxy layer---without
-invoking an LLM. We identify a fundamental flaw in the intuitive
+studied, to our knowledge prior proxy-level work does not provide a
+fully specified deterministic formula for aggregating per-turn pattern
+scores into a conversation-level risk score---without invoking an LLM.
+We identify a fundamental flaw in the intuitive
 weighted-average approach: it converges to the per-turn score regardless
 of turn count, meaning a 20-turn persistent attack scores identically to
 a single suspicious turn. Drawing on analogies from change-point
@@ -92,9 +97,10 @@ less attention at the proxy level. Existing multi-turn work---Defensive
 M2S~\cite{defensivem2s}, MindGuard~\cite{mindguard},
 AprielGuard~\cite{aprielguard}---requires LLM-based classification.
 
-The gap is specific: \textbf{no published formula exists for converting
-per-turn pattern scores into a conversation-level risk score using only
-proxy-computable operations.} This paper fills that gap.
+The gap is specific: \textbf{to our knowledge, prior proxy-level work
+does not provide a fully specified formula for converting per-turn
+pattern scores into a conversation-level risk score using only
+proxy-computable operations.} This paper addresses that gap.
 
 Multi-turn attacks are not theoretical. Yang et al.~\cite{yangsimpler}
 demonstrate that multi-turn jailbreaks achieve $>$70\% attack success
@@ -178,7 +184,8 @@ escalation and persistence.
 \subsection{Scoring Analogies from Adjacent Fields}
 \label{sec:analogies}
 
-While no published formula addresses our specific problem, adjacent
+To our knowledge, no prior proxy-level formula addresses this specific
+aggregation problem; adjacent
 fields have well-established approaches to accumulating evidence over
 time:
 
@@ -437,6 +444,12 @@ scoring layer. This prevents L3 verdicts from masking L4 behavior---a
 confound we discovered during initial evaluation when L3 false positives
 on benign conversations were incorrectly attributed to L4.
 
+All hyperparameters ($\rho, \delta, \beta_e, \beta_r, \tau$) were tuned
+on a validation split. Final metrics are reported once on a fixed,
+disjoint 20\% holdout split never used for tuning. Because source
+datasets have mixed redistribution licenses, we release the full data
+construction and evaluation scripts for reproducibility.
+
 \paragraph{Datasets.}
 \begin{itemize}[nosep]
   \item \textbf{Handcrafted attacks} (9 cases): Multi-turn sequences
@@ -483,7 +496,7 @@ they test a fundamentally different capability.
 \subsection{Results}
 
 Table~\ref{tab:results} summarizes peak + accumulation performance on
-the full evaluation corpus of 10,654 conversations.
+the holdout evaluation corpus of 10,654 conversations.
 
 \begin{table}[h]
 \centering
@@ -536,10 +549,11 @@ wildchat\_benign & benign & 10,000 & 9,879 & 98.8\% \\
 Of the 579 WildJailbreak-sourced attacks, 525 (90.7\%) are detected.
 The 54 false negatives fall into two categories: 39 are single-category
 conversations using only low-weight categories (escalation\_probing or
-deferred\_authority at weight 0.3), where the peak score of 0.3 plus
-persistence of $1.0 \times 0.45 = 0.45$ yields 0.75---just above
+deferred\_authority at weight 0.3). These misses are not fully
+persistent; their effective match ratios are low enough that
+$0.3 + \text{match\_ratio} \times 0.45$ remains below the 0.7
 threshold. The remaining 15 are escalation-gradient conversations where
-the benign opening turns dilute the match ratio.
+benign opening turns further dilute the match ratio.
 
 \paragraph{False positives.} The 121 false positives (1.20\% FPR) come
 from WildChat conversations containing phrases that match L4 regex
@@ -603,9 +617,9 @@ just ``run a classifier.''
 
 The persistence factor $\rho$ is the highest-leverage parameter in the
 formula, governing how much accumulated evidence contributes beyond the
-peak score. We swept $\rho$ from 0.15 to 0.65 in increments of 0.025,
-evaluating on the full corpus (588 attacks, 10,066 benign conversations)
-at each point. Figure~\ref{fig:sensitivity} shows the results.
+peak score. We swept $\rho$ from 0.15 to 0.65 in increments of 0.025 on
+the validation split, then fixed $\rho$ before holdout evaluation.
+Figure~\ref{fig:sensitivity} shows the sweep results.
 
 \begin{figure}[t]
 \centering
@@ -683,7 +697,7 @@ are neutralized before pattern matching.
 \label{sec:conclusion}
 % ------------------------------------------------------------------
 
-We presented the first published formula for proxy-level multi-turn LLM
+We presented a fully specified proxy-level formula for multi-turn LLM
 attack scoring. The weighted average approach, while intuitive, has a
 mathematical ceiling that makes it fundamentally unsuitable for
 persistence detection---the exact signal that characterizes multi-turn
@@ -703,7 +717,8 @@ transition.
 The formula is simple (5 lines of code), fast (microseconds per
 request), deterministic, and auditable. It requires no model inference,
 no training data, and no GPU. We release the implementation, pattern
-library, evaluation harness, and all datasets as open source.
+library, evaluation harness, and reproducibility artifacts (including
+dataset construction scripts and evaluation manifests) as open source.
 
 % ------------------------------------------------------------------
 % References

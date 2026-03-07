@@ -268,9 +268,19 @@ fn build_layer_configs(raw: Option<raw::RawLayerConfigs>) -> Result<LayerConfigs
                     )))
                 }
             };
+            let specialists = l1
+                .specialists
+                .into_iter()
+                .map(|(name, raw_spec)| {
+                    (name, L1SpecialistConfig { threshold: raw_spec.threshold })
+                })
+                .collect();
             Ok(L1Config {
                 mode,
                 threshold: l1.threshold,
+                min_agree: l1.min_agree,
+                generalist_solo_threshold: l1.generalist_solo_threshold,
+                specialists,
             })
         })
         .transpose()?;
