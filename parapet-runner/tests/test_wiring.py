@@ -193,7 +193,7 @@ def test_train_script_trainer_wires_arguments_and_returns_model_artifact() -> No
 
     executor = RecordingExecutor(returncode=0)
     trainer = TrainScriptTrainer(
-        trainer_script=Path("scripts/train_l1_specialist_variant.py"),
+        trainer_script=Path("scripts/train_l1_specialist.py"),
         workspace_root=Path("C:/tmp/workspace"),
         command_executor=executor,
         python_bin="python",
@@ -206,7 +206,7 @@ def test_train_script_trainer_wires_arguments_and_returns_model_artifact() -> No
     args, cwd = executor.calls[0]
     assert args[0] == "python"
     assert args[1] == "-u"
-    assert Path(args[2]).name == "train_l1_specialist_variant.py"
+    assert Path(args[2]).name == "train_l1_specialist.py"
     assert "--attack-files" in args
     assert "--benign-files" in args
     assert "--out" in args

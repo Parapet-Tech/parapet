@@ -17,6 +17,16 @@ python -m parapet_data curate \
 
 See `mirror_spec.example.yaml` for a complete, annotated spec with all available options documented inline.
 
+With adjudication enabled:
+
+```bash
+python -m parapet_data curate \
+  --spec mirror_spec.example.yaml \
+  --output ./curated/ \
+  --base-dir . \
+  --ledger adjudication/ledger.yaml
+```
+
 ## What goes in
 
 **A MirrorSpec** (YAML or JSON) defining cells, sources, distributions, and backfill policy. One cell per attack reason.
@@ -59,12 +69,12 @@ Each JSONL line:
 {"content": "...", "label": "malicious", "reason": "instruction_override", "source": "attacks_override", "language": "EN", "format_bin": "prose", "length_bin": "short"}
 ```
 
-The manifest records source hashes, content hashes per split, cell fill counts, gaps, cross-contamination drops, and a semantic hash for CI parity checking.
+The manifest records source hashes, content hashes per split, cell fill counts, gaps, cross-contamination drops, ledger actions, and a semantic hash for CI parity checking.
 
 ## CLI
 
-```
-python -m parapet_data curate --spec SPEC --output OUTPUT [--base-dir BASE_DIR] [-v]
+```bash
+python -m parapet_data curate --spec SPEC --output OUTPUT [--base-dir BASE_DIR] [--ledger LEDGER] [--materialize-verified-dir VERIFIED_DIR] [-v]
 ```
 
 | Flag | Required | Description |
@@ -72,7 +82,31 @@ python -m parapet_data curate --spec SPEC --output OUTPUT [--base-dir BASE_DIR] 
 | `--spec` | yes | Path to MirrorSpec YAML or JSON |
 | `--output` | yes | Output directory |
 | `--base-dir` | no | Root for resolving relative source paths (default: spec's parent dir) |
+| `--ledger` | no | Optional adjudication ledger applied during curation for all sources |
+| `--materialize-verified-dir` | no | Optional staged-source verified preflight output dir. Requires `--ledger` |
+| `--verified-staging-dir` | no | Optional staging dir for verified preflight (default: `<base-dir>/schema/eval/staging`) |
 | `-v` | no | Verbose logging |
+
+### Adjudication and verified preflight
+
+There are now two related paths:
+
+1. `curate --ledger ...`
+   Applies the adjudication ledger during source loading for all sources, including non-staged pooled corpora.
+
+2. `curate --ledger ... --materialize-verified-dir schema/eval/verified`
+   Runs a staged-source `verified-sync` preflight first, writes an inspectable `verified/` projection plus `sync_stats.json`, and records that receipt in the curation manifest.
+
+Correctness does not depend on the preflight. Curation still applies the ledger directly to all source rows.
+
+Standalone staged-source sync remains available:
+
+```bash
+python -m parapet_data verified-sync \
+  --staging-dir ../schema/eval/staging \
+  --verified-dir ../schema/eval/verified \
+  --ledger adjudication/ledger.yaml
+```
 
 ## Spec generator
 
@@ -119,13 +153,15 @@ See `mirror_v3.compact.yaml` for the complete annotated example.
 
 ## TheWall staging pipeline
 
-Use `stage` to convert raw TheWall datasets (JSON/JSONL/Parquet/CSV/TSV) into mirror-ready YAML sources under `schema/eval/staging/`.
+Use `stage` to convert raw datasets (JSON/JSONL/Parquet/CSV/TSV) into mirror-ready YAML sources under `schema/eval/staging/`.
+
+> **Note:** TheWall is a separate private data corpus not included in this repository. The `--index` flag accepts any INDEX.yaml that maps dataset names to local file paths. See the INDEX.yaml schema below for the expected format.
 
 Run from `parapet/`:
 
 ```bash
 python -m parapet_data stage \
-  --index ../TheWall/INDEX.yaml \
+  --index path/to/INDEX.yaml \
   --output schema/eval/staging/ \
   --holdout-sets schema/eval/l1_holdout.yaml \
                  schema/eval/t3/l1_holdout_generalist_curated_100k.yaml \
@@ -264,20 +300,54 @@ compose()         split 80/10/10, write JSONL, compute provenance hashes
 CurationManifest  immutable receipt -> manifest.json
 ```
 
-## Wire to parapet-runner
+With adjudication enabled, ledger actions are applied during sampling for every source. When verified preflight is requested, the manifest also records the staged-source sync receipt.
 
-parapet-runner reads the CurationManifest and split JSONL files to drive training:
+## End-to-end workflow
 
+All three steps run from `parapet/parapet-data/`.
+
+### Step 1: Generate the full spec from a compact spec
+
+```bash
+python generate_spec.py my_spec.compact.yaml -o my_spec.yaml
 ```
+
+Optional flags: `--total-target 19200`, `--name`, `--version`, `--dry-run`.
+
+### Step 2: Curate — sample, compose, manifest
+
+```bash
+python -m parapet_data curate \
+  --spec my_spec.yaml \
+  --output ./curated/my_run/ \
+  --base-dir .. \
+  --ledger adjudication/ledger.yaml \
+  --materialize-verified-dir ../schema/eval/verified \
+  --format yaml \
+  --stratified
+```
+
+`--base-dir ..` is required because source paths in the spec (e.g. `schema/eval/malicious/...`) resolve relative to `parapet/`, one level above `parapet-data/`.
+
+This produces `curated/my_run/manifest.json` plus train/val/holdout split files. If verified preflight is enabled, it also writes `schema/eval/verified/*` and `schema/eval/verified/sync_stats.json`. The manifest is the input to the runner.
+
+### Step 3: Train + calibrate + eval (via parapet-runner)
+
+```bash
+cd ../parapet-runner
+
 python -m parapet_runner.runner run \
-  --curation-manifest curated/manifest.json \
-  --train-config train_config.yaml \
-  --output-dir ./runs/run_001 \
-  --workspace-root .. \
-  --parapet-eval-bin ../target/release/parapet-eval.exe
+  --workspace-root <absolute-path-to-parapet/> \
+  --curation-manifest <absolute-path-to-manifest.json> \
+  --train-config configs/iteration_v1_calibrated.yaml \
+  --output-dir runs/my_run \
+  --parapet-eval-bin <absolute-path-to-parapet-eval.exe> \
+  --skip-recompile
 ```
 
-The runner verifies split content hashes against the manifest before training.
+`--workspace-root` and `--curation-manifest` and `--parapet-eval-bin` require absolute paths. `--train-config` and `--output-dir` can be relative to the runner's working directory.
+
+The runner verifies split content hashes against the manifest before training. Output lands in `runs/my_run/run_manifest.json`.
 
 ## Test
 
@@ -287,3 +357,16 @@ python -m pytest -q
 ```
 
 118 passed, 85% coverage.
+
+## v5 Cleaning Loop Notes
+
+- `apply_ledger_to_row(...)` is the shared adjudication primitive used by both `verified-sync` and curation.
+- `manifest.json` now records:
+  - `ledger_dropped`
+  - `ledger_quarantined`
+  - `ledger_rerouted`
+  - `ledger_relabeled`
+  - optional `verified_sync` receipt when `--materialize-verified-dir` is used
+- supported ledger rewrites now include:
+  - `reroute_reason`
+  - `relabel_class`

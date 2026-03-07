@@ -51,6 +51,7 @@ schema/eval/t*
 schema/eval/attack_types/
 schema/eval/baseline/
 schema/eval/l1_holdout.yaml.hashes
+schema/eval/verified/
 
 # Challenge sets (attack/benign data — reproducible via scripts/)
 schema/eval/challenges/

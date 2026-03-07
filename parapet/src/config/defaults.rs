@@ -4,7 +4,7 @@
 use crate::message::TrustLevel;
 
 use super::pattern::{CompiledPattern, PatternAction};
-use super::types::{L1Config, L1Mode, L1SpecialistConfig, L4Config, L4Mode, L4PatternCategory, LayerConfig, LayerConfigs};
+use super::types::{L1Config, L1Mode, L4Config, L4Mode, L4PatternCategory, LayerConfig, LayerConfigs};
 
 /// The default block patterns YAML, embedded at compile time.
 /// Contains curated regex patterns across 9 attack categories.
@@ -135,30 +135,8 @@ pub fn default_l4_patterns() -> Vec<L4PatternCategory> {
         .collect()
 }
 
-/// Default L1 ensemble specialist configs with production thresholds.
-///
-/// Thresholds are set per-specialist in raw SVM margin space. Higher threshold
-/// = fewer false positives but lower recall. The "frozen @1.0, roleplay @0.5"
-/// config yields compound FP < 0.5% across all 6 specialists.
-fn default_l1_specialists() -> std::collections::HashMap<String, L1SpecialistConfig> {
-    [
-        ("generalist", 0.0),
-        ("exfiltration", 0.5),
-        ("adversarial_suffix", 0.5),
-        ("indirect_injection", 1.0),
-        ("meta_probe", 1.0),
-        ("instruction_override", 1.0),
-        ("roleplay_jailbreak", 0.5),
-    ]
-    .into_iter()
-    .map(|(name, threshold)| {
-        (name.to_string(), L1SpecialistConfig { threshold })
-    })
-    .collect()
-}
-
-/// Default layer configs: all 4 layers active with sensible modes.
-/// A firewall should be ON by default.
+/// Default layer configs: core layers active with sensible modes.
+/// L2a remains explicit opt-in because it requires model provisioning.
 pub fn default_layer_configs() -> LayerConfigs {
     LayerConfigs {
         l0: Some(LayerConfig {
@@ -171,7 +149,7 @@ pub fn default_layer_configs() -> LayerConfigs {
             threshold: 0.0,
             min_agree: 2,
             generalist_solo_threshold: None,
-            specialists: default_l1_specialists(),
+            specialists: std::collections::HashMap::new(),
         }),
         l2a: None, // L2a requires explicit opt-in (model download + config)
         l3_inbound: Some(LayerConfig {
@@ -384,6 +362,10 @@ mod tests {
     fn default_layer_configs_all_active() {
         let layers = default_layer_configs();
         assert_eq!(layers.l0.as_ref().unwrap().mode, "sanitize");
+        let l1 = layers.l1.as_ref().unwrap();
+        assert_eq!(l1.mode, L1Mode::Block);
+        assert_eq!(l1.threshold, 0.0);
+        assert!(l1.specialists.is_empty(), "default L1 should be plain generalist");
         assert_eq!(layers.l3_inbound.as_ref().unwrap().mode, "block");
         assert_eq!(layers.l3_outbound.as_ref().unwrap().mode, "block");
         assert_eq!(layers.l5a.as_ref().unwrap().mode, "redact");

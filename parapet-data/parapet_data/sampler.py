@@ -12,7 +12,6 @@ This module owns the transition from MirrorSpec -> list[Sample].
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import random
 import re
@@ -24,7 +23,8 @@ from typing import Sequence
 import yaml
 
 from .extractors import get_extractor
-from .filters import ContentDeduplicator, looks_like_attack, passes_label_filter
+from .filters import ContentDeduplicator, content_hash, looks_like_attack, passes_label_filter
+from .ledger import Ledger, apply_ledger_to_row
 from .models import (
     AttackReason,
     BackfillPolicy,
@@ -157,20 +157,57 @@ def load_source(
     return list(rows)
 
 
-def extract_samples_from_source(
+@dataclass
+class SourceExtractResult:
+    """Samples extracted from one source plus ledger counters."""
+
+    samples: list[Sample]
+    ledger_dropped: int = 0
+    ledger_quarantined: int = 0
+    ledger_rerouted: int = 0
+    ledger_relabeled: int = 0
+
+
+def _source_extract_cache_key(
+    source: SourceRef,
+    *,
+    label: str,
+    reason: str,
+    base_dir: Path | None,
+) -> tuple[str, str, str, str, str, str]:
+    path = source.path
+    if not path.is_absolute() and base_dir is not None:
+        path = (base_dir / path).resolve()
+    else:
+        path = path.resolve()
+    return (
+        source.name,
+        str(path),
+        label,
+        reason,
+        repr(source.label_filter),
+        str(source.max_samples),
+    )
+
+
+def _extract_samples_from_source_with_ledger(
     source: SourceRef,
     label: str,
     reason: str,
     base_dir: Path | None = None,
-) -> list[Sample]:
-    """Load a source, extract text, classify bins, return Sample list."""
+    ledger: Ledger | None = None,
+) -> SourceExtractResult:
+    """Load a source, apply optional ledger actions, classify bins."""
     rows = load_source(source, base_dir=base_dir)
     extractor = get_extractor(source.extractor)
     samples: list[Sample] = []
+    ledger_dropped = 0
+    ledger_quarantined = 0
+    ledger_rerouted = 0
+    ledger_relabeled = 0
 
     max_samples = source.max_samples
     for row in rows:
-        # Apply label filter if configured
         if not passes_label_filter(row, source.label_filter):
             continue
 
@@ -178,27 +215,111 @@ def extract_samples_from_source(
         if not text:
             continue
 
-        content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        normalized_row = {
+            "content": text,
+            "label": label,
+            "reason": reason,
+            "source": source.name,
+            "language": source.language.value,
+        }
+        existing_hash = row.get("content_hash")
+        if existing_hash:
+            normalized_row["content_hash"] = existing_hash
+        else:
+            normalized_row["content_hash"] = content_hash(text)
+
+        if ledger is not None:
+            ledger_result = apply_ledger_to_row(normalized_row, ledger)
+            ledger_dropped += ledger_result.dropped
+            ledger_quarantined += ledger_result.quarantined
+            ledger_rerouted += ledger_result.rerouted
+            ledger_relabeled += ledger_result.relabeled
+            if ledger_result.row is None:
+                continue
+            normalized_row = ledger_result.row
+
+        text = normalized_row["content"]
         samples.append(Sample(
             content=text,
-            content_hash=content_hash,
-            label=label,
-            reason=reason,
+            content_hash=normalized_row["content_hash"],
+            label=normalized_row["label"],
+            reason=normalized_row["reason"],
             source_name=source.name,
             language=source.language.value,
             format_bin=classify_format(text).value,
             length_bin=classify_length(text).value,
         ))
 
-        # Stop early when a source-level cap is set so repeated cell passes
-        # don't traverse the entire source.
         if max_samples is not None and len(samples) >= max_samples:
             break
 
     if max_samples and len(samples) > max_samples:
         samples = samples[:max_samples]
 
-    return samples
+    return SourceExtractResult(
+        samples=samples,
+        ledger_dropped=ledger_dropped,
+        ledger_quarantined=ledger_quarantined,
+        ledger_rerouted=ledger_rerouted,
+        ledger_relabeled=ledger_relabeled,
+    )
+
+
+def extract_samples_from_source(
+    source: SourceRef,
+    label: str,
+    reason: str,
+    base_dir: Path | None = None,
+    ledger: Ledger | None = None,
+) -> list[Sample]:
+    """Load a source, extract text, classify bins, return Sample list."""
+    return _extract_samples_from_source_with_ledger(
+        source=source,
+        label=label,
+        reason=reason,
+        base_dir=base_dir,
+        ledger=ledger,
+    ).samples
+
+
+def _get_source_extract_result(
+    source: SourceRef,
+    *,
+    label: str,
+    reason: str,
+    base_dir: Path | None,
+    ledger: Ledger | None,
+    source_extract_cache: dict[tuple[str, str, str, str, str, str], SourceExtractResult] | None,
+) -> SourceExtractResult:
+    """Get extracted samples, optionally reusing a per-run cache."""
+    if source_extract_cache is None:
+        return _extract_samples_from_source_with_ledger(
+            source=source,
+            label=label,
+            reason=reason,
+            base_dir=base_dir,
+            ledger=ledger,
+        )
+
+    key = _source_extract_cache_key(
+        source,
+        label=label,
+        reason=reason,
+        base_dir=base_dir,
+    )
+    cached = source_extract_cache.get(key)
+    if cached is not None:
+        return cached
+
+    extracted = _extract_samples_from_source_with_ledger(
+        source=source,
+        label=label,
+        reason=reason,
+        base_dir=base_dir,
+        ledger=ledger,
+    )
+    source_extract_cache[key] = extracted
+    return extracted
 
 
 # ---------------------------------------------------------------------------
@@ -516,6 +637,10 @@ def sample_cell(
     base_dir: Path | None = None,
     filter_benign_attacks: bool = True,
     allowed_languages: set[str] | None = None,
+    ledger: Ledger | None = None,
+    ledger_totals: dict[str, int] | None = None,
+    source_extract_cache: dict[tuple[str, str, str, str, str, str], SourceExtractResult] | None = None,
+    extra_candidates: Sequence[Sample] | None = None,
 ) -> CellSampleResult:
     """Sample one side (attack or benign) of a mirror cell.
 
@@ -529,15 +654,27 @@ def sample_cell(
 
     # Load all candidate samples
     all_candidates: list[Sample] = []
+    if extra_candidates:
+        all_candidates.extend(sample for sample in extra_candidates if sample.label == label)
     for source in sources:
         # In language-quota mode, skip non-target source languages early so
         # they cannot consume dedup budget for other language passes.
         if allowed_languages is not None and source.language.value not in allowed_languages:
             continue
-        extracted = extract_samples_from_source(
-            source, label=label, reason=reason, base_dir=base_dir,
+        extracted = _get_source_extract_result(
+            source,
+            label=label,
+            reason=reason,
+            base_dir=base_dir,
+            ledger=ledger,
+            source_extract_cache=source_extract_cache,
         )
-        all_candidates.extend(extracted)
+        if ledger_totals is not None and source_extract_cache is None:
+            ledger_totals["dropped"] += extracted.ledger_dropped
+            ledger_totals["quarantined"] += extracted.ledger_quarantined
+            ledger_totals["rerouted"] += extracted.ledger_rerouted
+            ledger_totals["relabeled"] += extracted.ledger_relabeled
+        all_candidates.extend(sample for sample in extracted.samples if sample.label == label)
 
     # Filter
     filtered: list[Sample] = []
@@ -636,9 +773,14 @@ class SamplingResult:
     benign_samples: list[Sample]
     cell_fills: dict[str, CellFillRecord]
     gaps: list[str]
+    duplicates_dropped: int
     cross_contamination_dropped: int
     background_requested: int = 0
     background_actual: int = 0
+    ledger_dropped: int = 0
+    ledger_quarantined: int = 0
+    ledger_rerouted: int = 0
+    ledger_relabeled: int = 0
 
 
 def _language_targets_for_cell(
@@ -698,6 +840,7 @@ def _remove_samples_from_maps(
 def sample_spec(
     spec: MirrorSpec,
     base_dir: Path | None = None,
+    ledger: Ledger | None = None,
 ) -> SamplingResult:
     """Sample all cells in a MirrorSpec, producing labeled samples."""
     rng = random.Random(spec.seed)
@@ -745,6 +888,118 @@ def sample_spec(
         "benign": defaultdict(list),
     }
     all_gaps: list[str] = []
+    ledger_totals = {
+        "dropped": 0,
+        "quarantined": 0,
+        "rerouted": 0,
+        "relabeled": 0,
+    }
+    source_extract_cache: dict[
+        tuple[str, str, str, str, str, str],
+        SourceExtractResult,
+    ] = {}
+    relabeled_candidates: dict[str, dict[str, list[Sample]]] = {
+        "malicious": defaultdict(list),
+        "benign": defaultdict(list),
+    }
+
+    def _record_extract_counts(extracted: SourceExtractResult) -> None:
+        ledger_totals["dropped"] += extracted.ledger_dropped
+        ledger_totals["quarantined"] += extracted.ledger_quarantined
+        ledger_totals["rerouted"] += extracted.ledger_rerouted
+        ledger_totals["relabeled"] += extracted.ledger_relabeled
+
+    def _register_relabeled_candidates(
+        *,
+        source: SourceRef,
+        label: str,
+        reason: str,
+    ) -> None:
+        key = _source_extract_cache_key(
+            source,
+            label=label,
+            reason=reason,
+            base_dir=base_dir,
+        )
+        extracted = source_extract_cache.get(key)
+        if extracted is None:
+            extracted = _get_source_extract_result(
+                source,
+                label=label,
+                reason=reason,
+                base_dir=base_dir,
+                ledger=ledger,
+                source_extract_cache=source_extract_cache,
+            )
+            _record_extract_counts(extracted)
+        for sample in extracted.samples:
+            if sample.label != label:
+                relabeled_candidates[sample.label][sample.reason].append(sample)
+
+    for cell in spec.cells:
+        for source in cell.attack_sources:
+            _register_relabeled_candidates(
+                source=source,
+                label="malicious",
+                reason=cell.reason.value,
+            )
+        for source in cell.benign_sources:
+            _register_relabeled_candidates(
+                source=source,
+                label="benign",
+                reason=cell.reason.value,
+            )
+    for supp in spec.supplements:
+        supp_reason = f"supplement:{supp.name}"
+        for source in supp.attack_sources:
+            _register_relabeled_candidates(
+                source=source,
+                label="malicious",
+                reason=supp_reason,
+            )
+        for source in supp.benign_sources:
+            _register_relabeled_candidates(
+                source=source,
+                label="benign",
+                reason=supp_reason,
+            )
+    if spec.background:
+        for source in spec.background.sources:
+            _register_relabeled_candidates(
+                source=source,
+                label="benign",
+                reason="background",
+            )
+
+    def _sample_supplement_sources(
+        *,
+        sources: Sequence[SourceRef],
+        label: str,
+        reason: str,
+    ) -> list[Sample]:
+        samples: list[Sample] = []
+        for sample in relabeled_candidates[label].get(reason, []):
+            if sample.label != label:
+                continue
+            if not dedup.check(sample.content):
+                continue
+            samples.append(sample)
+        for source in sources:
+            extracted = _get_source_extract_result(
+                source,
+                label=label,
+                reason=reason,
+                base_dir=base_dir,
+                ledger=ledger,
+                source_extract_cache=source_extract_cache,
+            )
+            for sample in extracted.samples:
+                if sample.label != label:
+                    continue
+                if not dedup.check(sample.content):
+                    continue
+                samples.append(sample)
+        return samples
 
     def _sample_cell_with_optional_quota(
         cell: MirrorCell,
@@ -764,6 +1019,9 @@ def sample_spec(
                 base_dir=base_dir,
                 filter_benign_attacks=filter_benign_attacks,
                 allowed_languages=allowed_languages,
+                ledger=ledger,
+                source_extract_cache=source_extract_cache,
+                extra_candidates=relabeled_candidates[label].get(cell.reason.value, []),
             )
 
         language_targets = _language_targets_for_cell(
@@ -791,6 +1049,9 @@ def sample_spec(
                 base_dir=base_dir,
                 filter_benign_attacks=filter_benign_attacks,
                 allowed_languages={lang},
+                ledger=ledger,
+                source_extract_cache=source_extract_cache,
+                extra_candidates=relabeled_candidates[label].get(cell.reason.value, []),
             )
             merged_samples.extend(lang_result.samples)
             merged_available.extend(lang_result.available_pool)
@@ -978,7 +1239,7 @@ def sample_spec(
                 if gaps:
                     all_gaps.extend(gaps)
 
-    # Phase 5: Supplements
+    # Phase 5a: Supplement attack lane
     if spec.supplements:
         supplement_per = (
             int(spec.total_target * spec.supplement_ratio / len(spec.supplements) / 2)
@@ -991,40 +1252,41 @@ def sample_spec(
                 if supplement_per is not None
                 else supp.max_samples
             )
-            for sources, label in [
-                (supp.attack_sources, "malicious"),
-                (supp.benign_sources, "benign"),
-            ]:
-                supp_samples: list[Sample] = []
-                for source in sources:
-                    extracted = extract_samples_from_source(
-                        source,
-                        label=label,
-                        reason=f"supplement:{supp.name}",
-                        base_dir=base_dir,
-                    )
-                    for sample in extracted:
-                        if dedup.check(sample.content):
-                            supp_samples.append(sample)
-                if len(supp_samples) > cap:
-                    supp_samples = rng.sample(supp_samples, cap)
-                if label == "malicious":
-                    all_attack.extend(supp_samples)
-                else:
-                    all_benign.extend(supp_samples)
+            supp_attack = _sample_supplement_sources(
+                sources=supp.attack_sources,
+                label="malicious",
+                reason=f"supplement:{supp.name}",
+            )
+            if len(supp_attack) > cap:
+                supp_attack = rng.sample(supp_attack, cap)
+            all_attack.extend(supp_attack)
 
-    # Phase 6: Background benign lane
+    if spec.supplements:
+        dedup.register_attack_hashes([s.content_hash for s in all_attack])
+
+    # Phase 5b: Background benign lane
     background_actual = 0
     if spec.background and background_budget > 0:
         bg_candidates: list[Sample] = []
+        for sample in relabeled_candidates["benign"].get("background", []):
+            if sample.label != "benign":
+                continue
+            if looks_like_attack(sample.content):
+                continue
+            if dedup.check(sample.content):
+                bg_candidates.append(sample)
         for source in spec.background.sources:
-            extracted = extract_samples_from_source(
+            extracted = _get_source_extract_result(
                 source,
                 label="benign",
                 reason="background",
                 base_dir=base_dir,
+                ledger=ledger,
+                source_extract_cache=source_extract_cache,
             )
-            for sample in extracted:
+            for sample in extracted.samples:
+                if sample.label != "benign":
+                    continue
                 if looks_like_attack(sample.content):
                     continue
                 if dedup.check(sample.content):
@@ -1044,12 +1306,39 @@ def sample_spec(
                 f"got {background_actual} (-{background_budget - background_actual})"
             )
 
+    # Phase 5c: Supplement benign lane
+    if spec.supplements:
+        supplement_per = (
+            int(spec.total_target * spec.supplement_ratio / len(spec.supplements) / 2)
+            if spec.total_target
+            else None
+        )
+        for supp in spec.supplements:
+            cap = (
+                min(supplement_per, supp.max_samples)
+                if supplement_per is not None
+                else supp.max_samples
+            )
+            supp_benign = _sample_supplement_sources(
+                sources=supp.benign_sources,
+                label="benign",
+                reason=f"supplement:{supp.name}",
+            )
+            if len(supp_benign) > cap:
+                supp_benign = rng.sample(supp_benign, cap)
+            all_benign.extend(supp_benign)
+
     return SamplingResult(
         attack_samples=all_attack,
         benign_samples=all_benign,
         cell_fills=cell_fills,
         gaps=all_gaps,
+        duplicates_dropped=dedup.duplicates_dropped,
         cross_contamination_dropped=dedup.cross_contamination_dropped,
         background_requested=background_budget,
         background_actual=background_actual,
+        ledger_dropped=ledger_totals["dropped"],
+        ledger_quarantined=ledger_totals["quarantined"],
+        ledger_rerouted=ledger_totals["rerouted"],
+        ledger_relabeled=ledger_totals["relabeled"],
     )

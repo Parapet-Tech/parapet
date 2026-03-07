@@ -396,7 +396,7 @@ def main() -> int:
     parser.add_argument(
         "--train-script",
         type=Path,
-        default=Path("scripts/train_l1_specialist_variant.py"),
+        default=Path("scripts/train_l1_specialist.py"),
     )
     parser.add_argument(
         "--weights-target",

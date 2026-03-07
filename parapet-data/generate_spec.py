@@ -41,6 +41,10 @@ def make_source_ref(
     language: str,
     extractor: str = "col_content",
     label_filter: dict | None = None,
+    grounding_mode: str | None = None,
+    route_policy: str | None = None,
+    reason_provenance: str | None = None,
+    applicability_scope: str | None = None,
 ) -> dict:
     """Build a SourceRef dict for the output YAML."""
     ref: dict = {
@@ -51,7 +55,31 @@ def make_source_ref(
     }
     if label_filter:
         ref["label_filter"] = label_filter
+    if grounding_mode is not None:
+        ref["grounding_mode"] = grounding_mode
+    if route_policy is not None:
+        ref["route_policy"] = route_policy
+    if reason_provenance is not None:
+        ref["reason_provenance"] = reason_provenance
+    if applicability_scope is not None:
+        ref["applicability_scope"] = applicability_scope
     return ref
+
+
+def build_source_refs(source_defs: list[dict]) -> list[dict]:
+    """Expand compact source definitions into SourceRef dicts."""
+    return [make_source_ref(**src) for src in source_defs]
+
+
+def build_supplement(compact_supplement: dict) -> dict:
+    """Expand a compact supplement into a full Supplement dict."""
+    return {
+        "name": compact_supplement["name"],
+        "weakness": compact_supplement["weakness"],
+        "max_samples": compact_supplement["max_samples"],
+        "attack_sources": build_source_refs(compact_supplement.get("attack_sources", [])),
+        "benign_sources": build_source_refs(compact_supplement.get("benign_sources", [])),
+    }
 
 
 def build_cell(reason: str, compact: dict) -> dict:
@@ -62,7 +90,7 @@ def build_cell(reason: str, compact: dict) -> dict:
     attack_sources = []
 
     # Base attack sources (shared across all cells)
-    for src in compact["base_attack_sources"]:
+    for src in compact.get("base_attack_sources", []):
         attack_sources.append(make_source_ref(**src))
 
     # Per-cell extra attack sources
@@ -78,6 +106,10 @@ def build_cell(reason: str, compact: dict) -> dict:
                     path=staged_cfg["path"],
                     language=staged_cfg["language"],
                     label_filter={"column": "reason", "allowed": [reason]},
+                    grounding_mode=staged_cfg.get("grounding_mode"),
+                    route_policy=staged_cfg.get("route_policy"),
+                    reason_provenance=staged_cfg.get("reason_provenance"),
+                    applicability_scope=staged_cfg.get("applicability_scope"),
                 )
             )
 
@@ -85,7 +117,7 @@ def build_cell(reason: str, compact: dict) -> dict:
     benign_sources = []
 
     # Base benign sources (shared across all cells)
-    for src in compact["base_benign_sources"]:
+    for src in compact.get("base_benign_sources", []):
         benign_sources.append(make_source_ref(**src))
 
     # Per-cell extra benign sources
@@ -101,6 +133,10 @@ def build_cell(reason: str, compact: dict) -> dict:
                     path=staged_cfg["path"],
                     language=staged_cfg["language"],
                     label_filter={"column": "reason", "allowed": [reason]},
+                    grounding_mode=staged_cfg.get("grounding_mode"),
+                    route_policy=staged_cfg.get("route_policy"),
+                    reason_provenance=staged_cfg.get("reason_provenance"),
+                    applicability_scope=staged_cfg.get("applicability_scope"),
                 )
             )
 
@@ -115,6 +151,10 @@ def build_cell(reason: str, compact: dict) -> dict:
                     path=dataset_cfg["path"],
                     language="EN",
                     label_filter={"column": "reason", "allowed": [reason]},
+                    grounding_mode=dataset_cfg.get("grounding_mode"),
+                    route_policy=dataset_cfg.get("route_policy"),
+                    reason_provenance=dataset_cfg.get("reason_provenance"),
+                    applicability_scope=dataset_cfg.get("applicability_scope"),
                 )
             )
 
@@ -153,14 +193,23 @@ def expand_spec(compact: dict, overrides: dict | None = None) -> dict:
     spec["backfill"] = copy.deepcopy(compact["backfill"])
     spec["language_quota"] = copy.deepcopy(compact["language_quota"])
     spec["allow_partial_mirror"] = compact.get("allow_partial_mirror", False)
+    if "supplement_ratio" in compact:
+        spec["supplement_ratio"] = compact["supplement_ratio"]
+    if compact.get("holdout_only_reasons"):
+        spec["holdout_only_reasons"] = copy.deepcopy(compact["holdout_only_reasons"])
+    if compact.get("enforce_source_contracts"):
+        spec["enforce_source_contracts"] = True
 
     # Background lane
     if "background" in compact:
         bg = compact["background"]
         spec["background"] = {
             "budget_fraction": bg["budget_fraction"],
-            "sources": [make_source_ref(**src) for src in bg["sources"]],
+            "sources": build_source_refs(bg["sources"]),
         }
+
+    if "supplements" in compact:
+        spec["supplements"] = [build_supplement(supp) for supp in compact["supplements"]]
 
     # Expand cells
     defined_reasons = set(compact["cells"].keys())

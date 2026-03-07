@@ -13,7 +13,7 @@ import hashlib
 import json
 import logging
 import random
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Sequence
@@ -25,6 +25,8 @@ from .models import (
     CurationManifest,
     MirrorSpec,
     SplitManifest,
+    SourceMetadata,
+    VerifiedSyncManifest,
     compute_semantic_hash,
     compute_source_hash,
 )
@@ -184,6 +186,33 @@ OutputFormat = Literal["yaml", "jsonl"]
 _FORMAT_EXTENSIONS: dict[OutputFormat, str] = {"yaml": ".yaml", "jsonl": ".jsonl"}
 
 
+def _collect_source_alias_warnings(
+    source_metadata: dict[str, SourceMetadata],
+) -> list[str]:
+    """Warn when different source names point at the same path with different lanes."""
+    by_path: dict[str, list[tuple[str, SourceMetadata]]] = defaultdict(list)
+    for name, metadata in source_metadata.items():
+        by_path[str(metadata.path)].append((name, metadata))
+
+    warnings: list[str] = []
+    for path in sorted(by_path.keys()):
+        entries = by_path[path]
+        if len(entries) < 2:
+            continue
+        route_policies = {
+            metadata.route_policy.value if metadata.route_policy is not None else "unset"
+            for _, metadata in entries
+        }
+        if len(route_policies) < 2:
+            continue
+        aliases = ", ".join(sorted(name for name, _ in entries))
+        lanes = ", ".join(sorted(route_policies))
+        warnings.append(
+            f"source path {path} is aliased by {aliases} with differing route_policies: {lanes}"
+        )
+    return warnings
+
+
 def _sample_to_dict(sample: Sample) -> dict:
     """Convert a Sample to a serializable dict."""
     return {
@@ -251,6 +280,7 @@ def compose(
     stratified_split: bool = True,
     min_df: int | None = None,
     max_features: int | None = None,
+    verified_sync: VerifiedSyncManifest | None = None,
 ) -> CurationManifest:
     """Compose the final curated dataset from sampling results.
 
@@ -298,6 +328,7 @@ def compose(
 
     # Source hashes
     source_hashes: dict[str, str] = {}
+    source_metadata: dict[str, SourceMetadata] = {}
     all_sources = []
     for cell in spec.cells:
         all_sources.extend(cell.attack_sources)
@@ -305,7 +336,11 @@ def compose(
     for supp in spec.supplements:
         all_sources.extend(supp.attack_sources)
         all_sources.extend(supp.benign_sources)
+    if spec.background:
+        all_sources.extend(spec.background.sources)
     for source in all_sources:
+        if source.name not in source_metadata:
+            source_metadata[source.name] = SourceMetadata.from_source_ref(source)
         if source.name not in source_hashes:
             try:
                 source_hashes[source.name] = compute_source_hash(
@@ -334,6 +369,7 @@ def compose(
             max_features=max_features,
             language_quota=quota_profile,
         )
+    source_alias_warnings = _collect_source_alias_warnings(source_metadata)
 
     return CurationManifest(
         spec_name=spec.name,
@@ -342,6 +378,7 @@ def compose(
         seed=spec.seed,
         timestamp=datetime.now(timezone.utc).isoformat(),
         source_hashes=source_hashes,
+        source_metadata=source_metadata,
         output_path=Path(combined_path.name),
         output_hash=_sha256_file(combined_path),
         semantic_hash=semantic_hash,
@@ -351,10 +388,17 @@ def compose(
         splits=split_manifests,
         cell_fills=sampling_result.cell_fills,
         gaps=sampling_result.gaps,
+        duplicates_dropped=sampling_result.duplicates_dropped,
         cross_contamination_dropped=sampling_result.cross_contamination_dropped,
         background_requested=sampling_result.background_requested,
         background_actual=sampling_result.background_actual,
+        source_alias_warnings=source_alias_warnings,
         feature_coverage_warnings=feature_coverage_warnings,
+        ledger_dropped=sampling_result.ledger_dropped,
+        ledger_quarantined=sampling_result.ledger_quarantined,
+        ledger_rerouted=sampling_result.ledger_rerouted,
+        ledger_relabeled=sampling_result.ledger_relabeled,
+        verified_sync=verified_sync,
     )
 
 

@@ -332,7 +332,7 @@ class ManifestSplitResolver:
 
 
 class TrainScriptTrainer:
-    """Concrete trainer adapter around scripts/train_l1_specialist_variant.py."""
+    """Concrete trainer adapter around scripts/train_l1_specialist.py."""
 
     def __init__(
         self,
@@ -1376,7 +1376,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--run-id", type=str)
     run.add_argument("--run-manifest-path", type=Path)
     run.add_argument("--workspace-root", type=Path)
-    run.add_argument("--trainer-script", type=Path, default=Path("scripts/train_l1_specialist_variant.py"))
+    run.add_argument("--trainer-script", type=Path, default=Path("scripts/train_l1_specialist.py"))
     run.add_argument("--parapet-eval-bin", type=Path, default=Path("target/release/parapet-eval.exe"))
     run.add_argument("--l1-eval-config", type=Path, default=Path("schema/eval/eval_config_l1_only.yaml"))
     run.add_argument("--pg2-eval-config", type=Path, default=Path("schema/eval/eval_config_l2a_only.yaml"))

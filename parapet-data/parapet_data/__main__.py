@@ -17,7 +17,7 @@ import sys
 from pathlib import Path
 
 from .compositor import OutputFormat, compose, composition_report
-from .models import MirrorSpec
+from .models import MirrorSpec, VerifiedSyncManifest
 from .sampler import sample_spec
 
 
@@ -30,11 +30,31 @@ def _setup_logging(verbose: bool) -> None:
     )
 
 
+def _write_verified_sync_stats(verified_dir: Path, stats: object) -> Path:
+    """Write verified-sync stats JSON sidecar and return its path."""
+    stats_path = verified_dir / "sync_stats.json"
+    stats_path.write_text(
+        json.dumps({
+            "files_processed": stats.files_processed,
+            "total_input": stats.total_input,
+            "passed": stats.passed,
+            "dropped": stats.dropped,
+            "quarantined": stats.quarantined,
+            "rerouted": stats.rerouted,
+            "relabeled": stats.relabeled,
+        }, indent=2),
+        encoding="utf-8",
+    )
+    return stats_path
+
+
 def cmd_curate(args: argparse.Namespace) -> None:
     """Run the full curation pipeline: spec -> sample -> compose -> manifest."""
     spec_path = Path(args.spec)
     output_dir = Path(args.output)
     base_dir = Path(args.base_dir) if args.base_dir else spec_path.parent
+    ledger = None
+    verified_sync_manifest: VerifiedSyncManifest | None = None
 
     # Load spec
     spec_text = spec_path.read_text(encoding="utf-8")
@@ -49,10 +69,58 @@ def cmd_curate(args: argparse.Namespace) -> None:
     if spec.total_target:
         print(f"Target: {spec.total_target:,} samples", file=sys.stderr)
     print(f"Output: {output_dir}", file=sys.stderr)
+    if args.ledger:
+        from .ledger import Ledger
+
+        ledger_path = Path(args.ledger)
+        ledger = Ledger.load(ledger_path)
+        print(f"Ledger: {ledger_path} ({len(ledger)} entries)", file=sys.stderr)
+        if args.materialize_verified_dir:
+            from .verified import sync_verified
+
+            staging_dir = Path(args.verified_staging_dir) if args.verified_staging_dir else (
+                base_dir / "schema" / "eval" / "staging"
+            )
+            verified_dir = Path(args.materialize_verified_dir)
+            if not staging_dir.is_absolute():
+                staging_dir = (base_dir / staging_dir).resolve()
+            if not verified_dir.is_absolute():
+                verified_dir = (base_dir / verified_dir).resolve()
+            if not staging_dir.exists():
+                raise FileNotFoundError(
+                    f"verified preflight staging dir not found: {staging_dir}"
+                )
+
+            print("\nVerified preflight...", file=sys.stderr)
+            print(f"  Staging:  {staging_dir}", file=sys.stderr)
+            print(f"  Verified: {verified_dir}", file=sys.stderr)
+            stats = sync_verified(staging_dir, verified_dir, ledger)
+            stats_path = _write_verified_sync_stats(verified_dir, stats)
+            verified_sync_manifest = VerifiedSyncManifest(
+                staging_dir=staging_dir,
+                verified_dir=verified_dir,
+                files_processed=stats.files_processed,
+                total_input=stats.total_input,
+                passed=stats.passed,
+                dropped=stats.dropped,
+                quarantined=stats.quarantined,
+                rerouted=stats.rerouted,
+                relabeled=stats.relabeled,
+            )
+            print(
+                "  Verified sync: "
+                f"{stats.files_processed} files, {stats.total_input} rows, "
+                f"dropped={stats.dropped}, quarantined={stats.quarantined}, "
+                f"rerouted={stats.rerouted}, relabeled={stats.relabeled}",
+                file=sys.stderr,
+            )
+            print(f"  Stats:    {stats_path}", file=sys.stderr)
+    elif args.materialize_verified_dir:
+        raise ValueError("--materialize-verified-dir requires --ledger")
 
     # Sample
     print("\nSampling...", file=sys.stderr)
-    sampling_result = sample_spec(spec, base_dir=base_dir)
+    sampling_result = sample_spec(spec, base_dir=base_dir, ledger=ledger)
     n_attack = len(sampling_result.attack_samples)
     n_benign = len(sampling_result.benign_samples)
     print(
@@ -72,6 +140,25 @@ def cmd_curate(args: argparse.Namespace) -> None:
             f"{sampling_result.cross_contamination_dropped}",
             file=sys.stderr,
         )
+    if sampling_result.duplicates_dropped:
+        print(
+            f"Duplicate rows dropped: {sampling_result.duplicates_dropped}",
+            file=sys.stderr,
+        )
+    if (
+        sampling_result.ledger_dropped
+        or sampling_result.ledger_quarantined
+        or sampling_result.ledger_rerouted
+        or sampling_result.ledger_relabeled
+    ):
+        print(
+            "Ledger actions: "
+            f"dropped={sampling_result.ledger_dropped}, "
+            f"quarantined={sampling_result.ledger_quarantined}, "
+            f"rerouted={sampling_result.ledger_rerouted}, "
+            f"relabeled={sampling_result.ledger_relabeled}",
+            file=sys.stderr,
+        )
 
     if (args.min_df is None) != (args.max_features is None):
         raise ValueError("--min-df and --max-features must be provided together")
@@ -88,6 +175,7 @@ def cmd_curate(args: argparse.Namespace) -> None:
         stratified_split=args.stratified,
         min_df=args.min_df,
         max_features=args.max_features,
+        verified_sync=verified_sync_manifest,
     )
 
     # Write manifest
@@ -119,6 +207,13 @@ def cmd_curate(args: argparse.Namespace) -> None:
             file=sys.stderr,
         )
         for warning in manifest.feature_coverage_warnings:
+            print(f"    - {warning}", file=sys.stderr)
+    if manifest.source_alias_warnings:
+        print(
+            f"  Source alias warnings: {len(manifest.source_alias_warnings)}",
+            file=sys.stderr,
+        )
+        for warning in manifest.source_alias_warnings:
             print(f"    - {warning}", file=sys.stderr)
 
 
@@ -164,6 +259,37 @@ def cmd_stage(args: argparse.Namespace) -> None:
                 print(f"    {gate}: {count}", file=sys.stderr)
 
 
+def cmd_verified_sync(args: argparse.Namespace) -> None:
+    """Sync staging through the adjudication ledger to produce verified output."""
+    from .ledger import Ledger
+    from .verified import sync_verified
+
+    staging_dir = Path(args.staging_dir)
+    verified_dir = Path(args.verified_dir)
+    ledger_path = Path(args.ledger)
+
+    print(f"Staging: {staging_dir}", file=sys.stderr)
+    print(f"Verified: {verified_dir}", file=sys.stderr)
+    print(f"Ledger: {ledger_path}", file=sys.stderr)
+
+    ledger = Ledger.load(ledger_path)
+    print(f"Ledger entries: {len(ledger)}", file=sys.stderr)
+
+    stats = sync_verified(staging_dir, verified_dir, ledger)
+
+    print(f"\nVerified sync complete.", file=sys.stderr)
+    print(f"  Files processed: {stats.files_processed}", file=sys.stderr)
+    print(f"  Input rows:      {stats.total_input:,}", file=sys.stderr)
+    print(f"  Passed:          {stats.passed:,}", file=sys.stderr)
+    print(f"  Dropped:         {stats.dropped:,}", file=sys.stderr)
+    print(f"  Quarantined:     {stats.quarantined:,}", file=sys.stderr)
+    print(f"  Rerouted:        {stats.rerouted:,}", file=sys.stderr)
+    print(f"  Relabeled:       {stats.relabeled:,}", file=sys.stderr)
+
+    stats_path = _write_verified_sync_stats(verified_dir, stats)
+    print(f"  Stats: {stats_path}", file=sys.stderr)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="parapet-data",
@@ -183,6 +309,27 @@ def main() -> None:
         "--base-dir",
         default=None,
         help="Base directory for resolving relative source paths (default: spec parent dir)",
+    )
+    curate_parser.add_argument(
+        "--ledger",
+        default=None,
+        help="Optional adjudication ledger YAML to apply during curation",
+    )
+    curate_parser.add_argument(
+        "--materialize-verified-dir",
+        default=None,
+        help=(
+            "Optional verified-sync output directory for staged-source preflight "
+            "(requires --ledger)"
+        ),
+    )
+    curate_parser.add_argument(
+        "--verified-staging-dir",
+        default=None,
+        help=(
+            "Optional staging directory for verified preflight "
+            "(default: <base-dir>/schema/eval/staging)"
+        ),
     )
     curate_parser.add_argument(
         "--format",
@@ -252,6 +399,26 @@ def main() -> None:
         help="Optional directory for partial checkpoint files (default: --output)",
     )
 
+    vsync_parser = subparsers.add_parser(
+        "verified-sync",
+        help="Sync staging through adjudication ledger to verified output",
+    )
+    vsync_parser.add_argument(
+        "--staging-dir",
+        required=True,
+        help="Directory containing staged YAML files",
+    )
+    vsync_parser.add_argument(
+        "--verified-dir",
+        required=True,
+        help="Output directory for verified YAML files",
+    )
+    vsync_parser.add_argument(
+        "--ledger",
+        required=True,
+        help="Path to adjudication ledger YAML file",
+    )
+
     args = parser.parse_args()
     _setup_logging(args.verbose)
 
@@ -259,6 +426,8 @@ def main() -> None:
         cmd_curate(args)
     elif args.command == "stage":
         cmd_stage(args)
+    elif args.command == "verified-sync":
+        cmd_verified_sync(args)
     else:
         parser.print_help()
         sys.exit(1)

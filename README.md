@@ -1,5 +1,7 @@
 # Parapet
 
+> **Research project** -- this is an active research effort exploring local, transparent prompt injection detection for LLM applications. The architecture, training data, eval methodology, and detection layers are all under active development. Nothing here is stable or production-ready. We publish the code and results openly so others working on the same problem can learn from (and challenge) our approach.
+
 Transparent LLM proxy firewall. Scans every request and response for prompt injection, multi-turn attacks, tool abuse, and data exfiltration. Config-driven via YAML. Three lines to integrate.
 
 **[parapet.tech](https://parapet.tech)** | **[GitHub](https://github.com/Parapet-Tech/parapet)**

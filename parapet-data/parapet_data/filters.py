@@ -94,8 +94,13 @@ def passes_label_filter(
 
 
 def content_hash(text: str) -> str:
-    """SHA256 hash of content for dedup and provenance."""
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    """SHA256 hash of content for dedup and provenance.
+
+    Strips leading/trailing whitespace before hashing so that
+    trailing newlines or padding from YAML parsing don't create
+    phantom-distinct hashes.
+    """
+    return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()
 
 
 class ContentDeduplicator:

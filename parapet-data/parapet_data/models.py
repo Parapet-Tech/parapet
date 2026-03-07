@@ -74,6 +74,40 @@ class LanguageQuotaMode(str, Enum):
     BEST_EFFORT = "best_effort"
 
 
+class SourceGroundingMode(str, Enum):
+    """How trustworthy a source's reason assignment is."""
+
+    REASON_GROUNDED = "reason_grounded"
+    POOLED = "pooled"
+
+
+class SourceRoutePolicy(str, Enum):
+    """Which lane a source is intended to feed."""
+
+    MIRROR = "mirror"
+    RESIDUAL = "residual"
+    BACKGROUND = "background"
+    QUARANTINE = "quarantine"
+
+
+class ReasonProvenance(str, Enum):
+    """How a source's reason label was established."""
+
+    SOURCE_LABEL = "source_label"
+    MANUAL_MAP = "manual_map"
+    ADJUDICATED = "adjudicated"
+    HEURISTIC = "heuristic"
+    NONE = "none"
+
+
+class ApplicabilityScope(str, Enum):
+    """How well the source matches the generalist prompt-attack task."""
+
+    IN_DOMAIN = "in_domain"
+    MIXED = "mixed"
+    UNKNOWN = "unknown"
+
+
 # ---------------------------------------------------------------------------
 # Source references
 # ---------------------------------------------------------------------------
@@ -92,6 +126,90 @@ class SourceRef(BaseModel):
     extractor: str  # registry key for extraction function
     max_samples: int | None = None
     label_filter: dict[str, object] | None = None
+    grounding_mode: SourceGroundingMode | None = Field(
+        default=None,
+        exclude_if=lambda v: v is None,
+    )
+    route_policy: SourceRoutePolicy | None = Field(
+        default=None,
+        exclude_if=lambda v: v is None,
+    )
+    reason_provenance: ReasonProvenance | None = Field(
+        default=None,
+        exclude_if=lambda v: v is None,
+    )
+    applicability_scope: ApplicabilityScope | None = Field(
+        default=None,
+        exclude_if=lambda v: v is None,
+    )
+
+
+class SourceMetadata(BaseModel):
+    """Manifest snapshot of source selection and routing, keyed by source name.
+
+    The manifest needs enough information to explain which rows were eligible
+    from a physical source, not just where the source lived. That includes
+    selection instructions like label_filter/max_samples in addition to lane
+    routing and provenance metadata.
+    """
+
+    path: Path
+    language: Language
+    extractor: str
+    max_samples: int | None = None
+    label_filter: dict[str, object] | None = None
+    grounding_mode: SourceGroundingMode | None = Field(
+        default=None,
+        exclude_if=lambda v: v is None,
+    )
+    route_policy: SourceRoutePolicy | None = Field(
+        default=None,
+        exclude_if=lambda v: v is None,
+    )
+    reason_provenance: ReasonProvenance | None = Field(
+        default=None,
+        exclude_if=lambda v: v is None,
+    )
+    applicability_scope: ApplicabilityScope | None = Field(
+        default=None,
+        exclude_if=lambda v: v is None,
+    )
+
+    @classmethod
+    def from_source_ref(cls, source: SourceRef) -> SourceMetadata:
+        """Project spec-facing source fields into manifest metadata."""
+        return cls(
+            path=source.path,
+            language=source.language,
+            extractor=source.extractor,
+            max_samples=source.max_samples,
+            label_filter=source.label_filter,
+            grounding_mode=source.grounding_mode,
+            route_policy=source.route_policy,
+            reason_provenance=source.reason_provenance,
+            applicability_scope=source.applicability_scope,
+        )
+
+
+_STRICT_MIRROR_REASON_PROVENANCE = {
+    ReasonProvenance.SOURCE_LABEL,
+    ReasonProvenance.MANUAL_MAP,
+    ReasonProvenance.ADJUDICATED,
+}
+
+
+def _route_policy_violation(
+    source: SourceRef,
+    *,
+    expected: SourceRoutePolicy,
+    context: str,
+) -> str | None:
+    actual = source.route_policy.value if source.route_policy is not None else "unset"
+    if source.route_policy != expected:
+        return (
+            f"{context}: source {source.name} must declare route_policy={expected.value}, got {actual}"
+        )
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -261,6 +379,10 @@ class MirrorSpec(BaseModel):
     background: BackgroundLane | None = None
     seed: int = 42
     allow_partial_mirror: bool = False
+    enforce_source_contracts: bool = Field(
+        default=False,
+        exclude_if=lambda v: v is False,
+    )
     holdout_only_reasons: list[AttackReason] = Field(default_factory=list)
 
     @model_validator(mode="after")
@@ -289,6 +411,80 @@ class MirrorSpec(BaseModel):
                 )
         return self
 
+    @model_validator(mode="after")
+    def source_contracts_consistent(self) -> MirrorSpec:
+        if not self.enforce_source_contracts:
+            return self
+
+        violations: list[str] = []
+
+        for cell in self.cells:
+            reason = cell.reason.value
+            for source in cell.attack_sources:
+                context = f"{reason}: attack source"
+                violation = _route_policy_violation(
+                    source,
+                    expected=SourceRoutePolicy.MIRROR,
+                    context=context,
+                )
+                if violation is not None:
+                    violations.append(violation)
+                if source.grounding_mode != SourceGroundingMode.REASON_GROUNDED:
+                    violations.append(
+                        f"{context} {source.name} must declare grounding_mode=reason_grounded"
+                    )
+                if source.reason_provenance not in _STRICT_MIRROR_REASON_PROVENANCE:
+                    actual = (
+                        source.reason_provenance.value
+                        if source.reason_provenance is not None
+                        else "unset"
+                    )
+                    violations.append(
+                        f"{context} {source.name} must declare non-heuristic reason_provenance, got {actual}"
+                    )
+                if source.applicability_scope != ApplicabilityScope.IN_DOMAIN:
+                    actual = (
+                        source.applicability_scope.value
+                        if source.applicability_scope is not None
+                        else "unset"
+                    )
+                    violations.append(
+                        f"{context} {source.name} must declare applicability_scope=in_domain, got {actual}"
+                    )
+            for source in cell.benign_sources:
+                violation = _route_policy_violation(
+                    source,
+                    expected=SourceRoutePolicy.MIRROR,
+                    context=f"{reason}: benign source",
+                )
+                if violation is not None:
+                    violations.append(violation)
+
+        for supplement in self.supplements:
+            for source in supplement.attack_sources + supplement.benign_sources:
+                violation = _route_policy_violation(
+                    source,
+                    expected=SourceRoutePolicy.RESIDUAL,
+                    context=f"supplement {supplement.name}",
+                )
+                if violation is not None:
+                    violations.append(violation)
+
+        if self.background is not None:
+            for source in self.background.sources:
+                violation = _route_policy_violation(
+                    source,
+                    expected=SourceRoutePolicy.BACKGROUND,
+                    context="background",
+                )
+                if violation is not None:
+                    violations.append(violation)
+
+        if violations:
+            raise ValueError("source contract violations:\n" + "\n".join(violations))
+
+        return self
+
     def spec_hash(self) -> str:
         """Deterministic hash of the spec for provenance tracking."""
         canonical = self.model_dump_json(indent=None)
@@ -309,6 +505,20 @@ class SplitManifest(BaseModel):
     artifact_path: Path
 
 
+class VerifiedSyncManifest(BaseModel):
+    """Optional receipt of a verified-sync preflight run."""
+
+    staging_dir: Path
+    verified_dir: Path
+    files_processed: int
+    total_input: int
+    passed: int
+    dropped: int
+    quarantined: int
+    rerouted: int
+    relabeled: int
+
+
 class CurationManifest(BaseModel):
     """Immutable receipt of a curation run.
 
@@ -323,6 +533,7 @@ class CurationManifest(BaseModel):
     seed: int
     timestamp: str  # ISO 8601
     source_hashes: dict[str, str]  # source name -> Merkle hash
+    source_metadata: dict[str, SourceMetadata] = Field(default_factory=dict)
     output_hash: str  # SHA256 of the full curated dataset
     semantic_hash: str  # SHA256(sorted content hashes + per-cell counts)
     total_samples: int
@@ -331,10 +542,17 @@ class CurationManifest(BaseModel):
     splits: dict[str, SplitManifest]
     cell_fills: dict[str, CellFillRecord]
     gaps: list[str]
+    duplicates_dropped: int = 0
     cross_contamination_dropped: int
     background_requested: int = 0
     background_actual: int = 0
+    source_alias_warnings: list[str] = Field(default_factory=list)
     feature_coverage_warnings: list[str] = Field(default_factory=list)
+    ledger_dropped: int = 0
+    ledger_quarantined: int = 0
+    ledger_rerouted: int = 0
+    ledger_relabeled: int = 0
+    verified_sync: VerifiedSyncManifest | None = None
     output_path: Path
 
 

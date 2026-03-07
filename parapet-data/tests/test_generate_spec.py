@@ -14,7 +14,14 @@ import yaml
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from generate_spec import ALL_REASONS, LANGUAGES, build_cell, expand_spec, make_source_ref
+from generate_spec import (
+    ALL_REASONS,
+    LANGUAGES,
+    build_cell,
+    build_supplement,
+    expand_spec,
+    make_source_ref,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +90,62 @@ class TestMakeSourceRef:
     def test_custom_extractor(self):
         ref = make_source_ref("test", "path.yaml", "EN", extractor="wildchat")
         assert ref["extractor"] == "wildchat"
+
+    def test_preserves_lane_metadata(self):
+        ref = make_source_ref(
+            "test",
+            "path.yaml",
+            "EN",
+            grounding_mode="pooled",
+            route_policy="residual",
+            reason_provenance="heuristic",
+            applicability_scope="mixed",
+        )
+        assert ref["grounding_mode"] == "pooled"
+        assert ref["route_policy"] == "residual"
+        assert ref["reason_provenance"] == "heuristic"
+        assert ref["applicability_scope"] == "mixed"
+
+
+# ---------------------------------------------------------------------------
+# build_supplement
+# ---------------------------------------------------------------------------
+
+
+class TestBuildSupplement:
+    def test_expands_sources_and_preserves_lane_metadata(self):
+        supplement = build_supplement(
+            {
+                "name": "residual_pool",
+                "weakness": "pooled attacks need residual routing",
+                "max_samples": 120,
+                "attack_sources": [
+                    {
+                        "name": "pooled_atk",
+                        "path": "attacks.yaml",
+                        "language": "EN",
+                        "route_policy": "residual",
+                        "grounding_mode": "pooled",
+                        "reason_provenance": "none",
+                        "applicability_scope": "mixed",
+                    }
+                ],
+                "benign_sources": [
+                    {
+                        "name": "residual_ben",
+                        "path": "benign.yaml",
+                        "language": "EN",
+                        "route_policy": "residual",
+                        "applicability_scope": "in_domain",
+                    }
+                ],
+            }
+        )
+        assert supplement["name"] == "residual_pool"
+        assert supplement["max_samples"] == 120
+        assert supplement["attack_sources"][0]["route_policy"] == "residual"
+        assert supplement["attack_sources"][0]["grounding_mode"] == "pooled"
+        assert supplement["benign_sources"][0]["route_policy"] == "residual"
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +267,24 @@ class TestBuildCellStagedAttacks:
         staged_src = [s for s in cell["attack_sources"] if "staged" in s["name"]][0]
         assert staged_src["label_filter"] == {"column": "reason", "allowed": ["adversarial_suffix"]}
         assert staged_src["language"] == "RU"
+
+    def test_staged_attack_carries_lane_metadata(self):
+        compact = _minimal_compact()
+        compact["staged_attacks"] = {
+            "ru_staged": {
+                "path": "ru_staged.yaml",
+                "language": "RU",
+                "reasons": ["meta_probe"],
+                "grounding_mode": "reason_grounded",
+                "route_policy": "mirror",
+                "reason_provenance": "source_label",
+            }
+        }
+        cell = build_cell("meta_probe", compact)
+        staged_src = [s for s in cell["attack_sources"] if "staged" in s["name"]][0]
+        assert staged_src["grounding_mode"] == "reason_grounded"
+        assert staged_src["route_policy"] == "mirror"
+        assert staged_src["reason_provenance"] == "source_label"
 
 
 # ---------------------------------------------------------------------------
@@ -340,6 +421,44 @@ class TestExpandSpec:
         assert spec["background"]["budget_fraction"] == 0.15
         assert len(spec["background"]["sources"]) == 1
         assert spec["background"]["sources"][0]["name"] == "bg1"
+
+    def test_strict_source_contracts_copied_when_enabled(self):
+        compact = _minimal_compact()
+        compact["enforce_source_contracts"] = True
+        spec = expand_spec(compact)
+        assert spec["enforce_source_contracts"] is True
+
+    def test_supplements_expanded_when_present(self):
+        compact = _minimal_compact()
+        compact["supplement_ratio"] = 0.2
+        compact["supplements"] = [
+            {
+                "name": "residual_pool",
+                "weakness": "pooled attack coverage",
+                "max_samples": 100,
+                "attack_sources": [
+                    {
+                        "name": "pooled_atk",
+                        "path": "attacks.yaml",
+                        "language": "EN",
+                        "route_policy": "residual",
+                        "grounding_mode": "pooled",
+                    }
+                ],
+                "benign_sources": [
+                    {
+                        "name": "residual_ben",
+                        "path": "benign.yaml",
+                        "language": "EN",
+                        "route_policy": "residual",
+                    }
+                ],
+            }
+        ]
+        spec = expand_spec(compact)
+        assert spec["supplement_ratio"] == 0.2
+        assert len(spec["supplements"]) == 1
+        assert spec["supplements"][0]["attack_sources"][0]["route_policy"] == "residual"
 
     def test_missing_cell_exits(self):
         compact = _minimal_compact()
