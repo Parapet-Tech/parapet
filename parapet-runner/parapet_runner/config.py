@@ -75,7 +75,7 @@ class TrainConfig(BaseModel):
         out_path: Path,
         holdout_path: Path,
     ) -> list[str]:
-        """Render CLI args for scripts/train_l1_specialist_variant.py."""
+        """Render CLI args for scripts/train_l1_specialist.py."""
 
         if not attack_files:
             raise ValueError("attack_files cannot be empty")

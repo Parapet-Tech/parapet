@@ -4,6 +4,10 @@
 #   python -m parapet_data curate --spec mirror_spec.example.yaml --output ./curated/ --base-dir ..
 #
 # All paths in source refs are relative to --base-dir (defaults to this file's parent directory).
+#
+# NOTE: Paths starting with "data/" are placeholders for your own data sources.
+# You must supply your own YAML files in the expected extractor format (see README.md).
+# Paths starting with "schema/eval/" reference files included in this repository.
 
 name: mirror_v1
 version: "1.0.0"
@@ -37,7 +41,7 @@ allow_partial_mirror: false
 #     max_samples: 200
 #     attack_sources:
 #       - name: gcg_attacks
-#         path: TheWall/AmpleGCG/outputs/attacks.yaml
+#         path: data/AmpleGCG/outputs/attacks.yaml
 #         language: EN
 #         extractor: col_content
 #     benign_sources:
@@ -132,12 +136,12 @@ cells:
       long: 0.3
     attack_sources:
       - name: wildjailbreak_attacks
-        path: TheWall/wildjailbreak/adversarial.yaml
+        path: data/wildjailbreak/adversarial.yaml
         language: EN
         extractor: wildjailbreak
     benign_sources:
       - name: writingprompts_en
-        path: TheWall/writingprompts/stories.yaml
+        path: data/writingprompts/stories.yaml
         language: EN
         extractor: writingprompt
 
@@ -162,7 +166,7 @@ cells:
           allowed: [malicious]
     benign_sources:
       - name: xquad_en
-        path: TheWall/xquad/en.yaml
+        path: data/xquad/en.yaml
         language: EN
         extractor: xquad_question
 
@@ -187,7 +191,7 @@ cells:
           allowed: [malicious]
     benign_sources:
       - name: alpaca_en
-        path: TheWall/alpaca/en.yaml
+        path: data/alpaca/en.yaml
         language: EN
         extractor: instruction_response
 
@@ -204,12 +208,12 @@ cells:
       long: 0.3
     attack_sources:
       - name: gcg_attacks
-        path: TheWall/AmpleGCG/outputs/attacks.yaml
+        path: data/AmpleGCG/outputs/attacks.yaml
         language: EN
         extractor: col_content
     benign_sources:
       - name: code_benign
-        path: TheWall/code_samples/en.yaml
+        path: data/code_samples/en.yaml
         language: EN
         extractor: col_content
 
@@ -234,7 +238,7 @@ cells:
           allowed: [malicious]
     benign_sources:
       - name: arena_en
-        path: TheWall/chatbot_arena/en.yaml
+        path: data/chatbot_arena/en.yaml
         language: EN
         extractor: conversation_a
 
@@ -259,7 +263,7 @@ cells:
           allowed: [malicious]
     benign_sources:
       - name: structured_benign
-        path: TheWall/structured_text/en.yaml
+        path: data/structured_text/en.yaml
         language: EN
         extractor: col_content
 
@@ -284,6 +288,6 @@ cells:
           allowed: [malicious]
     benign_sources:
       - name: dolly_en
-        path: TheWall/dolly/en.yaml
+        path: data/dolly/en.yaml
         language: EN
         extractor: instruction_response

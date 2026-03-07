@@ -126,7 +126,30 @@ Artifacts are written incrementally under `parapet-runner/runs/mirror_v2_mix_abl
 - one folder per cell (`m{mirror}_n{non}_s{seed}`) with `status.json`, logs, and `result.json`
 - aggregate files regenerated after every completed cell: `results.jsonl`, `summary.csv`, `summary.md`
 
-## What's next
+## Usage
 
-1. **Run a full experiment** -- `python -m parapet_runner.runner run --curation-manifest manifest.json --train-config train.json --output-dir ./runs/`
-2. **Add Makefile orchestration targets** -- `make run-fast`, `make run-final`, `make compare`.
+Run from `parapet/parapet-runner/`:
+
+```bash
+python -m parapet_runner.runner run \
+  --workspace-root <absolute-path-to-parapet/> \
+  --curation-manifest <absolute-path-to-manifest.json> \
+  --train-config configs/iteration_v1_calibrated.yaml \
+  --output-dir runs/my_run \
+  --parapet-eval-bin <absolute-path-to-parapet-eval.exe> \
+  --skip-recompile
+```
+
+| Flag | Required | Notes |
+|------|----------|-------|
+| `--workspace-root` | yes | Absolute path to `parapet/`. All default relative paths resolve from here. |
+| `--curation-manifest` | yes | Absolute path to `manifest.json` produced by `parapet-data curate`. |
+| `--train-config` | yes | Path to a TrainConfig YAML. Can be relative to cwd. |
+| `--output-dir` | yes | Where run artifacts go. Can be relative to cwd. |
+| `--parapet-eval-bin` | yes | Absolute path to compiled `parapet-eval` binary. |
+| `--skip-recompile` | no | Skip Rust binary rebuild (use when iterating on data, not weights). |
+| `--pg2-mode on` | no | Enable PG2/L2A baseline comparison. Off by default. |
+| `--protectai-mode protectai_size_matched` | no | Enable ProtectAI baseline. Off by default. |
+| `--random-mode on` | no | Enable random-sample baseline. Off by default. |
+
+See `parapet-data/README.md` for the full end-to-end workflow (spec generation, curation, then runner).

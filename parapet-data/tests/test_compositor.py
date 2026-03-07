@@ -10,8 +10,17 @@ from pathlib import Path
 import pytest
 import yaml
 
+from parapet_data.filters import content_hash
+from parapet_data.ledger import (
+    AdjudicationReason,
+    Ledger,
+    LedgerAction,
+    LedgerEntry,
+)
 from parapet_data.models import (
     AttackReason,
+    ApplicabilityScope,
+    BackgroundLane,
     CellFillRecord,
     FormatBin,
     Language,
@@ -19,9 +28,12 @@ from parapet_data.models import (
     MirrorCell,
     MirrorSpec,
     SourceRef,
+    SourceRoutePolicy,
+    SourceMetadata,
 )
 from parapet_data.sampler import Sample, SamplingResult, sample_spec
 from parapet_data.compositor import (
+    _collect_source_alias_warnings,
     compose,
     composition_report,
     split_samples,
@@ -305,6 +317,118 @@ class TestCompose:
         # Should serialize without error
         json_str = manifest.model_dump_json(indent=2)
         assert "compose_test" in json_str
+
+    def test_manifest_emits_source_metadata_including_background(self, tmp_dir: Path) -> None:
+        spec = self._make_spec_with_files(tmp_dir)
+        bg_path = tmp_dir / "sources" / "bg.yaml"
+        _write_yaml(bg_path, [{"content": "Background benign text for testing"}])
+        spec.background = BackgroundLane(
+            budget_fraction=0.15,
+            sources=[
+                SourceRef(
+                    name="bg_source",
+                    path=bg_path,
+                    language=Language.EN,
+                    extractor="col_content",
+                    route_policy=SourceRoutePolicy.BACKGROUND,
+                )
+            ],
+        )
+        result = sample_spec(spec, base_dir=tmp_dir)
+        output_dir = tmp_dir / "output"
+        manifest = compose(spec, result, output_dir, base_dir=tmp_dir)
+
+        assert "bg_source" in manifest.source_metadata
+        bg_meta = manifest.source_metadata["bg_source"]
+        assert bg_meta.path == bg_path
+        assert bg_meta.route_policy == SourceRoutePolicy.BACKGROUND
+
+    def test_manifest_carries_ledger_counters(self, tmp_dir: Path) -> None:
+        spec = self._make_spec_with_files(tmp_dir)
+        atk_path = tmp_dir / "sources" / f"{AttackReason.INSTRUCTION_OVERRIDE.value}_atk.yaml"
+        _write_yaml(atk_path, [
+            {"content": "drop from compose manifest"},
+            {"content": "reroute from compose manifest"},
+            {"content": "relabel from compose manifest"},
+            {"content": "keep from compose manifest"},
+        ])
+        ledger = Ledger([
+            LedgerEntry(
+                content_hash=content_hash("drop from compose manifest"),
+                source=f"{AttackReason.INSTRUCTION_OVERRIDE.value}_atk",
+                action=LedgerAction.DROP,
+                adjudication=AdjudicationReason.MISLABEL,
+            ),
+            LedgerEntry(
+                content_hash=content_hash("reroute from compose manifest"),
+                source=f"{AttackReason.INSTRUCTION_OVERRIDE.value}_atk",
+                action=LedgerAction.REROUTE_REASON,
+                adjudication=AdjudicationReason.ROUTING_DEFECT,
+                reroute_to=AttackReason.META_PROBE.value,
+            ),
+            LedgerEntry(
+                content_hash=content_hash("relabel from compose manifest"),
+                source=f"{AttackReason.INSTRUCTION_OVERRIDE.value}_atk",
+                action=LedgerAction.RELABEL_CLASS,
+                adjudication=AdjudicationReason.MISLABEL,
+                relabel_to="benign",
+            ),
+        ])
+
+        result = sample_spec(spec, base_dir=tmp_dir, ledger=ledger)
+        output_dir = tmp_dir / "output"
+        manifest = compose(spec, result, output_dir, base_dir=tmp_dir)
+
+        assert manifest.ledger_dropped == 1
+        assert manifest.ledger_quarantined == 0
+        assert manifest.ledger_rerouted == 1
+        assert manifest.ledger_relabeled == 1
+
+
+class TestSourceAliasWarnings:
+    def test_warns_on_same_path_with_different_route_policies(self) -> None:
+        warnings = _collect_source_alias_warnings(
+            {
+                "bg_alias": SourceMetadata(
+                    path=Path("schema/eval/staging/en_shared.yaml"),
+                    language=Language.EN,
+                    extractor="col_content",
+                    route_policy=SourceRoutePolicy.BACKGROUND,
+                    applicability_scope=ApplicabilityScope.IN_DOMAIN,
+                ),
+                "residual_alias": SourceMetadata(
+                    path=Path("schema/eval/staging/en_shared.yaml"),
+                    language=Language.EN,
+                    extractor="col_content",
+                    route_policy=SourceRoutePolicy.RESIDUAL,
+                    applicability_scope=ApplicabilityScope.IN_DOMAIN,
+                ),
+            }
+        )
+        assert len(warnings) == 1
+        assert "bg_alias" in warnings[0]
+        assert "residual_alias" in warnings[0]
+        assert "background" in warnings[0]
+        assert "residual" in warnings[0]
+
+    def test_ignores_same_path_when_route_policy_matches(self) -> None:
+        warnings = _collect_source_alias_warnings(
+            {
+                "mirror_a": SourceMetadata(
+                    path=Path("schema/eval/staging/en_shared.yaml"),
+                    language=Language.EN,
+                    extractor="col_content",
+                    route_policy=SourceRoutePolicy.MIRROR,
+                ),
+                "mirror_b": SourceMetadata(
+                    path=Path("schema/eval/staging/en_shared.yaml"),
+                    language=Language.EN,
+                    extractor="col_content",
+                    route_policy=SourceRoutePolicy.MIRROR,
+                ),
+            }
+        )
+        assert warnings == []
 
 
 # ---------------------------------------------------------------------------

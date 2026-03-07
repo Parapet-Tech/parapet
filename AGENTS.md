@@ -92,7 +92,7 @@ L1 is a char n-gram SVM (`CountVectorizer` + `LinearSVC`) compiled to Rust `phf_
 Run from `parapet/`:
 
 1. `scripts/curate_global_benign.py` - build benign corpus from TheWall
-2. `scripts/train_l1_specialist_variant.py` - train/eval/codegen
+2. `scripts/train_l1_specialist.py` - train/eval/codegen
 3. `cargo build && cargo test -- l1` - compile and validate generated weights
 
 ### Key Flags

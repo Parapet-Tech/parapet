@@ -121,3 +121,14 @@ class TestContentDedup:
     def test_content_hash_deterministic(self) -> None:
         assert content_hash("test") == content_hash("test")
         assert content_hash("a") != content_hash("b")
+
+    def test_content_hash_strips_whitespace(self) -> None:
+        """Leading/trailing whitespace must not create distinct hashes."""
+        base = "some prompt injection text"
+        assert content_hash(base) == content_hash(f"  {base}")
+        assert content_hash(base) == content_hash(f"{base}\n")
+        assert content_hash(base) == content_hash(f"\t {base} \n")
+
+    def test_content_hash_preserves_internal_whitespace(self) -> None:
+        """Only outer whitespace is stripped — interior stays intact."""
+        assert content_hash("a  b") != content_hash("a b")
