@@ -401,7 +401,7 @@ def main() -> int:
     parser.add_argument(
         "--weights-target",
         type=Path,
-        default=Path("parapet/src/layers/l1_weights_generalist_clean_1to1_51042.rs"),
+        default=Path("parapet/src/layers/l1_weights.rs"),
     )
     parser.add_argument(
         "--parapet-eval",

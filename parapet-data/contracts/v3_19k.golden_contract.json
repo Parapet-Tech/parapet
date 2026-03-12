@@ -1,0 +1,846 @@
+{
+  "contract_version": 1,
+  "generated_at": "2026-03-07T15:16:17.030516+00:00",
+  "curated_dir": "parapet-data\\curated\\v3_19k",
+  "manifest_path": "parapet-data\\curated\\v3_19k\\manifest.json",
+  "spec_name": "mirror_v3_19k_control",
+  "spec_version": "3.0.0-19k",
+  "spec_hash": "d073786e92edcc68239f934f8f5d235d305597b8cb86eaaac4096b050445356b",
+  "seed": 42,
+  "semantic_hash": "1bdc8bc96b1d323a80ebfb21198ecf3e9c4f1c77e55bc3dc4df75b89da887eb1",
+  "output_hash": "09458f2937f74da0f20a4fdabc9d4286d423977e7efcaa9b4d5792d22840090a",
+  "totals": {
+    "samples": 19200,
+    "attack_samples": 9600,
+    "benign_samples": 9600
+  },
+  "distributions": {
+    "label": {
+      "benign": {
+        "count": 9600,
+        "share": 0.5
+      },
+      "malicious": {
+        "count": 9600,
+        "share": 0.5
+      }
+    },
+    "reason": {
+      "instruction_override": {
+        "count": 7183,
+        "share": 0.374115
+      },
+      "obfuscation": {
+        "count": 2683,
+        "share": 0.13974
+      },
+      "roleplay_jailbreak": {
+        "count": 2324,
+        "share": 0.121042
+      },
+      "meta_probe": {
+        "count": 1552,
+        "share": 0.080833
+      },
+      "background": {
+        "count": 1440,
+        "share": 0.075
+      },
+      "adversarial_suffix": {
+        "count": 1336,
+        "share": 0.069583
+      },
+      "constraint_bypass": {
+        "count": 1138,
+        "share": 0.059271
+      },
+      "exfiltration": {
+        "count": 1065,
+        "share": 0.055469
+      },
+      "indirect_injection": {
+        "count": 479,
+        "share": 0.024948
+      }
+    },
+    "language": {
+      "EN": {
+        "count": 12179,
+        "share": 0.634323
+      },
+      "RU": {
+        "count": 3672,
+        "share": 0.19125
+      },
+      "ZH": {
+        "count": 2907,
+        "share": 0.151406
+      },
+      "AR": {
+        "count": 442,
+        "share": 0.023021
+      }
+    },
+    "source": {
+      "zh_attacks_novel": {
+        "count": 2499,
+        "share": 0.130156
+      },
+      "en_attacks_merged": {
+        "count": 2140,
+        "share": 0.111458
+      },
+      "ru_staged_attacks_obfuscation": {
+        "count": 1161,
+        "share": 0.060469
+      },
+      "en_staged_codealpaca_adversarial_suffix": {
+        "count": 987,
+        "share": 0.051406
+      },
+      "en_staged_codealpaca_obfuscation": {
+        "count": 892,
+        "share": 0.046458
+      },
+      "en_benign_curated": {
+        "count": 831,
+        "share": 0.043281
+      },
+      "ru_staged_attacks_roleplay_jailbreak": {
+        "count": 748,
+        "share": 0.038958
+      },
+      "en_staged_codealpaca_constraint_bypass": {
+        "count": 704,
+        "share": 0.036667
+      },
+      "en_background_writingprompts": {
+        "count": 541,
+        "share": 0.028177
+      },
+      "en_obfuscation": {
+        "count": 502,
+        "share": 0.026146
+      },
+      "en_roleplay_jailbreak": {
+        "count": 502,
+        "share": 0.026146
+      },
+      "en_background_wildchat": {
+        "count": 486,
+        "share": 0.025313
+      },
+      "ru_attacks_corpus": {
+        "count": 441,
+        "share": 0.022969
+      },
+      "en_staged_codealpaca_exfiltration": {
+        "count": 408,
+        "share": 0.02125
+      },
+      "en_background_trivia_qa": {
+        "count": 380,
+        "share": 0.019792
+      },
+      "en_staged_wildchat_roleplay_jailbreak": {
+        "count": 360,
+        "share": 0.01875
+      },
+      "en_staged_dolly_indirect_injection": {
+        "count": 355,
+        "share": 0.01849
+      },
+      "en_meta_probe": {
+        "count": 342,
+        "share": 0.017812
+      },
+      "en_staged_dolly_meta_probe": {
+        "count": 308,
+        "share": 0.016042
+      },
+      "ru_staged_attacks_instruction_override": {
+        "count": 280,
+        "share": 0.014583
+      },
+      "ru_staged_attacks_adversarial_suffix": {
+        "count": 269,
+        "share": 0.01401
+      },
+      "ru_attacks_novel": {
+        "count": 260,
+        "share": 0.013542
+      },
+      "en_staged_writingprompts_exfiltration": {
+        "count": 245,
+        "share": 0.01276
+      },
+      "en_staged_codealpaca_meta_probe": {
+        "count": 244,
+        "share": 0.012708
+      },
+      "en_staged_dolly_exfiltration": {
+        "count": 232,
+        "share": 0.012083
+      },
+      "ru_staged_benign_roleplay_jailbreak": {
+        "count": 205,
+        "share": 0.010677
+      },
+      "en_staged_writingprompts_roleplay_jailbreak": {
+        "count": 168,
+        "share": 0.00875
+      },
+      "en_staged_chatbot_arena_meta_probe": {
+        "count": 166,
+        "share": 0.008646
+      },
+      "zh_staged_benign_meta_probe": {
+        "count": 163,
+        "share": 0.00849
+      },
+      "en_staged_chatbot_arena_roleplay_jailbreak": {
+        "count": 159,
+        "share": 0.008281
+      },
+      "ru_staged_benign_meta_probe": {
+        "count": 146,
+        "share": 0.007604
+      },
+      "zh_staged_benign_instruction_override": {
+        "count": 145,
+        "share": 0.007552
+      },
+      "ru_staged_benign_instruction_override": {
+        "count": 112,
+        "share": 0.005833
+      },
+      "en_staged_writingprompts_constraint_bypass": {
+        "count": 110,
+        "share": 0.005729
+      },
+      "en_constraint_bypass": {
+        "count": 104,
+        "share": 0.005417
+      },
+      "en_instruction_override": {
+        "count": 93,
+        "share": 0.004844
+      },
+      "ar_attacks_corpus": {
+        "count": 91,
+        "share": 0.00474
+      },
+      "ar_staged_benign_meta_probe": {
+        "count": 89,
+        "share": 0.004635
+      },
+      "en_staged_chatbot_arena_constraint_bypass": {
+        "count": 89,
+        "share": 0.004635
+      },
+      "ar_staged_benign_roleplay_jailbreak": {
+        "count": 88,
+        "share": 0.004583
+      },
+      "en_staged_wildchat_constraint_bypass": {
+        "count": 79,
+        "share": 0.004115
+      },
+      "en_staged_wildchat_obfuscation": {
+        "count": 79,
+        "share": 0.004115
+      },
+      "zh_attacks_corpus": {
+        "count": 74,
+        "share": 0.003854
+      },
+      "en_staged_wildchat_meta_probe": {
+        "count": 72,
+        "share": 0.00375
+      },
+      "en_staged_wildchat_exfiltration": {
+        "count": 71,
+        "share": 0.003698
+      },
+      "en_staged_chatbot_arena_exfiltration": {
+        "count": 66,
+        "share": 0.003438
+      },
+      "en_staged_codealpaca_roleplay_jailbreak": {
+        "count": 59,
+        "share": 0.003073
+      },
+      "ar_staged_benign_instruction_override": {
+        "count": 58,
+        "share": 0.003021
+      },
+      "en_staged_dolly_constraint_bypass": {
+        "count": 52,
+        "share": 0.002708
+      },
+      "ar_attacks_novel": {
+        "count": 51,
+        "share": 0.002656
+      },
+      "en_exfiltration": {
+        "count": 43,
+        "share": 0.00224
+      },
+      "en_staged_wildchat_indirect_injection": {
+        "count": 42,
+        "share": 0.002188
+      },
+      "en_staged_chatbot_arena_indirect_injection": {
+        "count": 41,
+        "share": 0.002135
+      },
+      "en_staged_codealpaca_indirect_injection": {
+        "count": 41,
+        "share": 0.002135
+      },
+      "en_staged_chatbot_arena_obfuscation": {
+        "count": 40,
+        "share": 0.002083
+      },
+      "ru_benign_wikipedia": {
+        "count": 38,
+        "share": 0.001979
+      },
+      "en_staged_dolly_roleplay_jailbreak": {
+        "count": 35,
+        "share": 0.001823
+      },
+      "en_staged_chatbot_arena_adversarial_suffix": {
+        "count": 34,
+        "share": 0.001771
+      },
+      "ar_background_arabguard": {
+        "count": 33,
+        "share": 0.001719
+      },
+      "en_staged_wildchat_adversarial_suffix": {
+        "count": 33,
+        "share": 0.001719
+      },
+      "ar_benign_wikipedia": {
+        "count": 29,
+        "share": 0.00151
+      },
+      "zh_benign_wikipedia": {
+        "count": 25,
+        "share": 0.001302
+      },
+      "en_staged_writingprompts_meta_probe": {
+        "count": 22,
+        "share": 0.001146
+      },
+      "en_benign_code": {
+        "count": 13,
+        "share": 0.000677
+      },
+      "ru_benign_xquad": {
+        "count": 12,
+        "share": 0.000625
+      },
+      "en_staged_dolly_obfuscation": {
+        "count": 5,
+        "share": 0.00026
+      },
+      "en_staged_writingprompts_obfuscation": {
+        "count": 4,
+        "share": 0.000208
+      },
+      "ar_benign_xquad": {
+        "count": 3,
+        "share": 0.000156
+      },
+      "zh_benign_xquad": {
+        "count": 1,
+        "share": 5.2e-05
+      }
+    },
+    "reason_by_label": {
+      "benign": {
+        "background": {
+          "count": 1440,
+          "share": 0.15
+        },
+        "instruction_override": {
+          "count": 1254,
+          "share": 0.130625
+        },
+        "meta_probe": {
+          "count": 1210,
+          "share": 0.126042
+        },
+        "roleplay_jailbreak": {
+          "count": 1074,
+          "share": 0.111875
+        },
+        "adversarial_suffix": {
+          "count": 1067,
+          "share": 0.111146
+        },
+        "constraint_bypass": {
+          "count": 1034,
+          "share": 0.107708
+        },
+        "exfiltration": {
+          "count": 1022,
+          "share": 0.106458
+        },
+        "obfuscation": {
+          "count": 1020,
+          "share": 0.10625
+        },
+        "indirect_injection": {
+          "count": 479,
+          "share": 0.049896
+        }
+      },
+      "malicious": {
+        "instruction_override": {
+          "count": 5929,
+          "share": 0.617604
+        },
+        "obfuscation": {
+          "count": 1663,
+          "share": 0.173229
+        },
+        "roleplay_jailbreak": {
+          "count": 1250,
+          "share": 0.130208
+        },
+        "meta_probe": {
+          "count": 342,
+          "share": 0.035625
+        },
+        "adversarial_suffix": {
+          "count": 269,
+          "share": 0.028021
+        },
+        "constraint_bypass": {
+          "count": 104,
+          "share": 0.010833
+        },
+        "exfiltration": {
+          "count": 43,
+          "share": 0.004479
+        }
+      }
+    },
+    "language_by_label": {
+      "benign": {
+        "EN": {
+          "count": 8453,
+          "share": 0.880521
+        },
+        "RU": {
+          "count": 513,
+          "share": 0.053437
+        },
+        "ZH": {
+          "count": 334,
+          "share": 0.034792
+        },
+        "AR": {
+          "count": 300,
+          "share": 0.03125
+        }
+      },
+      "malicious": {
+        "EN": {
+          "count": 3726,
+          "share": 0.388125
+        },
+        "RU": {
+          "count": 3159,
+          "share": 0.329062
+        },
+        "ZH": {
+          "count": 2573,
+          "share": 0.268021
+        },
+        "AR": {
+          "count": 142,
+          "share": 0.014792
+        }
+      }
+    },
+    "source_by_label": {
+      "benign": {
+        "en_staged_codealpaca_adversarial_suffix": {
+          "count": 987,
+          "share": 0.102813
+        },
+        "en_staged_codealpaca_obfuscation": {
+          "count": 892,
+          "share": 0.092917
+        },
+        "en_benign_curated": {
+          "count": 831,
+          "share": 0.086563
+        },
+        "en_staged_codealpaca_constraint_bypass": {
+          "count": 704,
+          "share": 0.073333
+        },
+        "en_background_writingprompts": {
+          "count": 541,
+          "share": 0.056354
+        },
+        "en_background_wildchat": {
+          "count": 486,
+          "share": 0.050625
+        },
+        "en_staged_codealpaca_exfiltration": {
+          "count": 408,
+          "share": 0.0425
+        },
+        "en_background_trivia_qa": {
+          "count": 380,
+          "share": 0.039583
+        },
+        "en_staged_wildchat_roleplay_jailbreak": {
+          "count": 360,
+          "share": 0.0375
+        },
+        "en_staged_dolly_indirect_injection": {
+          "count": 355,
+          "share": 0.036979
+        },
+        "en_staged_dolly_meta_probe": {
+          "count": 308,
+          "share": 0.032083
+        },
+        "en_staged_writingprompts_exfiltration": {
+          "count": 245,
+          "share": 0.025521
+        },
+        "en_staged_codealpaca_meta_probe": {
+          "count": 244,
+          "share": 0.025417
+        },
+        "en_staged_dolly_exfiltration": {
+          "count": 232,
+          "share": 0.024167
+        },
+        "ru_staged_benign_roleplay_jailbreak": {
+          "count": 205,
+          "share": 0.021354
+        },
+        "en_staged_writingprompts_roleplay_jailbreak": {
+          "count": 168,
+          "share": 0.0175
+        },
+        "en_staged_chatbot_arena_meta_probe": {
+          "count": 166,
+          "share": 0.017292
+        },
+        "zh_staged_benign_meta_probe": {
+          "count": 163,
+          "share": 0.016979
+        },
+        "en_staged_chatbot_arena_roleplay_jailbreak": {
+          "count": 159,
+          "share": 0.016563
+        },
+        "ru_staged_benign_meta_probe": {
+          "count": 146,
+          "share": 0.015208
+        },
+        "zh_staged_benign_instruction_override": {
+          "count": 145,
+          "share": 0.015104
+        },
+        "ru_staged_benign_instruction_override": {
+          "count": 112,
+          "share": 0.011667
+        },
+        "en_staged_writingprompts_constraint_bypass": {
+          "count": 110,
+          "share": 0.011458
+        },
+        "ar_staged_benign_meta_probe": {
+          "count": 89,
+          "share": 0.009271
+        },
+        "en_staged_chatbot_arena_constraint_bypass": {
+          "count": 89,
+          "share": 0.009271
+        },
+        "ar_staged_benign_roleplay_jailbreak": {
+          "count": 88,
+          "share": 0.009167
+        },
+        "en_staged_wildchat_constraint_bypass": {
+          "count": 79,
+          "share": 0.008229
+        },
+        "en_staged_wildchat_obfuscation": {
+          "count": 79,
+          "share": 0.008229
+        },
+        "en_staged_wildchat_meta_probe": {
+          "count": 72,
+          "share": 0.0075
+        },
+        "en_staged_wildchat_exfiltration": {
+          "count": 71,
+          "share": 0.007396
+        },
+        "en_staged_chatbot_arena_exfiltration": {
+          "count": 66,
+          "share": 0.006875
+        },
+        "en_staged_codealpaca_roleplay_jailbreak": {
+          "count": 59,
+          "share": 0.006146
+        },
+        "ar_staged_benign_instruction_override": {
+          "count": 58,
+          "share": 0.006042
+        },
+        "en_staged_dolly_constraint_bypass": {
+          "count": 52,
+          "share": 0.005417
+        },
+        "en_staged_wildchat_indirect_injection": {
+          "count": 42,
+          "share": 0.004375
+        },
+        "en_staged_chatbot_arena_indirect_injection": {
+          "count": 41,
+          "share": 0.004271
+        },
+        "en_staged_codealpaca_indirect_injection": {
+          "count": 41,
+          "share": 0.004271
+        },
+        "en_staged_chatbot_arena_obfuscation": {
+          "count": 40,
+          "share": 0.004167
+        },
+        "ru_benign_wikipedia": {
+          "count": 38,
+          "share": 0.003958
+        },
+        "en_staged_dolly_roleplay_jailbreak": {
+          "count": 35,
+          "share": 0.003646
+        },
+        "en_staged_chatbot_arena_adversarial_suffix": {
+          "count": 34,
+          "share": 0.003542
+        },
+        "ar_background_arabguard": {
+          "count": 33,
+          "share": 0.003438
+        },
+        "en_staged_wildchat_adversarial_suffix": {
+          "count": 33,
+          "share": 0.003438
+        },
+        "ar_benign_wikipedia": {
+          "count": 29,
+          "share": 0.003021
+        },
+        "zh_benign_wikipedia": {
+          "count": 25,
+          "share": 0.002604
+        },
+        "en_staged_writingprompts_meta_probe": {
+          "count": 22,
+          "share": 0.002292
+        },
+        "en_benign_code": {
+          "count": 13,
+          "share": 0.001354
+        },
+        "ru_benign_xquad": {
+          "count": 12,
+          "share": 0.00125
+        },
+        "en_staged_dolly_obfuscation": {
+          "count": 5,
+          "share": 0.000521
+        },
+        "en_staged_writingprompts_obfuscation": {
+          "count": 4,
+          "share": 0.000417
+        },
+        "ar_benign_xquad": {
+          "count": 3,
+          "share": 0.000313
+        },
+        "zh_benign_xquad": {
+          "count": 1,
+          "share": 0.000104
+        }
+      },
+      "malicious": {
+        "zh_attacks_novel": {
+          "count": 2499,
+          "share": 0.260313
+        },
+        "en_attacks_merged": {
+          "count": 2140,
+          "share": 0.222917
+        },
+        "ru_staged_attacks_obfuscation": {
+          "count": 1161,
+          "share": 0.120938
+        },
+        "ru_staged_attacks_roleplay_jailbreak": {
+          "count": 748,
+          "share": 0.077917
+        },
+        "en_obfuscation": {
+          "count": 502,
+          "share": 0.052292
+        },
+        "en_roleplay_jailbreak": {
+          "count": 502,
+          "share": 0.052292
+        },
+        "ru_attacks_corpus": {
+          "count": 441,
+          "share": 0.045937
+        },
+        "en_meta_probe": {
+          "count": 342,
+          "share": 0.035625
+        },
+        "ru_staged_attacks_instruction_override": {
+          "count": 280,
+          "share": 0.029167
+        },
+        "ru_staged_attacks_adversarial_suffix": {
+          "count": 269,
+          "share": 0.028021
+        },
+        "ru_attacks_novel": {
+          "count": 260,
+          "share": 0.027083
+        },
+        "en_constraint_bypass": {
+          "count": 104,
+          "share": 0.010833
+        },
+        "en_instruction_override": {
+          "count": 93,
+          "share": 0.009687
+        },
+        "ar_attacks_corpus": {
+          "count": 91,
+          "share": 0.009479
+        },
+        "zh_attacks_corpus": {
+          "count": 74,
+          "share": 0.007708
+        },
+        "ar_attacks_novel": {
+          "count": 51,
+          "share": 0.005313
+        },
+        "en_exfiltration": {
+          "count": 43,
+          "share": 0.004479
+        }
+      }
+    }
+  },
+  "source_hashes": {
+    "en_attacks_merged": "47830d4b85fdbf43e73e30e0ae3216fa09b2dc11d74711c15037d11c36b73ca7",
+    "en_instruction_override": "0ff26a375795092d7c088867a850243235ad77c3263dfc27501d9baa2cedc355",
+    "zh_attacks_corpus": "593b9cac4b8c85947ed82449d8ff94af0696ad2a20848cab685cfc5ef3b33e7c",
+    "zh_attacks_novel": "78a1d6c43d96832ac2e1705e2f8dcc7028e82cd58c7e04156c10a29bc5efe4ad",
+    "ar_attacks_corpus": "a2001ba436fe6d4a395b952441a002c76c31a4976f0740273a57a30518bf258c",
+    "ar_attacks_novel": "c17d8b07d8afe0efadd0450a24337dac5afe377de530ffc8db81ac7572de634e",
+    "ru_attacks_corpus": "fd0a4155df67c329faa1ad8f3afa40aeca8f891d80f1f50172252a7c99d2435b",
+    "ru_attacks_novel": "60b5f76806bc76b6fce71cc6cd8e8ffebd8c27caa6729f7502f1e1b8354b6cf5",
+    "ru_staged_attacks_instruction_override": "5ffaf4e487beeb5cd375981e753aa3758ffa9faf86143b88f7e35e8209d8128f",
+    "en_benign_curated": "267fa6cfd35192011801f1b66e77ac846b866d09333e371f908ae7918e355c11",
+    "zh_benign_wikipedia": "d1789592282ae0283797bfda2b0ad6ad1d5625e16454f8ded016bdd2de1bd15a",
+    "zh_benign_xquad": "e0c73731485a9b76f4c3f248b146566f0d71825483b2322a8b13acddae42b23d",
+    "ar_benign_wikipedia": "a289181b1b5eb90690304a652627b1b28edeeb6c1c99ef9c09c891b2768b18aa",
+    "ar_benign_xquad": "5f7b6a58c0bf1be565eb67f0485b800561f4842609693c88da98bbab6a15401c",
+    "ru_benign_wikipedia": "94c9df1eaddb531fe9a2440af4bb6fb467d5b04a34f6aef9e9be622715a27ab5",
+    "ru_benign_xquad": "4d6fc235c0448f028c71fdf4b007991e4aeeef6e43f45827ad70e6047766c103",
+    "ru_staged_benign_instruction_override": "246f3ec99294f62ba3f8e4999849f5ab5ab3148749660b367353d014243afee4",
+    "zh_staged_benign_instruction_override": "fb21c5c013bc36c5a0d0a0653092ef5512dddbd915be873850b29cc488c75eb5",
+    "ar_staged_benign_instruction_override": "bbec39189f55fb5f3168d831c588bab5a8574d84faf34117756f9b04eec9fcbc",
+    "en_roleplay_jailbreak": "918534a1e419f3c98c96cd8e8ce1ef805ec6a5050527da1d7af28068938b7e7d",
+    "ru_staged_attacks_roleplay_jailbreak": "5ffaf4e487beeb5cd375981e753aa3758ffa9faf86143b88f7e35e8209d8128f",
+    "ru_staged_benign_roleplay_jailbreak": "246f3ec99294f62ba3f8e4999849f5ab5ab3148749660b367353d014243afee4",
+    "ar_staged_benign_roleplay_jailbreak": "bbec39189f55fb5f3168d831c588bab5a8574d84faf34117756f9b04eec9fcbc",
+    "en_staged_dolly_roleplay_jailbreak": "730f28abf5c11932986b8fee3efd9a0941e820346bb61cc62cdbf29aaef46f90",
+    "en_staged_codealpaca_roleplay_jailbreak": "27523c34c1ea9d49e75732888efa03f175762fd4cef56dc5067ee9d72ef00452",
+    "en_staged_writingprompts_roleplay_jailbreak": "4fd148e8f1d62764d07995dc84d651abe3922257b212bd007312273ae3ab4305",
+    "en_staged_wildchat_roleplay_jailbreak": "9222360c1d284903452cac1d8ee724baf3c9fd1ff28675bf8e3c0d4fdfcbece3",
+    "en_staged_chatbot_arena_roleplay_jailbreak": "19a0f59c59e4fa6db5a50101a06e82d88ef8bbcdf3b98e2bc8f2297193fa6d29",
+    "en_meta_probe": "b0f03846b3cd06339d5516e9bd20a52ed4d0ca5184fae9e21bc54e5a1b275b2a",
+    "ru_staged_benign_meta_probe": "246f3ec99294f62ba3f8e4999849f5ab5ab3148749660b367353d014243afee4",
+    "zh_staged_benign_meta_probe": "fb21c5c013bc36c5a0d0a0653092ef5512dddbd915be873850b29cc488c75eb5",
+    "ar_staged_benign_meta_probe": "bbec39189f55fb5f3168d831c588bab5a8574d84faf34117756f9b04eec9fcbc",
+    "en_staged_dolly_meta_probe": "730f28abf5c11932986b8fee3efd9a0941e820346bb61cc62cdbf29aaef46f90",
+    "en_staged_codealpaca_meta_probe": "27523c34c1ea9d49e75732888efa03f175762fd4cef56dc5067ee9d72ef00452",
+    "en_staged_writingprompts_meta_probe": "4fd148e8f1d62764d07995dc84d651abe3922257b212bd007312273ae3ab4305",
+    "en_staged_wildchat_meta_probe": "9222360c1d284903452cac1d8ee724baf3c9fd1ff28675bf8e3c0d4fdfcbece3",
+    "en_staged_chatbot_arena_meta_probe": "19a0f59c59e4fa6db5a50101a06e82d88ef8bbcdf3b98e2bc8f2297193fa6d29",
+    "en_exfiltration": "dacb96052e595d57cead9c2a0e67187793045436c95468e2c8bc1220f534b026",
+    "en_staged_dolly_exfiltration": "730f28abf5c11932986b8fee3efd9a0941e820346bb61cc62cdbf29aaef46f90",
+    "en_staged_codealpaca_exfiltration": "27523c34c1ea9d49e75732888efa03f175762fd4cef56dc5067ee9d72ef00452",
+    "en_staged_writingprompts_exfiltration": "4fd148e8f1d62764d07995dc84d651abe3922257b212bd007312273ae3ab4305",
+    "en_staged_wildchat_exfiltration": "9222360c1d284903452cac1d8ee724baf3c9fd1ff28675bf8e3c0d4fdfcbece3",
+    "en_staged_chatbot_arena_exfiltration": "19a0f59c59e4fa6db5a50101a06e82d88ef8bbcdf3b98e2bc8f2297193fa6d29",
+    "ru_staged_attacks_adversarial_suffix": "5ffaf4e487beeb5cd375981e753aa3758ffa9faf86143b88f7e35e8209d8128f",
+    "en_benign_code": "253ba19980fce9cc6a8c2329cb5388dedb423da525178d40bf81c30db15ca560",
+    "en_staged_dolly_adversarial_suffix": "730f28abf5c11932986b8fee3efd9a0941e820346bb61cc62cdbf29aaef46f90",
+    "en_staged_codealpaca_adversarial_suffix": "27523c34c1ea9d49e75732888efa03f175762fd4cef56dc5067ee9d72ef00452",
+    "en_staged_writingprompts_adversarial_suffix": "4fd148e8f1d62764d07995dc84d651abe3922257b212bd007312273ae3ab4305",
+    "en_staged_wildchat_adversarial_suffix": "9222360c1d284903452cac1d8ee724baf3c9fd1ff28675bf8e3c0d4fdfcbece3",
+    "en_staged_chatbot_arena_adversarial_suffix": "19a0f59c59e4fa6db5a50101a06e82d88ef8bbcdf3b98e2bc8f2297193fa6d29",
+    "en_staged_dolly_indirect_injection": "730f28abf5c11932986b8fee3efd9a0941e820346bb61cc62cdbf29aaef46f90",
+    "en_staged_codealpaca_indirect_injection": "27523c34c1ea9d49e75732888efa03f175762fd4cef56dc5067ee9d72ef00452",
+    "en_staged_writingprompts_indirect_injection": "4fd148e8f1d62764d07995dc84d651abe3922257b212bd007312273ae3ab4305",
+    "en_staged_wildchat_indirect_injection": "9222360c1d284903452cac1d8ee724baf3c9fd1ff28675bf8e3c0d4fdfcbece3",
+    "en_staged_chatbot_arena_indirect_injection": "19a0f59c59e4fa6db5a50101a06e82d88ef8bbcdf3b98e2bc8f2297193fa6d29",
+    "en_obfuscation": "133bac60c763ec8f82309608c79f2b18b2e16b783253325785075c748b91f318",
+    "ru_staged_attacks_obfuscation": "5ffaf4e487beeb5cd375981e753aa3758ffa9faf86143b88f7e35e8209d8128f",
+    "en_staged_dolly_obfuscation": "730f28abf5c11932986b8fee3efd9a0941e820346bb61cc62cdbf29aaef46f90",
+    "en_staged_codealpaca_obfuscation": "27523c34c1ea9d49e75732888efa03f175762fd4cef56dc5067ee9d72ef00452",
+    "en_staged_writingprompts_obfuscation": "4fd148e8f1d62764d07995dc84d651abe3922257b212bd007312273ae3ab4305",
+    "en_staged_wildchat_obfuscation": "9222360c1d284903452cac1d8ee724baf3c9fd1ff28675bf8e3c0d4fdfcbece3",
+    "en_staged_chatbot_arena_obfuscation": "19a0f59c59e4fa6db5a50101a06e82d88ef8bbcdf3b98e2bc8f2297193fa6d29",
+    "en_constraint_bypass": "f31c7bfbd192ad3755a29d07867b355ce380bac7fee4e1d684e84a098eda24f8",
+    "en_staged_dolly_constraint_bypass": "730f28abf5c11932986b8fee3efd9a0941e820346bb61cc62cdbf29aaef46f90",
+    "en_staged_codealpaca_constraint_bypass": "27523c34c1ea9d49e75732888efa03f175762fd4cef56dc5067ee9d72ef00452",
+    "en_staged_writingprompts_constraint_bypass": "4fd148e8f1d62764d07995dc84d651abe3922257b212bd007312273ae3ab4305",
+    "en_staged_wildchat_constraint_bypass": "9222360c1d284903452cac1d8ee724baf3c9fd1ff28675bf8e3c0d4fdfcbece3",
+    "en_staged_chatbot_arena_constraint_bypass": "19a0f59c59e4fa6db5a50101a06e82d88ef8bbcdf3b98e2bc8f2297193fa6d29"
+  },
+  "source_metadata": {},
+  "matching_runs": [
+    {
+      "path": "parapet-runner\\runs\\mirror_v3_19k_control\\run_manifest.json",
+      "run_id": "20260305_221959",
+      "git_sha": "7c22d2172503a5fdbc0452c5e2459a853341a444",
+      "trainer_script_hash": "71b3952c459fa5e87961ff950cef6a0f9270fc620522e211c003cd3eefce714b",
+      "parapet_eval_hash": "66a5a866253fca813baf503c30f0d6cbd8b62648d6de2d74d465e3ea8fc21a6a",
+      "spec_hash": "d073786e92edcc68239f934f8f5d235d305597b8cb86eaaac4096b050445356b"
+    },
+    {
+      "path": "parapet-runner\\runs\\mirror_v3_19k_provenance\\run_manifest.json",
+      "run_id": "20260305_233554",
+      "git_sha": "7c22d2172503a5fdbc0452c5e2459a853341a444",
+      "trainer_script_hash": "f6844257b6e80a917d80f0d6fef2504555771f3d7ed34189175809eaf0a08fce",
+      "parapet_eval_hash": "ae392db3e4c43374a4637c2bee44a7308da9da319ee6385c8cd49535a2593bdc",
+      "spec_hash": "d073786e92edcc68239f934f8f5d235d305597b8cb86eaaac4096b050445356b"
+    }
+  ],
+  "unique_trainer_script_hashes": [
+    "71b3952c459fa5e87961ff950cef6a0f9270fc620522e211c003cd3eefce714b",
+    "f6844257b6e80a917d80f0d6fef2504555771f3d7ed34189175809eaf0a08fce"
+  ]
+}

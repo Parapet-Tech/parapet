@@ -40,7 +40,7 @@ background:
 
 # Attack sources present in every cell
 base_attack_sources:
-  - {name: en_attacks_merged, path: schema/eval/malicious/attacks_121624.yaml, language: EN, label_filter: {column: label, allowed: [malicious]}}
+  - {name: en_attacks_merged, path: schema/eval/malicious/attacks_121624.yaml, language: EN, max_samples: 20000, label_filter: {column: label, allowed: [malicious]}}
   - {name: zh_attacks_corpus, path: schema/eval/training/multilingual/attacks_121624_zh.yaml, language: ZH}
   - {name: zh_attacks_novel, path: schema/eval/training/multilingual/zh_attacks.yaml, language: ZH}
   - {name: ar_attacks_corpus, path: schema/eval/training/multilingual/attacks_121624_ar.yaml, language: AR}
@@ -50,7 +50,7 @@ base_attack_sources:
 
 # Benign sources present in every cell
 base_benign_sources:
-  - {name: en_benign_curated, path: schema/eval/training/global_benign_curated.yaml, language: EN}
+  - {name: en_benign_curated, path: schema/eval/training/global_benign_curated.yaml, language: EN, max_samples: 20000}
   - {name: zh_benign_wikipedia, path: schema/eval/benign/opensource_wikipedia_zh_benign.yaml, language: ZH}
   - {name: zh_benign_xquad, path: schema/eval/benign/opensource_xquad_zh_benign.yaml, language: ZH}
   - {name: ar_benign_wikipedia, path: schema/eval/benign/opensource_wikipedia_ar_benign.yaml, language: AR}
@@ -67,6 +67,7 @@ staged_attacks:
   ru_russian_prompt_injections:
     path: schema/eval/staging/ru_russian_prompt_injections_attacks_staged.yaml
     language: RU
+    max_samples: 20000
     reasons: [instruction_override, roleplay_jailbreak, adversarial_suffix, obfuscation]
 
 # Staged EN benign: each dataset generates one source per matching reason.
@@ -90,10 +91,12 @@ staged_benign_multilingual:
   ru_turbo_saiga:
     path: schema/eval/staging/ru_ru_turbo_saiga_benign_staged.yaml
     language: RU
+    max_samples: 20000
     reasons: [instruction_override, roleplay_jailbreak, meta_probe]
   zh_stem_instruction:
     path: schema/eval/staging/zh_stem_zh_instruction_benign_staged.yaml
     language: ZH
+    max_samples: 20000
     reasons: [instruction_override, meta_probe]
   ar_arabic_chatml:
     path: schema/eval/staging/ar_arabic-fine-tuning-chatML_benign_staged.yaml

@@ -289,7 +289,6 @@ cargo run --features eval --bin parapet-eval -- \
 
 - **Compressed streaming responses**: When an upstream provider returns a streaming response with `Content-Encoding: gzip` or `deflate`, individual SSE chunks cannot be decompressed in isolation. In this case, L5a redaction may not catch sensitive patterns that span chunk boundaries. Non-streaming responses and uncompressed streaming responses are fully scanned. Most LLM providers do not compress SSE streams.
 - **Free and open-source core**: Parapet's OSS core includes deterministic layers plus L2a neural payload detection via Prompt Guard 2 (CPU, no API calls). This provides strong practical protection, but highly adaptive human attackers may require additional LLM-based judgment layers.
-- **Optional future paid layers**: Full L2/L5 LLM layers are not in the current OSS release. If adoption justifies compute and operations cost, we may offer those advanced layers as a paid product.
 
 ## Building from source
 

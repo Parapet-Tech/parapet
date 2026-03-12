@@ -1,8 +1,8 @@
-name: mirror_v4
-version: 4.0.0
+name: mirror_v5
+version: 5.0.0
 seed: 42
 ratio: 1.0
-total_target: 19200
+total_target: 5000
 backfill:
   strategy: ngram_safe
   log_gaps: true
@@ -14,6 +14,8 @@ language_quota:
     ZH: 0.08
     AR: 0.07
 allow_partial_mirror: false
+supplement_ratio: 0.0
+enforce_source_contracts: true
 background:
   budget_fraction: 0.15
   sources:
@@ -21,18 +23,94 @@ background:
     path: schema/eval/staging/en_trivia-qa_benign_background_staged.yaml
     language: EN
     extractor: col_content
+    route_policy: background
   - name: en_background_wildchat
     path: schema/eval/staging/en_WildChat-1M_benign_background_staged.yaml
     language: EN
     extractor: col_content
+    route_policy: background
   - name: en_background_writingprompts
     path: schema/eval/staging/en_writingprompts_benign_background_staged.yaml
     language: EN
     extractor: col_content
+    route_policy: background
   - name: ar_background_arabguard
     path: schema/eval/staging/ar_ArabGuard-Egyptian-V1_benign_background_staged.yaml
     language: AR
     extractor: col_content
+    route_policy: background
+supplements:
+- name: pooled_en_attacks
+  weakness: EN pooled attack inventory for residual-only experiments
+  max_samples: 20000
+  attack_sources:
+  - name: en_attacks_merged
+    path: schema/eval/malicious/attacks_121624.yaml
+    language: EN
+    extractor: col_content
+    max_samples: 20000
+    label_filter:
+      column: label
+      allowed:
+      - malicious
+    grounding_mode: pooled
+    route_policy: residual
+    reason_provenance: none
+    applicability_scope: in_domain
+  benign_sources: []
+- name: pooled_multilingual_attacks
+  weakness: Multilingual attack coverage for ungrounded language families (ZH fully pooled, AR/RU partially pooled)
+  max_samples: 50000
+  attack_sources:
+  - name: zh_attacks_corpus
+    path: schema/eval/training/multilingual/attacks_121624_zh.yaml
+    language: ZH
+    extractor: col_content
+    grounding_mode: pooled
+    route_policy: residual
+    reason_provenance: none
+    applicability_scope: unknown
+  - name: zh_attacks_novel
+    path: schema/eval/training/multilingual/zh_attacks.yaml
+    language: ZH
+    extractor: col_content
+    grounding_mode: pooled
+    route_policy: residual
+    reason_provenance: none
+    applicability_scope: unknown
+  - name: ar_attacks_corpus
+    path: schema/eval/training/multilingual/attacks_121624_ar.yaml
+    language: AR
+    extractor: col_content
+    grounding_mode: pooled
+    route_policy: residual
+    reason_provenance: none
+    applicability_scope: unknown
+  - name: ar_attacks_novel
+    path: schema/eval/training/multilingual/ar_attacks.yaml
+    language: AR
+    extractor: col_content
+    grounding_mode: pooled
+    route_policy: residual
+    reason_provenance: none
+    applicability_scope: unknown
+  - name: ru_attacks_corpus
+    path: schema/eval/training/multilingual/attacks_121624_ru.yaml
+    language: RU
+    extractor: col_content
+    grounding_mode: pooled
+    route_policy: residual
+    reason_provenance: none
+    applicability_scope: unknown
+  - name: ru_attacks_novel
+    path: schema/eval/training/multilingual/ru_attacks.yaml
+    language: RU
+    extractor: col_content
+    grounding_mode: pooled
+    route_policy: residual
+    reason_provenance: none
+    applicability_scope: unknown
+  benign_sources: []
 cells:
 - reason: instruction_override
   teaching_goal: Neutralize 'text mentioning instructions = attack' correlation across EN/RU/ZH/AR
@@ -50,43 +128,22 @@ cells:
     medium: 0.3
     long: 0.2
   attack_sources:
-  - name: en_attacks_merged
-    path: schema/eval/malicious/attacks_121624.yaml
-    language: EN
-    extractor: col_content
-    max_samples: 20000
-    label_filter: &id001
-      column: label
-      allowed:
-      - malicious
-  - name: zh_attacks_corpus
-    path: schema/eval/training/multilingual/attacks_121624_zh.yaml
-    language: ZH
-    extractor: col_content
-  - name: zh_attacks_novel
-    path: schema/eval/training/multilingual/zh_attacks.yaml
-    language: ZH
-    extractor: col_content
-  - name: ar_attacks_corpus
-    path: schema/eval/training/multilingual/attacks_121624_ar.yaml
-    language: AR
-    extractor: col_content
-  - name: ar_attacks_novel
-    path: schema/eval/training/multilingual/ar_attacks.yaml
-    language: AR
-    extractor: col_content
-  - name: ru_attacks_corpus
-    path: schema/eval/training/multilingual/attacks_121624_ru.yaml
-    language: RU
-    extractor: col_content
-  - name: ru_attacks_novel
-    path: schema/eval/training/multilingual/ru_attacks.yaml
-    language: RU
-    extractor: col_content
   - name: en_instruction_override
     path: schema/eval/malicious/instruction_override_attacks.yaml
     language: EN
     extractor: col_content
+    grounding_mode: reason_grounded
+    route_policy: mirror
+    reason_provenance: manual_map
+    applicability_scope: in_domain
+  - name: zh_instruction_override_micro
+    path: schema/eval/staging/zh_instruction_override_micro_attacks_staged.yaml
+    language: ZH
+    extractor: col_content
+    grounding_mode: reason_grounded
+    route_policy: mirror
+    reason_provenance: adjudicated
+    applicability_scope: in_domain
   - name: ru_staged_attacks_instruction_override
     path: schema/eval/staging/ru_russian_prompt_injections_attacks_staged.yaml
     language: RU
@@ -96,36 +153,71 @@ cells:
       column: reason
       allowed:
       - instruction_override
+    grounding_mode: reason_grounded
+    route_policy: mirror
+    reason_provenance: source_label
+    applicability_scope: in_domain
+  - name: ar_staged_attacks_instruction_override
+    path: schema/eval/staging/ar_ArabGuard-Egyptian-V1_attacks_staged.yaml
+    language: AR
+    extractor: col_content
+    label_filter:
+      column: reason
+      allowed:
+      - instruction_override
+    grounding_mode: reason_grounded
+    route_policy: mirror
+    reason_provenance: source_label
+    applicability_scope: in_domain
+  - name: zh_staged_attacks_instruction_override
+    path: schema/eval/staging/zh_swarm_reviewed_attacks_staged.yaml
+    language: ZH
+    extractor: col_content
+    label_filter:
+      column: reason
+      allowed:
+      - instruction_override
+    grounding_mode: reason_grounded
+    route_policy: mirror
+    reason_provenance: source_label
+    applicability_scope: in_domain
   benign_sources:
   - name: en_benign_curated
     path: schema/eval/training/global_benign_curated.yaml
     language: EN
     extractor: col_content
     max_samples: 20000
+    route_policy: mirror
   - name: zh_benign_wikipedia
     path: schema/eval/benign/opensource_wikipedia_zh_benign.yaml
     language: ZH
     extractor: col_content
+    route_policy: mirror
   - name: zh_benign_xquad
     path: schema/eval/benign/opensource_xquad_zh_benign.yaml
     language: ZH
     extractor: col_content
+    route_policy: mirror
   - name: ar_benign_wikipedia
     path: schema/eval/benign/opensource_wikipedia_ar_benign.yaml
     language: AR
     extractor: col_content
+    route_policy: mirror
   - name: ar_benign_xquad
     path: schema/eval/benign/opensource_xquad_ar_benign.yaml
     language: AR
     extractor: col_content
+    route_policy: mirror
   - name: ru_benign_wikipedia
     path: schema/eval/benign/opensource_wikipedia_ru_benign.yaml
     language: RU
     extractor: col_content
+    route_policy: mirror
   - name: ru_benign_xquad
     path: schema/eval/benign/opensource_xquad_ru_benign.yaml
     language: RU
     extractor: col_content
+    route_policy: mirror
   - name: ru_staged_benign_instruction_override
     path: schema/eval/staging/ru_ru_turbo_saiga_benign_staged.yaml
     language: RU
@@ -135,6 +227,7 @@ cells:
       column: reason
       allowed:
       - instruction_override
+    route_policy: mirror
   - name: zh_staged_benign_instruction_override
     path: schema/eval/staging/zh_stem_zh_instruction_benign_staged.yaml
     language: ZH
@@ -144,6 +237,7 @@ cells:
       column: reason
       allowed:
       - instruction_override
+    route_policy: mirror
   - name: ar_staged_benign_instruction_override
     path: schema/eval/staging/ar_arabic-fine-tuning-chatML_benign_staged.yaml
     language: AR
@@ -152,6 +246,7 @@ cells:
       column: reason
       allowed:
       - instruction_override
+    route_policy: mirror
 - reason: roleplay_jailbreak
   teaching_goal: Neutralize 'roleplay/character language = attack' correlation across EN/RU/ZH/AR
   languages:
@@ -168,40 +263,22 @@ cells:
     medium: 0.4
     long: 0.3
   attack_sources:
-  - name: en_attacks_merged
-    path: schema/eval/malicious/attacks_121624.yaml
-    language: EN
-    extractor: col_content
-    max_samples: 20000
-    label_filter: *id001
-  - name: zh_attacks_corpus
-    path: schema/eval/training/multilingual/attacks_121624_zh.yaml
-    language: ZH
-    extractor: col_content
-  - name: zh_attacks_novel
-    path: schema/eval/training/multilingual/zh_attacks.yaml
-    language: ZH
-    extractor: col_content
-  - name: ar_attacks_corpus
-    path: schema/eval/training/multilingual/attacks_121624_ar.yaml
-    language: AR
-    extractor: col_content
-  - name: ar_attacks_novel
-    path: schema/eval/training/multilingual/ar_attacks.yaml
-    language: AR
-    extractor: col_content
-  - name: ru_attacks_corpus
-    path: schema/eval/training/multilingual/attacks_121624_ru.yaml
-    language: RU
-    extractor: col_content
-  - name: ru_attacks_novel
-    path: schema/eval/training/multilingual/ru_attacks.yaml
-    language: RU
-    extractor: col_content
   - name: en_roleplay_jailbreak
     path: schema/eval/malicious/roleplay_jailbreak_attacks.yaml
     language: EN
     extractor: col_content
+    grounding_mode: reason_grounded
+    route_policy: mirror
+    reason_provenance: manual_map
+    applicability_scope: in_domain
+  - name: zh_roleplay_jailbreak_micro
+    path: schema/eval/staging/zh_roleplay_jailbreak_micro_attacks_staged.yaml
+    language: ZH
+    extractor: col_content
+    grounding_mode: reason_grounded
+    route_policy: mirror
+    reason_provenance: adjudicated
+    applicability_scope: in_domain
   - name: ru_staged_attacks_roleplay_jailbreak
     path: schema/eval/staging/ru_russian_prompt_injections_attacks_staged.yaml
     language: RU
@@ -211,36 +288,59 @@ cells:
       column: reason
       allowed:
       - roleplay_jailbreak
+    grounding_mode: reason_grounded
+    route_policy: mirror
+    reason_provenance: source_label
+    applicability_scope: in_domain
+  - name: ar_staged_attacks_roleplay_jailbreak
+    path: schema/eval/staging/ar_ArabGuard-Egyptian-V1_attacks_staged.yaml
+    language: AR
+    extractor: col_content
+    label_filter:
+      column: reason
+      allowed:
+      - roleplay_jailbreak
+    grounding_mode: reason_grounded
+    route_policy: mirror
+    reason_provenance: source_label
+    applicability_scope: in_domain
   benign_sources:
   - name: en_benign_curated
     path: schema/eval/training/global_benign_curated.yaml
     language: EN
     extractor: col_content
     max_samples: 20000
+    route_policy: mirror
   - name: zh_benign_wikipedia
     path: schema/eval/benign/opensource_wikipedia_zh_benign.yaml
     language: ZH
     extractor: col_content
+    route_policy: mirror
   - name: zh_benign_xquad
     path: schema/eval/benign/opensource_xquad_zh_benign.yaml
     language: ZH
     extractor: col_content
+    route_policy: mirror
   - name: ar_benign_wikipedia
     path: schema/eval/benign/opensource_wikipedia_ar_benign.yaml
     language: AR
     extractor: col_content
+    route_policy: mirror
   - name: ar_benign_xquad
     path: schema/eval/benign/opensource_xquad_ar_benign.yaml
     language: AR
     extractor: col_content
+    route_policy: mirror
   - name: ru_benign_wikipedia
     path: schema/eval/benign/opensource_wikipedia_ru_benign.yaml
     language: RU
     extractor: col_content
+    route_policy: mirror
   - name: ru_benign_xquad
     path: schema/eval/benign/opensource_xquad_ru_benign.yaml
     language: RU
     extractor: col_content
+    route_policy: mirror
   - name: ru_staged_benign_roleplay_jailbreak
     path: schema/eval/staging/ru_ru_turbo_saiga_benign_staged.yaml
     language: RU
@@ -250,6 +350,7 @@ cells:
       column: reason
       allowed:
       - roleplay_jailbreak
+    route_policy: mirror
   - name: ar_staged_benign_roleplay_jailbreak
     path: schema/eval/staging/ar_arabic-fine-tuning-chatML_benign_staged.yaml
     language: AR
@@ -258,6 +359,7 @@ cells:
       column: reason
       allowed:
       - roleplay_jailbreak
+    route_policy: mirror
   - name: en_staged_dolly_roleplay_jailbreak
     path: schema/eval/staging/en_databricks-dolly-15k_benign_staged.yaml
     language: EN
@@ -266,6 +368,7 @@ cells:
       column: reason
       allowed:
       - roleplay_jailbreak
+    route_policy: mirror
   - name: en_staged_codealpaca_roleplay_jailbreak
     path: schema/eval/staging/en_evol-codealpaca-v1_benign_staged.yaml
     language: EN
@@ -274,6 +377,7 @@ cells:
       column: reason
       allowed:
       - roleplay_jailbreak
+    route_policy: mirror
   - name: en_staged_writingprompts_roleplay_jailbreak
     path: schema/eval/staging/en_writingprompts_benign_staged.yaml
     language: EN
@@ -282,6 +386,7 @@ cells:
       column: reason
       allowed:
       - roleplay_jailbreak
+    route_policy: mirror
   - name: en_staged_wildchat_roleplay_jailbreak
     path: schema/eval/staging/en_WildChat-1M_benign_staged.yaml
     language: EN
@@ -290,6 +395,7 @@ cells:
       column: reason
       allowed:
       - roleplay_jailbreak
+    route_policy: mirror
   - name: en_staged_chatbot_arena_roleplay_jailbreak
     path: schema/eval/staging/en_chatbot_arena_conversations_benign_staged.yaml
     language: EN
@@ -298,6 +404,7 @@ cells:
       column: reason
       allowed:
       - roleplay_jailbreak
+    route_policy: mirror
 - reason: meta_probe
   teaching_goal: Neutralize 'questions about the system = attack' correlation across EN/RU/ZH/AR
   languages:
@@ -314,70 +421,79 @@ cells:
     medium: 0.3
     long: 0.1
   attack_sources:
-  - name: en_attacks_merged
-    path: schema/eval/malicious/attacks_121624.yaml
-    language: EN
-    extractor: col_content
-    max_samples: 20000
-    label_filter: *id001
-  - name: zh_attacks_corpus
-    path: schema/eval/training/multilingual/attacks_121624_zh.yaml
-    language: ZH
-    extractor: col_content
-  - name: zh_attacks_novel
-    path: schema/eval/training/multilingual/zh_attacks.yaml
-    language: ZH
-    extractor: col_content
-  - name: ar_attacks_corpus
-    path: schema/eval/training/multilingual/attacks_121624_ar.yaml
-    language: AR
-    extractor: col_content
-  - name: ar_attacks_novel
-    path: schema/eval/training/multilingual/ar_attacks.yaml
-    language: AR
-    extractor: col_content
-  - name: ru_attacks_corpus
-    path: schema/eval/training/multilingual/attacks_121624_ru.yaml
-    language: RU
-    extractor: col_content
-  - name: ru_attacks_novel
-    path: schema/eval/training/multilingual/ru_attacks.yaml
-    language: RU
-    extractor: col_content
   - name: en_meta_probe
     path: schema/eval/malicious/meta_probe_attacks.yaml
     language: EN
     extractor: col_content
+    grounding_mode: reason_grounded
+    route_policy: mirror
+    reason_provenance: manual_map
+    applicability_scope: in_domain
+  - name: zh_meta_probe_micro
+    path: schema/eval/staging/zh_meta_probe_micro_attacks_staged.yaml
+    language: ZH
+    extractor: col_content
+    grounding_mode: reason_grounded
+    route_policy: mirror
+    reason_provenance: adjudicated
+    applicability_scope: in_domain
+  - name: ru_meta_probe_micro
+    path: schema/eval/staging/ru_meta_probe_micro_attacks_staged.yaml
+    language: RU
+    extractor: col_content
+    grounding_mode: reason_grounded
+    route_policy: mirror
+    reason_provenance: adjudicated
+    applicability_scope: in_domain
+  - name: ar_staged_attacks_meta_probe
+    path: schema/eval/staging/ar_swarm_reviewed_attacks_staged.yaml
+    language: AR
+    extractor: col_content
+    label_filter:
+      column: reason
+      allowed:
+      - meta_probe
+    grounding_mode: reason_grounded
+    route_policy: mirror
+    reason_provenance: source_label
+    applicability_scope: in_domain
   benign_sources:
   - name: en_benign_curated
     path: schema/eval/training/global_benign_curated.yaml
     language: EN
     extractor: col_content
     max_samples: 20000
+    route_policy: mirror
   - name: zh_benign_wikipedia
     path: schema/eval/benign/opensource_wikipedia_zh_benign.yaml
     language: ZH
     extractor: col_content
+    route_policy: mirror
   - name: zh_benign_xquad
     path: schema/eval/benign/opensource_xquad_zh_benign.yaml
     language: ZH
     extractor: col_content
+    route_policy: mirror
   - name: ar_benign_wikipedia
     path: schema/eval/benign/opensource_wikipedia_ar_benign.yaml
     language: AR
     extractor: col_content
+    route_policy: mirror
   - name: ar_benign_xquad
     path: schema/eval/benign/opensource_xquad_ar_benign.yaml
     language: AR
     extractor: col_content
+    route_policy: mirror
   - name: ru_benign_wikipedia
     path: schema/eval/benign/opensource_wikipedia_ru_benign.yaml
     language: RU
     extractor: col_content
+    route_policy: mirror
   - name: ru_benign_xquad
     path: schema/eval/benign/opensource_xquad_ru_benign.yaml
     language: RU
     extractor: col_content
+    route_policy: mirror
   - name: ru_staged_benign_meta_probe
     path: schema/eval/staging/ru_ru_turbo_saiga_benign_staged.yaml
     language: RU
@@ -387,6 +503,7 @@ cells:
       column: reason
       allowed:
       - meta_probe
+    route_policy: mirror
   - name: zh_staged_benign_meta_probe
     path: schema/eval/staging/zh_stem_zh_instruction_benign_staged.yaml
     language: ZH
@@ -396,6 +513,7 @@ cells:
       column: reason
       allowed:
       - meta_probe
+    route_policy: mirror
   - name: ar_staged_benign_meta_probe
     path: schema/eval/staging/ar_arabic-fine-tuning-chatML_benign_staged.yaml
     language: AR
@@ -404,6 +522,7 @@ cells:
       column: reason
       allowed:
       - meta_probe
+    route_policy: mirror
   - name: en_staged_dolly_meta_probe
     path: schema/eval/staging/en_databricks-dolly-15k_benign_staged.yaml
     language: EN
@@ -412,6 +531,7 @@ cells:
       column: reason
       allowed:
       - meta_probe
+    route_policy: mirror
   - name: en_staged_codealpaca_meta_probe
     path: schema/eval/staging/en_evol-codealpaca-v1_benign_staged.yaml
     language: EN
@@ -420,6 +540,7 @@ cells:
       column: reason
       allowed:
       - meta_probe
+    route_policy: mirror
   - name: en_staged_writingprompts_meta_probe
     path: schema/eval/staging/en_writingprompts_benign_staged.yaml
     language: EN
@@ -428,6 +549,7 @@ cells:
       column: reason
       allowed:
       - meta_probe
+    route_policy: mirror
   - name: en_staged_wildchat_meta_probe
     path: schema/eval/staging/en_WildChat-1M_benign_staged.yaml
     language: EN
@@ -436,6 +558,7 @@ cells:
       column: reason
       allowed:
       - meta_probe
+    route_policy: mirror
   - name: en_staged_chatbot_arena_meta_probe
     path: schema/eval/staging/en_chatbot_arena_conversations_benign_staged.yaml
     language: EN
@@ -444,6 +567,7 @@ cells:
       column: reason
       allowed:
       - meta_probe
+    route_policy: mirror
 - reason: exfiltration
   teaching_goal: Neutralize 'requesting data output = attack' correlation across EN/RU/ZH/AR
   languages:
@@ -460,70 +584,79 @@ cells:
     medium: 0.3
     long: 0.2
   attack_sources:
-  - name: en_attacks_merged
-    path: schema/eval/malicious/attacks_121624.yaml
-    language: EN
-    extractor: col_content
-    max_samples: 20000
-    label_filter: *id001
-  - name: zh_attacks_corpus
-    path: schema/eval/training/multilingual/attacks_121624_zh.yaml
-    language: ZH
-    extractor: col_content
-  - name: zh_attacks_novel
-    path: schema/eval/training/multilingual/zh_attacks.yaml
-    language: ZH
-    extractor: col_content
-  - name: ar_attacks_corpus
-    path: schema/eval/training/multilingual/attacks_121624_ar.yaml
-    language: AR
-    extractor: col_content
-  - name: ar_attacks_novel
-    path: schema/eval/training/multilingual/ar_attacks.yaml
-    language: AR
-    extractor: col_content
-  - name: ru_attacks_corpus
-    path: schema/eval/training/multilingual/attacks_121624_ru.yaml
-    language: RU
-    extractor: col_content
-  - name: ru_attacks_novel
-    path: schema/eval/training/multilingual/ru_attacks.yaml
-    language: RU
-    extractor: col_content
   - name: en_exfiltration
     path: schema/eval/malicious/exfiltration_attacks.yaml
     language: EN
     extractor: col_content
+    grounding_mode: reason_grounded
+    route_policy: mirror
+    reason_provenance: manual_map
+    applicability_scope: in_domain
+  - name: zh_exfiltration_micro
+    path: schema/eval/staging/zh_exfiltration_micro_attacks_staged.yaml
+    language: ZH
+    extractor: col_content
+    grounding_mode: reason_grounded
+    route_policy: mirror
+    reason_provenance: adjudicated
+    applicability_scope: in_domain
+  - name: ru_exfiltration_micro
+    path: schema/eval/staging/ru_exfiltration_micro_attacks_staged.yaml
+    language: RU
+    extractor: col_content
+    grounding_mode: reason_grounded
+    route_policy: mirror
+    reason_provenance: adjudicated
+    applicability_scope: in_domain
+  - name: ar_staged_attacks_exfiltration
+    path: schema/eval/staging/ar_ArabGuard-Egyptian-V1_attacks_staged.yaml
+    language: AR
+    extractor: col_content
+    label_filter:
+      column: reason
+      allowed:
+      - exfiltration
+    grounding_mode: reason_grounded
+    route_policy: mirror
+    reason_provenance: source_label
+    applicability_scope: in_domain
   benign_sources:
   - name: en_benign_curated
     path: schema/eval/training/global_benign_curated.yaml
     language: EN
     extractor: col_content
     max_samples: 20000
+    route_policy: mirror
   - name: zh_benign_wikipedia
     path: schema/eval/benign/opensource_wikipedia_zh_benign.yaml
     language: ZH
     extractor: col_content
+    route_policy: mirror
   - name: zh_benign_xquad
     path: schema/eval/benign/opensource_xquad_zh_benign.yaml
     language: ZH
     extractor: col_content
+    route_policy: mirror
   - name: ar_benign_wikipedia
     path: schema/eval/benign/opensource_wikipedia_ar_benign.yaml
     language: AR
     extractor: col_content
+    route_policy: mirror
   - name: ar_benign_xquad
     path: schema/eval/benign/opensource_xquad_ar_benign.yaml
     language: AR
     extractor: col_content
+    route_policy: mirror
   - name: ru_benign_wikipedia
     path: schema/eval/benign/opensource_wikipedia_ru_benign.yaml
     language: RU
     extractor: col_content
+    route_policy: mirror
   - name: ru_benign_xquad
     path: schema/eval/benign/opensource_xquad_ru_benign.yaml
     language: RU
     extractor: col_content
+    route_policy: mirror
   - name: en_staged_dolly_exfiltration
     path: schema/eval/staging/en_databricks-dolly-15k_benign_staged.yaml
     language: EN
@@ -532,6 +665,7 @@ cells:
       column: reason
       allowed:
       - exfiltration
+    route_policy: mirror
   - name: en_staged_codealpaca_exfiltration
     path: schema/eval/staging/en_evol-codealpaca-v1_benign_staged.yaml
     language: EN
@@ -540,6 +674,7 @@ cells:
       column: reason
       allowed:
       - exfiltration
+    route_policy: mirror
   - name: en_staged_writingprompts_exfiltration
     path: schema/eval/staging/en_writingprompts_benign_staged.yaml
     language: EN
@@ -548,6 +683,7 @@ cells:
       column: reason
       allowed:
       - exfiltration
+    route_policy: mirror
   - name: en_staged_wildchat_exfiltration
     path: schema/eval/staging/en_WildChat-1M_benign_staged.yaml
     language: EN
@@ -556,6 +692,7 @@ cells:
       column: reason
       allowed:
       - exfiltration
+    route_policy: mirror
   - name: en_staged_chatbot_arena_exfiltration
     path: schema/eval/staging/en_chatbot_arena_conversations_benign_staged.yaml
     language: EN
@@ -564,6 +701,7 @@ cells:
       column: reason
       allowed:
       - exfiltration
+    route_policy: mirror
 - reason: adversarial_suffix
   teaching_goal: Neutralize 'high-entropy/garbled text = attack' correlation across EN/RU/ZH/AR
   languages:
@@ -580,36 +718,30 @@ cells:
     medium: 0.4
     long: 0.3
   attack_sources:
-  - name: en_attacks_merged
-    path: schema/eval/malicious/attacks_121624.yaml
+  - name: en_thewall_amplegcg_adversarial_suffix
+    path: schema/eval/malicious/thewall_amplegcg_pos.yaml
     language: EN
     extractor: col_content
-    max_samples: 20000
-    label_filter: *id001
-  - name: zh_attacks_corpus
-    path: schema/eval/training/multilingual/attacks_121624_zh.yaml
+    grounding_mode: reason_grounded
+    route_policy: mirror
+    reason_provenance: manual_map
+    applicability_scope: in_domain
+  - name: zh_adversarial_suffix_micro
+    path: schema/eval/staging/zh_adversarial_suffix_micro_attacks_staged.yaml
     language: ZH
     extractor: col_content
-  - name: zh_attacks_novel
-    path: schema/eval/training/multilingual/zh_attacks.yaml
-    language: ZH
-    extractor: col_content
-  - name: ar_attacks_corpus
-    path: schema/eval/training/multilingual/attacks_121624_ar.yaml
+    grounding_mode: reason_grounded
+    route_policy: mirror
+    reason_provenance: adjudicated
+    applicability_scope: in_domain
+  - name: ar_adversarial_suffix_micro
+    path: schema/eval/staging/ar_adversarial_suffix_micro_attacks_staged.yaml
     language: AR
     extractor: col_content
-  - name: ar_attacks_novel
-    path: schema/eval/training/multilingual/ar_attacks.yaml
-    language: AR
-    extractor: col_content
-  - name: ru_attacks_corpus
-    path: schema/eval/training/multilingual/attacks_121624_ru.yaml
-    language: RU
-    extractor: col_content
-  - name: ru_attacks_novel
-    path: schema/eval/training/multilingual/ru_attacks.yaml
-    language: RU
-    extractor: col_content
+    grounding_mode: reason_grounded
+    route_policy: mirror
+    reason_provenance: adjudicated
+    applicability_scope: in_domain
   - name: ru_staged_attacks_adversarial_suffix
     path: schema/eval/staging/ru_russian_prompt_injections_attacks_staged.yaml
     language: RU
@@ -619,40 +751,52 @@ cells:
       column: reason
       allowed:
       - adversarial_suffix
+    grounding_mode: reason_grounded
+    route_policy: mirror
+    reason_provenance: source_label
+    applicability_scope: in_domain
   benign_sources:
   - name: en_benign_curated
     path: schema/eval/training/global_benign_curated.yaml
     language: EN
     extractor: col_content
     max_samples: 20000
+    route_policy: mirror
   - name: zh_benign_wikipedia
     path: schema/eval/benign/opensource_wikipedia_zh_benign.yaml
     language: ZH
     extractor: col_content
+    route_policy: mirror
   - name: zh_benign_xquad
     path: schema/eval/benign/opensource_xquad_zh_benign.yaml
     language: ZH
     extractor: col_content
+    route_policy: mirror
   - name: ar_benign_wikipedia
     path: schema/eval/benign/opensource_wikipedia_ar_benign.yaml
     language: AR
     extractor: col_content
+    route_policy: mirror
   - name: ar_benign_xquad
     path: schema/eval/benign/opensource_xquad_ar_benign.yaml
     language: AR
     extractor: col_content
+    route_policy: mirror
   - name: ru_benign_wikipedia
     path: schema/eval/benign/opensource_wikipedia_ru_benign.yaml
     language: RU
     extractor: col_content
+    route_policy: mirror
   - name: ru_benign_xquad
     path: schema/eval/benign/opensource_xquad_ru_benign.yaml
     language: RU
     extractor: col_content
+    route_policy: mirror
   - name: en_benign_code
     path: schema/eval/benign/code_samples.yaml
     language: EN
     extractor: col_content
+    route_policy: mirror
   - name: en_staged_dolly_adversarial_suffix
     path: schema/eval/staging/en_databricks-dolly-15k_benign_staged.yaml
     language: EN
@@ -661,6 +805,7 @@ cells:
       column: reason
       allowed:
       - adversarial_suffix
+    route_policy: mirror
   - name: en_staged_codealpaca_adversarial_suffix
     path: schema/eval/staging/en_evol-codealpaca-v1_benign_staged.yaml
     language: EN
@@ -669,6 +814,7 @@ cells:
       column: reason
       allowed:
       - adversarial_suffix
+    route_policy: mirror
   - name: en_staged_writingprompts_adversarial_suffix
     path: schema/eval/staging/en_writingprompts_benign_staged.yaml
     language: EN
@@ -677,6 +823,7 @@ cells:
       column: reason
       allowed:
       - adversarial_suffix
+    route_policy: mirror
   - name: en_staged_wildchat_adversarial_suffix
     path: schema/eval/staging/en_WildChat-1M_benign_staged.yaml
     language: EN
@@ -685,6 +832,7 @@ cells:
       column: reason
       allowed:
       - adversarial_suffix
+    route_policy: mirror
   - name: en_staged_chatbot_arena_adversarial_suffix
     path: schema/eval/staging/en_chatbot_arena_conversations_benign_staged.yaml
     language: EN
@@ -693,6 +841,7 @@ cells:
       column: reason
       allowed:
       - adversarial_suffix
+    route_policy: mirror
 - reason: indirect_injection
   teaching_goal: Neutralize 'embedded instructions in context = attack' correlation across EN/RU/ZH/AR
   languages:
@@ -709,66 +858,99 @@ cells:
     medium: 0.4
     long: 0.4
   attack_sources:
-  - name: en_attacks_merged
-    path: schema/eval/malicious/attacks_121624.yaml
+  - name: en_indirect_injection
+    path: schema/eval/staging/en_indirect_injection_attacks_staged.yaml
     language: EN
     extractor: col_content
-    max_samples: 20000
-    label_filter: *id001
-  - name: zh_attacks_corpus
-    path: schema/eval/training/multilingual/attacks_121624_zh.yaml
+    grounding_mode: reason_grounded
+    route_policy: mirror
+    reason_provenance: manual_map
+    applicability_scope: in_domain
+  - name: zh_indirect_injection_micro
+    path: schema/eval/staging/zh_indirect_injection_micro_attacks_staged.yaml
     language: ZH
     extractor: col_content
-  - name: zh_attacks_novel
-    path: schema/eval/training/multilingual/zh_attacks.yaml
+    grounding_mode: reason_grounded
+    route_policy: mirror
+    reason_provenance: adjudicated
+    applicability_scope: in_domain
+  - name: ru_indirect_injection_micro
+    path: schema/eval/staging/ru_indirect_injection_micro_attacks_staged.yaml
+    language: RU
+    extractor: col_content
+    grounding_mode: reason_grounded
+    route_policy: mirror
+    reason_provenance: adjudicated
+    applicability_scope: in_domain
+  - name: ar_indirect_injection_micro
+    path: schema/eval/staging/ar_indirect_injection_micro_attacks_staged.yaml
+    language: AR
+    extractor: col_content
+    grounding_mode: reason_grounded
+    route_policy: mirror
+    reason_provenance: adjudicated
+    applicability_scope: in_domain
+  - name: ar_staged_attacks_indirect_injection
+    path: schema/eval/staging/ar_ArabGuard-Egyptian-V1_attacks_staged.yaml
+    language: AR
+    extractor: col_content
+    label_filter:
+      column: reason
+      allowed:
+      - indirect_injection
+    grounding_mode: reason_grounded
+    route_policy: mirror
+    reason_provenance: source_label
+    applicability_scope: in_domain
+  - name: zh_staged_attacks_indirect_injection
+    path: schema/eval/staging/zh_swarm_reviewed_attacks_staged.yaml
     language: ZH
     extractor: col_content
-  - name: ar_attacks_corpus
-    path: schema/eval/training/multilingual/attacks_121624_ar.yaml
-    language: AR
-    extractor: col_content
-  - name: ar_attacks_novel
-    path: schema/eval/training/multilingual/ar_attacks.yaml
-    language: AR
-    extractor: col_content
-  - name: ru_attacks_corpus
-    path: schema/eval/training/multilingual/attacks_121624_ru.yaml
-    language: RU
-    extractor: col_content
-  - name: ru_attacks_novel
-    path: schema/eval/training/multilingual/ru_attacks.yaml
-    language: RU
-    extractor: col_content
+    label_filter:
+      column: reason
+      allowed:
+      - indirect_injection
+    grounding_mode: reason_grounded
+    route_policy: mirror
+    reason_provenance: source_label
+    applicability_scope: in_domain
   benign_sources:
   - name: en_benign_curated
     path: schema/eval/training/global_benign_curated.yaml
     language: EN
     extractor: col_content
     max_samples: 20000
+    route_policy: mirror
   - name: zh_benign_wikipedia
     path: schema/eval/benign/opensource_wikipedia_zh_benign.yaml
     language: ZH
     extractor: col_content
+    route_policy: mirror
   - name: zh_benign_xquad
     path: schema/eval/benign/opensource_xquad_zh_benign.yaml
     language: ZH
     extractor: col_content
+    route_policy: mirror
   - name: ar_benign_wikipedia
     path: schema/eval/benign/opensource_wikipedia_ar_benign.yaml
     language: AR
     extractor: col_content
+    route_policy: mirror
   - name: ar_benign_xquad
     path: schema/eval/benign/opensource_xquad_ar_benign.yaml
     language: AR
     extractor: col_content
+    route_policy: mirror
   - name: ru_benign_wikipedia
     path: schema/eval/benign/opensource_wikipedia_ru_benign.yaml
     language: RU
     extractor: col_content
+    route_policy: mirror
   - name: ru_benign_xquad
     path: schema/eval/benign/opensource_xquad_ru_benign.yaml
     language: RU
     extractor: col_content
+    route_policy: mirror
   - name: en_staged_dolly_indirect_injection
     path: schema/eval/staging/en_databricks-dolly-15k_benign_staged.yaml
     language: EN
@@ -777,6 +959,7 @@ cells:
       column: reason
       allowed:
       - indirect_injection
+    route_policy: mirror
   - name: en_staged_codealpaca_indirect_injection
     path: schema/eval/staging/en_evol-codealpaca-v1_benign_staged.yaml
     language: EN
@@ -785,6 +968,7 @@ cells:
       column: reason
       allowed:
       - indirect_injection
+    route_policy: mirror
   - name: en_staged_writingprompts_indirect_injection
     path: schema/eval/staging/en_writingprompts_benign_staged.yaml
     language: EN
@@ -793,6 +977,7 @@ cells:
       column: reason
       allowed:
       - indirect_injection
+    route_policy: mirror
   - name: en_staged_wildchat_indirect_injection
     path: schema/eval/staging/en_WildChat-1M_benign_staged.yaml
     language: EN
@@ -801,6 +986,7 @@ cells:
       column: reason
       allowed:
       - indirect_injection
+    route_policy: mirror
   - name: en_staged_chatbot_arena_indirect_injection
     path: schema/eval/staging/en_chatbot_arena_conversations_benign_staged.yaml
     language: EN
@@ -809,6 +995,7 @@ cells:
       column: reason
       allowed:
       - indirect_injection
+    route_policy: mirror
 - reason: obfuscation
   teaching_goal: Neutralize 'base64/ROT13/encoded text = attack' correlation across EN/RU/ZH/AR
   languages:
@@ -825,40 +1012,22 @@ cells:
     medium: 0.4
     long: 0.2
   attack_sources:
-  - name: en_attacks_merged
-    path: schema/eval/malicious/attacks_121624.yaml
-    language: EN
-    extractor: col_content
-    max_samples: 20000
-    label_filter: *id001
-  - name: zh_attacks_corpus
-    path: schema/eval/training/multilingual/attacks_121624_zh.yaml
-    language: ZH
-    extractor: col_content
-  - name: zh_attacks_novel
-    path: schema/eval/training/multilingual/zh_attacks.yaml
-    language: ZH
-    extractor: col_content
-  - name: ar_attacks_corpus
-    path: schema/eval/training/multilingual/attacks_121624_ar.yaml
-    language: AR
-    extractor: col_content
-  - name: ar_attacks_novel
-    path: schema/eval/training/multilingual/ar_attacks.yaml
-    language: AR
-    extractor: col_content
-  - name: ru_attacks_corpus
-    path: schema/eval/training/multilingual/attacks_121624_ru.yaml
-    language: RU
-    extractor: col_content
-  - name: ru_attacks_novel
-    path: schema/eval/training/multilingual/ru_attacks.yaml
-    language: RU
-    extractor: col_content
   - name: en_obfuscation
     path: schema/eval/malicious/obfuscation_attacks.yaml
     language: EN
     extractor: col_content
+    grounding_mode: reason_grounded
+    route_policy: mirror
+    reason_provenance: manual_map
+    applicability_scope: in_domain
+  - name: zh_obfuscation_micro
+    path: schema/eval/staging/zh_obfuscation_micro_attacks_staged.yaml
+    language: ZH
+    extractor: col_content
+    grounding_mode: reason_grounded
+    route_policy: mirror
+    reason_provenance: adjudicated
+    applicability_scope: in_domain
   - name: ru_staged_attacks_obfuscation
     path: schema/eval/staging/ru_russian_prompt_injections_attacks_staged.yaml
     language: RU
@@ -868,36 +1037,71 @@ cells:
       column: reason
       allowed:
       - obfuscation
+    grounding_mode: reason_grounded
+    route_policy: mirror
+    reason_provenance: source_label
+    applicability_scope: in_domain
+  - name: ar_staged_attacks_obfuscation
+    path: schema/eval/staging/ar_ArabGuard-Egyptian-V1_attacks_staged.yaml
+    language: AR
+    extractor: col_content
+    label_filter:
+      column: reason
+      allowed:
+      - obfuscation
+    grounding_mode: reason_grounded
+    route_policy: mirror
+    reason_provenance: source_label
+    applicability_scope: in_domain
+  - name: zh_staged_attacks_obfuscation
+    path: schema/eval/staging/zh_swarm_reviewed_attacks_staged.yaml
+    language: ZH
+    extractor: col_content
+    label_filter:
+      column: reason
+      allowed:
+      - obfuscation
+    grounding_mode: reason_grounded
+    route_policy: mirror
+    reason_provenance: source_label
+    applicability_scope: in_domain
   benign_sources:
   - name: en_benign_curated
     path: schema/eval/training/global_benign_curated.yaml
     language: EN
     extractor: col_content
     max_samples: 20000
+    route_policy: mirror
   - name: zh_benign_wikipedia
     path: schema/eval/benign/opensource_wikipedia_zh_benign.yaml
     language: ZH
     extractor: col_content
+    route_policy: mirror
   - name: zh_benign_xquad
     path: schema/eval/benign/opensource_xquad_zh_benign.yaml
     language: ZH
     extractor: col_content
+    route_policy: mirror
   - name: ar_benign_wikipedia
     path: schema/eval/benign/opensource_wikipedia_ar_benign.yaml
     language: AR
     extractor: col_content
+    route_policy: mirror
   - name: ar_benign_xquad
     path: schema/eval/benign/opensource_xquad_ar_benign.yaml
     language: AR
     extractor: col_content
+    route_policy: mirror
   - name: ru_benign_wikipedia
     path: schema/eval/benign/opensource_wikipedia_ru_benign.yaml
     language: RU
     extractor: col_content
+    route_policy: mirror
   - name: ru_benign_xquad
     path: schema/eval/benign/opensource_xquad_ru_benign.yaml
     language: RU
     extractor: col_content
+    route_policy: mirror
   - name: en_staged_dolly_obfuscation
     path: schema/eval/staging/en_databricks-dolly-15k_benign_staged.yaml
     language: EN
@@ -906,6 +1110,7 @@ cells:
       column: reason
       allowed:
       - obfuscation
+    route_policy: mirror
   - name: en_staged_codealpaca_obfuscation
     path: schema/eval/staging/en_evol-codealpaca-v1_benign_staged.yaml
     language: EN
@@ -914,6 +1119,7 @@ cells:
       column: reason
       allowed:
       - obfuscation
+    route_policy: mirror
   - name: en_staged_writingprompts_obfuscation
     path: schema/eval/staging/en_writingprompts_benign_staged.yaml
     language: EN
@@ -922,6 +1128,7 @@ cells:
       column: reason
       allowed:
       - obfuscation
+    route_policy: mirror
   - name: en_staged_wildchat_obfuscation
     path: schema/eval/staging/en_WildChat-1M_benign_staged.yaml
     language: EN
@@ -930,6 +1137,7 @@ cells:
       column: reason
       allowed:
       - obfuscation
+    route_policy: mirror
   - name: en_staged_chatbot_arena_obfuscation
     path: schema/eval/staging/en_chatbot_arena_conversations_benign_staged.yaml
     language: EN
@@ -938,6 +1146,7 @@ cells:
       column: reason
       allowed:
       - obfuscation
+    route_policy: mirror
 - reason: constraint_bypass
   teaching_goal: Neutralize 'requests to ignore rules = attack' correlation across EN/RU/ZH/AR
   languages:
@@ -954,70 +1163,71 @@ cells:
     medium: 0.3
     long: 0.2
   attack_sources:
-  - name: en_attacks_merged
-    path: schema/eval/malicious/attacks_121624.yaml
-    language: EN
-    extractor: col_content
-    max_samples: 20000
-    label_filter: *id001
-  - name: zh_attacks_corpus
-    path: schema/eval/training/multilingual/attacks_121624_zh.yaml
-    language: ZH
-    extractor: col_content
-  - name: zh_attacks_novel
-    path: schema/eval/training/multilingual/zh_attacks.yaml
-    language: ZH
-    extractor: col_content
-  - name: ar_attacks_corpus
-    path: schema/eval/training/multilingual/attacks_121624_ar.yaml
-    language: AR
-    extractor: col_content
-  - name: ar_attacks_novel
-    path: schema/eval/training/multilingual/ar_attacks.yaml
-    language: AR
-    extractor: col_content
-  - name: ru_attacks_corpus
-    path: schema/eval/training/multilingual/attacks_121624_ru.yaml
-    language: RU
-    extractor: col_content
-  - name: ru_attacks_novel
-    path: schema/eval/training/multilingual/ru_attacks.yaml
-    language: RU
-    extractor: col_content
   - name: en_constraint_bypass
     path: schema/eval/malicious/constraint_bypass_attacks.yaml
     language: EN
     extractor: col_content
+    grounding_mode: reason_grounded
+    route_policy: mirror
+    reason_provenance: manual_map
+    applicability_scope: in_domain
+  - name: zh_constraint_bypass_micro
+    path: schema/eval/staging/zh_constraint_bypass_micro_attacks_staged.yaml
+    language: ZH
+    extractor: col_content
+    grounding_mode: reason_grounded
+    route_policy: mirror
+    reason_provenance: adjudicated
+    applicability_scope: in_domain
+  - name: ar_staged_attacks_constraint_bypass
+    path: schema/eval/staging/ar_ArabGuard-Egyptian-V1_attacks_staged.yaml
+    language: AR
+    extractor: col_content
+    label_filter:
+      column: reason
+      allowed:
+      - constraint_bypass
+    grounding_mode: reason_grounded
+    route_policy: mirror
+    reason_provenance: source_label
+    applicability_scope: in_domain
   benign_sources:
   - name: en_benign_curated
     path: schema/eval/training/global_benign_curated.yaml
     language: EN
     extractor: col_content
     max_samples: 20000
+    route_policy: mirror
   - name: zh_benign_wikipedia
     path: schema/eval/benign/opensource_wikipedia_zh_benign.yaml
     language: ZH
     extractor: col_content
+    route_policy: mirror
   - name: zh_benign_xquad
     path: schema/eval/benign/opensource_xquad_zh_benign.yaml
     language: ZH
     extractor: col_content
+    route_policy: mirror
   - name: ar_benign_wikipedia
     path: schema/eval/benign/opensource_wikipedia_ar_benign.yaml
     language: AR
     extractor: col_content
+    route_policy: mirror
   - name: ar_benign_xquad
     path: schema/eval/benign/opensource_xquad_ar_benign.yaml
     language: AR
     extractor: col_content
+    route_policy: mirror
   - name: ru_benign_wikipedia
     path: schema/eval/benign/opensource_wikipedia_ru_benign.yaml
     language: RU
     extractor: col_content
+    route_policy: mirror
   - name: ru_benign_xquad
     path: schema/eval/benign/opensource_xquad_ru_benign.yaml
     language: RU
     extractor: col_content
+    route_policy: mirror
   - name: en_staged_dolly_constraint_bypass
     path: schema/eval/staging/en_databricks-dolly-15k_benign_staged.yaml
     language: EN
@@ -1026,6 +1236,7 @@ cells:
       column: reason
       allowed:
       - constraint_bypass
+    route_policy: mirror
   - name: en_staged_codealpaca_constraint_bypass
     path: schema/eval/staging/en_evol-codealpaca-v1_benign_staged.yaml
     language: EN
@@ -1034,6 +1245,7 @@ cells:
       column: reason
       allowed:
       - constraint_bypass
+    route_policy: mirror
   - name: en_staged_writingprompts_constraint_bypass
     path: schema/eval/staging/en_writingprompts_benign_staged.yaml
     language: EN
@@ -1042,6 +1254,7 @@ cells:
       column: reason
       allowed:
       - constraint_bypass
+    route_policy: mirror
   - name: en_staged_wildchat_constraint_bypass
     path: schema/eval/staging/en_WildChat-1M_benign_staged.yaml
     language: EN
@@ -1050,6 +1263,7 @@ cells:
       column: reason
       allowed:
       - constraint_bypass
+    route_policy: mirror
   - name: en_staged_chatbot_arena_constraint_bypass
     path: schema/eval/staging/en_chatbot_arena_conversations_benign_staged.yaml
     language: EN
@@ -1058,3 +1272,4 @@ cells:
       column: reason
       allowed:
       - constraint_bypass
+    route_policy: mirror

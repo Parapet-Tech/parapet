@@ -21,11 +21,12 @@ schema/eval/opensource_*.yaml
 schema/eval/multiturn_*.yaml
 schema/eval/out_of_scope/
 
-# LaTeX build artifacts
-paper/*.aux
-paper/*.log
-paper/*.out
-paper/local_author.tex
+# LaTeX build artifacts & author privacy
+publications/*/*.aux
+publications/*/*.log
+publications/*/*.out
+publications/*/*.synctex.gz
+publications/*/local_author.tex
 
 # Secrets
 .env
@@ -72,5 +73,11 @@ parapet-runner/.pytest_cache/
 parapet-runner/runs/
 parapet-runner/tests/.tmp_outputs/
 
+# Swarm working data (TheWall-derived, never commit)
+work/
+
 # Codex
 .codex/
+
+# Editor backup files
+*.py.current

@@ -16,6 +16,7 @@ from parapet_runner.runner import (
     OutputHashVerifier,
     RandomBaselineProvider,
     ResolvedSplits,
+    _build_parser,
     _install_weights_and_rebuild,
     assert_no_leakage,
 )
@@ -440,6 +441,49 @@ def test_install_weights_raises_on_cargo_failure() -> None:
             last_installed_hash=None,
             executor=FailingExecutor(),
         )
+
+
+def test_runner_cli_defaults_install_into_runtime_l1_weights_module() -> None:
+    parser = _build_parser()
+    args = parser.parse_args(
+        [
+            "run",
+            "--curation-manifest",
+            "manifest.json",
+            "--train-config",
+            "config.yaml",
+            "--output-dir",
+            "runs/out",
+        ]
+    )
+    assert args.weights_install_target == "l1_weights.rs"
+
+
+def test_install_weights_can_rebuild_with_eval_and_l2a() -> None:
+    base = _new_output_dir("recompile_l2a")
+    rust_crate = base / "parapet"
+    layers_dir = rust_crate / "src" / "layers"
+    layers_dir.mkdir(parents=True)
+
+    weights = base / "model" / "l1_weights_generalist.rs"
+    weights.parent.mkdir(parents=True)
+    weights.write_text("pub const BIAS: f64 = -0.5;\n", encoding="utf-8")
+
+    executor = _RecordingExecutor()
+
+    _install_weights_and_rebuild(
+        model_artifact=weights,
+        rust_crate_dir=rust_crate,
+        weights_install_target="test.rs",
+        last_installed_hash=None,
+        executor=executor,
+        build_features=("eval", "l2a"),
+    )
+
+    assert len(executor.commands) == 1
+    assert "--features" in executor.commands[0]
+    assert "eval,l2a" in executor.commands[0]
+    assert (layers_dir / "test.rs").exists()
 
 
 def _write_pool(path: Path, entries: list[dict]) -> None:

@@ -40,6 +40,7 @@ def make_source_ref(
     path: str,
     language: str,
     extractor: str = "col_content",
+    max_samples: int | None = None,
     label_filter: dict | None = None,
     grounding_mode: str | None = None,
     route_policy: str | None = None,
@@ -53,6 +54,8 @@ def make_source_ref(
         "language": language,
         "extractor": extractor,
     }
+    if max_samples is not None:
+        ref["max_samples"] = max_samples
     if label_filter:
         ref["label_filter"] = label_filter
     if grounding_mode is not None:
@@ -105,6 +108,7 @@ def build_cell(reason: str, compact: dict) -> dict:
                     name=f"{staged_cfg['language'].lower()}_staged_attacks_{reason}",
                     path=staged_cfg["path"],
                     language=staged_cfg["language"],
+                    max_samples=staged_cfg.get("max_samples"),
                     label_filter={"column": "reason", "allowed": [reason]},
                     grounding_mode=staged_cfg.get("grounding_mode"),
                     route_policy=staged_cfg.get("route_policy"),
@@ -132,6 +136,7 @@ def build_cell(reason: str, compact: dict) -> dict:
                     name=f"{staged_cfg['language'].lower()}_staged_benign_{reason}",
                     path=staged_cfg["path"],
                     language=staged_cfg["language"],
+                    max_samples=staged_cfg.get("max_samples"),
                     label_filter={"column": "reason", "allowed": [reason]},
                     grounding_mode=staged_cfg.get("grounding_mode"),
                     route_policy=staged_cfg.get("route_policy"),
@@ -150,6 +155,7 @@ def build_cell(reason: str, compact: dict) -> dict:
                     name=f"en_staged_{dataset_name}_{reason}",
                     path=dataset_cfg["path"],
                     language="EN",
+                    max_samples=dataset_cfg.get("max_samples"),
                     label_filter={"column": "reason", "allowed": [reason]},
                     grounding_mode=dataset_cfg.get("grounding_mode"),
                     route_policy=dataset_cfg.get("route_policy"),

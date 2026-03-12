@@ -154,8 +154,7 @@ def apply_ledger_to_row(
     The returned row is a shallow copy so callers can safely reuse the
     input row in multiple pipeline stages without in-place mutation.
     """
-    existing_hash = row.get("content_hash")
-    resolved_hash = existing_hash or content_hash(row["content"])
+    resolved_hash = content_hash(row["content"])
     entry = ledger.lookup(resolved_hash)
     normalized = dict(row)
     normalized["content_hash"] = resolved_hash
