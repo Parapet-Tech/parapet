@@ -446,6 +446,7 @@ def _install_weights_and_rebuild(
     weights_install_target: str,
     last_installed_hash: str | None,
     executor: CommandExecutor,
+    build_features: Sequence[str] = ("eval",),
 ) -> str:
     """Copy trained weights to Rust source tree and rebuild if changed.
 
@@ -459,8 +460,12 @@ def _install_weights_and_rebuild(
     install_path = rust_crate_dir / "src" / "layers" / weights_install_target
     shutil.copy2(model_artifact, install_path)
 
+    features = [feature.strip() for feature in build_features if str(feature).strip()]
+    if not features:
+        raise ValueError("build_features cannot be empty")
+
     result = executor.run(
-        ["cargo", "build", "--features", "eval", "--release"],
+        ["cargo", "build", "--features", ",".join(features), "--release"],
         cwd=rust_crate_dir,
     )
     if result.returncode != 0:
@@ -484,7 +489,8 @@ class ParapetEvalEvaluator:
         command_executor: CommandExecutor | None = None,
         accepted_returncodes: Sequence[int] = (0, 1),
         rust_crate_dir: Path | None = None,
-        weights_install_target: str = "l1_weights_generalist_clean_1to1_51042.rs",
+        weights_install_target: str = "l1_weights.rs",
+        build_features: Sequence[str] = ("eval",),
     ) -> None:
         self._parapet_eval_bin = parapet_eval_bin
         self._eval_config = eval_config
@@ -493,6 +499,7 @@ class ParapetEvalEvaluator:
         self._accepted_returncodes = set(accepted_returncodes)
         self._rust_crate_dir = rust_crate_dir
         self._weights_install_target = weights_install_target
+        self._build_features = tuple(build_features)
         self._last_installed_weights_hash: str | None = None
 
     def evaluate(
@@ -514,6 +521,7 @@ class ParapetEvalEvaluator:
                 weights_install_target=self._weights_install_target,
                 last_installed_hash=self._last_installed_weights_hash,
                 executor=self._executor,
+                build_features=self._build_features,
             )
 
         run_dir = output_dir / f"_eval_{split_name}_{str(threshold).replace('.', 'p').replace('-', 'm')}"
@@ -1272,6 +1280,10 @@ def _cli_run(args: argparse.Namespace) -> int:
         command_executor=executor,
         python_bin=args.python_bin,
     )
+    build_features = ["eval"]
+    if args.pg2_mode == "on":
+        build_features.append("l2a")
+
     evaluator = ParapetEvalEvaluator(
         parapet_eval_bin=parapet_eval_bin,
         eval_config=l1_eval_config,
@@ -1279,6 +1291,7 @@ def _cli_run(args: argparse.Namespace) -> int:
         command_executor=executor,
         rust_crate_dir=rust_crate_dir,
         weights_install_target=args.weights_install_target,
+        build_features=build_features,
     )
     threshold_calibrator = F1GridSearchCalibrator(thresholds=thresholds)
 
@@ -1452,7 +1465,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--weights-install-target",
         type=str,
-        default="l1_weights_generalist_clean_1to1_51042.rs",
+        default="l1_weights.rs",
         help="Filename in Rust crate's src/layers/ to overwrite with trained weights",
     )
     run.add_argument(

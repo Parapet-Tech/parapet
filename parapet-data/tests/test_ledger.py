@@ -326,6 +326,22 @@ class TestApplyLedgerToRow:
         assert result.dropped == 1
         assert result.action == LedgerAction.DROP
 
+    def test_stale_row_content_hash_does_not_override_content(self) -> None:
+        row = self._row("drop me")
+        row["content_hash"] = content_hash("stale metadata")
+        ledger = Ledger([
+            LedgerEntry(
+                content_hash=content_hash("drop me"),
+                source="test_source",
+                action=LedgerAction.DROP,
+                adjudication=AdjudicationReason.MISLABEL,
+            ),
+        ])
+        result = apply_ledger_to_row(row, ledger)
+        assert result.row is None
+        assert result.dropped == 1
+        assert result.content_hash == content_hash("drop me")
+
     def test_quarantine_returns_none_row(self) -> None:
         row = self._row("quarantine me")
         ledger = Ledger([

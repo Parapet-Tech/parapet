@@ -222,11 +222,9 @@ def _extract_samples_from_source_with_ledger(
             "source": source.name,
             "language": source.language.value,
         }
-        existing_hash = row.get("content_hash")
-        if existing_hash:
-            normalized_row["content_hash"] = existing_hash
-        else:
-            normalized_row["content_hash"] = content_hash(text)
+        # Canonicalize from extracted content so stale staged metadata
+        # cannot poison split manifests or ledger lookups.
+        normalized_row["content_hash"] = content_hash(text)
 
         if ledger is not None:
             ledger_result = apply_ledger_to_row(normalized_row, ledger)
@@ -1006,14 +1004,16 @@ def sample_spec(
         label: str,
         target_per_side: int | None,
         filter_benign_attacks: bool,
+        dedup_override: ContentDeduplicator | None = None,
     ) -> CellSampleResult:
+        effective_dedup = dedup_override if dedup_override is not None else dedup
         allowed_languages = {lang.value for lang in cell.languages}
         if target_per_side is None or spec.language_quota is None:
             return sample_cell(
                 cell=cell,
                 label=label,
                 target_per_side=target_per_side,
-                dedup=dedup,
+                dedup=effective_dedup,
                 rng=rng,
                 backfill=spec.backfill,
                 base_dir=base_dir,
@@ -1043,7 +1043,7 @@ def sample_spec(
                 cell=cell,
                 label=label,
                 target_per_side=lang_target,
-                dedup=dedup,
+                dedup=effective_dedup,
                 rng=rng,
                 backfill=spec.backfill,
                 base_dir=base_dir,
@@ -1116,16 +1116,31 @@ def sample_spec(
         all_gaps.extend(result.gaps)
 
     # Phase 2: Register attack hashes for cross-contamination
-    dedup.register_attack_hashes([s.content_hash for s in all_attack])
+    attack_hashes = [s.content_hash for s in all_attack]
+    dedup.register_attack_hashes(attack_hashes)
 
     # Phase 3: Benign sampling
+    # Use per-cell dedup to prevent starvation of shared multilingual
+    # benign pools.  The global dedup marks ALL candidates as seen during
+    # filtering (even those not ultimately sampled), so shared benign
+    # sources like wikipedia/xquad get entirely consumed by the first
+    # cell, leaving subsequent cells with 0 benign for that language.
+    # Per-cell dedup still prevents within-cell duplicates and
+    # attack↔benign cross-contamination via registered attack hashes.
+    benign_duplicates_dropped = 0
+    benign_cross_contamination_dropped = 0
     for cell in spec.cells:
+        cell_benign_dedup = ContentDeduplicator()
+        cell_benign_dedup.register_attack_hashes(attack_hashes)
         result = _sample_cell_with_optional_quota(
             cell=cell,
             label="benign",
             target_per_side=per_cell_benign,
             filter_benign_attacks=True,
+            dedup_override=cell_benign_dedup,
         )
+        benign_duplicates_dropped += cell_benign_dedup.duplicates_dropped
+        benign_cross_contamination_dropped += cell_benign_dedup.cross_contamination_dropped
         all_benign.extend(result.samples)
         assigned_hashes.update(sample.content_hash for sample in result.samples)
         key = f"{cell.cell_id}_benign"
@@ -1333,8 +1348,8 @@ def sample_spec(
         benign_samples=all_benign,
         cell_fills=cell_fills,
         gaps=all_gaps,
-        duplicates_dropped=dedup.duplicates_dropped,
-        cross_contamination_dropped=dedup.cross_contamination_dropped,
+        duplicates_dropped=dedup.duplicates_dropped + benign_duplicates_dropped,
+        cross_contamination_dropped=dedup.cross_contamination_dropped + benign_cross_contamination_dropped,
         background_requested=background_budget,
         background_actual=background_actual,
         ledger_dropped=ledger_totals["dropped"],

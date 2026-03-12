@@ -106,6 +106,10 @@ class TestMakeSourceRef:
         assert ref["reason_provenance"] == "heuristic"
         assert ref["applicability_scope"] == "mixed"
 
+    def test_preserves_max_samples(self):
+        ref = make_source_ref("test", "path.yaml", "EN", max_samples=123)
+        assert ref["max_samples"] == 123
+
 
 # ---------------------------------------------------------------------------
 # build_supplement
@@ -286,6 +290,20 @@ class TestBuildCellStagedAttacks:
         assert staged_src["route_policy"] == "mirror"
         assert staged_src["reason_provenance"] == "source_label"
 
+    def test_staged_attack_preserves_max_samples(self):
+        compact = _minimal_compact()
+        compact["staged_attacks"] = {
+            "ru_staged": {
+                "path": "ru_staged.yaml",
+                "language": "RU",
+                "reasons": ["meta_probe"],
+                "max_samples": 200,
+            }
+        }
+        cell = build_cell("meta_probe", compact)
+        staged_src = [s for s in cell["attack_sources"] if "staged" in s["name"]][0]
+        assert staged_src["max_samples"] == 200
+
 
 # ---------------------------------------------------------------------------
 # build_cell — staged EN benign
@@ -333,6 +351,18 @@ class TestBuildCellStagedBenignEN:
         assert staged["label_filter"] == {"column": "reason", "allowed": ["exfiltration"]}
         assert staged["language"] == "EN"
 
+    def test_en_staged_preserves_max_samples(self):
+        compact = _minimal_compact()
+        compact["staged_benign_en"] = {
+            "reasons": ["meta_probe"],
+            "datasets": {
+                "dolly": {"path": "dolly_staged.yaml", "max_samples": 50},
+            },
+        }
+        cell = build_cell("meta_probe", compact)
+        staged = [s for s in cell["benign_sources"] if s["name"] == "en_staged_dolly_meta_probe"][0]
+        assert staged["max_samples"] == 50
+
 
 # ---------------------------------------------------------------------------
 # build_cell — staged multilingual benign
@@ -377,6 +407,20 @@ class TestBuildCellStagedBenignMultilingual:
         ben_names = [s["name"] for s in cell["benign_sources"]]
         staged = [n for n in ben_names if "staged" in n]
         assert staged == []
+
+    def test_multilingual_preserves_max_samples(self):
+        compact = _minimal_compact()
+        compact["staged_benign_multilingual"] = {
+            "ru_saiga": {
+                "path": "ru_saiga.yaml",
+                "language": "RU",
+                "reasons": ["meta_probe"],
+                "max_samples": 75,
+            }
+        }
+        cell = build_cell("meta_probe", compact)
+        staged = [s for s in cell["benign_sources"] if s["name"] == "ru_staged_benign_meta_probe"][0]
+        assert staged["max_samples"] == 75
 
 
 # ---------------------------------------------------------------------------

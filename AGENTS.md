@@ -92,6 +92,30 @@ parapet/
 | `schema/eval/eval_config.yaml` | Default eval harness config |
 | `schema/parapet.schema.json` | JSON Schema for config validation |
 
+## Diagnostic Automation
+
+Prefer automation-first diagnostics. For drift, integrity, reproducibility, or
+curation-quality issues, extend scripts and guardrails before adding prose
+runbooks to `AGENTS.md`.
+
+Canonical entrypoints:
+
+| Entry Point | Purpose |
+|------------|---------|
+| `parapet-data/scripts/check_golden_contract.py` | Fail closed on source/language composition drift against a trusted curated baseline |
+| `parapet-data/scripts/diagnose_drift.py` | Compare sampler/backfill behavior when curated outputs diverge |
+| `parapet-data/scripts/audit_curated.py` | Audit curated corpora and export reviewable issues |
+| `parapet-data/scripts/extract_golden_contract.py` | Extract a golden contract from a trusted curated artifact |
+| `python -m parapet_data verified-sync ...` | Materialize and inspect staged-source projections before curation |
+
+Diagnostic completion standard:
+
+- A diagnosis is not complete until it is verified by a concrete artifact:
+  guardrail result, semantic hash, manifest diff, source-mix report, or a
+  minimal reproducer.
+- If the required automation does not exist yet, add or improve the script,
+  guardrail, or skill instead of encoding a manual checklist here.
+
 ## L1 Classifier (Current Work)
 
 Current default direction:
@@ -152,6 +176,9 @@ Run from `parapet/`:
 - Strategy docs: `strategy/`
 - Run scripts from `parapet/` so relative paths resolve correctly
 - Always review top features and FP/FN outputs after training
+- For large YAML/JSONL/curated corpora, prefer `rg`, targeted sampling,
+  manifests, and script outputs over full-file parsing; load the entire dataset
+  only when required.
 - If a required command is blocked by sandbox/permissions/timeouts, stop and ask the user to run it or approve escalation; do not change the experiment definition as a workaround
 
 ## Building & Running
