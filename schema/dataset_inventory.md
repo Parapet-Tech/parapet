@@ -73,6 +73,8 @@ Notes:
 | geekyrakshit | [geekyrakshit/prompt-injection-dataset](https://huggingface.co/datasets/geekyrakshit/prompt-injection-dataset) | Not declared | 534,434 | 500 (mixed) | test | attack+benign | `prompt` | `label` 0/1 | `fetch_geekyrakshit.py` | `opensource_geekyrakshit_{attacks,benign}.yaml` |
 | safeguard | [xTRam1/safe-guard-prompt-injection](https://huggingface.co/datasets/xTRam1/safe-guard-prompt-injection) | Not declared | 10,296 | 2,060 (full test) | test | attack+benign | `text` | `label` 0/1 | `fetch_safeguard.py` | `opensource_safeguard_{attacks,benign}.yaml` |
 
+Note on `jbb-paraphrase`: post-hoc inspection suggests this dataset behaves more like a content-safety / harmful-use refusal set than a prompt-injection benchmark. The 56 labeled "attacks" are direct harmful requests rather than instruction override, role hijacking, or indirect injection. Keep it out of core PI benchmarking.
+
 ### Training-only staged datasets
 
 Datasets fetched for L1 training but kept in `schema/eval/staging/` to avoid

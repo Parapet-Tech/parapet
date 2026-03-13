@@ -806,11 +806,17 @@ threshold of $+2.0$, the hard-benign FPR remained 12.3\%. On the same
 challenge set, PG2 (22M) reached 21.3\% FPR---better, but still far too
 high for production use. A 22-million-parameter semantic model cuts the
 hard-benign FPR roughly in half relative to a sparse lexical model, but
-it does not solve use-versus-mention disambiguation. Separately, on
-heavily paraphrased attacks (JailbreakBench~\cite{jailbreakbench}
-paraphrase variants), both the SVM and Prompt Guard~2 plateau around
-21\% recall. That limitation should not be hidden, because it is the
-strongest reason to keep a higher semantic layer in the architecture.
+it does not solve use-versus-mention disambiguation.
+A separate challenge slice drawn from
+JailbreakBench~\cite{jailbreakbench} paraphrase variants initially
+appeared to expose a shared ceiling ($\sim$21\% recall for both the SVM
+and Prompt Guard~2). Post-hoc inspection, however, showed that this
+slice consists of direct harmful-content requests rather than prompt
+injection: bomb-making, identity theft, hate speech, and similar
+content-safety refusals, with no instruction override, role hijacking,
+or indirect injection. We therefore no longer interpret that result as a
+PI benchmark. Its only useful lesson is methodological: evaluation
+slices must be scoped strictly to control-plane manipulation.
 
 This is also the right bridge to the next design problem. The question
 is no longer whether to replace the SVM with a bigger model. It is how
@@ -838,10 +844,13 @@ good at capturing lexical and structural control-plane traces, but they
 do not robustly resolve contextual ambiguity. A security whitepaper
 quoting a jailbreak prompt can still look too much like an attack
 (51.9\% FPR on the hard-benign challenge set at default threshold).
-Heavily paraphrased attacks evade both sparse n-grams and the Prompt
-Guard~2 baseline, with both plateauing around 21\% recall on
-JailbreakBench paraphrase variants. These ceilings are innate and
-architectural, not solvable by more data alone.
+An earlier evaluation against JailbreakBench paraphrase variants
+appeared to show both models plateauing at $\sim$21\% recall, but that
+slice turned out to be content-safety material rather than prompt
+injection (see Section~6.4). True paraphrase-robust PI evasion---attacks
+that preserve injection semantics while eliminating lexical n-gram
+traces---remains an open and likely architectural challenge for any
+sparse linear model.
 
 Although we report bootstrap intervals, the final holdout is modest in
 size, and broader external validity across unseen production traffic
