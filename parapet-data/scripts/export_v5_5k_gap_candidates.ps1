@@ -11,6 +11,7 @@ Set-Location $repoRoot
 
 $python = "python"
 $exporter = "parapet-data/scripts/export_attack_candidates.py"
+$gapMiningRoot = "parapet-data/adjudication/review/exports/gap_mining/v5_5k"
 
 $jobs = @(
     [ordered]@{
@@ -29,8 +30,8 @@ $jobs = @(
             "--shuffle",
             "--seed", "42",
             "--limit", "400",
-            "--output", "work/gap_mining/v5_5k/en_indirect_injection/llmail_seed.jsonl",
-            "--manifest-output", "work/gap_mining/v5_5k/en_indirect_injection/llmail_seed_manifest.json"
+            "--output", "$gapMiningRoot/en_indirect_injection/llmail_seed.jsonl",
+            "--manifest-output", "$gapMiningRoot/en_indirect_injection/llmail_seed_manifest.json"
         )
     },
     [ordered]@{
@@ -49,8 +50,8 @@ $jobs = @(
             "--shuffle",
             "--seed", "42",
             "--limit", "120",
-            "--output", "work/gap_mining/v5_5k/en_indirect_injection/wildjailbreak_topup.jsonl",
-            "--manifest-output", "work/gap_mining/v5_5k/en_indirect_injection/wildjailbreak_topup_manifest.json"
+            "--output", "$gapMiningRoot/en_indirect_injection/wildjailbreak_topup.jsonl",
+            "--manifest-output", "$gapMiningRoot/en_indirect_injection/wildjailbreak_topup_manifest.json"
         )
     },
     [ordered]@{
@@ -70,8 +71,8 @@ $jobs = @(
             "--shuffle",
             "--seed", "42",
             "--limit", "240",
-            "--output", "work/gap_mining/v5_5k/zh_roleplay_jailbreak/seed_pool.jsonl",
-            "--manifest-output", "work/gap_mining/v5_5k/zh_roleplay_jailbreak/seed_pool_manifest.json"
+            "--output", "$gapMiningRoot/zh_roleplay_jailbreak/seed_pool.jsonl",
+            "--manifest-output", "$gapMiningRoot/zh_roleplay_jailbreak/seed_pool_manifest.json"
         )
     },
     [ordered]@{
@@ -90,8 +91,8 @@ $jobs = @(
             "--shuffle",
             "--seed", "42",
             "--limit", "120",
-            "--output", "work/gap_mining/v5_5k/zh_meta_probe/hackaprompt_seed.jsonl",
-            "--manifest-output", "work/gap_mining/v5_5k/zh_meta_probe/hackaprompt_seed_manifest.json"
+            "--output", "$gapMiningRoot/zh_meta_probe/hackaprompt_seed.jsonl",
+            "--manifest-output", "$gapMiningRoot/zh_meta_probe/hackaprompt_seed_manifest.json"
         )
     },
     [ordered]@{
@@ -110,8 +111,8 @@ $jobs = @(
             "--shuffle",
             "--seed", "42",
             "--limit", "120",
-            "--output", "work/gap_mining/v5_5k/zh_meta_probe/tensor_seed.jsonl",
-            "--manifest-output", "work/gap_mining/v5_5k/zh_meta_probe/tensor_seed_manifest.json"
+            "--output", "$gapMiningRoot/zh_meta_probe/tensor_seed.jsonl",
+            "--manifest-output", "$gapMiningRoot/zh_meta_probe/tensor_seed_manifest.json"
         )
     },
     [ordered]@{
@@ -130,8 +131,8 @@ $jobs = @(
             "--shuffle",
             "--seed", "42",
             "--limit", "40",
-            "--output", "work/gap_mining/v5_5k/zh_meta_probe/spml_seed.jsonl",
-            "--manifest-output", "work/gap_mining/v5_5k/zh_meta_probe/spml_seed_manifest.json"
+            "--output", "$gapMiningRoot/zh_meta_probe/spml_seed.jsonl",
+            "--manifest-output", "$gapMiningRoot/zh_meta_probe/spml_seed_manifest.json"
         )
     },
     [ordered]@{
@@ -150,8 +151,8 @@ $jobs = @(
             "--shuffle",
             "--seed", "42",
             "--limit", "40",
-            "--output", "work/gap_mining/v5_5k/zh_meta_probe/prompt_subtle_seed.jsonl",
-            "--manifest-output", "work/gap_mining/v5_5k/zh_meta_probe/prompt_subtle_seed_manifest.json"
+            "--output", "$gapMiningRoot/zh_meta_probe/prompt_subtle_seed.jsonl",
+            "--manifest-output", "$gapMiningRoot/zh_meta_probe/prompt_subtle_seed_manifest.json"
         )
     },
     [ordered]@{
@@ -168,8 +169,8 @@ $jobs = @(
             "--shuffle",
             "--seed", "42",
             "--limit", "120",
-            "--output", "work/gap_mining/v5_5k/zh_meta_probe/tensor_trust_raw.jsonl",
-            "--manifest-output", "work/gap_mining/v5_5k/zh_meta_probe/tensor_trust_raw_manifest.json"
+            "--output", "$gapMiningRoot/zh_meta_probe/tensor_trust_raw.jsonl",
+            "--manifest-output", "$gapMiningRoot/zh_meta_probe/tensor_trust_raw_manifest.json"
         )
     },
     [ordered]@{
@@ -188,8 +189,8 @@ $jobs = @(
             "--shuffle",
             "--seed", "42",
             "--limit", "240",
-            "--output", "work/gap_mining/v5_5k/zh_exfiltration/llmail_seed.jsonl",
-            "--manifest-output", "work/gap_mining/v5_5k/zh_exfiltration/llmail_seed_manifest.json"
+            "--output", "$gapMiningRoot/zh_exfiltration/llmail_seed.jsonl",
+            "--manifest-output", "$gapMiningRoot/zh_exfiltration/llmail_seed_manifest.json"
         )
     },
     [ordered]@{
@@ -208,8 +209,8 @@ $jobs = @(
             "--shuffle",
             "--seed", "42",
             "--limit", "80",
-            "--output", "work/gap_mining/v5_5k/zh_exfiltration/wildjailbreak_topup.jsonl",
-            "--manifest-output", "work/gap_mining/v5_5k/zh_exfiltration/wildjailbreak_topup_manifest.json"
+            "--output", "$gapMiningRoot/zh_exfiltration/wildjailbreak_topup.jsonl",
+            "--manifest-output", "$gapMiningRoot/zh_exfiltration/wildjailbreak_topup_manifest.json"
         )
     },
     [ordered]@{
@@ -225,8 +226,8 @@ $jobs = @(
             "--shuffle",
             "--seed", "42",
             "--limit", "160",
-            "--output", "work/gap_mining/v5_5k/zh_adversarial_suffix/amplegcg_seed.jsonl",
-            "--manifest-output", "work/gap_mining/v5_5k/zh_adversarial_suffix/amplegcg_seed_manifest.json"
+            "--output", "$gapMiningRoot/zh_adversarial_suffix/amplegcg_seed.jsonl",
+            "--manifest-output", "$gapMiningRoot/zh_adversarial_suffix/amplegcg_seed_manifest.json"
         )
     },
     [ordered]@{
@@ -242,8 +243,8 @@ $jobs = @(
             "--shuffle",
             "--seed", "42",
             "--limit", "160",
-            "--output", "work/gap_mining/v5_5k/zh_adversarial_suffix/llm_attacks_seed.jsonl",
-            "--manifest-output", "work/gap_mining/v5_5k/zh_adversarial_suffix/llm_attacks_seed_manifest.json"
+            "--output", "$gapMiningRoot/zh_adversarial_suffix/llm_attacks_seed.jsonl",
+            "--manifest-output", "$gapMiningRoot/zh_adversarial_suffix/llm_attacks_seed_manifest.json"
         )
     },
     [ordered]@{
@@ -262,8 +263,8 @@ $jobs = @(
             "--shuffle",
             "--seed", "42",
             "--limit", "120",
-            "--output", "work/gap_mining/v5_5k/zh_adversarial_suffix/llmail_topup.jsonl",
-            "--manifest-output", "work/gap_mining/v5_5k/zh_adversarial_suffix/llmail_topup_manifest.json"
+            "--output", "$gapMiningRoot/zh_adversarial_suffix/llmail_topup.jsonl",
+            "--manifest-output", "$gapMiningRoot/zh_adversarial_suffix/llmail_topup_manifest.json"
         )
     },
     [ordered]@{
@@ -285,8 +286,8 @@ $jobs = @(
             "--shuffle",
             "--seed", "42",
             "--limit", "240",
-            "--output", "work/gap_mining/v5_5k/zh_constraint_bypass/seed_pool.jsonl",
-            "--manifest-output", "work/gap_mining/v5_5k/zh_constraint_bypass/seed_pool_manifest.json"
+            "--output", "$gapMiningRoot/zh_constraint_bypass/seed_pool.jsonl",
+            "--manifest-output", "$gapMiningRoot/zh_constraint_bypass/seed_pool_manifest.json"
         )
     },
     [ordered]@{
@@ -305,8 +306,8 @@ $jobs = @(
             "--shuffle",
             "--seed", "42",
             "--limit", "80",
-            "--output", "work/gap_mining/v5_5k/ar_indirect_injection/llmail_seed.jsonl",
-            "--manifest-output", "work/gap_mining/v5_5k/ar_indirect_injection/llmail_seed_manifest.json"
+            "--output", "$gapMiningRoot/ar_indirect_injection/llmail_seed.jsonl",
+            "--manifest-output", "$gapMiningRoot/ar_indirect_injection/llmail_seed_manifest.json"
         )
     },
     [ordered]@{
@@ -325,8 +326,8 @@ $jobs = @(
             "--shuffle",
             "--seed", "42",
             "--limit", "40",
-            "--output", "work/gap_mining/v5_5k/ar_indirect_injection/wildjailbreak_topup.jsonl",
-            "--manifest-output", "work/gap_mining/v5_5k/ar_indirect_injection/wildjailbreak_topup_manifest.json"
+            "--output", "$gapMiningRoot/ar_indirect_injection/wildjailbreak_topup.jsonl",
+            "--manifest-output", "$gapMiningRoot/ar_indirect_injection/wildjailbreak_topup_manifest.json"
         )
     },
     [ordered]@{
@@ -342,8 +343,8 @@ $jobs = @(
             "--shuffle",
             "--seed", "42",
             "--limit", "80",
-            "--output", "work/gap_mining/v5_5k/ar_adversarial_suffix/amplegcg_seed.jsonl",
-            "--manifest-output", "work/gap_mining/v5_5k/ar_adversarial_suffix/amplegcg_seed_manifest.json"
+            "--output", "$gapMiningRoot/ar_adversarial_suffix/amplegcg_seed.jsonl",
+            "--manifest-output", "$gapMiningRoot/ar_adversarial_suffix/amplegcg_seed_manifest.json"
         )
     },
     [ordered]@{
@@ -359,8 +360,8 @@ $jobs = @(
             "--shuffle",
             "--seed", "42",
             "--limit", "80",
-            "--output", "work/gap_mining/v5_5k/ar_adversarial_suffix/llm_attacks_seed.jsonl",
-            "--manifest-output", "work/gap_mining/v5_5k/ar_adversarial_suffix/llm_attacks_seed_manifest.json"
+            "--output", "$gapMiningRoot/ar_adversarial_suffix/llm_attacks_seed.jsonl",
+            "--manifest-output", "$gapMiningRoot/ar_adversarial_suffix/llm_attacks_seed_manifest.json"
         )
     },
     [ordered]@{
@@ -379,8 +380,8 @@ $jobs = @(
             "--shuffle",
             "--seed", "42",
             "--limit", "80",
-            "--output", "work/gap_mining/v5_5k/ar_adversarial_suffix/llmail_topup.jsonl",
-            "--manifest-output", "work/gap_mining/v5_5k/ar_adversarial_suffix/llmail_topup_manifest.json"
+            "--output", "$gapMiningRoot/ar_adversarial_suffix/llmail_topup.jsonl",
+            "--manifest-output", "$gapMiningRoot/ar_adversarial_suffix/llmail_topup_manifest.json"
         )
     },
     [ordered]@{
@@ -396,8 +397,8 @@ $jobs = @(
             "--shuffle",
             "--seed", "42",
             "--limit", "96",
-            "--output", "work/gap_mining/v5_5k/ru_tail_review/wambosec_tail.jsonl",
-            "--manifest-output", "work/gap_mining/v5_5k/ru_tail_review/wambosec_tail_manifest.json"
+            "--output", "$gapMiningRoot/ru_tail_review/wambosec_tail.jsonl",
+            "--manifest-output", "$gapMiningRoot/ru_tail_review/wambosec_tail_manifest.json"
         )
     },
     [ordered]@{
@@ -412,8 +413,8 @@ $jobs = @(
             "--copy-field", "description",
             "--shuffle",
             "--seed", "42",
-            "--output", "work/gap_mining/v5_5k/ru_tail_review/mosscap_tail.jsonl",
-            "--manifest-output", "work/gap_mining/v5_5k/ru_tail_review/mosscap_tail_manifest.json"
+            "--output", "$gapMiningRoot/ru_tail_review/mosscap_tail.jsonl",
+            "--manifest-output", "$gapMiningRoot/ru_tail_review/mosscap_tail_manifest.json"
         )
     },
     [ordered]@{
@@ -428,8 +429,8 @@ $jobs = @(
             "--copy-field", "description",
             "--shuffle",
             "--seed", "42",
-            "--output", "work/gap_mining/v5_5k/ru_tail_review/nueralchemy_tail.jsonl",
-            "--manifest-output", "work/gap_mining/v5_5k/ru_tail_review/nueralchemy_tail_manifest.json"
+            "--output", "$gapMiningRoot/ru_tail_review/nueralchemy_tail.jsonl",
+            "--manifest-output", "$gapMiningRoot/ru_tail_review/nueralchemy_tail_manifest.json"
         )
     },
     [ordered]@{
@@ -444,8 +445,8 @@ $jobs = @(
             "--copy-field", "description",
             "--shuffle",
             "--seed", "42",
-            "--output", "work/gap_mining/v5_5k/ru_tail_review/llmail_tail.jsonl",
-            "--manifest-output", "work/gap_mining/v5_5k/ru_tail_review/llmail_tail_manifest.json"
+            "--output", "$gapMiningRoot/ru_tail_review/llmail_tail.jsonl",
+            "--manifest-output", "$gapMiningRoot/ru_tail_review/llmail_tail_manifest.json"
         )
     },
     [ordered]@{
@@ -460,8 +461,8 @@ $jobs = @(
             "--copy-field", "description",
             "--shuffle",
             "--seed", "42",
-            "--output", "work/gap_mining/v5_5k/ru_tail_review/ctf_tail.jsonl",
-            "--manifest-output", "work/gap_mining/v5_5k/ru_tail_review/ctf_tail_manifest.json"
+            "--output", "$gapMiningRoot/ru_tail_review/ctf_tail.jsonl",
+            "--manifest-output", "$gapMiningRoot/ru_tail_review/ctf_tail_manifest.json"
         )
     },
     [ordered]@{
@@ -476,8 +477,8 @@ $jobs = @(
             "--copy-field", "description",
             "--shuffle",
             "--seed", "42",
-            "--output", "work/gap_mining/v5_5k/ru_tail_review/tensor_tail.jsonl",
-            "--manifest-output", "work/gap_mining/v5_5k/ru_tail_review/tensor_tail_manifest.json"
+            "--output", "$gapMiningRoot/ru_tail_review/tensor_tail.jsonl",
+            "--manifest-output", "$gapMiningRoot/ru_tail_review/tensor_tail_manifest.json"
         )
     },
     [ordered]@{
@@ -493,8 +494,8 @@ $jobs = @(
             "--shuffle",
             "--seed", "42",
             "--limit", "160",
-            "--output", "work/gap_mining/v5_5k/ru_tail_review/browsesafe_tail.jsonl",
-            "--manifest-output", "work/gap_mining/v5_5k/ru_tail_review/browsesafe_tail_manifest.json"
+            "--output", "$gapMiningRoot/ru_tail_review/browsesafe_tail.jsonl",
+            "--manifest-output", "$gapMiningRoot/ru_tail_review/browsesafe_tail_manifest.json"
         )
     },
     [ordered]@{
@@ -509,8 +510,8 @@ $jobs = @(
             "--copy-field", "description",
             "--shuffle",
             "--seed", "42",
-            "--output", "work/gap_mining/v5_5k/ru_tail_review/atlas_tail.jsonl",
-            "--manifest-output", "work/gap_mining/v5_5k/ru_tail_review/atlas_tail_manifest.json"
+            "--output", "$gapMiningRoot/ru_tail_review/atlas_tail.jsonl",
+            "--manifest-output", "$gapMiningRoot/ru_tail_review/atlas_tail_manifest.json"
         )
     },
     [ordered]@{
@@ -525,8 +526,8 @@ $jobs = @(
             "--copy-field", "description",
             "--shuffle",
             "--seed", "42",
-            "--output", "work/gap_mining/v5_5k/ru_tail_review/agentic_rag_tail.jsonl",
-            "--manifest-output", "work/gap_mining/v5_5k/ru_tail_review/agentic_rag_tail_manifest.json"
+            "--output", "$gapMiningRoot/ru_tail_review/agentic_rag_tail.jsonl",
+            "--manifest-output", "$gapMiningRoot/ru_tail_review/agentic_rag_tail_manifest.json"
         )
     }
 )

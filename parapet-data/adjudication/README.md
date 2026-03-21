@@ -12,6 +12,15 @@ Not versioned here:
 - review exports
 - other locally derived cleanup data
 
+Local review artifacts belong under:
+- `review/exports/`
+- `review/batches/`
+- `review/classified/`
+- `review/manifests/`
+
+`work/` is retired. Keep local review and repair state here instead of under
+the repository root.
+
 Use a local `ledger.yaml` in this directory when running:
 
 ```powershell

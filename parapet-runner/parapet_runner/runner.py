@@ -1430,13 +1430,13 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--random-attack-pool",
         type=Path,
-        default=Path("schema/eval/t3/attacks49521.yaml"),
+        default=Path("schema/eval/baseline/baseline_attacks.yaml"),
         help="Attack pool YAML for random baseline",
     )
     run.add_argument(
         "--random-benign-pool",
         type=Path,
-        default=Path("schema/eval/t3/global_benign_curated_100k.yaml"),
+        default=Path("schema/eval/baseline/baseline_benign.yaml"),
         help="Benign pool YAML for random baseline",
     )
     run.add_argument("--python-bin", type=str, default="python")

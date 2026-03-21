@@ -73,8 +73,7 @@ parapet-runner/.pytest_cache/
 parapet-runner/runs/
 parapet-runner/tests/.tmp_outputs/
 
-# Swarm working data (TheWall-derived, never commit)
-work/
+# Local adjudication review state is ignored by parapet-data/adjudication/.gitignore
 
 # Codex
 .codex/

@@ -12,8 +12,8 @@ Examples:
         --language-hint EN \
         --shuffle \
         --limit 400 \
-        --output work/gap_mining/v5_5k/en_indirect_injection/llmail_seed.jsonl \
-        --manifest-output work/gap_mining/v5_5k/en_indirect_injection/llmail_seed_manifest.json
+        --output parapet-data/adjudication/review/exports/gap_mining/v5_5k/en_indirect_injection/llmail_seed.jsonl \
+        --manifest-output parapet-data/adjudication/review/exports/gap_mining/v5_5k/en_indirect_injection/llmail_seed_manifest.json
 """
 
 from __future__ import annotations

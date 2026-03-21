@@ -12,7 +12,7 @@ Usage:
         --language-hint AR \
         --batch-size 200 \
         --max-rows 0 \
-        --output-dir work/swarm_batches/ar_attack_recovery \
+        --output-dir parapet-data/adjudication/review/batches/swarm_batches/ar_attack_recovery \
         --seed 42
 
 Run from the parapet/ directory (paths are relative to it).

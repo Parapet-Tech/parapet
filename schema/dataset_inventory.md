@@ -4,8 +4,9 @@ Canonical registry of all datasets used by `parapet-eval`.
 Versioned alongside eval configs and YAML files in `schema/eval/`.
 
 This inventory tracks source datasets and durable derived source files.
-It does not track local curated/run artifacts under `parapet-data/curated*`
-or `parapet-runner/runs/`.
+It does not track local review state under `parapet-data/adjudication/review/`,
+local curated artifacts under `parapet-data/curated*`, or run artifacts under
+`parapet-runner/runs/`.
 
 ## Processing layers
 
@@ -29,6 +30,9 @@ Notes:
 - `verified/` is derived from `staging/` plus the local adjudication ledger.
 - Mirror specs live in `parapet-data/`, not under `schema/eval/`.
 - Local adjudication ledgers are not versioned.
+- Local review exports and swarm batches live under
+  `parapet-data/adjudication/review/`.
+- `work/` has been retired and should not be used for new local data.
 
 ## Datasets
 
