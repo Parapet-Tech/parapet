@@ -3,8 +3,8 @@
 Usage:
   cd parapet
   python scripts/render_gap_tracker.py \
-    --manifest schema/eval/t_mirror/v3/manifest.json \
-    --out strategy/v3_gap_tracker.md
+    --manifest path/to/manifest.json \
+    --out strategy/gap_tracker.md
 """
 
 from __future__ import annotations
@@ -232,8 +232,8 @@ def build_report(manifest: dict, *, expected: dict[str, int], manifest_rel: str)
     out.append("```bash")
     out.append("cd parapet")
     out.append("python scripts/render_gap_tracker.py \\")
-    out.append("  --manifest schema/eval/t_mirror/v3/manifest.json \\")
-    out.append("  --out strategy/v3_gap_tracker.md")
+    out.append("  --manifest path/to/manifest.json \\")
+    out.append("  --out strategy/gap_tracker.md")
     out.append("```")
     out.append("")
     return "\n".join(out)

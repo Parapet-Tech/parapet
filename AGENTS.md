@@ -144,7 +144,7 @@ Run from `parapet/`:
 - `--analyzer char_wb` - default analyzer for L1 (do not switch casually)
 
 ### Current Data Notes
-- Attack training set: `schema/eval/training/attacks51042.yaml` (~51k)
+- Attack training corpora should come from the active staged/verified or curated mirror workflow, not legacy `t2/` or `t3/` outputs.
 - Current source-locked cleaned mirror baseline lives in `parapet-data/mirror_v4.compact.yaml` and `parapet-data/mirror_spec_v4_19k.yaml`
 - Mirror-based curation via `parapet-data/` is the active workflow for L1 corpus work
 - Adjudication ledgers are local-only; keep the machinery versioned, not the live ledger
@@ -172,7 +172,7 @@ Run from `parapet/`:
 - scaling data volume without curation quality controls
 
 ## Experiment Conventions
-- Training experiments: `schema/eval/t2/`
+- Keep generated training experiment outputs out of `schema/eval/`; use `parapet-runner/runs/` or other local ignored paths.
 - Strategy docs: `strategy/`
 - Run scripts from `parapet/` so relative paths resolve correctly
 - Always review top features and FP/FN outputs after training

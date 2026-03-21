@@ -164,7 +164,6 @@ python -m parapet_data stage \
   --index path/to/INDEX.yaml \
   --output schema/eval/staging/ \
   --holdout-sets schema/eval/l1_holdout.yaml \
-                 schema/eval/t3/l1_holdout_generalist_curated_100k.yaml \
                  schema/eval/challenges/tough_attack_v1/tough_attack_mirror_v2_novel.yaml \
                  schema/eval/challenges/tough_neutral_v1/tough_neutral_mirror_v2_novel.yaml
 ```

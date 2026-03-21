@@ -11,7 +11,7 @@
 # Sources without staged data for a reason are unchanged from v2.
 #
 # Usage:
-#   python -m parapet_data curate --spec mirror_spec_v3.yaml --output ../schema/eval/t_mirror/v3/ --base-dir ..
+#   python -m parapet_data curate --spec mirror_spec_v3.yaml --output ../parapet-data/curated/ --base-dir ..
 
 name: mirror_v3
 version: "3.0.0"
