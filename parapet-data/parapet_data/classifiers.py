@@ -42,7 +42,7 @@ CONFIDENCE_FLOOR = 0.6  # Below this: reject, do not stage
 class ReasonClassification:
     """Classification of a single text sample into an attack reason."""
 
-    reason: AttackReason
+    reason: str
     confidence: float  # 0.0-1.0
     signals: tuple[str, ...]  # which patterns matched
 

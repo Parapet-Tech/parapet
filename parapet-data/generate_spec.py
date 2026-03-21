@@ -20,8 +20,8 @@ from pathlib import Path
 import yaml
 
 
-# All 8 attack reasons, in canonical order matching models.py
-ALL_REASONS = [
+# Default prompt-injection categories, in canonical order matching models.py.
+DEFAULT_REASON_CATEGORIES = [
     "instruction_override",
     "roleplay_jailbreak",
     "meta_probe",
@@ -31,8 +31,29 @@ ALL_REASONS = [
     "obfuscation",
     "constraint_bypass",
 ]
+ALL_REASONS = DEFAULT_REASON_CATEGORIES
 
 LANGUAGES = ["EN", "RU", "ZH", "AR"]
+
+
+def get_reason_categories(compact: dict) -> list[str]:
+    """Resolve the mirror category set for a compact spec.
+
+    Legacy compact specs inherit the default prompt-injection taxonomy.
+    Residual/cascade specs can either declare `reason_categories` explicitly
+    or define custom cell names, which become the category set automatically.
+    """
+
+    explicit = compact.get("reason_categories")
+    if explicit is None:
+        explicit = compact.get("entity_categories")
+    if explicit:
+        return [str(reason).strip() for reason in explicit]
+
+    defined_reasons = list(compact.get("cells", {}).keys())
+    if any(reason not in DEFAULT_REASON_CATEGORIES for reason in defined_reasons):
+        return defined_reasons
+    return list(DEFAULT_REASON_CATEGORIES)
 
 
 def make_source_ref(
@@ -147,7 +168,7 @@ def build_cell(reason: str, compact: dict) -> dict:
 
     # Staged EN benign (each dataset x matching reasons)
     staged_en = compact.get("staged_benign_en", {})
-    staged_en_reasons = staged_en.get("reasons", ALL_REASONS)
+    staged_en_reasons = staged_en.get("reasons", get_reason_categories(compact))
     if reason in staged_en_reasons:
         for dataset_name, dataset_cfg in staged_en.get("datasets", {}).items():
             benign_sources.append(
@@ -199,6 +220,15 @@ def expand_spec(compact: dict, overrides: dict | None = None) -> dict:
     spec["backfill"] = copy.deepcopy(compact["backfill"])
     spec["language_quota"] = copy.deepcopy(compact["language_quota"])
     spec["allow_partial_mirror"] = compact.get("allow_partial_mirror", False)
+    reason_categories = get_reason_categories(compact)
+    defined_reasons = set(compact["cells"].keys())
+    explicit_categories = (
+        "reason_categories" in compact or "entity_categories" in compact
+    )
+    if explicit_categories or any(
+        reason not in DEFAULT_REASON_CATEGORIES for reason in reason_categories
+    ):
+        spec["reason_categories"] = copy.deepcopy(reason_categories)
     if "supplement_ratio" in compact:
         spec["supplement_ratio"] = compact["supplement_ratio"]
     if compact.get("holdout_only_reasons"):
@@ -218,14 +248,20 @@ def expand_spec(compact: dict, overrides: dict | None = None) -> dict:
         spec["supplements"] = [build_supplement(supp) for supp in compact["supplements"]]
 
     # Expand cells
-    defined_reasons = set(compact["cells"].keys())
-    missing = set(ALL_REASONS) - defined_reasons
+    missing = set(reason_categories) - defined_reasons
     if missing and not spec["allow_partial_mirror"]:
         print(f"error: compact spec missing cells for: {missing}", file=sys.stderr)
         sys.exit(1)
+    unexpected = defined_reasons - set(reason_categories)
+    if unexpected:
+        print(
+            f"error: compact spec defines cells outside reason_categories: {unexpected}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     spec["cells"] = []
-    for reason in ALL_REASONS:
+    for reason in reason_categories:
         if reason in defined_reasons:
             spec["cells"].append(build_cell(reason, compact))
 

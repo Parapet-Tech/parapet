@@ -181,6 +181,37 @@ Run from `parapet/`:
   only when required.
 - If a required command is blocked by sandbox/permissions/timeouts, stop and ask the user to run it or approve escalation; do not change the experiment definition as a workaround
 
+## Codex CLI Subagents
+
+Use `codex exec` for explicit subagent-style batch work instead of silently
+doing the task in the main thread.
+
+- Default pattern for parallel batch annotation/review:
+  run one `codex exec` worker per batch and write the worker's final response to
+  a file with `-o`.
+- If the user asked for a cheaper/lighter worker, use a lower-tier model such
+  as `gpt-5.1` instead of the default top-tier model.
+- The local config currently defaults to `model_reasoning_effort = "xhigh"`.
+  Override that for `gpt-5.1` runs with:
+  `-c model_reasoning_effort='medium'`
+- If `codex exec` fails because the sandbox blocks network access, rerun the
+  exact command with escalation instead of falling back to in-thread manual
+  work.
+- Keep the prompt narrow: point the worker at the task file, schema/rubric, and
+  one batch file; require machine-readable output only.
+
+Example:
+
+```bash
+cd parapet
+codex exec \
+  -m gpt-5.1 \
+  -c model_reasoning_effort='medium' \
+  -s read-only \
+  -o parapet-runner/runs/.../batch_audit.jsonl \
+  "Read CODEX_TASK.md, the audit rubric, and one batch file. Output JSONL only."
+```
+
 ## Building & Running
 
 ```bash

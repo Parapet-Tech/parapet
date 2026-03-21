@@ -26,7 +26,6 @@ from .extractors import get_extractor
 from .filters import ContentDeduplicator, content_hash, looks_like_attack, passes_label_filter
 from .ledger import Ledger, apply_ledger_to_row
 from .models import (
-    AttackReason,
     BackfillPolicy,
     BackgroundLane,
     CellFillRecord,
@@ -60,7 +59,7 @@ class Sample:
     content: str
     content_hash: str
     label: str  # "malicious" or "benign"
-    reason: str  # AttackReason value or supplement name
+    reason: str  # mirror category or supplement name
     source_name: str
     language: str
     format_bin: str
@@ -519,7 +518,7 @@ def _apply_backfill_ladder(
     if missing <= 0:
         return [], [], []
 
-    desired_reason = cell.reason.value
+    desired_reason = cell.reason
     desired_languages = {lang.value for lang in cell.languages}
     desired_formats = {
         fmt.value for fmt, pct in cell.format_distribution.items() if pct > 0
@@ -648,7 +647,7 @@ def sample_cell(
     4. Apply backfill if under target
     """
     sources = cell.attack_sources if label == "malicious" else cell.benign_sources
-    reason = cell.reason.value
+    reason = cell.reason
 
     # Load all candidate samples
     all_candidates: list[Sample] = []
@@ -939,13 +938,13 @@ def sample_spec(
             _register_relabeled_candidates(
                 source=source,
                 label="malicious",
-                reason=cell.reason.value,
+                reason=cell.reason,
             )
         for source in cell.benign_sources:
             _register_relabeled_candidates(
                 source=source,
                 label="benign",
-                reason=cell.reason.value,
+                reason=cell.reason,
             )
     for supp in spec.supplements:
         supp_reason = f"supplement:{supp.name}"
@@ -1021,7 +1020,7 @@ def sample_spec(
                 allowed_languages=allowed_languages,
                 ledger=ledger,
                 source_extract_cache=source_extract_cache,
-                extra_candidates=relabeled_candidates[label].get(cell.reason.value, []),
+                extra_candidates=relabeled_candidates[label].get(cell.reason, []),
             )
 
         language_targets = _language_targets_for_cell(
@@ -1051,7 +1050,7 @@ def sample_spec(
                 allowed_languages={lang},
                 ledger=ledger,
                 source_extract_cache=source_extract_cache,
-                extra_candidates=relabeled_candidates[label].get(cell.reason.value, []),
+                extra_candidates=relabeled_candidates[label].get(cell.reason, []),
             )
             merged_samples.extend(lang_result.samples)
             merged_available.extend(lang_result.available_pool)
@@ -1164,7 +1163,7 @@ def sample_spec(
             gap = per_cell_benign - fill.actual
             other_benign = [
                 s for reason, samples in available_by_reason["benign"].items()
-                if reason != cell.reason.value
+                if reason != cell.reason
                 for s in samples
                 if s.content_hash not in assigned_hashes
             ]

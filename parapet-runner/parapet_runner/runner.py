@@ -1474,6 +1474,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Skip automatic Rust binary recompilation after weight training",
     )
 
+    eval_cmd = subparsers.add_parser("eval", help="Run parapet-eval against a dataset directory")
+    eval_cmd.add_argument("--dataset", type=Path, required=True, help="Directory of YAML eval/staged files")
+    eval_cmd.add_argument("--output-dir", type=Path, required=True, help="Where to write results")
+    eval_cmd.add_argument("--workspace-root", type=Path)
+    eval_cmd.add_argument("--parapet-eval-bin", type=Path, default=Path("parapet/target/release/parapet-eval.exe"))
+    eval_cmd.add_argument("--eval-config", type=Path, default=Path("schema/eval/eval_config_l1_only.yaml"))
+    eval_cmd.add_argument("--layer", type=str, default="l1")
+    eval_cmd.add_argument("--threshold", type=float, default=0.0)
+    eval_cmd.add_argument("--max-failures", type=int, default=200)
+    eval_cmd.add_argument("--skip-converted", action="store_true", help="Skip files already converted from a previous run")
+
     semantic_hash = subparsers.add_parser(
         "semantic-hash",
         help="Compute SHA256(sorted content hashes + per-cell counts)",
@@ -1483,11 +1494,104 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _cli_eval(args: argparse.Namespace) -> int:
+    workspace_root = (
+        Path(args.workspace_root).resolve()
+        if args.workspace_root is not None
+        else _default_workspace_root()
+    )
+    parapet_eval_bin = _resolve_relative_path(Path(args.parapet_eval_bin), base_dir=workspace_root)
+    eval_config_path = _resolve_relative_path(Path(args.eval_config), base_dir=workspace_root)
+    dataset = Path(args.dataset).resolve()
+    output_dir = Path(args.output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Load all YAMLs from the dataset directory and convert to eval format
+    import sys
+    converted_dir = output_dir / "_eval_dataset"
+    converted_dir.mkdir(parents=True, exist_ok=True)
+
+    total_cases = 0
+    skipped = 0
+    for yaml_file in sorted(dataset.glob("*.yaml")):
+        if yaml_file.name.startswith("eval_config") or yaml_file.name == "sync_stats.json":
+            continue
+        out_path = converted_dir / yaml_file.name
+        if args.skip_converted and out_path.exists():
+            print(f"  {yaml_file.name}: skip", file=sys.stderr)
+            continue
+        try:
+            entries = _load_labeled_entries(yaml_file)
+        except Exception as exc:
+            print(f"  SKIP {yaml_file.name}: {exc}", file=sys.stderr)
+            skipped += 1
+            continue
+        if not entries:
+            continue
+        split_name = yaml_file.stem
+        cases = _build_eval_cases(entries, split_name=split_name)
+        _write_yaml_entries(converted_dir / yaml_file.name, cases)
+        total_cases += len(cases)
+        print(f"  {yaml_file.name}: {len(cases)} cases", file=sys.stderr)
+
+    print(f"Converted {total_cases} cases from {dataset} ({skipped} files skipped)", file=sys.stderr)
+
+    # Set threshold in eval config
+    base_config = yaml.safe_load(eval_config_path.read_text(encoding="utf-8"))
+    threshold_config = _set_l1_threshold(base_config, args.threshold)
+    config_path = output_dir / "eval_config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(threshold_config, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+
+    output_json = output_dir / "eval.json"
+    command = [
+        str(parapet_eval_bin),
+        "--config", str(config_path),
+        "--dataset", str(converted_dir),
+        "--layer", args.layer,
+        "--json",
+        "--output", str(output_json),
+        "--max-failures", str(args.max_failures),
+    ]
+
+    print(f"Running: {' '.join(command)}", file=sys.stderr)
+    executor = SubprocessCommandExecutor()
+    result = executor.run(command, cwd=workspace_root)
+
+    if result.stderr:
+        print(result.stderr, file=sys.stderr)
+
+    if not output_json.exists():
+        print(f"eval binary did not produce output: exit={result.returncode}", file=sys.stderr)
+        return 1
+
+    payload = json.loads(output_json.read_text(encoding="utf-8"))
+    eval_result = parse_eval_result_json(payload, threshold_fallback=args.threshold)
+
+    error_analyzer = YamlErrorAnalyzer()
+    error_analyzer.write(
+        eval_result=eval_result,
+        baseline_results={},
+        baseline_deltas={},
+        output_dir=output_dir,
+    )
+
+    print(f"F1={eval_result.f1:.4f}  P={eval_result.precision:.4f}  R={eval_result.recall:.4f}")
+    print(f"FP={eval_result.false_positives}  FN={eval_result.false_negatives}  N={eval_result.holdout_size}")
+    print(f"Results: {output_json}")
+    print(f"Errors:  {output_dir / 'errors.yaml'}")
+    return 0 if result.returncode in (0, 1) else result.returncode
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
     if args.command == "run":
         return _cli_run(args)
+    if args.command == "eval":
+        return _cli_eval(args)
     if args.command == "semantic-hash":
         return _cli_semantic_hash(args.content_hashes_file, args.cell_counts_json)
     parser.print_help()

@@ -29,6 +29,14 @@ backfill:
 # Set true to define fewer than 8 cells (for fast iteration).
 allow_partial_mirror: false
 
+# Optional explicit mirror category set.
+# Omit this for the legacy prompt-injection default, or set it when you want
+# a custom taxonomy or a non-default subset of categories.
+# reason_categories:
+#   - use_vs_mention
+#   - multilingual_gap
+#   - semantic_paraphrase
+
 # Reasons routed exclusively to holdout — tests generalization to unseen attack categories.
 # holdout_only_reasons:
 #   - adversarial_suffix

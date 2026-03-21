@@ -296,7 +296,7 @@ def compose(
     all_samples = sampling_result.attack_samples + sampling_result.benign_samples
 
     # Split
-    holdout_reasons = [r.value for r in spec.holdout_only_reasons]
+    holdout_reasons = list(spec.holdout_only_reasons)
     splits = split_samples(
         all_samples,
         holdout_only_reasons=holdout_reasons,

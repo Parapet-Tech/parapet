@@ -29,7 +29,7 @@ python -m parapet_data curate \
 
 ## What goes in
 
-**A MirrorSpec** (YAML or JSON) defining cells, sources, distributions, and backfill policy. One cell per attack reason.
+**A MirrorSpec** (YAML or JSON) defining cells, sources, distributions, and backfill policy. One cell per mirror category.
 
 **Source YAML files** — lists of dicts. The `extractor` field on each SourceRef tells parapet-data how to read each format:
 
@@ -140,7 +140,7 @@ The compact YAML has these sections:
 
 | Section | Purpose |
 |---------|---------|
-| Top-level | `name`, `version`, `seed`, `ratio`, `total_target`, `backfill`, `language_quota` |
+| Top-level | `name`, `version`, `seed`, `ratio`, `total_target`, `backfill`, `language_quota`, optional `reason_categories` |
 | `base_attack_sources` | Attack sources shared by all cells (merged corpora, multilingual) |
 | `base_benign_sources` | Benign sources shared by all cells (curated, wikipedia, xquad) |
 | `staged_attacks` | Staged attack sources with `reasons` filter (auto-expanded per matching cell) |
@@ -193,9 +193,11 @@ See [`schema/eval/staging/README.md`](../schema/eval/staging/README.md) for stag
 
 ## Available options
 
-### Attack reasons
+### Mirror categories
 
-8 categories. All required in a MirrorSpec unless `allow_partial_mirror: true`.
+`MirrorSpec` can declare `reason_categories` explicitly when you want a custom mirror taxonomy. If omitted, the legacy 8 prompt-injection categories remain the default as long as every cell uses the built-in PI category names.
+
+Default categories:
 
 | Value | Mirror neutralizes |
 |-------|-------------------|

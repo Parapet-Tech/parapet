@@ -72,7 +72,7 @@ def _mirror_benign_source(name: str = "ben", lang: Language = Language.EN) -> So
 
 
 def _cell(
-    reason: AttackReason = AttackReason.INSTRUCTION_OVERRIDE,
+    reason: str | AttackReason = AttackReason.INSTRUCTION_OVERRIDE,
     languages: list[Language] | None = None,
 ) -> MirrorCell:
     return MirrorCell(
@@ -228,6 +228,7 @@ class TestMirrorSpec:
             cells=_full_cells(),
         )
         assert len(spec.cells) == len(AttackReason)
+        assert spec.mirror_reason_categories == [reason.value for reason in AttackReason]
 
     def test_rejects_incomplete_mirror(self) -> None:
         incomplete = [_cell(reason=r) for r in list(AttackReason)[:3]]
@@ -248,6 +249,72 @@ class TestMirrorSpec:
             holdout_only_reasons=[AttackReason.ROLEPLAY_JAILBREAK],
         )
         assert len(spec.cells) == 1
+
+    def test_reason_categories_omitted_for_legacy_default(self) -> None:
+        dumped = MirrorSpec(
+            name="legacy_default",
+            version="0.1.0",
+            cells=_full_cells(),
+        ).model_dump()
+        assert "reason_categories" not in dumped
+
+    def test_infers_custom_reason_categories_from_cells(self) -> None:
+        spec = MirrorSpec(
+            name="residual",
+            version="0.1.0",
+            cells=[
+                _cell(reason="use_vs_mention"),
+                _cell(reason="multilingual_gap"),
+                _cell(reason="semantic_paraphrase"),
+            ],
+        )
+        assert spec.mirror_reason_categories == [
+            "use_vs_mention",
+            "multilingual_gap",
+            "semantic_paraphrase",
+        ]
+
+    def test_explicit_reason_categories_allow_canonical_subset(self) -> None:
+        spec = MirrorSpec(
+            name="subset",
+            version="0.1.0",
+            cells=[_cell(reason=AttackReason.INSTRUCTION_OVERRIDE)],
+            reason_categories=[AttackReason.INSTRUCTION_OVERRIDE],
+        )
+        assert spec.mirror_reason_categories == ["instruction_override"]
+
+    def test_entity_categories_alias_maps_to_reason_categories(self) -> None:
+        spec = MirrorSpec.model_validate(
+            {
+                "name": "alias",
+                "version": "0.1.0",
+                "cells": [
+                    _cell(reason="use_vs_mention").model_dump(mode="json"),
+                ],
+                "entity_categories": ["use_vs_mention"],
+            }
+        )
+        assert spec.reason_categories == ["use_vs_mention"]
+        assert spec.mirror_reason_categories == ["use_vs_mention"]
+
+    def test_rejects_cell_reason_outside_declared_reason_categories(self) -> None:
+        with pytest.raises(ValueError, match="outside reason_categories"):
+            MirrorSpec(
+                name="bad_categories",
+                version="0.1.0",
+                cells=[_cell(reason="semantic_paraphrase")],
+                reason_categories=["use_vs_mention"],
+            )
+
+    def test_rejects_holdout_reason_outside_declared_reason_categories(self) -> None:
+        with pytest.raises(ValueError, match="holdout_only_reasons reference undeclared categories"):
+            MirrorSpec(
+                name="bad_holdout",
+                version="0.1.0",
+                cells=[_cell(reason="semantic_paraphrase")],
+                reason_categories=["semantic_paraphrase"],
+                holdout_only_reasons=["multilingual_gap"],
+            )
 
     def test_rejects_supplement_ratio_without_supplements(self) -> None:
         with pytest.raises(ValueError, match="supplement_ratio > 0 but no supplements"):

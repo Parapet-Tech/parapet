@@ -266,8 +266,8 @@ Test cases across L1 classifier, L3 single-turn, and L4 multi-turn evaluations, 
 For corpus curation and staging docs:
 
 - `parapet-data/README.md` -- `curate` and `stage` CLI usage
+- `parapet-runner/README.md` 
 - `schema/eval/staging/README.md` -- staged row schema, manifest contract, and artifact semantics
-- `strategy/staging_pipeline_plan.md` -- architecture decisions, quality gates, and rollout phases
 
 Run L1-only eval:
 

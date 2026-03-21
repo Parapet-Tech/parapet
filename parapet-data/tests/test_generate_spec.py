@@ -20,6 +20,7 @@ from generate_spec import (
     build_cell,
     build_supplement,
     expand_spec,
+    get_reason_categories,
     make_source_ref,
 )
 
@@ -363,6 +364,46 @@ class TestBuildCellStagedBenignEN:
         staged = [s for s in cell["benign_sources"] if s["name"] == "en_staged_dolly_meta_probe"][0]
         assert staged["max_samples"] == 50
 
+    def test_en_staged_defaults_to_dynamic_reason_categories(self):
+        compact = {
+            "name": "residual_probe",
+            "version": "1.0.0",
+            "seed": 42,
+            "ratio": 1.0,
+            "total_target": 100,
+            "backfill": {"strategy": "ngram_safe", "log_gaps": True},
+            "language_quota": {
+                "mode": "best_effort",
+                "profile": {"EN": 1.0},
+            },
+            "base_attack_sources": [{"name": "atk", "path": "attacks.yaml", "language": "EN"}],
+            "base_benign_sources": [{"name": "ben", "path": "benign.yaml", "language": "EN"}],
+            "cells": {
+                "use_vs_mention": {
+                    "teaching_goal": "separate mention from use",
+                    "format": {"prose": 1.0},
+                    "length": {"short": 1.0},
+                },
+                "multilingual_gap": {
+                    "teaching_goal": "recover multilingual residuals",
+                    "format": {"prose": 1.0},
+                    "length": {"short": 1.0},
+                },
+            },
+            "staged_benign_en": {
+                "datasets": {
+                    "dolly": {"path": "dolly.yaml"},
+                }
+            },
+        }
+
+        use_cell = build_cell("use_vs_mention", compact)
+        multi_cell = build_cell("multilingual_gap", compact)
+        assert "en_staged_dolly_use_vs_mention" in [s["name"] for s in use_cell["benign_sources"]]
+        assert "en_staged_dolly_multilingual_gap" in [
+            s["name"] for s in multi_cell["benign_sources"]
+        ]
+
 
 # ---------------------------------------------------------------------------
 # build_cell — staged multilingual benign
@@ -524,6 +565,67 @@ class TestExpandSpec:
         original_target = compact["total_target"]
         expand_spec(compact, {"total_target": 9999})
         assert compact["total_target"] == original_target
+
+    def test_get_reason_categories_defaults_to_custom_cells(self):
+        compact = _minimal_compact()
+        compact["cells"] = {
+            "use_vs_mention": {
+                "teaching_goal": "use vs mention",
+                "format": {"prose": 1.0},
+                "length": {"short": 1.0},
+            },
+            "multilingual_gap": {
+                "teaching_goal": "multilingual gap",
+                "format": {"prose": 1.0},
+                "length": {"short": 1.0},
+            },
+        }
+        assert get_reason_categories(compact) == ["use_vs_mention", "multilingual_gap"]
+
+    def test_expand_spec_copies_explicit_reason_categories(self):
+        compact = _minimal_compact()
+        compact["reason_categories"] = ["instruction_override", "meta_probe"]
+        compact["cells"] = {
+            "instruction_override": compact["cells"]["instruction_override"],
+            "meta_probe": compact["cells"]["meta_probe"],
+        }
+        spec = expand_spec(compact)
+        assert spec["reason_categories"] == ["instruction_override", "meta_probe"]
+        assert [cell["reason"] for cell in spec["cells"]] == [
+            "instruction_override",
+            "meta_probe",
+        ]
+
+    def test_expand_spec_infers_custom_reason_categories(self):
+        compact = _minimal_compact()
+        compact["cells"] = {
+            "use_vs_mention": {
+                "teaching_goal": "use vs mention",
+                "format": {"prose": 1.0},
+                "length": {"short": 1.0},
+            },
+            "multilingual_gap": {
+                "teaching_goal": "multilingual gap",
+                "format": {"prose": 1.0},
+                "length": {"short": 1.0},
+            },
+        }
+        spec = expand_spec(compact)
+        assert spec["reason_categories"] == ["use_vs_mention", "multilingual_gap"]
+        assert [cell["reason"] for cell in spec["cells"]] == [
+            "use_vs_mention",
+            "multilingual_gap",
+        ]
+
+    def test_reason_categories_reject_extra_cells(self):
+        compact = _minimal_compact()
+        compact["reason_categories"] = ["instruction_override"]
+        compact["cells"] = {
+            "instruction_override": compact["cells"]["instruction_override"],
+            "meta_probe": compact["cells"]["meta_probe"],
+        }
+        with pytest.raises(SystemExit):
+            expand_spec(compact)
 
 
 # ---------------------------------------------------------------------------

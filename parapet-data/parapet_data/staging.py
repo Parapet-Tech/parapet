@@ -97,12 +97,12 @@ class DatasetConfig:
     index_section: str  # "datasets" or "benign"
     # Staging-specific (optional in INDEX, can be set in code for pilot)
     reason_column: str | None = None  # column with per-row attack type
-    reason_map: dict[str, str] | None = None  # map reason_column values → AttackReason
+    reason_map: dict[str, str] | None = None  # map reason_column values → mirror category
     staging_status: str = "ready"
     label_map: dict[str, str] | None = None
     # For benign: which mirror reason(s) this source routes to
     benign_reasons: list[str] | None = None
-    # For attacks: dataset-level reason routing when classifier can't label
+    # For attacks: dataset-level mirror-category routing when classifier can't label
     specialist_routing: list[str] | None = None
     language_mode: str = "strict"  # "strict" or "best_effort"
 
@@ -115,7 +115,7 @@ class StagedSample:
     label: str
     language: str
     source: str
-    reason: str | None  # AttackReason value or None for unrouted benign
+    reason: str | None  # mirror category or None for unrouted benign
     content_hash: str
 
 
@@ -598,6 +598,12 @@ def validate_script(text: str, language: Language) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _reason_value(reason: str | AttackReason) -> str:
+    if isinstance(reason, AttackReason):
+        return reason.value
+    return str(reason)
+
+
 def resolve_reason(
     text: str,
     label: str,
@@ -612,16 +618,30 @@ def resolve_reason(
     For benign: source-level routing via config.benign_reasons.
     Returns None if no reason can be assigned (sample goes to review queue).
     """
+    def _normalize_declared_reason(reason: str | AttackReason | None) -> str | None:
+        if reason is None:
+            return None
+        if isinstance(reason, AttackReason):
+            return reason.value
+        normalized = str(reason).strip()
+        return normalized or None
+
+    def _normalized_reason_list(reasons: Sequence[str] | None) -> list[str]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for reason in reasons or []:
+            resolved = _normalize_declared_reason(reason)
+            if resolved is None or resolved in seen:
+                continue
+            seen.add(resolved)
+            normalized.append(resolved)
+        return normalized
+
     if label == "benign":
         if config.benign_reasons:
             # Deterministic partition: hash content to pick a reason.
             # Stable across reruns — same content always maps to same reason.
-            reasons = []
-            for r in config.benign_reasons:
-                try:
-                    reasons.append(AttackReason(r))
-                except ValueError:
-                    continue
+            reasons = _normalized_reason_list(config.benign_reasons)
             if not reasons:
                 return None
             bucket = int(content_hash(text)[:8], 16) % len(reasons)
@@ -639,17 +659,13 @@ def resolve_reason(
         raw_class = row.get(config.reason_column)
         if raw_class is not None:
             mapped = config.reason_map.get(str(raw_class))
-            if mapped:
-                try:
-                    reason = AttackReason(mapped)
-                except ValueError:
-                    pass  # fall through to heuristic classifier
-                else:
-                    return ReasonClassification(
-                        reason=reason,
-                        confidence=1.0,
-                        signals=(f"reason_map:{raw_class}",),
-                    )
+            reason = _normalize_declared_reason(mapped)
+            if reason is not None:
+                return ReasonClassification(
+                    reason=reason,
+                    confidence=1.0,
+                    signals=(f"reason_map:{raw_class}",),
+                )
 
     # Fallback: heuristic classifier
     result = classify_reason(text)
@@ -658,12 +674,7 @@ def resolve_reason(
 
     # Last resort: dataset-level specialist_routing from INDEX.yaml
     if config.specialist_routing:
-        reasons = []
-        for r in config.specialist_routing:
-            try:
-                reasons.append(AttackReason(r))
-            except ValueError:
-                continue
+        reasons = _normalized_reason_list(config.specialist_routing)
         if reasons:
             bucket = int(content_hash(text)[:8], 16) % len(reasons)
             return ReasonClassification(
@@ -959,17 +970,17 @@ def stage_dataset(
                     if classification.confidence < CONFIDENCE_FLOOR:
                         _reject(
                             "low_confidence",
-                            f"{classification.reason.value}={classification.confidence:.2f}",
+                            f"{_reason_value(classification.reason)}={classification.confidence:.2f}",
                             text,
                         )
                         continue
-                    reason_value = classification.reason.value
+                    reason_value = _reason_value(classification.reason)
                 else:
                     # Benign: surface classifier or source routing; unmatched → background lane
                     if classification is None:
                         reason_value = None
                     else:
-                        reason_value = classification.reason.value
+                        reason_value = _reason_value(classification.reason)
 
                 sample = StagedSample(
                     content=text,
