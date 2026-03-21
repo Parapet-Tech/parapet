@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import sys
+import time
 
 import yaml
 
@@ -84,13 +85,16 @@ def sync_verified(
             flush=True,
         )
 
+        t0 = time.perf_counter()
         with open(staged_file, "r", encoding="utf-8") as f:
             raw = yaml.load(f, Loader=_YAML_LOADER)
+        t_load = time.perf_counter()
         if not raw:
             raw = []
 
         before = stats.total_input
         output = _sync_file(raw, ledger, stats)
+        t_sync = time.perf_counter()
         stats.files_processed += 1
         n_in = stats.total_input - before
         n_dropped = n_in - len(output)
@@ -98,13 +102,22 @@ def sync_verified(
         out_path = verified_dir / staged_file.name
         with open(out_path, "w", encoding="utf-8") as f:
             yaml.dump(output, f, Dumper=_YAML_DUMPER,
-                      allow_unicode=True, default_flow_style=False)
+                      allow_unicode=True, default_flow_style=False,
+                      sort_keys=False, width=2000)
+        t_dump = time.perf_counter()
 
         if n_dropped:
             print(
                 f"           -> {n_in} in, {len(output)} out ({n_dropped} removed)",
                 file=sys.stderr,
             )
+        print(
+            "           "
+            f"load={t_load - t0:.2f}s "
+            f"sync={t_sync - t_load:.2f}s "
+            f"dump={t_dump - t_sync:.2f}s",
+            file=sys.stderr,
+        )
 
     log.info(
         "Verified sync: %d files, %d input -> %d passed "

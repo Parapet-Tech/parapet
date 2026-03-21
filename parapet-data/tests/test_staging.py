@@ -145,9 +145,9 @@ def test_no_fallback_without_specialist_routing():
         assert "specialist_routing_fallback" not in result.signals
 
 
-def test_invalid_specialist_routing_values_ignored():
-    """Invalid AttackReason values in specialist_routing are silently skipped."""
-    config = _config(specialist_routing=["not_a_real_reason"])
+def test_blank_specialist_routing_values_ignored():
+    """Blank specialist_routing entries are ignored."""
+    config = _config(specialist_routing=["", "   "])
     text = "Some text that the classifier won't match"
     result = resolve_reason(text, "malicious", config)
     # Should return None (or classifier result), not crash
@@ -155,9 +155,19 @@ def test_invalid_specialist_routing_values_ignored():
         assert "specialist_routing_fallback" not in result.signals
 
 
-def test_mixed_valid_invalid_specialist_routing():
-    """Valid reasons work even when mixed with invalid ones."""
-    config = _config(specialist_routing=["bogus", "roleplay_jailbreak", "also_bogus"])
+def test_custom_specialist_routing_values_preserved():
+    """Custom mirror categories should survive specialist_routing fallback."""
+    config = _config(specialist_routing=["use_vs_mention", "semantic_paraphrase"])
+    text = "A narrative prompt with no legacy classifier match"
+    result = resolve_reason(text, "malicious", config)
+    assert result is not None
+    assert result.reason in {"use_vs_mention", "semantic_paraphrase"}
+    assert "specialist_routing_fallback" in result.signals
+
+
+def test_mixed_valid_blank_specialist_routing():
+    """Valid reasons work even when mixed with blank entries."""
+    config = _config(specialist_routing=["", "roleplay_jailbreak", "   "])
     text = "A creative scenario that has no keyword matches"
     result = resolve_reason(text, "malicious", config)
     assert result is not None
@@ -291,6 +301,16 @@ def test_benign_reasons_takes_priority_over_surface():
     result = resolve_reason(text, "benign", config)
     assert result is not None
     assert result.reason == AttackReason.META_PROBE
+    assert "source_level_routing" in result.signals
+
+
+def test_custom_benign_reasons_preserved():
+    """Source-level benign routing should allow non-legacy mirror categories."""
+    config = _benign_config(benign_reasons=["use_vs_mention"])
+    text = "Write a story about a detective solving a mystery in London"
+    result = resolve_reason(text, "benign", config)
+    assert result is not None
+    assert result.reason == "use_vs_mention"
     assert "source_level_routing" in result.signals
 
 
@@ -450,4 +470,43 @@ def test_stage_dataset_writes_partial_checkpoints(monkeypatch):
     attacks_path.unlink(missing_ok=True)
     benign_path.unlink(missing_ok=True)
     progress_path.unlink(missing_ok=True)
+
+
+def test_reason_map_preserves_custom_category_in_stage_dataset(monkeypatch):
+    base_dir = Path(__file__).parent
+    dataset_name = f"custom_reason_map_{uuid4().hex}"
+    data_file = base_dir / f"{dataset_name}.jsonl"
+    _write_jsonl(
+        data_file,
+        [
+            {"text": "neutral attack sample", "attack_type": "mention"},
+        ],
+    )
+    monkeypatch.setattr("parapet_data.staging.discover_files", lambda _d, _f: [data_file])
+
+    config = DatasetConfig(
+        name=dataset_name,
+        path=str(base_dir),
+        format="jsonl",
+        text_column="text",
+        label_column=None,
+        label_values=["all attacks"],
+        languages=["en"],
+        index_section="datasets",
+        reason_column="attack_type",
+        reason_map={"mention": "use_vs_mention"},
+    )
+
+    try:
+        result = stage_dataset(
+            config=config,
+            thewall_root=base_dir,
+            dedup=ContentDeduplicator(),
+            holdout_sets={},
+        )
+    finally:
+        data_file.unlink(missing_ok=True)
+
+    assert len(result.staged) == 1
+    assert result.staged[0].reason == "use_vs_mention"
 

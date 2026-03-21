@@ -1,7 +1,7 @@
 """
 Core types for mirror-based corpus curation.
 
-The organizing principle: every benign sample exists because a specific attack
+The organizing principle: every benign sample exists because a specific mirror
 category exists. The benign corpus mirrors the attack corpus along every
 dimension except the injection signal itself, forcing the classifier to learn
 actual discriminative features instead of spurious correlations.
@@ -17,7 +17,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import AliasChoices, BaseModel, Field, model_validator
 
 
 # ---------------------------------------------------------------------------
@@ -51,11 +51,7 @@ class LengthBin(str, Enum):
 
 
 class AttackReason(str, Enum):
-    """Why an attack exists — the signal the classifier must isolate.
-
-    Each reason maps to a benign mirror that shares the same surface
-    characteristics (vocabulary, format, length) but lacks the injection signal.
-    """
+    """Legacy/default prompt-injection mirror taxonomy."""
 
     INSTRUCTION_OVERRIDE = "instruction_override"
     ROLEPLAY_JAILBREAK = "roleplay_jailbreak"
@@ -106,6 +102,40 @@ class ApplicabilityScope(str, Enum):
     IN_DOMAIN = "in_domain"
     MIXED = "mixed"
     UNKNOWN = "unknown"
+
+
+DEFAULT_REASON_CATEGORIES: tuple[str, ...] = tuple(reason.value for reason in AttackReason)
+
+
+def _normalize_category_name(value: str | AttackReason, *, field_name: str) -> str:
+    category = str(value).strip()
+    if not category:
+        raise ValueError(f"{field_name} must not be empty")
+    return category
+
+
+def _normalize_category_list(
+    values: list[str | AttackReason],
+    *,
+    field_name: str,
+) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    duplicates: list[str] = []
+
+    for value in values:
+        category = _normalize_category_name(value, field_name=field_name)
+        if category in seen:
+            duplicates.append(category)
+            continue
+        seen.add(category)
+        normalized.append(category)
+
+    if duplicates:
+        duplicate_list = ", ".join(sorted(set(duplicates)))
+        raise ValueError(f"{field_name} contains duplicates: {duplicate_list}")
+
+    return normalized
 
 
 # ---------------------------------------------------------------------------
@@ -218,20 +248,25 @@ def _route_policy_violation(
 
 
 class MirrorCell(BaseModel):
-    """One attack reason and its benign twin.
+    """One mirror category and its benign twin.
 
     The cell defines WHAT the classifier should learn: the teaching_goal
     describes the spurious correlation that the mirror neutralizes. Both
     sides must be populated — a mirror with only one side is not a mirror.
     """
 
-    reason: AttackReason
+    reason: str
     attack_sources: list[SourceRef]
     benign_sources: list[SourceRef]
     teaching_goal: str
     languages: list[Language]
     format_distribution: dict[FormatBin, float]
     length_distribution: dict[LengthBin, float]
+
+    @model_validator(mode="after")
+    def reason_non_empty(self) -> MirrorCell:
+        self.reason = _normalize_category_name(self.reason, field_name="reason")
+        return self
 
     @model_validator(mode="after")
     def both_sides_populated(self) -> MirrorCell:
@@ -268,7 +303,7 @@ class MirrorCell(BaseModel):
     def cell_id(self) -> str:
         """Stable cell identifier including reason and language set."""
         langs = ",".join(sorted({lang.value for lang in self.languages}))
-        return f"{self.reason.value}__{langs}"
+        return f"{self.reason}__{langs}"
 
 
 # ---------------------------------------------------------------------------
@@ -383,17 +418,80 @@ class MirrorSpec(BaseModel):
         default=False,
         exclude_if=lambda v: v is False,
     )
-    holdout_only_reasons: list[AttackReason] = Field(default_factory=list)
+    reason_categories: list[str] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("reason_categories", "entity_categories"),
+        exclude_if=lambda v: not v,
+    )
+    holdout_only_reasons: list[str] = Field(default_factory=list)
+
+    @property
+    def mirror_reason_categories(self) -> list[str]:
+        explicit = _normalize_category_list(
+            self.reason_categories,
+            field_name="reason_categories",
+        )
+        if explicit:
+            return explicit
+
+        cell_reasons = _normalize_category_list(
+            [cell.reason for cell in self.cells],
+            field_name="cells.reason",
+        )
+        if any(reason not in DEFAULT_REASON_CATEGORIES for reason in cell_reasons):
+            return cell_reasons
+        return list(DEFAULT_REASON_CATEGORIES)
 
     @model_validator(mode="after")
-    def all_reasons_covered(self) -> MirrorSpec:
+    def reason_categories_consistent(self) -> MirrorSpec:
+        self.holdout_only_reasons = _normalize_category_list(
+            self.holdout_only_reasons,
+            field_name="holdout_only_reasons",
+        )
+        if self.reason_categories:
+            self.reason_categories = _normalize_category_list(
+                self.reason_categories,
+                field_name="reason_categories",
+            )
+
+        seen: set[str] = set()
+        duplicates: list[str] = []
+        for cell in self.cells:
+            if cell.reason in seen:
+                duplicates.append(cell.reason)
+                continue
+            seen.add(cell.reason)
+        if duplicates:
+            duplicate_list = ", ".join(sorted(set(duplicates)))
+            raise ValueError(f"cells contain duplicate reasons: {duplicate_list}")
+
+        declared_categories = self.mirror_reason_categories
+        declared_set = set(declared_categories)
+        covered = {cell.reason for cell in self.cells}
+
+        unexpected = covered - declared_set
+        if unexpected:
+            unexpected_list = ", ".join(sorted(unexpected))
+            raise ValueError(
+                f"cells declare reasons outside reason_categories: {unexpected_list}"
+            )
+
+        undeclared_holdout = set(self.holdout_only_reasons) - declared_set
+        if undeclared_holdout:
+            undeclared_list = ", ".join(sorted(undeclared_holdout))
+            raise ValueError(
+                "holdout_only_reasons reference undeclared categories: "
+                f"{undeclared_list}"
+            )
+
         if self.allow_partial_mirror:
             return self
-        covered = {c.reason for c in self.cells}
-        missing = set(AttackReason) - covered
+
+        missing = declared_set - covered
         if missing:
+            missing_list = ", ".join(sorted(missing))
             raise ValueError(
-                f"Mirror incomplete — uncovered attack reasons: {missing}"
+                f"Mirror incomplete — uncovered categories: {missing_list}"
             )
         return self
 
@@ -419,7 +517,7 @@ class MirrorSpec(BaseModel):
         violations: list[str] = []
 
         for cell in self.cells:
-            reason = cell.reason.value
+            reason = cell.reason
             for source in cell.attack_sources:
                 context = f"{reason}: attack source"
                 violation = _route_policy_violation(
