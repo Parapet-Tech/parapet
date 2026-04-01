@@ -21,7 +21,8 @@ use std::io::Read as _;
 
 use crate::config::{Config, FailureMode, L2aMode, PatternAction};
 use crate::constraint::{ConstraintEvaluator, DslConstraintEvaluator, ToolCallVerdict};
-use crate::layers::l1::{DefaultL1Scanner, EnsembleL1Scanner, L1Scanner, L1Verdict};
+use crate::layers::l1::{EnsembleL1Scanner, L1Scanner, L1Verdict, L1Block, SvmModel};
+use crate::layers::l1_harness::{L1Harness, L1Model, L1Signal, MENTION_RAW_DELTA_THRESHOLD};
 use crate::layers::l2a::L2aScanner;
 use crate::layers::l3_inbound::{DefaultInboundScanner, InboundScanner, InboundVerdict};
 use crate::config::L4Mode;
@@ -192,6 +193,7 @@ pub struct EngineDeps {
     pub normalizer: Arc<dyn Normalizer>,
     pub trust_assigner: Arc<dyn TrustAssigner>,
     pub l1_scanner: Option<Arc<dyn L1Scanner>>,
+    pub l1_model: Option<Arc<dyn L1Model>>,
     pub l2a_scanner: Option<Arc<dyn L2aScanner>>,
     pub l2a_semaphore: Option<Arc<tokio::sync::Semaphore>>,
     pub inbound_scanner: Arc<dyn InboundScanner>,
@@ -201,6 +203,10 @@ pub struct EngineDeps {
     pub multi_turn_scanner: Option<Arc<dyn MultiTurnScanner>>,
     pub signal_extractor: Arc<dyn SignalExtractor>,
     pub verdict_combiner: Arc<dyn VerdictCombiner>,
+    /// Emit `x-parapet-l1-signals` JSON header on responses. Eval-only —
+    /// production must leave this false to avoid leaking internals and
+    /// hitting proxy header-size limits.
+    pub emit_l1_signals: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -288,13 +294,119 @@ impl UpstreamClient for EngineUpstreamClient {
 
         // Hoisted layer results for the verdict processor.
         let mut l1_result_opt: Option<crate::layers::l1::L1Result> = None;
+        let mut l1_signals_opt: Option<Vec<L1Signal>> = None;
         let mut inbound_result_opt: Option<crate::layers::l3_inbound::InboundResult> = None;
         let mut l4_result_opt: Option<crate::layers::l4::L4Result> = None;
 
         let on_failure = &self.deps.config.runtime.engine.on_failure;
 
         // 3.5) L1 lightweight classifier (if enabled)
-        if let (Some(scanner), Some(l1_config)) = (&self.deps.l1_scanner, &self.deps.config.policy.layers.l1) {
+        //
+        // Two paths: harness (l1_model) or legacy scanner (l1_scanner).
+        // Harness path produces Vec<L1Signal> for the signal extractor and
+        // derives L1Verdict for backward-compatible blocking/logging.
+        // Legacy path produces L1Result directly (ensemble scanners).
+        if let (Some(model), Some(l1_config)) = (&self.deps.l1_model, &self.deps.config.policy.layers.l1) {
+            let l1_start = Instant::now();
+            let l1_scan = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                L1Harness::scan(&messages, model.as_ref())
+            }));
+            let l1_ms = l1_start.elapsed().as_secs_f64() * 1000.0;
+
+            match l1_scan {
+                Ok(signals) => {
+                    // Derive verdict from harness signals.
+                    //
+                    // Mention dampening: if attack signal is concentrated in
+                    // quoted regions, compare raw_unquoted_score against
+                    // threshold instead of raw_score.
+                    //
+                    // Squash score is emitted to the signal bus for downstream
+                    // consumers but does NOT participate in the verdict. At
+                    // threshold=0.0 the squash transform generates too many
+                    // false positives on benign text (665 extra FPs for 45 TPs
+                    // on the holdout set).
+                    let verdict = signals.iter()
+                        .find_map(|s| {
+                            let eff = effective_raw(s);
+                            if eff >= l1_config.threshold {
+                                let mention = s.quote_detected
+                                    && s.raw_score_delta > MENTION_RAW_DELTA_THRESHOLD;
+                                let score_label = if mention { "unquoted_score" } else { "score" };
+                                Some(L1Verdict::Block(L1Block {
+                                    reason: format!(
+                                        "L1 {} {:.3} >= threshold {:.3}",
+                                        score_label, eff, l1_config.threshold
+                                    ),
+                                    message_index: s.message_index,
+                                    role: s.role.clone(),
+                                    score: eff,
+                                }))
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(L1Verdict::Allow);
+
+                    match &verdict {
+                        L1Verdict::Block(block) if l1_config.mode == crate::config::L1Mode::Block => {
+                            tracing::info!(
+                                request_id = %ctx.request_id,
+                                contract_hash = %ctx.contract_hash,
+                                provider = ctx.provider_str,
+                                model = %ctx.model,
+                                layer = "L1",
+                                verdict = "block",
+                                role = ?block.role,
+                                message_index = block.message_index,
+                                score = block.score,
+                                reason = %block.reason,
+                                latency_ms = l1_ms,
+                                "L1 classifier blocked"
+                            );
+                            let body = adapter.serialize_error("request blocked by content policy", 403);
+                            pending_block = Some(ProxyResponse::blocked(body, "L1"));
+                        }
+                        L1Verdict::Block(block) => {
+                            tracing::info!(
+                                request_id = %ctx.request_id,
+                                contract_hash = %ctx.contract_hash,
+                                provider = ctx.provider_str,
+                                model = %ctx.model,
+                                layer = "L1",
+                                verdict = "shadow_block",
+                                role = ?block.role,
+                                message_index = block.message_index,
+                                score = block.score,
+                                reason = %block.reason,
+                                latency_ms = l1_ms,
+                                "L1 classifier detected (shadow)"
+                            );
+                        }
+                        L1Verdict::Allow => {
+                            tracing::debug!(
+                                request_id = %ctx.request_id,
+                                contract_hash = %ctx.contract_hash,
+                                provider = ctx.provider_str,
+                                model = %ctx.model,
+                                layer = "L1",
+                                verdict = "allow",
+                                latency_ms = l1_ms,
+                                "L1 classifier passed"
+                            );
+                        }
+                    }
+
+                    l1_signals_opt = Some(signals);
+                }
+                Err(_) => {
+                    if let Some(resp) = handle_layer_error(on_failure, adapter.as_ref(), "L1", "scanner_panic", "scanner panicked", &ctx.request_id) {
+                        return Ok(resp);
+                    }
+                }
+            }
+        } else if let (Some(scanner), Some(l1_config)) = (&self.deps.l1_scanner, &self.deps.config.policy.layers.l1) {
+            // Legacy scanner path (ensemble specialists).
             let l1_start = Instant::now();
             let l1_scan = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 scanner.scan(&messages, l1_config)
@@ -309,7 +421,6 @@ impl UpstreamClient for EngineUpstreamClient {
                     if let Some(resp) = handle_layer_error(on_failure, adapter.as_ref(), "L1", "scanner_panic", "scanner panicked", &ctx.request_id) {
                         return Ok(resp);
                     }
-                    // on_failure: open — skip L1, continue pipeline
                 }
             }
 
@@ -334,7 +445,6 @@ impl UpstreamClient for EngineUpstreamClient {
                         pending_block = Some(ProxyResponse::blocked(body, "L1"));
                     }
                     L1Verdict::Block(block) => {
-                        // Shadow mode: log but don't block
                         tracing::info!(
                             request_id = %ctx.request_id,
                             contract_hash = %ctx.contract_hash,
@@ -656,7 +766,9 @@ impl UpstreamClient for EngineUpstreamClient {
         // Verdict processor (shadow — log only, no behavioral change).
         {
             let mut signals = Vec::new();
-            if let Some(ref l1r) = l1_result_opt {
+            if let Some(ref l1s) = l1_signals_opt {
+                signals.extend(self.deps.signal_extractor.extract_l1_signals(l1s));
+            } else if let Some(ref l1r) = l1_result_opt {
                 signals.extend(self.deps.signal_extractor.extract_l1(l1r));
             }
             signals.extend(l2a_signals);
@@ -683,6 +795,9 @@ impl UpstreamClient for EngineUpstreamClient {
         // All layers have run and logged their signals — the first blocker wins.
         if let Some(mut resp) = pending_block {
             attach_evidence_headers(&mut resp.headers, evidence_count, &evidence_categories);
+            if self.deps.emit_l1_signals {
+                attach_l1_signal_headers(&mut resp.headers, &l1_signals_opt);
+            }
             attach_l2a_score_headers(&mut resp.headers, l2a_has_scores, l2a_max_fused, l2a_max_raw);
             return Ok(resp);
         }
@@ -725,6 +840,9 @@ impl UpstreamClient for EngineUpstreamClient {
         if stream {
             let mut resp = self.handle_streaming_response(provider, upstream, &ctx);
             attach_evidence_headers(&mut resp.headers, evidence_count, &evidence_categories);
+            if self.deps.emit_l1_signals {
+                attach_l1_signal_headers(&mut resp.headers, &l1_signals_opt);
+            }
             attach_l2a_score_headers(&mut resp.headers, l2a_has_scores, l2a_max_fused, l2a_max_raw);
             return Ok(resp);
         }
@@ -764,6 +882,9 @@ impl UpstreamClient for EngineUpstreamClient {
         resp_headers.remove(reqwest::header::TRANSFER_ENCODING);
 
         attach_evidence_headers(&mut resp_headers, evidence_count, &evidence_categories);
+        if self.deps.emit_l1_signals {
+            attach_l1_signal_headers(&mut resp_headers, &l1_signals_opt);
+        }
         attach_l2a_score_headers(&mut resp_headers, l2a_has_scores, l2a_max_fused, l2a_max_raw);
         if let Some(extra) = processed.extra_headers {
             for (key, value) in extra.iter() {
@@ -1315,19 +1436,20 @@ impl HttpSender for ReqwestHttpSender {
 pub fn build_engine_client(config: Arc<Config>) -> Result<EngineUpstreamClient, StartupError> {
     let session_store: Option<Arc<dyn crate::session::SessionStore>> = None; // Sprint 2
 
-    let l1_scanner: Option<Arc<dyn L1Scanner>> =
+    // L1: harness path for generalist, legacy scanner for ensemble.
+    let (l1_model, l1_scanner): (Option<Arc<dyn L1Model>>, Option<Arc<dyn L1Scanner>>) =
         if let Some(l1_config) = &config.policy.layers.l1 {
             if l1_config.specialists.is_empty() {
-                Some(Arc::new(DefaultL1Scanner::new()))
+                (Some(Arc::new(SvmModel)), None)
             } else {
-                Some(Arc::new(EnsembleL1Scanner::new(
+                (None, Some(Arc::new(EnsembleL1Scanner::new(
                     &l1_config.specialists,
                     l1_config.min_agree,
                     l1_config.generalist_solo_threshold,
-                )))
+                ))))
             }
         } else {
-            None
+            (None, None)
         };
 
     let multi_turn_scanner: Option<Arc<dyn MultiTurnScanner>> =
@@ -1381,6 +1503,7 @@ pub fn build_engine_client(config: Arc<Config>) -> Result<EngineUpstreamClient, 
         normalizer: Arc::new(L0Normalizer::new()),
         trust_assigner: Arc::new(RoleTrustAssigner),
         l1_scanner,
+        l1_model,
         l2a_scanner,
         l2a_semaphore,
         inbound_scanner: Arc::new(DefaultInboundScanner::new()),
@@ -1390,6 +1513,7 @@ pub fn build_engine_client(config: Arc<Config>) -> Result<EngineUpstreamClient, 
         multi_turn_scanner,
         signal_extractor: Arc::new(DefaultSignalExtractor::new()),
         verdict_combiner: Arc::new(DefaultVerdictCombiner::new()),
+        emit_l1_signals: false,
     };
 
     Ok(EngineUpstreamClient::new_with(deps))
@@ -1482,6 +1606,29 @@ fn attach_evidence_headers(headers: &mut HeaderMap, evidence_count: usize, evide
 
 /// Attach L2a score headers for offline threshold sweeps.
 ///
+/// Attach L1 harness signals for eval observability.
+/// Serializes the full per-message signal set so offline sweeps can
+/// replay both block-threshold and delta-threshold logic exactly.
+fn attach_l1_signal_headers(headers: &mut HeaderMap, signals: &Option<Vec<L1Signal>>) {
+    let signals = match signals {
+        Some(s) if !s.is_empty() => s,
+        _ => return,
+    };
+    if let Ok(json) = serde_json::to_string(signals) {
+        if let Ok(v) = json.parse() {
+            headers.insert("x-parapet-l1-signals", v);
+        }
+    }
+}
+
+/// Compute the effective raw score for an L1Signal, matching verdict derivation logic.
+/// Mention-dampened signals use raw_unquoted_score; all others use raw_score.
+fn effective_raw(s: &L1Signal) -> f64 {
+    let mention = s.quote_detected
+        && s.raw_score_delta > MENTION_RAW_DELTA_THRESHOLD;
+    if mention { s.raw_unquoted_score } else { s.raw_score }
+}
+
 /// Emits both the fused score (what the threshold applies to) and the raw
 /// model score (pre-fusion PG2 softmax) so sweeps can target either.
 fn attach_l2a_score_headers(headers: &mut HeaderMap, has_scores: bool, max_fused: f32, max_raw: f32) {

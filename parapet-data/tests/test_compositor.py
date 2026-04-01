@@ -21,6 +21,7 @@ from parapet_data.models import (
     AttackReason,
     ApplicabilityScope,
     BackgroundLane,
+    DiscussionBenignLane,
     CellFillRecord,
     FormatBin,
     Language,
@@ -342,6 +343,36 @@ class TestCompose:
         bg_meta = manifest.source_metadata["bg_source"]
         assert bg_meta.path == bg_path
         assert bg_meta.route_policy == SourceRoutePolicy.BACKGROUND
+
+    def test_manifest_emits_source_metadata_including_discussion_benign(
+        self, tmp_dir: Path
+    ) -> None:
+        spec = self._make_spec_with_files(tmp_dir)
+        discussion_path = tmp_dir / "sources" / "discussion.yaml"
+        _write_yaml(
+            discussion_path,
+            [{"content": "security writeup quoting ignore previous instructions"}],
+        )
+        spec.discussion_benign = DiscussionBenignLane(
+            budget_fraction=0.05,
+            sources=[
+                SourceRef(
+                    name="discussion_source",
+                    path=discussion_path,
+                    language=Language.EN,
+                    extractor="col_content",
+                    route_policy=SourceRoutePolicy.DISCUSSION_BENIGN,
+                )
+            ],
+        )
+        result = sample_spec(spec, base_dir=tmp_dir)
+        output_dir = tmp_dir / "output"
+        manifest = compose(spec, result, output_dir, base_dir=tmp_dir)
+
+        assert "discussion_source" in manifest.source_metadata
+        discussion_meta = manifest.source_metadata["discussion_source"]
+        assert discussion_meta.path == discussion_path
+        assert discussion_meta.route_policy == SourceRoutePolicy.DISCUSSION_BENIGN
 
     def test_manifest_carries_ledger_counters(self, tmp_dir: Path) -> None:
         spec = self._make_spec_with_files(tmp_dir)

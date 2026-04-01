@@ -165,6 +165,8 @@ def build_scorecard(manifest: dict, total_target: int, budget_fraction: float):
     # Background info
     background_actual = manifest.get("background_actual", 0)
     total_actual += background_actual
+    discussion_actual = manifest.get("discussion_actual", 0)
+    total_actual += discussion_actual
 
     return {
         "rows": rows,
@@ -181,6 +183,7 @@ def build_scorecard(manifest: dict, total_target: int, budget_fraction: float):
         "total_target": total_target,
         "budget_fraction": budget_fraction,
         "background_actual": background_actual,
+        "discussion_actual": discussion_actual,
     }
 
 

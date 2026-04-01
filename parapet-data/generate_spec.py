@@ -106,6 +106,14 @@ def build_supplement(compact_supplement: dict) -> dict:
     }
 
 
+def build_benign_lane(compact_lane: dict) -> dict:
+    """Expand a benign-only lane into the full YAML shape."""
+    return {
+        "budget_fraction": compact_lane["budget_fraction"],
+        "sources": build_source_refs(compact_lane["sources"]),
+    }
+
+
 def build_cell(reason: str, compact: dict) -> dict:
     """Expand a single cell from compact spec into full MirrorCell dict."""
     cell_cfg = compact["cells"][reason]
@@ -235,14 +243,15 @@ def expand_spec(compact: dict, overrides: dict | None = None) -> dict:
         spec["holdout_only_reasons"] = copy.deepcopy(compact["holdout_only_reasons"])
     if compact.get("enforce_source_contracts"):
         spec["enforce_source_contracts"] = True
+    if compact.get("allow_heuristic_mirror_attacks"):
+        spec["allow_heuristic_mirror_attacks"] = True
 
     # Background lane
     if "background" in compact:
-        bg = compact["background"]
-        spec["background"] = {
-            "budget_fraction": bg["budget_fraction"],
-            "sources": build_source_refs(bg["sources"]),
-        }
+        spec["background"] = build_benign_lane(compact["background"])
+
+    if "discussion_benign" in compact:
+        spec["discussion_benign"] = build_benign_lane(compact["discussion_benign"])
 
     if "supplements" in compact:
         spec["supplements"] = [build_supplement(supp) for supp in compact["supplements"]]

@@ -80,3 +80,4 @@ parapet-runner/tests/.tmp_outputs/
 
 # Editor backup files
 *.py.current
+/runs/

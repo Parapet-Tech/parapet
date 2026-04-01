@@ -13,6 +13,7 @@ from parapet_data.models import (
     AttackReason,
     BackfillPolicy,
     BackgroundLane,
+    DiscussionBenignLane,
     CellFillRecord,
     FormatBin,
     Language,
@@ -412,9 +413,29 @@ class TestMirrorSpec:
         )
         assert spec.language_quota is not None
 
+    def test_rejects_benign_side_lane_budget_exhaustion(self) -> None:
+        with pytest.raises(ValueError, match="background \\+ discussion_benign"):
+            MirrorSpec(
+                name="lane_overflow",
+                version="0.1.0",
+                cells=_full_cells(),
+                background=BackgroundLane(
+                    budget_fraction=0.50,
+                    sources=[_source("bg")],
+                ),
+                discussion_benign=DiscussionBenignLane(
+                    budget_fraction=0.50,
+                    sources=[_source("discussion")],
+                ),
+            )
+
     def test_strict_contract_flag_omitted_when_unset(self) -> None:
         dumped = MirrorSpec(name="default", version="0.1.0", cells=_full_cells()).model_dump()
         assert "enforce_source_contracts" not in dumped
+
+    def test_heuristic_mirror_flag_omitted_when_unset(self) -> None:
+        dumped = MirrorSpec(name="default", version="0.1.0", cells=_full_cells()).model_dump()
+        assert "allow_heuristic_mirror_attacks" not in dumped
 
     def test_strict_source_contracts_accept_clean_lane_routing(self) -> None:
         supplement = Supplement(
@@ -452,12 +473,25 @@ class TestMirrorSpec:
                 )
             ],
         )
+        discussion_benign = DiscussionBenignLane(
+            budget_fraction=0.05,
+            sources=[
+                SourceRef(
+                    name="discussion",
+                    path=DUMMY_PATH,
+                    language=Language.EN,
+                    extractor="passthrough",
+                    route_policy=SourceRoutePolicy.DISCUSSION_BENIGN,
+                )
+            ],
+        )
         spec = MirrorSpec(
             name="strict_ok",
             version="0.1.0",
             cells=_strict_full_cells(),
             supplements=[supplement],
             background=background,
+            discussion_benign=discussion_benign,
             enforce_source_contracts=True,
         )
         assert spec.enforce_source_contracts is True
@@ -524,6 +558,37 @@ class TestMirrorSpec:
                 cells=dirty_cells,
                 enforce_source_contracts=True,
             )
+
+    def test_strict_source_contracts_allow_heuristic_mirror_attack_with_opt_in(self) -> None:
+        dirty_cells = _strict_full_cells()
+        dirty_cells[0] = MirrorCell(
+            reason=dirty_cells[0].reason,
+            attack_sources=[
+                SourceRef(
+                    name="heuristic_atk",
+                    path=DUMMY_PATH,
+                    language=Language.EN,
+                    extractor="passthrough",
+                    grounding_mode=SourceGroundingMode.REASON_GROUNDED,
+                    route_policy=SourceRoutePolicy.MIRROR,
+                    reason_provenance=ReasonProvenance.HEURISTIC,
+                    applicability_scope=ApplicabilityScope.IN_DOMAIN,
+                )
+            ],
+            benign_sources=[_mirror_benign_source()],
+            teaching_goal=dirty_cells[0].teaching_goal,
+            languages=dirty_cells[0].languages,
+            format_distribution=dirty_cells[0].format_distribution,
+            length_distribution=dirty_cells[0].length_distribution,
+        )
+        spec = MirrorSpec(
+            name="strict_heuristic_ok",
+            version="0.1.0",
+            cells=dirty_cells,
+            enforce_source_contracts=True,
+            allow_heuristic_mirror_attacks=True,
+        )
+        assert spec.allow_heuristic_mirror_attacks is True
 
     def test_strict_source_contracts_reject_mixed_scope_mirror_attack(self) -> None:
         dirty_cells = _strict_full_cells()
@@ -597,6 +662,27 @@ class TestMirrorSpec:
                             language=Language.EN,
                             extractor="passthrough",
                             route_policy=SourceRoutePolicy.MIRROR,
+                        )
+                    ],
+                ),
+                enforce_source_contracts=True,
+            )
+
+    def test_strict_source_contracts_reject_non_discussion_discussion_source(self) -> None:
+        with pytest.raises(ValueError, match="route_policy=discussion_benign"):
+            MirrorSpec(
+                name="strict_bad_discussion",
+                version="0.1.0",
+                cells=_strict_full_cells(),
+                discussion_benign=DiscussionBenignLane(
+                    budget_fraction=0.05,
+                    sources=[
+                        SourceRef(
+                            name="wrong_discussion_lane",
+                            path=DUMMY_PATH,
+                            language=Language.EN,
+                            extractor="passthrough",
+                            route_policy=SourceRoutePolicy.BACKGROUND,
                         )
                     ],
                 ),

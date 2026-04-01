@@ -1,0 +1,414 @@
+# v6 compact mirror spec — harness-era sensor freeze seed.
+#
+# Derived from v5 with three changes per model.md:
+#   1. total_target raised to 25K (seed for autotrain search, not a law)
+#   2. language_quota shifted toward multilingual: {EN:0.60, RU:0.15, ZH:0.13, AR:0.12}
+#   3. discussion_benign added as an explicit experimental source family
+#
+# Usage:
+#   python generate_spec.py mirror_v6.compact.yaml -o mirror_spec_v6_25k.yaml
+#   python generate_spec.py mirror_v6.compact.yaml -o mirror_spec_v6_10k.yaml --total-target 10000
+#
+# Design rules (inherited from v5):
+#   - enforce_source_contracts is ON: every source declares its contract
+#   - cell attack_sources must be reason_grounded with mirror route_policy
+#   - pooled attack sources are admitted into mirror via heuristic per-cell
+#     routing (`reason_provenance: heuristic`)
+#   - supplement_ratio=0.0: no residual supplement budget reserved in v6
+#
+# What changed from v5:
+#   - EN quota drops from 0.75 to 0.60 (absolute EN count still rises with
+#     total_target: 25K * 0.60 = 15K vs 5K * 0.75 = 3.75K)
+#   - RU/ZH/AR quotas increase to improve multilingual n-gram retention
+#   - discussion_benign section added for harness-era FP measurement
+#   - total_target raised from 5K to 25K to give autotrain search room
+#
+# Known gaps carried from v5:
+#   - RU constraint_bypass is the accepted miss (no reason-grounded source)
+#   - discussion_benign data not yet staged — see TODO below
+
+name: mirror_v6
+version: "6.0.0"
+seed: 42
+ratio: 1.0
+total_target: 25000
+allow_partial_mirror: false
+enforce_source_contracts: true
+allow_heuristic_mirror_attacks: true
+supplement_ratio: 0.0
+
+backfill:
+  strategy: ngram_safe
+  log_gaps: true
+
+language_quota:
+  mode: best_effort
+  profile: {EN: 0.60, RU: 0.15, ZH: 0.13, AR: 0.12}
+
+background:
+  budget_fraction: 0.15
+  sources:
+    - {name: en_background_trivia_qa, path: schema/eval/staging/en_trivia-qa_benign_background_staged.yaml, language: EN, route_policy: background}
+    - {name: en_background_wildchat, path: schema/eval/staging/en_WildChat-1M_benign_background_staged.yaml, language: EN, route_policy: background}
+    - {name: en_background_writingprompts, path: schema/eval/staging/en_writingprompts_benign_background_staged.yaml, language: EN, route_policy: background}
+    - {name: ar_background_arabguard, path: schema/eval/staging/ar_ArabGuard-Egyptian-V1_benign_background_staged.yaml, language: AR, route_policy: background}
+
+# ---------------------------------------------------------------------------
+# Discussion-benign — benign content with attack-adjacent lexical patterns.
+#
+# Purpose: security blog posts, CTF writeups, PI research discussion, red-team
+# post-mortems, and chat messages that quote or discuss attack techniques
+# without executing them. Training on this family is a lexical-coverage fix
+# so discussed attacks land in the ambiguous band (harness-routable), not the
+# high-confidence attack zone.
+#
+# Measurement: explicit FPR on a held-out discussion_benign eval slice,
+# reported separately from general benign FPR.
+#
+# TODO: Source and stage real discussion_benign data. Candidates:
+#   - Security StackExchange / InfoSec blog posts discussing injection
+#   - CTF challenge writeups (PI-themed)
+#   - Academic papers on prompt injection (abstracts + excerpts)
+#   - Red-team post-mortems that quote attack payloads in context
+#   - wildjailbreak benign is a partial proxy (attack-structured framing,
+#     benign intent) but not the real thing — it tests jailbreak-adjacent
+#     creative writing, not security discussion.
+#
+# Until real sources are staged, wildjailbreak benign serves as the
+# placeholder for structural validation of the discussion_benign lane.
+# ---------------------------------------------------------------------------
+
+discussion_benign:
+  budget_fraction: 0.05
+  sources:
+    # Placeholder: wildjailbreak benign has attack-adjacent lexical patterns
+    # but is creative writing, not security discussion. Replace with real
+    # discussion_benign sources when staged.
+    - {name: en_discussion_wildjailbreak_proxy, path: schema/eval/staging/en_wildjailbreak_benign_staged.yaml, language: EN, route_policy: discussion_benign}
+
+# ---------------------------------------------------------------------------
+# No base attack sources — pooled sources go to supplements.
+# Only reason-grounded sources belong in cells (via extra_attack_sources
+# and staged_attacks).
+# ---------------------------------------------------------------------------
+
+base_attack_sources:
+  - name: en_attacks_merged
+    path: schema/eval/malicious/attacks_121624.yaml
+    language: EN
+    max_samples: 20000
+    label_filter: {column: label, allowed: [malicious]}
+    route_policy: mirror
+    grounding_mode: reason_grounded
+    reason_provenance: heuristic
+    applicability_scope: in_domain
+  - {name: zh_attacks_corpus, path: schema/eval/training/multilingual/attacks_121624_zh.yaml, language: ZH, route_policy: mirror, grounding_mode: reason_grounded, reason_provenance: heuristic, applicability_scope: in_domain}
+  - {name: zh_attacks_novel, path: schema/eval/training/multilingual/zh_attacks.yaml, language: ZH, route_policy: mirror, grounding_mode: reason_grounded, reason_provenance: heuristic, applicability_scope: in_domain}
+  - {name: ar_attacks_corpus, path: schema/eval/training/multilingual/attacks_121624_ar.yaml, language: AR, route_policy: mirror, grounding_mode: reason_grounded, reason_provenance: heuristic, applicability_scope: in_domain}
+  - {name: ar_attacks_novel, path: schema/eval/training/multilingual/ar_attacks.yaml, language: AR, route_policy: mirror, grounding_mode: reason_grounded, reason_provenance: heuristic, applicability_scope: in_domain}
+  - {name: ru_attacks_corpus, path: schema/eval/training/multilingual/attacks_121624_ru.yaml, language: RU, route_policy: mirror, grounding_mode: reason_grounded, reason_provenance: heuristic, applicability_scope: in_domain}
+  - {name: ru_attacks_novel, path: schema/eval/training/multilingual/ru_attacks.yaml, language: RU, route_policy: mirror, grounding_mode: reason_grounded, reason_provenance: heuristic, applicability_scope: in_domain}
+
+base_benign_sources:
+  - {name: en_benign_curated, path: schema/eval/training/global_benign_curated.yaml, language: EN, max_samples: 20000, route_policy: mirror}
+  - {name: zh_benign_wikipedia, path: schema/eval/benign/opensource_wikipedia_zh_benign.yaml, language: ZH, route_policy: mirror}
+  - {name: zh_benign_xquad, path: schema/eval/benign/opensource_xquad_zh_benign.yaml, language: ZH, route_policy: mirror}
+  - {name: ar_benign_wikipedia, path: schema/eval/benign/opensource_wikipedia_ar_benign.yaml, language: AR, route_policy: mirror}
+  - {name: ar_benign_xquad, path: schema/eval/benign/opensource_xquad_ar_benign.yaml, language: AR, route_policy: mirror}
+  - {name: ru_benign_wikipedia, path: schema/eval/benign/opensource_wikipedia_ru_benign.yaml, language: RU, route_policy: mirror}
+  - {name: ru_benign_xquad, path: schema/eval/benign/opensource_xquad_ru_benign.yaml, language: RU, route_policy: mirror}
+
+# ---------------------------------------------------------------------------
+# Staged attack sources — reason-grounded, expand into matching cells
+# ---------------------------------------------------------------------------
+
+staged_attacks:
+  ru_russian_prompt_injections:
+    path: schema/eval/staging/ru_russian_prompt_injections_attacks_staged.yaml
+    language: RU
+    max_samples: 20000
+    reasons: [instruction_override, roleplay_jailbreak, adversarial_suffix, obfuscation]
+    grounding_mode: reason_grounded
+    route_policy: mirror
+    reason_provenance: source_label
+    applicability_scope: in_domain
+  ar_arabguard:
+    path: schema/eval/staging/ar_ArabGuard-Egyptian-V1_attacks_staged.yaml
+    language: AR
+    reasons: [instruction_override, roleplay_jailbreak, exfiltration, indirect_injection, obfuscation, constraint_bypass]
+    grounding_mode: reason_grounded
+    route_policy: mirror
+    reason_provenance: source_label
+    applicability_scope: in_domain
+  ar_swarm_reviewed:
+    path: schema/eval/staging/ar_swarm_reviewed_attacks_staged.yaml
+    language: AR
+    reasons: [meta_probe]
+    grounding_mode: reason_grounded
+    route_policy: mirror
+    reason_provenance: source_label
+    applicability_scope: in_domain
+  zh_swarm_reviewed:
+    path: schema/eval/staging/zh_swarm_reviewed_attacks_staged.yaml
+    language: ZH
+    reasons: [instruction_override, indirect_injection, obfuscation]
+    grounding_mode: reason_grounded
+    route_policy: mirror
+    reason_provenance: source_label
+    applicability_scope: in_domain
+
+# ---------------------------------------------------------------------------
+# Staged EN benign — reason-filtered from multi-reason staged datasets
+# ---------------------------------------------------------------------------
+
+staged_benign_en:
+  reasons: [roleplay_jailbreak, meta_probe, exfiltration, adversarial_suffix, indirect_injection, obfuscation, constraint_bypass]
+  datasets:
+    dolly:
+      path: schema/eval/staging/en_databricks-dolly-15k_benign_staged.yaml
+      route_policy: mirror
+    codealpaca:
+      path: schema/eval/staging/en_evol-codealpaca-v1_benign_staged.yaml
+      route_policy: mirror
+    writingprompts:
+      path: schema/eval/staging/en_writingprompts_benign_staged.yaml
+      route_policy: mirror
+    wildchat:
+      path: schema/eval/staging/en_WildChat-1M_benign_staged.yaml
+      route_policy: mirror
+    chatbot_arena:
+      path: schema/eval/staging/en_chatbot_arena_conversations_benign_staged.yaml
+      route_policy: mirror
+
+# ---------------------------------------------------------------------------
+# Staged multilingual benign — reason-filtered per language
+# ---------------------------------------------------------------------------
+
+staged_benign_multilingual:
+  ru_turbo_saiga:
+    path: schema/eval/staging/ru_ru_turbo_saiga_benign_staged.yaml
+    language: RU
+    max_samples: 20000
+    reasons: [instruction_override, roleplay_jailbreak, meta_probe]
+    route_policy: mirror
+  zh_stem_instruction:
+    path: schema/eval/staging/zh_stem_zh_instruction_benign_staged.yaml
+    language: ZH
+    max_samples: 20000
+    reasons: [instruction_override, meta_probe]
+    route_policy: mirror
+  ar_arabic_chatml:
+    path: schema/eval/staging/ar_arabic-fine-tuning-chatML_benign_staged.yaml
+    language: AR
+    reasons: [instruction_override, roleplay_jailbreak, meta_probe]
+    route_policy: mirror
+
+# ---------------------------------------------------------------------------
+# Supplements — pooled attack sources, route_policy=residual.
+# These do not count as mirror evidence. They contribute only when
+# supplement_ratio > 0.
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Cells — only reason-grounded attack sources in extra_attack_sources.
+# Staged attacks expand automatically via the staged_attacks section.
+# ---------------------------------------------------------------------------
+
+cells:
+  instruction_override:
+    teaching_goal: "Neutralize 'text mentioning instructions = attack' correlation across EN/RU/ZH/AR"
+    format: {prose: 0.7, structured: 0.2, code: 0.1}
+    length: {short: 0.5, medium: 0.3, long: 0.2}
+    extra_attack_sources:
+      - name: en_instruction_override
+        path: schema/eval/malicious/instruction_override_attacks.yaml
+        language: EN
+        route_policy: mirror
+        grounding_mode: reason_grounded
+        reason_provenance: manual_map
+        applicability_scope: in_domain
+      - name: zh_instruction_override_micro
+        path: schema/eval/staging/zh_instruction_override_micro_attacks_staged.yaml
+        language: ZH
+        route_policy: mirror
+        grounding_mode: reason_grounded
+        reason_provenance: adjudicated
+        applicability_scope: in_domain
+
+  roleplay_jailbreak:
+    teaching_goal: "Neutralize 'roleplay/character language = attack' correlation across EN/RU/ZH/AR"
+    format: {prose: 0.8, structured: 0.1, code: 0.1}
+    length: {short: 0.3, medium: 0.4, long: 0.3}
+    extra_attack_sources:
+      - name: en_roleplay_jailbreak
+        path: schema/eval/malicious/roleplay_jailbreak_attacks.yaml
+        language: EN
+        route_policy: mirror
+        grounding_mode: reason_grounded
+        reason_provenance: manual_map
+        applicability_scope: in_domain
+      - name: zh_roleplay_jailbreak_micro
+        path: schema/eval/staging/zh_roleplay_jailbreak_micro_attacks_staged.yaml
+        language: ZH
+        route_policy: mirror
+        grounding_mode: reason_grounded
+        reason_provenance: adjudicated
+        applicability_scope: in_domain
+
+  meta_probe:
+    teaching_goal: "Neutralize 'questions about the system = attack' correlation across EN/RU/ZH/AR"
+    format: {prose: 0.8, structured: 0.1, code: 0.1}
+    length: {short: 0.6, medium: 0.3, long: 0.1}
+    extra_attack_sources:
+      - name: en_meta_probe
+        path: schema/eval/malicious/meta_probe_attacks.yaml
+        language: EN
+        route_policy: mirror
+        grounding_mode: reason_grounded
+        reason_provenance: manual_map
+        applicability_scope: in_domain
+      - name: zh_meta_probe_micro
+        path: schema/eval/staging/zh_meta_probe_micro_attacks_staged.yaml
+        language: ZH
+        route_policy: mirror
+        grounding_mode: reason_grounded
+        reason_provenance: adjudicated
+        applicability_scope: in_domain
+      - name: ru_meta_probe_micro
+        path: schema/eval/staging/ru_meta_probe_micro_attacks_staged.yaml
+        language: RU
+        route_policy: mirror
+        grounding_mode: reason_grounded
+        reason_provenance: adjudicated
+        applicability_scope: in_domain
+
+  exfiltration:
+    teaching_goal: "Neutralize 'requesting data output = attack' correlation across EN/RU/ZH/AR"
+    format: {prose: 0.6, structured: 0.3, code: 0.1}
+    length: {short: 0.5, medium: 0.3, long: 0.2}
+    extra_attack_sources:
+      - name: en_exfiltration
+        path: schema/eval/malicious/exfiltration_attacks.yaml
+        language: EN
+        route_policy: mirror
+        grounding_mode: reason_grounded
+        reason_provenance: manual_map
+        applicability_scope: in_domain
+      - name: zh_exfiltration_micro
+        path: schema/eval/staging/zh_exfiltration_micro_attacks_staged.yaml
+        language: ZH
+        route_policy: mirror
+        grounding_mode: reason_grounded
+        reason_provenance: adjudicated
+        applicability_scope: in_domain
+      - name: ru_exfiltration_micro
+        path: schema/eval/staging/ru_exfiltration_micro_attacks_staged.yaml
+        language: RU
+        route_policy: mirror
+        grounding_mode: reason_grounded
+        reason_provenance: adjudicated
+        applicability_scope: in_domain
+
+  adversarial_suffix:
+    teaching_goal: "Neutralize 'high-entropy/garbled text = attack' correlation across EN/RU/ZH/AR"
+    format: {prose: 0.4, structured: 0.2, code: 0.4}
+    length: {short: 0.3, medium: 0.4, long: 0.3}
+    extra_attack_sources:
+      - name: en_thewall_amplegcg_adversarial_suffix
+        path: schema/eval/malicious/thewall_amplegcg_pos.yaml
+        language: EN
+        route_policy: mirror
+        grounding_mode: reason_grounded
+        reason_provenance: manual_map
+        applicability_scope: in_domain
+      - name: zh_adversarial_suffix_micro
+        path: schema/eval/staging/zh_adversarial_suffix_micro_attacks_staged.yaml
+        language: ZH
+        route_policy: mirror
+        grounding_mode: reason_grounded
+        reason_provenance: adjudicated
+        applicability_scope: in_domain
+      - name: ar_adversarial_suffix_micro
+        path: schema/eval/staging/ar_adversarial_suffix_micro_attacks_staged.yaml
+        language: AR
+        route_policy: mirror
+        grounding_mode: reason_grounded
+        reason_provenance: adjudicated
+        applicability_scope: in_domain
+    extra_benign_sources:
+      - {name: en_benign_code, path: schema/eval/benign/code_samples.yaml, language: EN, route_policy: mirror}
+
+  indirect_injection:
+    teaching_goal: "Neutralize 'embedded instructions in context = attack' correlation across EN/RU/ZH/AR"
+    format: {prose: 0.5, structured: 0.4, code: 0.1}
+    length: {short: 0.2, medium: 0.4, long: 0.4}
+    extra_attack_sources:
+      - name: en_indirect_injection
+        path: schema/eval/staging/en_indirect_injection_attacks_staged.yaml
+        language: EN
+        route_policy: mirror
+        grounding_mode: reason_grounded
+        reason_provenance: manual_map
+        applicability_scope: in_domain
+      - name: zh_indirect_injection_micro
+        path: schema/eval/staging/zh_indirect_injection_micro_attacks_staged.yaml
+        language: ZH
+        route_policy: mirror
+        grounding_mode: reason_grounded
+        reason_provenance: adjudicated
+        applicability_scope: in_domain
+      - name: ru_indirect_injection_micro
+        path: schema/eval/staging/ru_indirect_injection_micro_attacks_staged.yaml
+        language: RU
+        route_policy: mirror
+        grounding_mode: reason_grounded
+        reason_provenance: adjudicated
+        applicability_scope: in_domain
+      - name: ar_indirect_injection_micro
+        path: schema/eval/staging/ar_indirect_injection_micro_attacks_staged.yaml
+        language: AR
+        route_policy: mirror
+        grounding_mode: reason_grounded
+        reason_provenance: adjudicated
+        applicability_scope: in_domain
+
+  obfuscation:
+    teaching_goal: "Neutralize 'base64/ROT13/encoded text = attack' correlation across EN/RU/ZH/AR"
+    format: {prose: 0.3, structured: 0.4, code: 0.3}
+    length: {short: 0.4, medium: 0.4, long: 0.2}
+    extra_attack_sources:
+      - name: en_obfuscation
+        path: schema/eval/malicious/obfuscation_attacks.yaml
+        language: EN
+        route_policy: mirror
+        grounding_mode: reason_grounded
+        reason_provenance: manual_map
+        applicability_scope: in_domain
+      - name: zh_obfuscation_micro
+        path: schema/eval/staging/zh_obfuscation_micro_attacks_staged.yaml
+        language: ZH
+        route_policy: mirror
+        grounding_mode: reason_grounded
+        reason_provenance: adjudicated
+        applicability_scope: in_domain
+
+  constraint_bypass:
+    teaching_goal: "Neutralize 'requests to ignore rules = attack' correlation across EN/RU/ZH/AR"
+    format: {prose: 0.8, structured: 0.1, code: 0.1}
+    length: {short: 0.5, medium: 0.3, long: 0.2}
+    extra_attack_sources:
+      - name: en_constraint_bypass
+        path: schema/eval/malicious/constraint_bypass_attacks.yaml
+        language: EN
+        route_policy: mirror
+        grounding_mode: reason_grounded
+        reason_provenance: manual_map
+        applicability_scope: in_domain
+      - name: zh_constraint_bypass_micro
+        path: schema/eval/staging/zh_constraint_bypass_micro_attacks_staged.yaml
+        language: ZH
+        route_policy: mirror
+        grounding_mode: reason_grounded
+        reason_provenance: adjudicated
+        applicability_scope: in_domain
