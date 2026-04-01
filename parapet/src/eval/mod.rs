@@ -26,7 +26,8 @@ use crate::engine::{
 };
 use crate::signal::combiner::DefaultVerdictCombiner;
 use crate::signal::extractor::DefaultSignalExtractor;
-use crate::layers::l1::{DefaultL1Scanner, EnsembleL1Scanner, L1Scanner};
+use crate::layers::l1::{EnsembleL1Scanner, L1Scanner, SvmModel};
+use crate::layers::l1_harness::{L1Model, L1Signal};
 #[cfg(feature = "l2a")]
 use crate::layers::l2a::{DefaultHeuristicScanner, DefaultL2aScanner, L2aScanner};
 #[cfg(feature = "l2a")]
@@ -112,6 +113,12 @@ pub struct EvalResult {
     /// Evidence pattern categories that matched (from x-parapet-evidence-categories header).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub evidence_categories: Vec<String>,
+    // -- L1 harness signals (full per-message set) --
+    /// All L1 signals emitted by the harness, one per scanned message.
+    /// Enables offline replay of both block-threshold and delta-threshold sweeps.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub l1_signals: Vec<L1Signal>,
+    // -- L2a --
     /// L2a fused score (max across segments). Enables offline threshold sweeps.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub l2a_score: Option<f32>,
@@ -300,19 +307,19 @@ pub fn load_dataset(dir: &Path) -> Result<Vec<EvalCase>, String> {
 pub fn build_eval_engine(config: Arc<Config>) -> (EngineUpstreamClient, Arc<MockHttpSender>) {
     let mock = Arc::new(MockHttpSender::new());
 
-    let l1_scanner: Option<Arc<dyn L1Scanner>> =
+    let (l1_model, l1_scanner): (Option<Arc<dyn L1Model>>, Option<Arc<dyn L1Scanner>>) =
         if let Some(l1_config) = &config.policy.layers.l1 {
             if l1_config.specialists.is_empty() {
-                Some(Arc::new(DefaultL1Scanner::new()))
+                (Some(Arc::new(SvmModel)), None)
             } else {
-                Some(Arc::new(EnsembleL1Scanner::new(
+                (None, Some(Arc::new(EnsembleL1Scanner::new(
                     &l1_config.specialists,
                     l1_config.min_agree,
                     l1_config.generalist_solo_threshold,
-                )))
+                ))))
             }
         } else {
-            None
+            (None, None)
         };
 
     let multi_turn_scanner: Option<Arc<dyn MultiTurnScanner>> =
@@ -350,6 +357,7 @@ pub fn build_eval_engine(config: Arc<Config>) -> (EngineUpstreamClient, Arc<Mock
         normalizer: Arc::new(L0Normalizer::new()),
         trust_assigner: Arc::new(RoleTrustAssigner),
         l1_scanner,
+        l1_model,
         l2a_scanner,
         l2a_semaphore,
         inbound_scanner: Arc::new(DefaultInboundScanner::new()),
@@ -359,6 +367,7 @@ pub fn build_eval_engine(config: Arc<Config>) -> (EngineUpstreamClient, Arc<Mock
         multi_turn_scanner,
         signal_extractor: Arc::new(DefaultSignalExtractor),
         verdict_combiner: Arc::new(DefaultVerdictCombiner),
+        emit_l1_signals: true,
     };
 
     (EngineUpstreamClient::new_with(deps), mock)
@@ -417,6 +426,7 @@ pub async fn run_eval(
                     detail: format!("engine error: {e}"),
                     evidence_count: 0,
                     evidence_categories: Vec::new(),
+                    l1_signals: Vec::new(),
                     l2a_score: None,
                     l2a_pg_score: None,
                     duration_ms,
@@ -437,6 +447,13 @@ pub async fn run_eval(
         let l2a_score = parse_l2a_score(&headers);
         let l2a_pg_score = parse_l2a_pg_score(&headers);
 
+        // L1 harness signals — full per-message set
+        let l1_signals: Vec<L1Signal> = headers
+            .get("x-parapet-l1-signals")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+
         results.push(EvalResult {
             case_id: case.id.clone(),
             layer: case.layer.clone(),
@@ -448,6 +465,7 @@ pub async fn run_eval(
             detail,
             evidence_count,
             evidence_categories,
+            l1_signals,
             l2a_score,
             l2a_pg_score,
             duration_ms,
@@ -867,6 +885,7 @@ fn parse_evidence_categories(headers: &HeaderMap) -> Vec<String> {
         .map(|s| s.split(',').map(|c| c.trim().to_string()).collect())
         .unwrap_or_default()
 }
+
 
 fn parse_l2a_score(headers: &HeaderMap) -> Option<f32> {
     headers
@@ -1568,6 +1587,7 @@ layers:
                 detail: String::new(),
                 evidence_count: 0,
                 evidence_categories: Vec::new(),
+                l1_signals: Vec::new(),
                 l2a_score: None,
                 l2a_pg_score: None,
                 duration_ms: 1.0,
@@ -1583,6 +1603,7 @@ layers:
                 detail: String::new(),
                 evidence_count: 0,
                 evidence_categories: Vec::new(),
+                l1_signals: Vec::new(),
                 l2a_score: None,
                 l2a_pg_score: None,
                 duration_ms: 2.0,
@@ -1598,6 +1619,7 @@ layers:
                 detail: String::new(),
                 evidence_count: 0,
                 evidence_categories: Vec::new(),
+                l1_signals: Vec::new(),
                 l2a_score: None,
                 l2a_pg_score: None,
                 duration_ms: 3.0,

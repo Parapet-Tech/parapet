@@ -5,10 +5,22 @@
 
 use crate::config::{Config, PatternAction};
 use crate::layers::l1::L1Result;
+use crate::layers::l1_harness::L1Signal;
 use crate::layers::l3_inbound::InboundResult;
 use crate::layers::l4::L4Result;
 
 use super::{LayerId, Signal, SignalKind};
+
+// ---------------------------------------------------------------------------
+// Constants for L1Signal extraction
+// ---------------------------------------------------------------------------
+
+use crate::layers::l1_harness::MENTION_RAW_DELTA_THRESHOLD;
+
+/// Minimum calibrated score gap (squash - full-text) to emit an
+/// `obfuscation` signal. A gap of 0.1 in probability space means
+/// squash-deobfuscation uncovered material attack signal.
+const OBFUSCATION_SCORE_GAP: f32 = 0.1;
 
 // ---------------------------------------------------------------------------
 // Trait
@@ -17,6 +29,7 @@ use super::{LayerId, Signal, SignalKind};
 /// Converts layer results into signals for the verdict processor.
 pub trait SignalExtractor: Send + Sync {
     fn extract_l1(&self, result: &L1Result) -> Vec<Signal>;
+    fn extract_l1_signals(&self, signals: &[L1Signal]) -> Vec<Signal>;
     fn extract_l3(&self, result: &InboundResult, config: &Config) -> Vec<Signal>;
     fn extract_l4(&self, result: &L4Result) -> Vec<Signal>;
 }
@@ -49,6 +62,53 @@ impl SignalExtractor for DefaultSignalExtractor {
                 )
             })
             .collect()
+    }
+
+    fn extract_l1_signals(&self, signals: &[L1Signal]) -> Vec<Signal> {
+        let mut out = Vec::new();
+
+        for s in signals {
+            // Use-vs-mention dampening: if attack signal is concentrated
+            // in quoted regions, emit the UNQUOTED score instead of the
+            // full-text score. This dampens the primary signal — the combiner
+            // naturally sees a lower score without needing a new signal kind.
+            let mention = s.quote_detected
+                && s.raw_score_delta > MENTION_RAW_DELTA_THRESHOLD;
+
+            let primary_score = if mention { s.unquoted_score } else { s.score };
+            let category = if mention {
+                Some("mention_dampened".to_string())
+            } else {
+                None
+            };
+
+            let mut primary = Signal::new(
+                LayerId::L1,
+                SignalKind::Evidence,
+                category,
+                primary_score,
+                1.0, // L1 is calibrated
+            );
+            primary.message_index = Some(s.message_index);
+            out.push(primary);
+
+            // Obfuscation signal: squash score meaningfully exceeds
+            // full-text score → attack patterns were hidden by formatting.
+            // Compared against original score, not dampened score.
+            if s.squash_score > s.score + OBFUSCATION_SCORE_GAP {
+                let mut obfusc = Signal::new(
+                    LayerId::L1,
+                    SignalKind::Evidence,
+                    Some("obfuscation".to_string()),
+                    s.squash_score,
+                    0.9, // squash is deterministic and well-tested
+                );
+                obfusc.message_index = Some(s.message_index);
+                out.push(obfusc);
+            }
+        }
+
+        out
     }
 
     fn extract_l3(&self, result: &InboundResult, config: &Config) -> Vec<Signal> {
@@ -283,5 +343,213 @@ mod tests {
         assert_eq!(signals[1].category.as_deref(), Some("instruction_seeding"));
         assert!((signals[1].confidence - 0.8).abs() < f32::EPSILON);
         assert_eq!(signals[2].category.as_deref(), Some("role_confusion"));
+    }
+
+    // -- L1Signal-based extraction --
+
+    #[test]
+    fn l1_signals_emits_all_messages() {
+        let extractor = DefaultSignalExtractor::new();
+        let signals = vec![
+            L1Signal {
+                message_index: 0,
+                role: Role::User,
+                raw_score: -3.0,
+                raw_unquoted_score: -3.0,
+                raw_squash_score: -3.0,
+                score: 0.14,
+                unquoted_score: 0.14,
+                squash_score: 0.14,
+                quote_detected: false,
+                raw_score_delta: 0.0,
+            },
+            L1Signal {
+                message_index: 1,
+                role: Role::User,
+                raw_score: 3.0,
+                raw_unquoted_score: 3.0,
+                raw_squash_score: 3.0,
+                score: 0.86,
+                unquoted_score: 0.86,
+                squash_score: 0.86,
+                quote_detected: false,
+                raw_score_delta: 0.0,
+            },
+        ];
+        let extracted = extractor.extract_l1_signals(&signals);
+        // No filtering — all messages emit signals.
+        assert_eq!(extracted.len(), 2);
+        assert!((extracted[0].score - 0.14).abs() < f32::EPSILON);
+        assert!((extracted[1].score - 0.86).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn l1_signals_sets_message_index() {
+        let extractor = DefaultSignalExtractor::new();
+        let signals = vec![L1Signal {
+            message_index: 7,
+            role: Role::Assistant,
+            raw_score: 1.0,
+            raw_unquoted_score: 1.0,
+            raw_squash_score: 1.0,
+            score: 0.65,
+            unquoted_score: 0.65,
+            squash_score: 0.65,
+            quote_detected: false,
+            raw_score_delta: 0.0,
+        }];
+        let extracted = extractor.extract_l1_signals(&signals);
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(extracted[0].message_index, Some(7));
+        assert_eq!(extracted[0].layer, LayerId::L1);
+        assert_eq!(extracted[0].kind, SignalKind::Evidence);
+    }
+
+    #[test]
+    fn l1_signals_empty_input() {
+        let extractor = DefaultSignalExtractor::new();
+        let extracted = extractor.extract_l1_signals(&[]);
+        assert!(extracted.is_empty());
+    }
+
+    #[test]
+    fn l1_signals_mention_dampens_primary() {
+        // quote_detected + raw_score_delta > threshold → primary dampened
+        // to unquoted_score with category "mention_dampened".
+        let extractor = DefaultSignalExtractor::new();
+        let signals = vec![L1Signal {
+            message_index: 0,
+            role: Role::User,
+            raw_score: 3.0,
+            raw_unquoted_score: -1.0,
+            raw_squash_score: 3.0,
+            score: 0.86,
+            unquoted_score: 0.14,
+            squash_score: 0.86,
+            quote_detected: true,
+            raw_score_delta: 4.0, // well above threshold of 1.0
+        }];
+        let extracted = extractor.extract_l1_signals(&signals);
+        // Only 1 signal — primary dampened to unquoted_score.
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(extracted[0].category.as_deref(), Some("mention_dampened"));
+        assert!((extracted[0].score - 0.14).abs() < f32::EPSILON,
+            "mention should dampen primary to unquoted_score");
+        assert_eq!(extracted[0].message_index, Some(0));
+    }
+
+    #[test]
+    fn l1_signals_no_dampen_without_quotes() {
+        // High delta but no quote_detected → primary at full score.
+        let extractor = DefaultSignalExtractor::new();
+        let signals = vec![L1Signal {
+            message_index: 0,
+            role: Role::User,
+            raw_score: 3.0,
+            raw_unquoted_score: -1.0,
+            raw_squash_score: 3.0,
+            score: 0.86,
+            unquoted_score: 0.14,
+            squash_score: 0.86,
+            quote_detected: false,
+            raw_score_delta: 4.0,
+        }];
+        let extracted = extractor.extract_l1_signals(&signals);
+        assert_eq!(extracted.len(), 1);
+        assert!(extracted[0].category.is_none());
+        assert!((extracted[0].score - 0.86).abs() < f32::EPSILON,
+            "no dampen without quote_detected");
+    }
+
+    #[test]
+    fn l1_signals_no_dampen_below_threshold() {
+        // Quotes detected but delta below threshold → primary at full score.
+        let extractor = DefaultSignalExtractor::new();
+        let signals = vec![L1Signal {
+            message_index: 0,
+            role: Role::User,
+            raw_score: 0.5,
+            raw_unquoted_score: 0.0,
+            raw_squash_score: 0.5,
+            score: 0.57,
+            unquoted_score: 0.5,
+            squash_score: 0.57,
+            quote_detected: true,
+            raw_score_delta: 0.5, // below threshold of 1.0
+        }];
+        let extracted = extractor.extract_l1_signals(&signals);
+        assert_eq!(extracted.len(), 1);
+        assert!(extracted[0].category.is_none());
+        assert!((extracted[0].score - 0.57).abs() < f32::EPSILON,
+            "small delta should not trigger dampening");
+    }
+
+    #[test]
+    fn l1_signals_obfuscation_emitted() {
+        // squash_score > score + gap → obfuscation signal.
+        let extractor = DefaultSignalExtractor::new();
+        let signals = vec![L1Signal {
+            message_index: 0,
+            role: Role::User,
+            raw_score: 0.5,
+            raw_unquoted_score: 0.5,
+            raw_squash_score: 4.0,
+            score: 0.57,
+            unquoted_score: 0.57,
+            squash_score: 0.92, // 0.35 gap, well above 0.1
+            quote_detected: false,
+            raw_score_delta: 0.0,
+        }];
+        let extracted = extractor.extract_l1_signals(&signals);
+        assert_eq!(extracted.len(), 2);
+        assert_eq!(extracted[1].category.as_deref(), Some("obfuscation"));
+        assert!((extracted[1].score - 0.92).abs() < f32::EPSILON);
+        assert!((extracted[1].confidence - 0.9).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn l1_signals_obfuscation_not_emitted_small_gap() {
+        // squash_score barely above score → no obfuscation signal.
+        let extractor = DefaultSignalExtractor::new();
+        let signals = vec![L1Signal {
+            message_index: 0,
+            role: Role::User,
+            raw_score: 3.0,
+            raw_unquoted_score: 3.0,
+            raw_squash_score: 3.2,
+            score: 0.86,
+            unquoted_score: 0.86,
+            squash_score: 0.87, // 0.01 gap, below 0.1
+            quote_detected: false,
+            raw_score_delta: 0.0,
+        }];
+        let extracted = extractor.extract_l1_signals(&signals);
+        assert_eq!(extracted.len(), 1, "tiny squash gap should not trigger obfuscation");
+    }
+
+    #[test]
+    fn l1_signals_mention_dampen_plus_obfuscation() {
+        // Both mention dampening and obfuscation can fire on the same message.
+        let extractor = DefaultSignalExtractor::new();
+        let signals = vec![L1Signal {
+            message_index: 0,
+            role: Role::User,
+            raw_score: 2.0,
+            raw_unquoted_score: -1.0,
+            raw_squash_score: 5.0,
+            score: 0.77,
+            unquoted_score: 0.14,
+            squash_score: 0.95, // gap vs score = 0.18 > 0.1
+            quote_detected: true,
+            raw_score_delta: 3.0, // > 1.0
+        }];
+        let extracted = extractor.extract_l1_signals(&signals);
+        // dampened primary + obfuscation = 2 signals.
+        assert_eq!(extracted.len(), 2);
+        assert_eq!(extracted[0].category.as_deref(), Some("mention_dampened"));
+        assert!((extracted[0].score - 0.14).abs() < f32::EPSILON,
+            "primary dampened to unquoted_score");
+        assert_eq!(extracted[1].category.as_deref(), Some("obfuscation"));
+        assert!((extracted[1].score - 0.95).abs() < f32::EPSILON);
     }
 }

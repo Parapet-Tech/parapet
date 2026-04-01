@@ -102,6 +102,7 @@ fn build_test_engine(yaml: &str, mock_url: &str) -> EngineUpstreamClient {
         normalizer: Arc::new(L0Normalizer::new()),
         trust_assigner: Arc::new(RoleTrustAssigner),
         l1_scanner: None,
+        l1_model: None,
         l2a_scanner: None,
         l2a_semaphore: None,
         inbound_scanner: Arc::new(DefaultInboundScanner::new()),
@@ -111,6 +112,7 @@ fn build_test_engine(yaml: &str, mock_url: &str) -> EngineUpstreamClient {
         multi_turn_scanner: None,
         signal_extractor: Arc::new(DefaultSignalExtractor),
         verdict_combiner: Arc::new(DefaultVerdictCombiner),
+        emit_l1_signals: false,
     };
 
     EngineUpstreamClient::new_with(deps)
@@ -670,6 +672,7 @@ fn build_test_engine_with_http(yaml: &str, http: Arc<dyn HttpSender>) -> EngineU
         normalizer: Arc::new(L0Normalizer::new()),
         trust_assigner: Arc::new(RoleTrustAssigner),
         l1_scanner: None,
+        l1_model: None,
         l2a_scanner: None,
         l2a_semaphore: None,
         inbound_scanner: Arc::new(DefaultInboundScanner::new()),
@@ -679,6 +682,7 @@ fn build_test_engine_with_http(yaml: &str, http: Arc<dyn HttpSender>) -> EngineU
         multi_turn_scanner: None,
         signal_extractor: Arc::new(DefaultSignalExtractor),
         verdict_combiner: Arc::new(DefaultVerdictCombiner),
+        emit_l1_signals: false,
     };
 
     EngineUpstreamClient::new_with(deps)
@@ -791,6 +795,7 @@ fn build_test_engine_with_panicking_inbound(yaml: &str, mock_url: &str) -> Engin
         normalizer: Arc::new(L0Normalizer::new()),
         trust_assigner: Arc::new(RoleTrustAssigner),
         l1_scanner: None,
+        l1_model: None,
         l2a_scanner: None,
         l2a_semaphore: None,
         inbound_scanner: Arc::new(PanickingInboundScanner),
@@ -800,6 +805,7 @@ fn build_test_engine_with_panicking_inbound(yaml: &str, mock_url: &str) -> Engin
         multi_turn_scanner: None,
         signal_extractor: Arc::new(DefaultSignalExtractor),
         verdict_combiner: Arc::new(DefaultVerdictCombiner),
+        emit_l1_signals: false,
     };
 
     EngineUpstreamClient::new_with(deps)

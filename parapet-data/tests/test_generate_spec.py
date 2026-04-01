@@ -507,11 +507,36 @@ class TestExpandSpec:
         assert len(spec["background"]["sources"]) == 1
         assert spec["background"]["sources"][0]["name"] == "bg1"
 
+    def test_discussion_benign_expanded(self):
+        compact = _minimal_compact()
+        compact["discussion_benign"] = {
+            "budget_fraction": 0.05,
+            "sources": [
+                {
+                    "name": "discussion1",
+                    "path": "discussion.yaml",
+                    "language": "EN",
+                    "route_policy": "discussion_benign",
+                }
+            ],
+        }
+        spec = expand_spec(compact)
+        assert spec["discussion_benign"]["budget_fraction"] == 0.05
+        assert len(spec["discussion_benign"]["sources"]) == 1
+        assert spec["discussion_benign"]["sources"][0]["name"] == "discussion1"
+        assert spec["discussion_benign"]["sources"][0]["route_policy"] == "discussion_benign"
+
     def test_strict_source_contracts_copied_when_enabled(self):
         compact = _minimal_compact()
         compact["enforce_source_contracts"] = True
         spec = expand_spec(compact)
         assert spec["enforce_source_contracts"] is True
+
+    def test_allow_heuristic_mirror_attacks_copied_when_enabled(self):
+        compact = _minimal_compact()
+        compact["allow_heuristic_mirror_attacks"] = True
+        spec = expand_spec(compact)
+        assert spec["allow_heuristic_mirror_attacks"] is True
 
     def test_supplements_expanded_when_present(self):
         compact = _minimal_compact()

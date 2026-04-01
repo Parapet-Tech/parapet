@@ -22,6 +22,7 @@ from typing import Sequence
 
 import yaml
 
+from .classifiers import classify_reason
 from .extractors import get_extractor
 from .filters import ContentDeduplicator, content_hash, looks_like_attack, passes_label_filter
 from .ledger import Ledger, apply_ledger_to_row
@@ -35,6 +36,7 @@ from .models import (
     LengthBin,
     MirrorCell,
     MirrorSpec,
+    ReasonProvenance,
     SourceRef,
     Supplement,
 )
@@ -173,7 +175,7 @@ def _source_extract_cache_key(
     label: str,
     reason: str,
     base_dir: Path | None,
-) -> tuple[str, str, str, str, str, str]:
+) -> tuple[str, str, str, str, str, str, str]:
     path = source.path
     if not path.is_absolute() and base_dir is not None:
         path = (base_dir / path).resolve()
@@ -186,6 +188,7 @@ def _source_extract_cache_key(
         reason,
         repr(source.label_filter),
         str(source.max_samples),
+        source.reason_provenance.value if source.reason_provenance is not None else "unset",
     )
 
 
@@ -214,10 +217,27 @@ def _extract_samples_from_source_with_ledger(
         if not text:
             continue
 
+        assigned_reason = reason
+        if (
+            label == "malicious"
+            and source.reason_provenance == ReasonProvenance.HEURISTIC
+        ):
+            classification = classify_reason(text)
+            if classification is None:
+                continue
+            classified_reason = (
+                classification.reason.value
+                if hasattr(classification.reason, "value")
+                else str(classification.reason)
+            )
+            if classified_reason != reason:
+                continue
+            assigned_reason = classified_reason
+
         normalized_row = {
             "content": text,
             "label": label,
-            "reason": reason,
+            "reason": assigned_reason,
             "source": source.name,
             "language": source.language.value,
         }
@@ -286,7 +306,7 @@ def _get_source_extract_result(
     reason: str,
     base_dir: Path | None,
     ledger: Ledger | None,
-    source_extract_cache: dict[tuple[str, str, str, str, str, str], SourceExtractResult] | None,
+    source_extract_cache: dict[tuple[str, str, str, str, str, str, str], SourceExtractResult] | None,
 ) -> SourceExtractResult:
     """Get extracted samples, optionally reusing a per-run cache."""
     if source_extract_cache is None:
@@ -636,7 +656,7 @@ def sample_cell(
     allowed_languages: set[str] | None = None,
     ledger: Ledger | None = None,
     ledger_totals: dict[str, int] | None = None,
-    source_extract_cache: dict[tuple[str, str, str, str, str, str], SourceExtractResult] | None = None,
+    source_extract_cache: dict[tuple[str, str, str, str, str, str, str], SourceExtractResult] | None = None,
     extra_candidates: Sequence[Sample] | None = None,
 ) -> CellSampleResult:
     """Sample one side (attack or benign) of a mirror cell.
@@ -774,6 +794,8 @@ class SamplingResult:
     cross_contamination_dropped: int
     background_requested: int = 0
     background_actual: int = 0
+    discussion_requested: int = 0
+    discussion_actual: int = 0
     ledger_dropped: int = 0
     ledger_quarantined: int = 0
     ledger_rerouted: int = 0
@@ -845,6 +867,7 @@ def sample_spec(
 
     # Calculate per-cell budget
     background_budget = 0
+    discussion_budget = 0
     if spec.total_target:
         supplement_budget = int(spec.total_target * spec.supplement_ratio)
         mirror_budget = spec.total_target - supplement_budget
@@ -853,12 +876,17 @@ def sample_spec(
         # ratio = benign:malicious, so per_side = total / (1 + ratio)
         per_cell_attack = int(per_cell_total / (1 + spec.ratio))
         per_cell_benign = per_cell_total - per_cell_attack
-        # Carve background from benign budget to keep total_target unchanged
+        # Carve benign-only side lanes from the benign budget while keeping
+        # total_target unchanged.
+        total_benign = n_cells * per_cell_benign
+        if spec.discussion_benign:
+            discussion_budget = int(
+                total_benign * spec.discussion_benign.budget_fraction
+            )
         if spec.background:
-            total_benign = n_cells * per_cell_benign
             background_budget = int(total_benign * spec.background.budget_fraction)
-            mirror_benign = total_benign - background_budget
-            per_cell_benign = mirror_benign // n_cells if n_cells else 0
+        mirror_benign = max(total_benign - background_budget - discussion_budget, 0)
+        per_cell_benign = mirror_benign // n_cells if n_cells else 0
     else:
         per_cell_attack = None
         per_cell_benign = None
@@ -892,7 +920,7 @@ def sample_spec(
         "relabeled": 0,
     }
     source_extract_cache: dict[
-        tuple[str, str, str, str, str, str],
+        tuple[str, str, str, str, str, str, str],
         SourceExtractResult,
     ] = {}
     relabeled_candidates: dict[str, dict[str, list[Sample]]] = {
@@ -967,6 +995,13 @@ def sample_spec(
                 label="benign",
                 reason="background",
             )
+    if spec.discussion_benign:
+        for source in spec.discussion_benign.sources:
+            _register_relabeled_candidates(
+                source=source,
+                label="benign",
+                reason="discussion_benign",
+            )
 
     def _sample_supplement_sources(
         *,
@@ -996,6 +1031,41 @@ def sample_spec(
                 if not dedup.check(sample.content):
                     continue
                 samples.append(sample)
+        return samples
+
+    def _sample_benign_lane(
+        *,
+        lane_name: str,
+        sources: Sequence[SourceRef],
+        budget: int,
+        filter_attacklike: bool,
+    ) -> list[Sample]:
+        samples: list[Sample] = []
+        for sample in relabeled_candidates["benign"].get(lane_name, []):
+            if sample.label != "benign":
+                continue
+            if filter_attacklike and looks_like_attack(sample.content):
+                continue
+            if dedup.check(sample.content):
+                samples.append(sample)
+        for source in sources:
+            extracted = _get_source_extract_result(
+                source,
+                label="benign",
+                reason=lane_name,
+                base_dir=base_dir,
+                ledger=ledger,
+                source_extract_cache=source_extract_cache,
+            )
+            for sample in extracted.samples:
+                if sample.label != "benign":
+                    continue
+                if filter_attacklike and looks_like_attack(sample.content):
+                    continue
+                if dedup.check(sample.content):
+                    samples.append(sample)
+        if len(samples) > budget:
+            samples = rng.sample(samples, budget)
         return samples
 
     def _sample_cell_with_optional_quota(
@@ -1278,35 +1348,39 @@ def sample_spec(
     if spec.supplements:
         dedup.register_attack_hashes([s.content_hash for s in all_attack])
 
-    # Phase 5b: Background benign lane
+    # Phase 5b: Discussion-benign lane
+    # Reserve attack-adjacent benign discussion before background/supplement
+    # benign so this scarce slice is measured explicitly.
+    discussion_actual = 0
+    if spec.discussion_benign and discussion_budget > 0:
+        discussion_candidates = _sample_benign_lane(
+            lane_name="discussion_benign",
+            sources=spec.discussion_benign.sources,
+            budget=discussion_budget,
+            filter_attacklike=False,
+        )
+        all_benign.extend(discussion_candidates)
+        discussion_actual = len(discussion_candidates)
+        logger.info(
+            "discussion_benign lane: requested=%d actual=%d",
+            discussion_budget,
+            discussion_actual,
+        )
+        if discussion_actual < discussion_budget:
+            all_gaps.append(
+                f"discussion_benign: requested {discussion_budget}, "
+                f"got {discussion_actual} (-{discussion_budget - discussion_actual})"
+            )
+
+    # Phase 5c: Background benign lane
     background_actual = 0
     if spec.background and background_budget > 0:
-        bg_candidates: list[Sample] = []
-        for sample in relabeled_candidates["benign"].get("background", []):
-            if sample.label != "benign":
-                continue
-            if looks_like_attack(sample.content):
-                continue
-            if dedup.check(sample.content):
-                bg_candidates.append(sample)
-        for source in spec.background.sources:
-            extracted = _get_source_extract_result(
-                source,
-                label="benign",
-                reason="background",
-                base_dir=base_dir,
-                ledger=ledger,
-                source_extract_cache=source_extract_cache,
-            )
-            for sample in extracted.samples:
-                if sample.label != "benign":
-                    continue
-                if looks_like_attack(sample.content):
-                    continue
-                if dedup.check(sample.content):
-                    bg_candidates.append(sample)
-        if len(bg_candidates) > background_budget:
-            bg_candidates = rng.sample(bg_candidates, background_budget)
+        bg_candidates = _sample_benign_lane(
+            lane_name="background",
+            sources=spec.background.sources,
+            budget=background_budget,
+            filter_attacklike=True,
+        )
         all_benign.extend(bg_candidates)
         background_actual = len(bg_candidates)
         logger.info(
@@ -1320,7 +1394,7 @@ def sample_spec(
                 f"got {background_actual} (-{background_budget - background_actual})"
             )
 
-    # Phase 5c: Supplement benign lane
+    # Phase 5d: Supplement benign lane
     if spec.supplements:
         supplement_per = (
             int(spec.total_target * spec.supplement_ratio / len(spec.supplements) / 2)
@@ -1351,6 +1425,8 @@ def sample_spec(
         cross_contamination_dropped=dedup.cross_contamination_dropped + benign_cross_contamination_dropped,
         background_requested=background_budget,
         background_actual=background_actual,
+        discussion_requested=discussion_budget,
+        discussion_actual=discussion_actual,
         ledger_dropped=ledger_totals["dropped"],
         ledger_quarantined=ledger_totals["quarantined"],
         ledger_rerouted=ledger_totals["rerouted"],

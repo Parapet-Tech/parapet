@@ -347,6 +347,235 @@ def dedup_entries(entries: list[dict], content_key: str = "content") -> list[dic
 
 
 # ---------------------------------------------------------------------------
+# Source-group splitting
+# ---------------------------------------------------------------------------
+
+
+def _build_attack_cell_map(
+    groups: dict[str, list[dict]],
+    atk_sources: list[str],
+) -> dict[tuple[str, str], set[str]]:
+    """Map (language, reason) attack cells to the attack-majority sources
+    that contribute malicious entries to them."""
+    cell_map: dict[tuple[str, str], set[str]] = {}
+    for name in atk_sources:
+        for e in groups[name]:
+            if e["label"] == "malicious":
+                cell = (e.get("language", "?"), e.get("reason", "?"))
+                cell_map.setdefault(cell, set()).add(name)
+    return cell_map
+
+
+def split_by_source_group(
+    entries: list[dict],
+    test_size: float,
+    seed: int,
+    constrained: bool = True,
+) -> tuple[list[dict], list[dict]]:
+    """Split entries by source group: each source is entirely in train or holdout.
+
+    Groups entries by their ``source`` field and assigns whole groups to
+    train or holdout.  Uses label-stratified greedy fill: sources are
+    classified as attack-majority or benign-majority, then each pool
+    fills its proportional share of the holdout budget independently.
+
+    When *constrained* (default), sources that are the sole provider of any
+    (language, reason) attack cell are pinned to train.  This guarantees
+    every populated cell has training signal.  Only multi-source cells can
+    donate a source to holdout.  Use ``constrained=False`` for unconstrained
+    stress-test evaluation where all sources are eligible.
+
+    Returns (train_entries, holdout_entries).
+    """
+    import random as _random
+
+    rng = _random.Random(seed)
+
+    # Build per-source groups
+    groups: dict[str, list[dict]] = {}
+    for entry in entries:
+        groups.setdefault(entry["source"], []).append(entry)
+
+    total = len(entries)
+
+    # Classify sources by majority label
+    atk_sources: list[str] = []
+    ben_sources: list[str] = []
+    for name, members in groups.items():
+        n_atk = sum(1 for e in members if e["label"] == "malicious")
+        if n_atk > len(members) // 2:
+            atk_sources.append(name)
+        else:
+            ben_sources.append(name)
+
+    rng.shuffle(atk_sources)
+    rng.shuffle(ben_sources)
+
+    # --- Cell-coverage constraint (attack sources only) ---
+    pinned: set[str] = set()
+    cell_map: dict[tuple[str, str], set[str]] | None = None
+    if constrained:
+        cell_map = _build_attack_cell_map(groups, atk_sources)
+        for cell, sources in cell_map.items():
+            if len(sources) == 1:
+                pinned.update(sources)
+
+        singleton_count = sum(1 for srcs in cell_map.values() if len(srcs) == 1)
+        multi_count = len(cell_map) - singleton_count
+        pinned_entries = sum(len(groups[n]) for n in pinned)
+        print(
+            f"  Cell coverage: {len(cell_map)} attack cells, "
+            f"{singleton_count} singleton, {multi_count} multi-source",
+            file=sys.stderr,
+        )
+        print(
+            f"  Pinned {len(pinned)} singleton-cell sources to train "
+            f"({pinned_entries} entries)",
+            file=sys.stderr,
+        )
+
+    eligible_atk = [s for s in atk_sources if s not in pinned]
+
+    # Per-pool holdout budgets proportional to eligible pool sizes
+    eligible_atk_total = sum(len(groups[n]) for n in eligible_atk)
+    ben_total = sum(len(groups[n]) for n in ben_sources)
+    atk_budget = int(eligible_atk_total * test_size)
+    ben_budget = int(ben_total * test_size)
+
+    # Warn if any single group exceeds its pool budget
+    eligible_atk_set = set(eligible_atk)
+    for name in eligible_atk + ben_sources:
+        n = len(groups[name])
+        pool_budget = atk_budget if name in eligible_atk_set else ben_budget
+        if n > pool_budget:
+            pct = n / total * 100
+            print(
+                f"  WARN: source {name!r} has {n} entries ({pct:.1f}% of total), "
+                f"exceeds its pool holdout budget of {pool_budget}. It will stay in train.",
+                file=sys.stderr,
+            )
+
+    # Greedy fill per pool.  When cell_map is provided, refuse to add a
+    # source whose removal would leave any (language, reason) cell with
+    # zero train coverage.  Pinned sources (not in names) are implicitly
+    # "in train" and counted via their presence in cell_map values.
+    def _greedy_fill(
+        names: list[str],
+        budget: int,
+        cell_map: dict[tuple[str, str], set[str]] | None = None,
+    ) -> set[str]:
+        selected: set[str] = set()
+        count = 0
+        for name in names:
+            n = len(groups[name])
+            if count + n > budget:
+                continue
+            if cell_map is not None:
+                would_orphan = False
+                for cell, sources in cell_map.items():
+                    if name not in sources:
+                        continue
+                    # sources still in train after this donation
+                    remaining = sources - selected - {name}
+                    if not remaining:
+                        would_orphan = True
+                        break
+                if would_orphan:
+                    continue
+            selected.add(name)
+            count += n
+        return selected
+
+    atk_cell_map = cell_map  # None when unconstrained, populated when constrained
+    holdout_sources = (
+        _greedy_fill(eligible_atk, atk_budget, atk_cell_map)
+        | _greedy_fill(ben_sources, ben_budget)
+    )
+
+    train_entries = []
+    holdout_entries = []
+    for entry in entries:
+        if entry["source"] in holdout_sources:
+            holdout_entries.append(entry)
+        else:
+            train_entries.append(entry)
+
+    # --- Report composition ---
+    actual_pct = len(holdout_entries) / total * 100 if total else 0
+    target_pct = test_size * 100
+    n_atk_hold_src = len(holdout_sources & set(atk_sources))
+    n_ben_hold_src = len(holdout_sources & set(ben_sources))
+    print(
+        f"  Source-group split: {len(groups)} sources -> "
+        f"{len(groups) - len(holdout_sources)} train, {len(holdout_sources)} holdout "
+        f"({n_atk_hold_src} atk-majority, {n_ben_hold_src} ben-majority)",
+        file=sys.stderr,
+    )
+    print(
+        f"  Holdout: {len(holdout_entries)} rows ({actual_pct:.1f}%, target {target_pct:.0f}%)",
+        file=sys.stderr,
+    )
+
+    # Per-split label balance
+    train_atk = sum(1 for e in train_entries if e["label"] == "malicious")
+    hold_atk = sum(1 for e in holdout_entries if e["label"] == "malicious")
+    print(
+        f"  Train labels: {train_atk} atk / {len(train_entries) - train_atk} ben",
+        file=sys.stderr,
+    )
+    print(
+        f"  Holdout labels: {hold_atk} atk / {len(holdout_entries) - hold_atk} ben",
+        file=sys.stderr,
+    )
+
+    # --- Post-split cell coverage table ---
+    train_cells: dict[tuple[str, str], int] = {}
+    holdout_cells: dict[tuple[str, str], int] = {}
+    for e in train_entries:
+        if e["label"] == "malicious":
+            c = (e.get("language", "?"), e.get("reason", "?"))
+            train_cells[c] = train_cells.get(c, 0) + 1
+    for e in holdout_entries:
+        if e["label"] == "malicious":
+            c = (e.get("language", "?"), e.get("reason", "?"))
+            holdout_cells[c] = holdout_cells.get(c, 0) + 1
+
+    all_cells = sorted(set(train_cells) | set(holdout_cells))
+    zero_train = [c for c in all_cells if train_cells.get(c, 0) == 0]
+
+    print(f"\n  Attack cell coverage ({len(all_cells)} cells):", file=sys.stderr)
+    for cell in all_cells:
+        t = train_cells.get(cell, 0)
+        h = holdout_cells.get(cell, 0)
+        flag = " <- ZERO TRAIN" if t == 0 else ""
+        print(
+            f"    {cell[0]:>2} x {cell[1]:<25} train={t:>5}  holdout={h:>5}{flag}",
+            file=sys.stderr,
+        )
+
+    if zero_train:
+        print(
+            f"  WARNING: {len(zero_train)}/{len(all_cells)} cells have "
+            f"ZERO training signal",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"  OK: all {len(all_cells)} cells have training coverage",
+            file=sys.stderr,
+        )
+
+    if not holdout_entries:
+        print(
+            "  WARN: holdout is empty -- all groups too large for budget. "
+            "Consider increasing --holdout-pct or reducing dominant sources.",
+            file=sys.stderr,
+        )
+
+    return train_entries, holdout_entries
+
+
+# ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
 
@@ -776,6 +1005,13 @@ def main():
                         help="Prune weights with |w| below this (default: 0.05)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed (default: 42)")
+    parser.add_argument("--split-by-source", action="store_true",
+                        help="Split by source group with cell-coverage floor. "
+                             "Singleton-cell sources pinned to train so every "
+                             "(language, reason) cell has training signal.")
+    parser.add_argument("--split-by-source-stress", action="store_true",
+                        help="Split by source group without constraints (stress test). "
+                             "All sources eligible for holdout — may create zero-coverage cells.")
     parser.add_argument("--max-per-file", type=int, default=0,
                         help="Cap samples per file (0=unlimited)")
     parser.add_argument("--squash-augment", action="store_true",
@@ -932,12 +1168,24 @@ def main():
             file_stats[src]["benign"] += 1
 
     # --- 3. Split ---
-    train_entries, holdout_entries = train_test_split(
-        all_entries,
-        test_size=args.holdout_pct,
-        random_state=args.seed,
-        stratify=[e["label"] for e in all_entries],
-    )
+    use_source_split = args.split_by_source or args.split_by_source_stress
+    if use_source_split:
+        constrained = args.split_by_source and not args.split_by_source_stress
+        mode = "constrained" if constrained else "stress (unconstrained)"
+        print(f"\nSource-group split ({mode}):", file=sys.stderr)
+        train_entries, holdout_entries = split_by_source_group(
+            all_entries,
+            test_size=args.holdout_pct,
+            seed=args.seed,
+            constrained=constrained,
+        )
+    else:
+        train_entries, holdout_entries = train_test_split(
+            all_entries,
+            test_size=args.holdout_pct,
+            random_state=args.seed,
+            stratify=[e["label"] for e in all_entries],
+        )
 
     n_train_atk = sum(1 for e in train_entries if e["label"] == "malicious")
     n_train_ben = len(train_entries) - n_train_atk
@@ -947,6 +1195,20 @@ def main():
     print(f"\nSplit: {len(train_entries)} train ({n_train_atk} atk, {n_train_ben} ben) / "
           f"{len(holdout_entries)} holdout ({n_hold_atk} atk, {n_hold_ben} ben)",
           file=sys.stderr)
+
+    # Validate no source leakage when using source-group split
+    if use_source_split:
+        train_sources = {e["source"] for e in train_entries}
+        holdout_sources = {e["source"] for e in holdout_entries}
+        leaked = train_sources & holdout_sources
+        if leaked:
+            print(
+                f"  ERROR: {len(leaked)} sources appear in both train and holdout: "
+                f"{sorted(leaked)[:5]}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        print(f"  Source disjointness verified: 0 leaked sources", file=sys.stderr)
 
     # --- 4. Save holdout ---
     save_holdout(holdout_entries, holdout_out, specialist, args.seed, args.holdout_pct)

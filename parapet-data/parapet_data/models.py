@@ -83,6 +83,7 @@ class SourceRoutePolicy(str, Enum):
     MIRROR = "mirror"
     RESIDUAL = "residual"
     BACKGROUND = "background"
+    DISCUSSION_BENIGN = "discussion_benign"
     QUARANTINE = "quarantine"
 
 
@@ -378,6 +379,23 @@ class BackgroundLane(BaseModel):
     )
 
 
+class DiscussionBenignLane(BaseModel):
+    """Benign-only attack-adjacent discussion samples outside the mirror.
+
+    These samples are not generic background. They deliberately resemble attack
+    language so the lexical sensor sees benign discussion of attack patterns.
+    Budget comes from the benign allocation, just like background.
+    """
+
+    sources: list[SourceRef]
+    budget_fraction: float = Field(
+        default=0.05,
+        ge=0.0,
+        le=0.5,
+        description="Fraction of total benign budget allocated to discussion-benign",
+    )
+
+
 # ---------------------------------------------------------------------------
 # MirrorSpec — the experiment's data contract
 # ---------------------------------------------------------------------------
@@ -412,9 +430,14 @@ class MirrorSpec(BaseModel):
     )
     language_quota: LanguageQuota | None = None
     background: BackgroundLane | None = None
+    discussion_benign: DiscussionBenignLane | None = None
     seed: int = 42
     allow_partial_mirror: bool = False
     enforce_source_contracts: bool = Field(
+        default=False,
+        exclude_if=lambda v: v is False,
+    )
+    allow_heuristic_mirror_attacks: bool = Field(
         default=False,
         exclude_if=lambda v: v is False,
     )
@@ -510,6 +533,19 @@ class MirrorSpec(BaseModel):
         return self
 
     @model_validator(mode="after")
+    def benign_lane_budget_consistency(self) -> MirrorSpec:
+        lane_fraction = 0.0
+        if self.background is not None:
+            lane_fraction += self.background.budget_fraction
+        if self.discussion_benign is not None:
+            lane_fraction += self.discussion_benign.budget_fraction
+        if lane_fraction >= 1.0:
+            raise ValueError(
+                "background + discussion_benign budget_fraction exhausts benign budget"
+            )
+        return self
+
+    @model_validator(mode="after")
     def source_contracts_consistent(self) -> MirrorSpec:
         if not self.enforce_source_contracts:
             return self
@@ -531,7 +567,14 @@ class MirrorSpec(BaseModel):
                     violations.append(
                         f"{context} {source.name} must declare grounding_mode=reason_grounded"
                     )
-                if source.reason_provenance not in _STRICT_MIRROR_REASON_PROVENANCE:
+                allow_heuristic = (
+                    self.allow_heuristic_mirror_attacks
+                    and source.reason_provenance == ReasonProvenance.HEURISTIC
+                )
+                if (
+                    source.reason_provenance not in _STRICT_MIRROR_REASON_PROVENANCE
+                    and not allow_heuristic
+                ):
                     actual = (
                         source.reason_provenance.value
                         if source.reason_provenance is not None
@@ -574,6 +617,16 @@ class MirrorSpec(BaseModel):
                     source,
                     expected=SourceRoutePolicy.BACKGROUND,
                     context="background",
+                )
+                if violation is not None:
+                    violations.append(violation)
+
+        if self.discussion_benign is not None:
+            for source in self.discussion_benign.sources:
+                violation = _route_policy_violation(
+                    source,
+                    expected=SourceRoutePolicy.DISCUSSION_BENIGN,
+                    context="discussion_benign",
                 )
                 if violation is not None:
                     violations.append(violation)
@@ -644,6 +697,8 @@ class CurationManifest(BaseModel):
     cross_contamination_dropped: int
     background_requested: int = 0
     background_actual: int = 0
+    discussion_requested: int = 0
+    discussion_actual: int = 0
     source_alias_warnings: list[str] = Field(default_factory=list)
     feature_coverage_warnings: list[str] = Field(default_factory=list)
     ledger_dropped: int = 0

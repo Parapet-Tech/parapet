@@ -4,6 +4,7 @@
 // Layer implementations (L0, L1, L2a, L3-inbound, L3-outbound, L4, L5a)
 
 pub mod l1;
+pub mod l1_harness;
 pub mod l2a;
 pub mod l2a_model;
 pub mod l3_inbound;

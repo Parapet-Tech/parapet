@@ -163,6 +163,7 @@ fn engine_with_config(config: Config) -> EngineUpstreamClient {
         normalizer: Arc::new(NoopNormalizer),
         trust_assigner: Arc::new(NoopTrustAssigner),
         l1_scanner: None,
+        l1_model: None,
         l2a_scanner: None,
         l2a_semaphore: None,
         inbound_scanner: Arc::new(NoopInboundScanner),
@@ -172,6 +173,7 @@ fn engine_with_config(config: Config) -> EngineUpstreamClient {
         multi_turn_scanner: None,
         signal_extractor: Arc::new(DefaultSignalExtractor::new()),
         verdict_combiner: Arc::new(DefaultVerdictCombiner::new()),
+        emit_l1_signals: false,
     };
     EngineUpstreamClient::new_with(deps)
 }
@@ -742,6 +744,7 @@ fn engine_with_http_sender(config: Config, http: Arc<dyn HttpSender>) -> EngineU
         normalizer: Arc::new(NoopNormalizer),
         trust_assigner: Arc::new(NoopTrustAssigner),
         l1_scanner: None,
+        l1_model: None,
         l2a_scanner: None,
         l2a_semaphore: None,
         inbound_scanner: Arc::new(NoopInboundScanner),
@@ -751,6 +754,7 @@ fn engine_with_http_sender(config: Config, http: Arc<dyn HttpSender>) -> EngineU
         multi_turn_scanner: None,
         signal_extractor: Arc::new(DefaultSignalExtractor::new()),
         verdict_combiner: Arc::new(DefaultVerdictCombiner::new()),
+        emit_l1_signals: false,
     };
     EngineUpstreamClient::new_with(deps)
 }
@@ -2102,6 +2106,7 @@ fn engine_with_l2a_scanner(
         normalizer: Arc::new(NoopNormalizer),
         trust_assigner: Arc::new(NoopTrustAssigner),
         l1_scanner: None,
+        l1_model: None,
         l2a_scanner: Some(scanner),
         l2a_semaphore: Some(Arc::new(tokio::sync::Semaphore::new(semaphore_permits))),
         inbound_scanner: Arc::new(NoopInboundScanner),
@@ -2111,6 +2116,7 @@ fn engine_with_l2a_scanner(
         multi_turn_scanner: None,
         signal_extractor: Arc::new(DefaultSignalExtractor::new()),
         verdict_combiner: Arc::new(DefaultVerdictCombiner::new()),
+        emit_l1_signals: false,
     };
     EngineUpstreamClient::new_with(deps)
 }
@@ -2330,6 +2336,7 @@ async fn l2a_no_scanner_configured_passes_through() {
         normalizer: Arc::new(NoopNormalizer),
         trust_assigner: Arc::new(NoopTrustAssigner),
         l1_scanner: None,
+        l1_model: None,
         l2a_scanner: None,
         l2a_semaphore: None,
         inbound_scanner: Arc::new(NoopInboundScanner),
@@ -2339,6 +2346,7 @@ async fn l2a_no_scanner_configured_passes_through() {
         multi_turn_scanner: None,
         signal_extractor: Arc::new(DefaultSignalExtractor::new()),
         verdict_combiner: Arc::new(DefaultVerdictCombiner::new()),
+        emit_l1_signals: false,
     };
     let engine = EngineUpstreamClient::new_with(deps);
     let resp = engine.forward(Provider::OpenAi, openai_request()).await.unwrap();
@@ -2378,6 +2386,7 @@ fn engine_with_output_scanner(config: Config, scanner: Arc<dyn OutputScanner>) -
         normalizer: Arc::new(NoopNormalizer),
         trust_assigner: Arc::new(NoopTrustAssigner),
         l1_scanner: None,
+        l1_model: None,
         l2a_scanner: None,
         l2a_semaphore: None,
         inbound_scanner: Arc::new(NoopInboundScanner),
@@ -2387,6 +2396,7 @@ fn engine_with_output_scanner(config: Config, scanner: Arc<dyn OutputScanner>) -
         multi_turn_scanner: None,
         signal_extractor: Arc::new(DefaultSignalExtractor::new()),
         verdict_combiner: Arc::new(DefaultVerdictCombiner::new()),
+        emit_l1_signals: false,
     };
     EngineUpstreamClient::new_with(deps)
 }

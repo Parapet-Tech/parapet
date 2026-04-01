@@ -338,6 +338,8 @@ def compose(
         all_sources.extend(supp.benign_sources)
     if spec.background:
         all_sources.extend(spec.background.sources)
+    if spec.discussion_benign:
+        all_sources.extend(spec.discussion_benign.sources)
     for source in all_sources:
         if source.name not in source_metadata:
             source_metadata[source.name] = SourceMetadata.from_source_ref(source)
@@ -392,6 +394,8 @@ def compose(
         cross_contamination_dropped=sampling_result.cross_contamination_dropped,
         background_requested=sampling_result.background_requested,
         background_actual=sampling_result.background_actual,
+        discussion_requested=sampling_result.discussion_requested,
+        discussion_actual=sampling_result.discussion_actual,
         source_alias_warnings=source_alias_warnings,
         feature_coverage_warnings=feature_coverage_warnings,
         ledger_dropped=sampling_result.ledger_dropped,
