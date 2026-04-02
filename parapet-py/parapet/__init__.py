@@ -43,6 +43,7 @@ def init(
     config_path: str,
     *,
     port: int = _DEFAULT_PORT,
+    engine_bin: str | None = None,
     extra_hosts: Iterable[str] | None = None,
 ) -> None:
     """Initialize the parapet SDK.
@@ -54,11 +55,14 @@ def init(
     Args:
         config_path: Path to the parapet.yaml configuration file.
         port: Port for the engine to listen on (default 9800).
+        engine_bin: Explicit path to the ``parapet-engine`` binary.
+            Falls back to ``PARAPET_ENGINE_PATH`` env var, then ``PATH``.
         extra_hosts: Additional LLM API hosts to intercept beyond the
             built-in defaults (e.g., ``["api.together.xyz"]``).
 
     Raises:
-        FileNotFoundError: If *config_path* does not exist.
+        FileNotFoundError: If *config_path* does not exist or the engine
+            binary cannot be found.
     """
     path = Path(config_path)
     if not path.exists():
@@ -67,7 +71,7 @@ def init(
         )
 
     hosts = frozenset(extra_hosts) if extra_hosts else None
-    start_engine(config_path=config_path, port=port, state=_engine_state)
+    start_engine(config_path=config_path, port=port, engine_bin=engine_bin, state=_engine_state)
     patch_httpx(port=port, extra_hosts=hosts)
 
 
