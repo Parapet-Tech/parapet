@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch, mock_open
 
 import pytest
 
-from parapet.sidecar import EngineState, start_engine, stop_engine
+from parapet.sidecar import EngineState, start_engine, stop_engine, _resolve_engine_binary
 
 
 class TestStartEngineIdempotent:
@@ -144,3 +144,69 @@ class TestStopEngine:
         assert not pid_path.exists()
         assert state.process is None
         assert state.initialized is False
+
+
+class TestResolveEngineBinary:
+    """_resolve_engine_binary uses 3-tier fallback."""
+
+    def test_explicit_arg_wins(self, monkeypatch):
+        monkeypatch.setenv("PARAPET_ENGINE_PATH", "/env/parapet-engine")
+        assert _resolve_engine_binary("/explicit/bin") == "/explicit/bin"
+
+    def test_env_var_fallback(self, monkeypatch):
+        monkeypatch.setenv("PARAPET_ENGINE_PATH", "/env/parapet-engine")
+        assert _resolve_engine_binary(None) == "/env/parapet-engine"
+
+    def test_bare_name_fallback(self, monkeypatch):
+        monkeypatch.delenv("PARAPET_ENGINE_PATH", raising=False)
+        assert _resolve_engine_binary(None) == "parapet-engine"
+
+
+class TestEngineBinaryNotFound:
+    """start_engine raises actionable error when binary is missing."""
+
+    @patch("parapet.sidecar.subprocess.Popen", side_effect=FileNotFoundError)
+    @patch("parapet.sidecar._start_heartbeat")
+    def test_missing_binary_actionable_error(self, mock_hb, mock_popen):
+        state = EngineState()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pid_path = Path(tmpdir) / "engine.pid"
+            log_path = Path(tmpdir) / "engine.log"
+
+            with pytest.raises(FileNotFoundError, match="PARAPET_ENGINE_PATH"):
+                start_engine(
+                    config_path="parapet.yaml",
+                    port=9800,
+                    state=state,
+                    pid_path=pid_path,
+                    log_path=log_path,
+                )
+
+    @patch("parapet.sidecar.subprocess.Popen")
+    @patch("parapet.sidecar._start_heartbeat")
+    def test_engine_bin_kwarg_passed_to_popen(self, mock_hb, mock_popen):
+        mock_proc = MagicMock()
+        mock_proc.pid = 42
+        mock_proc.poll.return_value = None
+        mock_popen.return_value = mock_proc
+
+        state = EngineState()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pid_path = Path(tmpdir) / "engine.pid"
+            log_path = Path(tmpdir) / "engine.log"
+
+            start_engine(
+                config_path="parapet.yaml",
+                port=9800,
+                state=state,
+                engine_bin="/custom/parapet-engine",
+                pid_path=pid_path,
+                log_path=log_path,
+            )
+
+            cmd = mock_popen.call_args[0][0]
+            assert cmd[0] == "/custom/parapet-engine"
+
+            stop_engine(state=state, pid_path=pid_path)

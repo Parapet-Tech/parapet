@@ -82,11 +82,28 @@ def _start_heartbeat(state: EngineState, port: int) -> None:
     state._heartbeat_thread = thread
 
 
+def _resolve_engine_binary(engine_bin: str | None) -> str:
+    """Resolve the engine binary path.
+
+    Resolution order:
+      1. Explicit *engine_bin* argument.
+      2. ``PARAPET_ENGINE_PATH`` environment variable.
+      3. Bare ``parapet-engine`` name (must be on ``PATH``).
+    """
+    if engine_bin:
+        return engine_bin
+    from_env = os.environ.get("PARAPET_ENGINE_PATH")
+    if from_env:
+        return from_env
+    return "parapet-engine"
+
+
 def start_engine(
     config_path: str,
     port: int,
     *,
     state: EngineState,
+    engine_bin: str | None = None,
     pid_path: Path = _DEFAULT_PID_PATH,
     log_path: Path = _DEFAULT_LOG_PATH,
 ) -> None:
@@ -101,6 +118,8 @@ def start_engine(
         config_path: Path to the parapet.yaml configuration file.
         port: Port for the engine to listen on.
         state: Mutable engine state object.
+        engine_bin: Explicit path to the ``parapet-engine`` binary.
+            Falls back to ``PARAPET_ENGINE_PATH`` env var, then ``PATH``.
         pid_path: Path to write the engine PID file.
         log_path: Path to write the engine log file.
     """
@@ -141,18 +160,30 @@ def start_engine(
     # Open log file for engine stdout/stderr.
     log_file: IO[bytes] = open(log_path, "ab")
 
+    # Resolve engine binary.
+    binary = _resolve_engine_binary(engine_bin)
+
     # Spawn the engine process.
-    proc = subprocess.Popen(
-        [
-            "parapet-engine",
-            "--config",
-            config_path,
-            "--port",
-            str(port),
-        ],
-        stdout=log_file,
-        stderr=log_file,
-    )
+    try:
+        proc = subprocess.Popen(
+            [
+                binary,
+                "--config",
+                config_path,
+                "--port",
+                str(port),
+            ],
+            stdout=log_file,
+            stderr=log_file,
+        )
+    except FileNotFoundError:
+        log_file.close()
+        raise FileNotFoundError(
+            f"Engine binary not found: {binary!r}. "
+            "Install parapet-engine and add it to PATH, or set "
+            "PARAPET_ENGINE_PATH to the binary location, or pass "
+            "engine_bin= to init()."
+        ) from None
 
     state.process = proc
     state.initialized = True
