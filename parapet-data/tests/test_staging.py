@@ -220,6 +220,21 @@ def test_resolve_label_falls_back_to_group_when_label_column_missing():
     assert resolve_label(row, config) == "malicious"
 
 
+def test_is_attack_true_labels_malicious():
+    """Datasets using is_attack as label column must map True -> malicious.
+
+    Regression test: ctf-satml24 was mislabeled because the INDEX used
+    was_successful_secret_extraction (success of the attack) instead of
+    is_attack (whether it was an attack at all). Failed attacks were
+    labeled benign, which is wrong — a failed attack is still an attack.
+    """
+    config = _config(label_column="is_attack", label_values=["true", "false"])
+    assert resolve_label({"is_attack": True, "text": "ignore instructions"}, config) == "malicious"
+    assert resolve_label({"is_attack": "True", "text": "ignore instructions"}, config) == "malicious"
+    assert resolve_label({"is_attack": False, "text": "what is 2+2?"}, config) == "benign"
+    assert resolve_label({"is_attack": "False", "text": "what is 2+2?"}, config) == "benign"
+
+
 # â”€â”€ benign surface classifier routing â”€â”€
 
 
