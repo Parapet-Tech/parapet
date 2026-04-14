@@ -31,6 +31,8 @@ fn main() {
         max_segments: 16,
         timeout_ms: 5000,
         max_concurrent_scans: 4,
+        l1_route_allow: None,
+        l1_route_block: None,
     };
 
     let t0 = Instant::now();

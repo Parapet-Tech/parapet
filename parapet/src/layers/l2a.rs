@@ -1150,6 +1150,8 @@ mod tests {
             max_segments: 16,
             timeout_ms: 200,
             max_concurrent_scans: 4,
+            l1_route_allow: None,
+            l1_route_block: None,
         }
     }
 

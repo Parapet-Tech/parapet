@@ -54,8 +54,8 @@ class TrainConfig(BaseModel):
         if self.mode == "iteration":
             if self.cv_folds != 0:
                 raise ValueError("iteration mode requires cv_folds=0")
-            if self.max_features > 15_000:
-                raise ValueError("iteration mode expects max_features <= 15000")
+            if self.max_features > 25_000:
+                raise ValueError("iteration mode expects max_features <= 25000")
         else:
             if self.cv_folds < 3:
                 raise ValueError("final mode requires cv_folds >= 3")
