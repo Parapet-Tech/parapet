@@ -233,24 +233,32 @@ pub enum L2aMode {
 pub struct L2aConfig {
     /// Operating mode: shadow (log-only) or block (enforce).
     pub mode: L2aMode,
-    /// Model name: "pg2-86m" or "pg2-22m".
+    /// Model name: "pg2-86m", "pg2-22m", or "minilm-l6-v2".
+    ///
+    /// "pg2-*" selects OnnxPromptGuard (classification model).
+    /// "minilm-l6-v2" selects OnnxMiniLmClassifier (semantic embedding + LR).
     pub model: String,
     /// Directory containing model files.
     /// Resolution order: config.model_dir > $PARAPET_MODEL_DIR > ~/.parapet/models/
     pub model_dir: Option<String>,
     /// PG2 sensor firing threshold: pg_score >= this means "PG2 fired"
     /// in the fusion function. Not the enforcement threshold.
+    /// Only used when model is "pg2-*".
     pub pg_threshold: f32,
     /// Fused-score threshold for per-layer enforcement.
     /// When mode == Block, any signal with score >= block_threshold triggers a block.
     pub block_threshold: f32,
     /// Weight applied to heuristic-only scores in fusion.
+    /// Only used when model is "pg2-*".
     pub heuristic_weight: f32,
     /// Confidence when PG2 + heuristic agree.
+    /// Only used when model is "pg2-*".
     pub fusion_confidence_agreement: f32,
     /// Confidence when PG2 fires alone.
+    /// Only used when model is "pg2-*".
     pub fusion_confidence_pg_only: f32,
     /// Confidence when heuristic fires alone.
+    /// Only used when model is "pg2-*".
     pub fusion_confidence_heuristic_only: f32,
     /// Maximum segments to scan per request.
     pub max_segments: usize,
@@ -258,6 +266,12 @@ pub struct L2aConfig {
     pub timeout_ms: u64,
     /// Maximum concurrent L2a scans across in-flight requests.
     pub max_concurrent_scans: usize,
+    /// L1 raw score below which traffic is allowed without L2 routing.
+    /// Only used when model is "minilm-l6-v2".
+    pub l1_route_allow: Option<f64>,
+    /// L1 raw score at or above which traffic is blocked without L2 routing.
+    /// Only used when model is "minilm-l6-v2".
+    pub l1_route_block: Option<f64>,
 }
 
 /// L1 operating mode.

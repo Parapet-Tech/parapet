@@ -163,6 +163,26 @@ def cmd_curate(args: argparse.Namespace) -> None:
     if (args.min_df is None) != (args.max_features is None):
         raise ValueError("--min-df and --max-features must be provided together")
 
+    # Parse split ratios
+    split_ratios = None
+    if args.split_ratios:
+        parts = args.split_ratios.split(":")
+        if len(parts) != 3:
+            raise ValueError(
+                f"--split-ratios must be 3 colon-separated floats (got {args.split_ratios!r})"
+            )
+        train_r, val_r, holdout_r = float(parts[0]), float(parts[1]), float(parts[2])
+        total = train_r + val_r + holdout_r
+        if abs(total - 1.0) > 0.01:
+            raise ValueError(
+                f"--split-ratios must sum to 1.0 (got {total:.4f})"
+            )
+        split_ratios = {"train": train_r, "val": val_r, "holdout": holdout_r}
+        print(
+            f"Split ratios: train={train_r:.2f}, val={val_r:.2f}, holdout={holdout_r:.2f}",
+            file=sys.stderr,
+        )
+
     # Compose
     fmt: OutputFormat = args.format
     print(f"\nComposing splits ({fmt})...", file=sys.stderr)
@@ -176,6 +196,7 @@ def cmd_curate(args: argparse.Namespace) -> None:
         min_df=args.min_df,
         max_features=args.max_features,
         verified_sync=verified_sync_manifest,
+        split_ratios=split_ratios,
     )
 
     # Write manifest
@@ -342,6 +363,15 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Use stratified split logic (default: true)",
+    )
+    curate_parser.add_argument(
+        "--split-ratios",
+        default=None,
+        help=(
+            "Custom train:val:holdout split ratios as colon-separated floats "
+            "(e.g. '0.70:0.12:0.18'). Must sum to 1.0. "
+            "Default: 0.8:0.1:0.1"
+        ),
     )
     curate_parser.add_argument(
         "--min-df",

@@ -140,6 +140,10 @@ pub struct RawL2aConfig {
     pub timeout_ms: u64,
     #[serde(default = "default_l2a_max_concurrent_scans")]
     pub max_concurrent_scans: usize,
+    /// L1 raw score routing threshold (allow). Only for minilm-l6-v2.
+    pub l1_route_allow: Option<f64>,
+    /// L1 raw score routing threshold (block). Only for minilm-l6-v2.
+    pub l1_route_block: Option<f64>,
 }
 
 fn default_l2a_max_segments() -> usize {

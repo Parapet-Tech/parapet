@@ -352,6 +352,8 @@ fn build_layer_configs(raw: Option<raw::RawLayerConfigs>) -> Result<LayerConfigs
                 max_segments: l2a.max_segments,
                 timeout_ms: l2a.timeout_ms,
                 max_concurrent_scans: l2a.max_concurrent_scans,
+                l1_route_allow: l2a.l1_route_allow,
+                l1_route_block: l2a.l1_route_block,
             })
         })
         .transpose()?;

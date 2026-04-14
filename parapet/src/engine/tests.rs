@@ -1967,6 +1967,8 @@ fn build_engine_client_rejects_l2a_config_without_feature() {
         max_segments: 16,
         timeout_ms: 200,
         max_concurrent_scans: 4,
+        l1_route_allow: None,
+        l1_route_block: None,
     });
     let result = build_engine_client(Arc::new(config));
     match result {
@@ -2077,6 +2079,8 @@ fn l2a_test_config() -> L2aConfig {
         max_segments: 16,
         timeout_ms: 200,
         max_concurrent_scans: 4,
+        l1_route_allow: None,
+        l1_route_block: None,
     }
 }
 

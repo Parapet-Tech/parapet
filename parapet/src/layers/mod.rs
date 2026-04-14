@@ -7,6 +7,8 @@ pub mod l1;
 pub mod l1_harness;
 pub mod l2a;
 pub mod l2a_model;
+pub mod l2_semantic;
+pub mod l2_weights;
 pub mod l3_inbound;
 pub mod l4;
 pub mod l5a;

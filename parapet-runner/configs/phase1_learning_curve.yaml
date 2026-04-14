@@ -1,0 +1,32 @@
+# Phase 1: Learning Curve — fixed hyperparameters per experiment_spec.md
+#
+# C=0.1, min_df=3, max_features=25000, class_weight=none
+# Threshold calibrated via F1 grid search on val (= calibration split)
+
+specialist: generalist
+mode: iteration
+
+# Feature extraction
+analyzer: char_wb
+ngram_min: 3
+ngram_max: 5
+max_features: 25000
+min_df: 3
+
+# SVM
+c: 0.1
+class_weight: none
+max_iter: 100000
+
+# Cross-validation (skip for speed — learning curve has 35 cells)
+cv_folds: 0
+cv_max_samples: 120000
+
+# Threshold
+threshold_policy: calibrate_f1
+threshold_value: -0.5
+
+# Pruning
+prune_threshold: 0.05
+
+seed: 42

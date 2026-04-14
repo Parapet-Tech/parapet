@@ -81,3 +81,8 @@ parapet-runner/tests/.tmp_outputs/
 # Editor backup files
 *.py.current
 /runs/
+
+adjudication
+models
+# L2 parity test fixtures (regenerable via scripts/prep_l2_assets.py)
+tests/fixtures/

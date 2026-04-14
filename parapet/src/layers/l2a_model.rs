@@ -79,7 +79,40 @@ impl std::error::Error for ModelInitError {}
 
 /// Known model names accepted by the L2a layer.
 /// Used by config validation and ONNX initialization.
-pub const KNOWN_MODELS: &[&str] = &["pg2-86m", "pg2-22m"];
+pub const KNOWN_MODELS: &[&str] = &["pg2-86m", "pg2-22m", "minilm-l6-v2"];
+
+// ---------------------------------------------------------------------------
+// Semantic classifier contract (MiniLM + LR)
+// ---------------------------------------------------------------------------
+
+/// L1 harness context passed to the semantic classifier at routing time.
+///
+/// These signals are the most important L2 features (measured in the L2b
+/// experiment). They are standardized and clamped before concatenation
+/// with the embedding vector.
+#[derive(Debug, Clone)]
+pub struct L2Context {
+    /// Full-text raw margin from L1.
+    pub raw_score: f64,
+    /// Raw margin after stripping quoted regions.
+    pub raw_unquoted_score: f64,
+    /// Raw margin after squash / deobfuscation.
+    pub raw_squash_score: f64,
+    /// raw_score - raw_unquoted_score. Quote-concentration signal.
+    pub raw_score_delta: f64,
+    /// Whether structural quoting markers were detected.
+    pub quote_detected: bool,
+}
+
+/// Classifies text with L1 harness context for use-vs-mention detection.
+///
+/// Returns a score in [0.0, 1.0] where higher = more likely attack.
+/// The implementation runs MiniLM embedding + logistic regression head
+/// with harness signal features.
+pub trait SemanticClassifier: Send + Sync {
+    /// Classify a single text segment with L1 context.
+    fn classify(&self, text: &str, ctx: &L2Context) -> Result<f32, ClassifyError>;
+}
 
 // ---------------------------------------------------------------------------
 // Feature-gated: OnnxPromptGuard
@@ -491,6 +524,45 @@ mod tests {
     fn known_models_contains_expected_values() {
         assert!(KNOWN_MODELS.contains(&"pg2-86m"));
         assert!(KNOWN_MODELS.contains(&"pg2-22m"));
+        assert!(KNOWN_MODELS.contains(&"minilm-l6-v2"));
         assert!(!KNOWN_MODELS.contains(&"pg2-999b"));
+    }
+
+    // -- SemanticClassifier mock tests --
+
+    struct MockSemanticClassifier {
+        score: f32,
+    }
+
+    impl SemanticClassifier for MockSemanticClassifier {
+        fn classify(&self, _text: &str, _ctx: &L2Context) -> Result<f32, ClassifyError> {
+            Ok(self.score)
+        }
+    }
+
+    #[test]
+    fn semantic_classify_returns_configured_score() {
+        let c = MockSemanticClassifier { score: 0.75 };
+        let ctx = L2Context {
+            raw_score: 1.5,
+            raw_unquoted_score: 0.3,
+            raw_squash_score: 2.0,
+            raw_score_delta: 1.2,
+            quote_detected: true,
+        };
+        assert!((c.classify("test", &ctx).unwrap() - 0.75).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn semantic_trait_object_works() {
+        let c: Box<dyn SemanticClassifier> = Box::new(MockSemanticClassifier { score: 0.42 });
+        let ctx = L2Context {
+            raw_score: 0.0,
+            raw_unquoted_score: 0.0,
+            raw_squash_score: 0.0,
+            raw_score_delta: 0.0,
+            quote_detected: false,
+        };
+        assert!((c.classify("test", &ctx).unwrap() - 0.42).abs() < f32::EPSILON);
     }
 }

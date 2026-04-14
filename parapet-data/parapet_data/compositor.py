@@ -281,6 +281,7 @@ def compose(
     min_df: int | None = None,
     max_features: int | None = None,
     verified_sync: VerifiedSyncManifest | None = None,
+    split_ratios: dict[str, float] | None = None,
 ) -> CurationManifest:
     """Compose the final curated dataset from sampling results.
 
@@ -299,6 +300,7 @@ def compose(
     holdout_reasons = list(spec.holdout_only_reasons)
     splits = split_samples(
         all_samples,
+        ratios=split_ratios,
         holdout_only_reasons=holdout_reasons,
         seed=spec.seed,
         stratified=stratified_split,
