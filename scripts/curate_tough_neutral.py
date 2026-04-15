@@ -68,13 +68,15 @@ PRIMARY_PLANS: list[SourcePlan] = [
     SourcePlan("safeguard_benign", Path("schema/eval/benign/opensource_safeguard_benign.yaml"), 220),
     SourcePlan("promptshield_benign", Path("schema/eval/benign/opensource_promptshield_benign.yaml"), 300),
     SourcePlan("generalist_fp_benign", Path("schema/eval/benign/generalist_errors.yaml"), 220, mode="fp_only"),
-    SourcePlan("wildguardmix_benign", Path("schema/eval/benign/opensource_wildguardmix_benign.yaml"), 450),
-    SourcePlan("ctf_satml24_benign", Path("schema/eval/benign/thewall_ctf-satml24_benign.yaml"), 800),
+    SourcePlan("wildguardmix_benign", Path("schema/eval/benign/opensource_wildguardmix_benign.yaml"), 600),
+    # ctf_satml24_benign removed: those samples are real attacks mislabeled as
+    # benign (is_attack was confused with was_successful_secret_extraction).
+    # See test_is_attack_true_labels_malicious in test_staging.py.
 ]
 
 FALLBACK_PLANS: list[SourcePlan] = [
-    SourcePlan("wildjailbreak_sparse_benign", Path("schema/eval/benign/opensource_wildjailbreak_benign.yaml"), 300),
-    SourcePlan("spml_benign", Path("schema/eval/benign/opensource_spml_benign.yaml"), 240),
+    SourcePlan("wildjailbreak_sparse_benign", Path("schema/eval/benign/opensource_wildjailbreak_benign.yaml"), 400),
+    SourcePlan("spml_benign", Path("schema/eval/benign/opensource_spml_benign.yaml"), 300),
 ]
 
 
