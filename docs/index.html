@@ -3,18 +3,18 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="description" content="Parapet is an open-source LLM security proxy that stops prompt injection, tool abuse, and data exfiltration before they reach your model.">
-    <title>Parapet — LLM Security Proxy</title>
+    <meta name="description" content="Parapet is an open-source research project exploring local, inspectable prompt-injection defense for LLM applications.">
+    <title>Parapet - Prompt Injection Defense Research</title>
     <link rel="canonical" href="https://parapet.tech/">
-    <meta property="og:title" content="Parapet — LLM Security Proxy">
-    <meta property="og:description" content="Stop prompt injection before it reaches your LLM. Open-source proxy firewall with layered defense, config-driven via YAML.">
+    <meta property="og:title" content="Parapet - Prompt Injection Defense Research">
+    <meta property="og:description" content="Open-source research into local, inspectable prompt-injection defense for LLM applications.">
     <meta property="og:url" content="https://parapet.tech/">
     <meta property="og:type" content="website">
     <meta property="og:site_name" content="Parapet">
     <meta property="og:image" content="https://parapet.tech/imgs/pp6.png">
     <meta name="twitter:card" content="summary_large_image">
-    <meta name="twitter:title" content="Parapet — LLM Security Proxy">
-    <meta name="twitter:description" content="Stop prompt injection before it reaches your LLM. Open-source proxy firewall with layered defense.">
+    <meta name="twitter:title" content="Parapet - Prompt Injection Defense Research">
+    <meta name="twitter:description" content="Open-source research into local, inspectable prompt-injection defense for LLM applications.">
     <meta name="twitter:image" content="https://parapet.tech/imgs/pp6.png">
     <script type="application/ld+json">
     {
@@ -22,7 +22,7 @@
       "@type": "SoftwareApplication",
       "name": "Parapet",
       "applicationCategory": "SecurityApplication",
-      "description": "Open-source LLM security proxy that stops prompt injection, tool abuse, and data exfiltration.",
+      "description": "Open-source research project for local, inspectable prompt-injection defense in LLM applications.",
       "url": "https://parapet.tech/",
       "operatingSystem": "Cross-platform",
       "offers": {
@@ -40,32 +40,30 @@
 </head>
 <body>
 
-    <!-- Nav -->
     <nav aria-label="Main navigation">
         <span class="nav-brand">parapet</span>
         <ul class="nav-links">
             <li><a href="#how-it-works">How It Works</a></li>
             <li><a href="#quickstart">Quickstart</a></li>
-            <li><a href="https://arxiv.org/abs/2602.11247">Paper</a></li>
+            <li><a href="#research">Research</a></li>
             <li><a href="https://github.com/Parapet-Tech/parapet" aria-label="Parapet on GitHub">GitHub</a></li>
         </ul>
     </nav>
 
     <aside class="research-banner" role="note">
         <div class="container">
-            <strong>Research project</strong> — Parapet is an active research effort exploring local, transparent prompt injection detection for LLM applications. The architecture, eval methodology, and detection layers are all under development. Nothing here is stable or production-ready.
+            <strong>Research project</strong> - Parapet is an active research effort building a local, inspectable prompt-injection defense stack for LLM applications. The architecture, evaluation methodology, and layer mix are still evolving. Nothing here should be treated as production-ready.
         </div>
     </aside>
 
     <main>
 
-    <!-- Hero -->
     <section class="hero" id="hero">
         <img src="imgs/p1.png" alt="" class="hero-bg" role="presentation">
         <div class="container">
-            <p class="hero-label">Open-source LLM security</p>
-            <h1>Stop prompt injection <em>before</em> it reaches your LLM</h1>
-            <p class="hero-sub">Parapet is a transparent proxy firewall that scans every request and response for prompt injection, tool abuse, and data exfiltration. Config-driven. Self-hosted. Three lines to integrate.</p>
+            <p class="hero-label">Open-source prompt-injection research</p>
+            <h1>A local defense stack for prompt injection</h1>
+            <p class="hero-sub">Parapet is a transparent proxy firewall for studying prompt injection, tool abuse, and data exfiltration in LLM applications. Config-driven. Self-hosted. Built to be inspected, measured, and revised.</p>
             <div class="lang-toggle" role="radiogroup" aria-label="Language selection">
                 <button class="lang-btn active" data-lang="python" role="radio" aria-checked="true">Python</button>
                 <button class="lang-btn" data-lang="typescript" role="radio" aria-checked="false">TypeScript</button>
@@ -85,36 +83,34 @@
         </div>
     </section>
 
-    <!-- Problem -->
     <section id="problem">
         <div class="container">
             <p class="section-label">The Problem</p>
-            <h2>LLMs trust everything they read</h2>
-            <p class="section-desc">Your model can't tell the difference between your instructions and an attacker's. Every tool call, every retrieved document, every user message is an attack surface.</p>
+            <h2>LLM applications still need local defensive layers</h2>
+            <p class="section-desc">Providers give you model access, not deterministic protection for your application boundary. User messages, retrieved content, and tool outputs are all part of the attack surface.</p>
             <div class="stats-grid">
                 <div class="stat">
                     <div class="stat-number">0</div>
-                    <div class="stat-label">LLM providers offer deterministic multi-turn prompt injection detection at the API level</div>
+                    <div class="stat-label">providers expose deterministic, application-specific prompt-injection defense at the API boundary</div>
                 </div>
                 <div class="stat">
-                    <div class="stat-number">5 min</div>
-                    <div class="stat-label">from install to your first blocked attack with Parapet</div>
+                    <div class="stat-number">Local</div>
+                    <div class="stat-label">the fast path runs inside your own proxy boundary rather than as a hosted safety service</div>
                 </div>
                 <div class="stat">
-                    <div class="stat-number">98.6%</div>
-                    <div class="stat-label">F1 on prompt injection detection — sub-microsecond, no LLM call</div>
+                    <div class="stat-number">Research</div>
+                    <div class="stat-label">the architecture, datasets, and evaluation methodology are still being revised in the open</div>
                 </div>
             </div>
         </div>
     </section>
 
-    <!-- How It Works — Layer Pipeline -->
     <section id="how-it-works">
         <div class="container">
             <p class="section-label">How It Works</p>
             <h2>Layered defense in the request pipeline</h2>
             <p class="section-desc">Parapet sits between your app and the LLM provider. Every message passes through a stack of security layers before it reaches the model, and again before the response reaches your app.</p>
-            <div class="pipeline-roundtrip" role="img" aria-label="Request pipeline: L0 Normalize, L1 Classify, L2a Data Payload Scan, L3 Inbound Block, and L4 Multi-Turn scoring. Response pipeline: L3 Outbound Constrain and L5a Redact.">
+            <div class="pipeline-roundtrip" role="img" aria-label="Request pipeline: L0 Normalize, L1 Classify, L2a Payload Analysis, L3 Inbound Block, and L4 Multi-Turn scoring. Response pipeline: L3 Outbound Constrain and L5a Redact.">
                 <div class="pipeline-row-label">Request</div>
                 <div class="pipeline-row">
                     <div class="pipeline-node">
@@ -126,25 +122,25 @@
                     <div class="pipeline-node node-blocked">
                         <div class="pipeline-node-label">L1</div>
                         <div class="pipeline-node-name">Classify</div>
-                        <div class="pipeline-node-desc">ML injection detection</div>
+                        <div class="pipeline-node-desc">Fast lexical sensor</div>
                     </div>
                     <div class="pipeline-arrow" aria-hidden="true">&#8594;</div>
                     <div class="pipeline-node node-blocked">
                         <div class="pipeline-node-label">L2a</div>
-                        <div class="pipeline-node-name">Scan</div>
-                        <div class="pipeline-node-desc">Neural data scan</div>
+                        <div class="pipeline-node-name">Analyze</div>
+                        <div class="pipeline-node-desc">Optional deeper read</div>
                     </div>
                     <div class="pipeline-arrow" aria-hidden="true">&#8594;</div>
                     <div class="pipeline-node node-blocked">
                         <div class="pipeline-node-label">L3 Inbound</div>
                         <div class="pipeline-node-name">Block</div>
-                        <div class="pipeline-node-desc">Pattern &amp; injection scan</div>
+                        <div class="pipeline-node-desc">Patterns &amp; evidence</div>
                     </div>
                     <div class="pipeline-arrow" aria-hidden="true">&#8594;</div>
                     <div class="pipeline-node node-blocked">
                         <div class="pipeline-node-label">L4</div>
                         <div class="pipeline-node-name">Multi-Turn</div>
-                        <div class="pipeline-node-desc">Cross-turn risk scoring</div>
+                        <div class="pipeline-node-desc">Cross-turn scoring</div>
                     </div>
                 </div>
                 <div class="pipeline-row-label">Response</div>
@@ -175,12 +171,11 @@
         </div>
     </section>
 
-    <!-- Config -->
     <section id="config">
         <div class="container">
             <p class="section-label">Config-Driven</p>
             <h2>Define your security policy in YAML</h2>
-            <p class="section-desc">Write a YAML policy, call <code>parapet.init()</code> before your first HTTP client, and every request is scanned.</p>
+            <p class="section-desc">Write a YAML policy, call <code>parapet.init()</code> before your first HTTP client, and route requests through the stack.</p>
             <figure class="code-block" aria-labelledby="code-filename">
                 <div class="code-header">
                     <span class="code-filename" id="code-filename">parapet.yaml</span>
@@ -216,29 +211,28 @@
         </div>
     </section>
 
-    <!-- Quickstart -->
     <section id="quickstart">
         <div class="container">
             <p class="section-label">Quickstart</p>
-            <h2>Five minutes to your first blocked attack</h2>
+            <h2>Minimal local setup</h2>
             <div class="steps">
                 <div class="step">
                     <div class="step-number">Step 1</div>
                     <h3>Install</h3>
-                    <p>Parapet works with any OpenAI-compatible provider.</p>
+                    <p>Parapet works with OpenAI-compatible clients and local proxy deployment.</p>
                     <code class="lang-python">pip install parapet</code>
                     <code class="lang-typescript" hidden>npm install @parapet-tech/parapet</code>
                 </div>
                 <div class="step">
                     <div class="step-number">Step 2</div>
                     <h3>Configure</h3>
-                    <p>Create a YAML file with one line. All security layers active by default.</p>
+                    <p>Create a YAML file with one line. Start with the default stack, then add policy as needed.</p>
                     <code>parapet: v1</code>
                 </div>
                 <div class="step">
                     <div class="step-number">Step 3</div>
                     <h3>Init</h3>
-                    <p>One call. Every LLM request is scanned from that point on.</p>
+                    <p>Initialize the SDK or point your client at the proxy. Requests are inspected from that point on.</p>
                     <code class="lang-python">parapet.init()</code>
                     <code class="lang-typescript" hidden>await init()</code>
                 </div>
@@ -246,7 +240,6 @@
         </div>
     </section>
 
-    <!-- Architecture -->
     <section id="architecture">
         <div class="container">
             <p class="section-label">Architecture</p>
@@ -276,81 +269,78 @@
         </div>
     </section>
 
-    <!-- Features -->
     <section id="features">
         <div class="container">
-            <p class="section-label">Defense Layers</p>
-            <h2>What Parapet catches</h2>
+            <p class="section-label">Defense Stack</p>
+            <h2>How the layers divide the work</h2>
             <div class="features-grid">
                 <div class="feature">
                     <h3>ML Classifier (L1)</h3>
-                    <p>Trained character n-gram SVM compiled into the binary. 98.6% F1 on 25K eval cases, sub-microsecond inference. Catches injection attempts that slip past pattern matching. No LLM call needed.</p>
+                    <p>Compiled character n-gram model in the fast path. It provides cheap lexical signal for obvious prompt-injection language, routing, and observability without requiring an LLM call.</p>
                 </div>
                 <div class="feature">
-                    <h3>Data Payload Scanner (L2a)</h3>
-                    <p>Neural scanning of tool results and RAG documents via Meta's Prompt Guard 2 ONNX model combined with structural heuristics. Runs on CPU, no GPU required. 0.04% false positive rate across 4,742 benign inputs.</p>
+                    <h3>Payload Analysis (L2a)</h3>
+                    <p>Optional deeper analysis for untrusted payloads such as tool results and RAG documents. The active direction is a Parapet-owned semantic path in the L2a slot rather than Prompt Guard 2 as the long-term strategy.</p>
                 </div>
                 <div class="feature">
                     <h3>Pattern Matching (L3)</h3>
-                    <p>Regex patterns across 10 attack categories: instruction override, role hijacking, jailbreaks, system prompt extraction, privilege escalation, exfiltration. Scanned after Unicode normalization to defeat encoding tricks.</p>
+                    <p>Deterministic patterns for instruction override, role hijacking, jailbreaks, prompt extraction, privilege escalation, and exfiltration. Runs after normalization to reduce encoding-trick bypasses.</p>
                 </div>
                 <div class="feature">
                     <h3>Tool Abuse</h3>
-                    <p>Per-tool constraints on arguments. Block path traversal in file tools, dangerous commands in shell tools, SSRF in web tools. Allowlists and denylists per tool name.</p>
+                    <p>Per-tool constraints on arguments. Block path traversal in file tools, dangerous shell inputs, and SSRF-style web requests. Allowlists and denylists apply per tool.</p>
                 </div>
                 <div class="feature">
                     <h3>Data Exfiltration</h3>
-                    <p>Redact API keys, private keys, and secrets from LLM output. Regex-based pattern matching catches keys even if the model tries to encode or obfuscate them.</p>
+                    <p>Redact API keys, private keys, and other secrets from model output. Deterministic matching stays in the proxy boundary.</p>
                 </div>
                 <div class="feature">
                     <h3>Multi-Turn Attacks</h3>
-                    <p>Cross-turn risk scoring detects attacks distributed across conversation turns: instruction seeding, role confusion escalation, resampling, and authority claim buildup. Peak + accumulation scoring — no LLM classifier needed.</p>
+                    <p>Cross-turn risk scoring detects attacks distributed across conversation turns: instruction seeding, role confusion escalation, resampling, and authority claim buildup. Peak-plus-accumulation scoring stays local to the stack.</p>
                 </div>
                 <div class="feature">
                     <h3>Canary Tokens</h3>
-                    <p>Inject canary strings into system prompts. If they appear in output, your system prompt is leaking. Detect exfiltration attempts that bypass pattern matching.</p>
+                    <p>Inject canary strings into system prompts. If they appear in output, your system prompt is leaking. This helps catch exfiltration attempts that bypass simpler pattern checks.</p>
                 </div>
             </div>
         </div>
     </section>
 
-    <!-- Trust / Research -->
     <section id="research">
         <div class="container">
             <p class="section-label">Research-Backed</p>
-            <h2>Built on the literature, not on vibes</h2>
-            <p class="section-desc">Parapet's defense layers are grounded in published academic research on LLM security, prompt injection, and adversarial attacks on language models. Our multi-turn scoring formula — <em>peak + accumulation</em> — achieves 90.8% recall at 1.20% FPR on 10,654 conversations, without invoking an LLM. Read the paper: <a href="https://arxiv.org/abs/2602.11247">arXiv:2602.11247</a>.</p>
+            <h2>Built from experiments, not slogans</h2>
+            <p class="section-desc">Parapet's layer design is informed by published work and by ongoing in-repo evaluation. The broader stack remains an active research program rather than a finished product. Current papers: <a href="https://arxiv.org/abs/2602.11247">multi-turn scoring</a> and <a href="../publications/mirror/paper.pdf">Mirror Design pattern</a>.</p>
             <div class="trust-badges">
                 <div class="trust-badge">
                     <div class="trust-badge-icon" aria-hidden="true"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg></div>
                     <div class="trust-badge-text">
                         <strong>Research-Grounded</strong>
-                        Defense layers informed by the literature on prompt injection and adversarial attacks
+                        Layer design informed by published work and ongoing evaluation
                     </div>
                 </div>
                 <div class="trust-badge">
                     <div class="trust-badge-icon" aria-hidden="true"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></div>
                     <div class="trust-badge-text">
                         <strong>Open Source</strong>
-                        Free defense-in-depth stack, self-hosted, no data leaves your infrastructure
+                        Self-hosted stack with inspectable code, configs, and evaluation artifacts
                     </div>
                 </div>
                 <div class="trust-badge">
                     <div class="trust-badge-icon" aria-hidden="true"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg></div>
                     <div class="trust-badge-text">
                         <strong>Rust Engine</strong>
-                        Microsecond scanning on the fast path, no latency added to your requests
+                        Fast local enforcement path designed to stay inside the application boundary
                     </div>
                 </div>
             </div>
         </div>
     </section>
 
-    <!-- CTA -->
     <section class="cta-section" id="cta">
         <div class="container">
-            <h2>Your LLM deserves a wall</h2>
-            <p>Parapet is free, open source, and takes five minutes to set up.</p>
+            <h2>Read the work, run the stack, inspect the tradeoffs</h2>
+            <p>Parapet is open source and still under active development. The repo is the best place to see what is stable, what is experimental, and what is changing.</p>
             <div class="hero-ctas">
                 <a href="https://github.com/Parapet-Tech/parapet" class="btn btn-primary">View on GitHub</a>
                 <a href="#quickstart" class="btn btn-secondary">Read the Quickstart</a>
@@ -360,7 +350,6 @@
 
     </main>
 
-    <!-- Footer -->
     <footer>
         <p>
             <a href="https://github.com/Parapet-Tech/parapet">GitHub</a> &middot;
