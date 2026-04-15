@@ -1,208 +1,86 @@
-# L2a: Data Payload Scanning
+# L2a: Optional Payload Analysis
 
-L2a scans untrusted data payloads (tool results, retrieved documents, API responses) for prompt injection using Meta's [Prompt Guard 2](https://huggingface.co/meta-llama/Prompt-Guard-2-22M) ONNX model combined with structural heuristics. This catches injections hiding in data that bypass pattern-based detection.
+L2a is Parapet's optional heavier-weight analysis slot for untrusted payloads and routed traffic.
 
-L2a runs on CPU. No GPU required.
+Typical inputs:
 
-## Model options
+- tool results
+- retrieved documents
+- API responses
+- other untrusted payload-like text
+- traffic escalated from `L1` when a deeper read is worth the latency
 
-| Model | Parameters | Size on disk | Overall recall | Best for |
-|-------|-----------|-------------|---------------|----------|
-| `pg2-22m` | 22M | ~85 MB | 59.5% | Low-latency blocking path |
-| `pg2-86m` | 86M | ~1.1 GB | 61.9% (+2.4pp) | Shadow analysis or high-latency budgets |
+## Strategic Role
 
-### Latency snapshot: fixed(512) vs dynamic padding
+L2a exists to do work that `L1` should not try to do alone:
 
-`pg2-22m`:
+- disambiguate harder contextual cases
+- analyze attack-like content inside larger payloads
+- add a richer signal before final policy decisions
 
-| Case | Before | After | Speedup |
-|------|-------:|------:|--------:|
-| Short (9 tok) | 129 ms | 11 ms | 12x |
-| Medium (60 tok) | 133 ms | 19 ms | 7x |
-| Long (185 tok) | 137 ms | 40 ms | 3.4x |
+L2a is optional and should remain off by default unless the runtime budget and operating mode justify it.
 
-`pg2-86m`:
+## Current Direction
 
-| Case | Before | After | Speedup |
-|------|-------:|------:|--------:|
-| Short (9 tok) | 393 ms | 30 ms | 13x |
-| Medium (60 tok) | 666 ms | 58 ms | 11x |
-| Long (185 tok) | 613 ms | 136 ms | 4.5x |
+The active direction is away from Prompt Guard 2 and toward a Parapet-owned semantic implementation in the `L2a` slot.
 
-### Dynamic padding head-to-head (median)
+Why:
 
-| Case | 22M | 86M | Ratio |
-|------|----:|----:|------:|
-| Short | 11 ms | 30 ms | 2.7x |
-| Medium | 19 ms | 58 ms | 3.0x |
-| Long | 40 ms | 136 ms | 3.4x |
+- the old PG2 path is no longer the strategic bet
+- recent research showed that lexical-only follow-on models help, but do not fully solve the harder benign families
+- Parapet needs a Rust-first, CPU-viable semantic stage that fits the stack and can evolve with the rest of the system
 
-Observed on recent local benchmark runs. Absolute numbers vary by CPU and runtime environment.
+Prompt Guard 2 should now be treated as historical background, not the canonical future of `L2a`.
 
-## Config
+## Current Candidate Shapes
 
-```yaml
-layers:
-  L2a:
-    mode: shadow         # shadow | block
-    model: pg2-22m       # pg2-22m | pg2-86m
-    model_dir: null      # optional
-    pg_threshold: 0.5
-    block_threshold: 0.8
-    heuristic_weight: 0.3
-    fusion_confidence_agreement: 0.95
-    fusion_confidence_pg_only: 0.7
-    fusion_confidence_heuristic_only: 0.4
-    max_segments: 16
-    timeout_ms: 200
-    max_concurrent_scans: 4
-```
+The current working candidates are:
 
-Model path resolution order:
+1. `L1 -> L2a`
+2. `L1 -> L2b -> L2a`
 
-1. `layers.L2a.model_dir` (config)
-2. `$PARAPET_MODEL_DIR` (environment)
-3. `~/.parapet/models/` (default)
+Where:
 
-Fetch model files explicitly before enabling L2a:
+- `L2a` is the semantic stage in the official stack
+- `L2b` is an experimental lexical helper stage, not a canonical public layer
 
-```bash
-parapet-fetch --model pg2-22m --skip-checksum
-```
+`L2b` may still be useful when:
 
-If L2a is configured but the model cannot be loaded, engine startup fails closed.
+- it reduces routed volume
+- it improves precision on known lexical false-positive families
+- it acts as a latency shield before semantic inference
 
-## Detection results: pg2-22m
+## Runtime Requirements
 
-Evaluated on 10,489 cases (5,747 attack, 4,742 benign) across 9 open-source datasets. All attacks are prompt injection payloads delivered as tool results / data payloads.
+The current `L2a` direction is designed around:
 
-### Attack detection (recall)
+- Rust-owned inference and routing
+- CPU-only operation
+- explicit model assets
+- bounded latency suitable for routed traffic, not full-stream always-on inference
 
-| Dataset | Cases | Detected | Missed | Recall | F1 |
-|---------|------:|--------:|-------:|-------:|---:|
-| Gandalf | 1,000 | 973 | 27 | 97.3% | 98.6% |
-| Giskard | 35 | 33 | 2 | 94.3% | 97.1% |
-| Jailbreak-CLS | 666 | 594 | 72 | 89.2% | 94.3% |
-| HackAPrompt | 2,000 | 1,441 | 559 | 72.0% | 83.8% |
-| JailbreakBench | 100 | 29 | 71 | 29.0% | 45.0% |
-| deepset | 203 | 41 | 162 | 20.2% | 33.6% |
-| Mosscap | 1,743 | 310 | 1,433 | 17.8% | 30.2% |
-| **Total** | **5,747** | **3,421** | **2,326** | **59.5%** | |
+The design target is an optional semantic stage that stays compatible with Parapet's existing deployment model.
 
-Zero false positives across all attack datasets (100% precision).
+## What L2a Should And Should Not Do
 
-### False positive rate
+L2a should:
 
-| Dataset | Cases | False positives | Accuracy |
-|---------|------:|---------------:|--------:|
-| HC3 (benign) | 4,399 | 1 | 100.0% |
-| deepset (benign) | 343 | 1 | 99.7% |
-| **Total** | **4,742** | **2** | **99.96%** |
+- analyze untrusted payload-like content that deserves more context than `L1` can provide
+- complement deterministic layers such as `L3_inbound`
+- improve stack behavior on context-sensitive cases without requiring a large-model dependency
 
-False positive rate: **0.04%** (2 out of 4,742 benign inputs incorrectly blocked).
+L2a should not:
 
-### What the numbers mean
+- replace `L0`, `L3_inbound`, `L3_outbound`, or `L5a`
+- be treated as mandatory for every deployment
+- depend on a GPU or an external inference service
 
-PG2-22M is strongest against **direct, explicit injection** -- attack strings that contain clear instruction-override language:
+## Status
 
-- Gandalf (97.3%), Giskard (94.3%), Jailbreak-CLS (89.2%) -- these datasets contain direct "ignore instructions", "you are now", "reveal the password" style attacks. PG2-22M catches nearly all of them.
+Current status is research and implementation transition:
 
-- HackAPrompt (72.0%) -- mixed difficulty. Many direct injections caught, but competition entries include creative obfuscation that evades the model.
+- PG2-based `L2a` is no longer the long-term strategy
+- semantic `L2a` is the active implementation direction
+- exact model choice, routing shape, and latency tradeoffs are still being validated
 
-- JailbreakBench (29.0%), deepset (20.2%), Mosscap (17.8%) -- these datasets contain **indirect, subtle, or heavily obfuscated** attacks. The 22M model lacks capacity to recognize these patterns.
-
-PG2-22M is best used as a **complement to L3 pattern matching**, not a replacement. L3 catches attacks by structural patterns (regex); L2a catches attacks by semantic understanding. Together they cover more ground than either alone.
-
-## Detection results: pg2-86m
-
-Evaluated on 10,489 cases (5,747 attack, 4,742 benign) across 9 open-source datasets. Same test suite as pg2-22m.
-
-### Attack detection (recall)
-
-| Dataset | Cases | Detected | Missed | Recall | F1 |
-|---------|------:|--------:|-------:|-------:|---:|
-| Gandalf | 1,000 | 993 | 7 | 99.3% | 99.6% |
-| Giskard | 35 | 33 | 2 | 94.3% | 97.1% |
-| Jailbreak-CLS | 666 | 626 | 40 | 94.0% | 96.9% |
-| HackAPrompt | 2,000 | 1,498 | 502 | 74.9% | 85.6% |
-| JailbreakBench | 100 | 31 | 69 | 31.0% | 47.3% |
-| deepset | 203 | 50 | 153 | 24.6% | 39.5% |
-| Mosscap | 1,743 | 327 | 1,416 | 18.8% | 31.6% |
-| **Total** | **5,747** | **3,558** | **2,189** | **61.9%** | |
-
-Zero false positives across all attack datasets (100% precision).
-
-### False positive rate
-
-| Dataset | Cases | False positives | Accuracy |
-|---------|------:|---------------:|--------:|
-| HC3 (benign) | 4,399 | 1 | 100.0% |
-| deepset (benign) | 343 | 1 | 99.7% |
-| **Total** | **4,742** | **2** | **99.96%** |
-
-False positive rate: **0.04%** (2 out of 4,742 benign inputs incorrectly blocked).
-
-### Head-to-head: pg2-22m vs pg2-86m
-
-| Dataset | 22M Recall | 86M Recall | Delta |
-|---------|----------:|----------:|------:|
-| Gandalf | 97.3% | 99.3% | +2.0 |
-| Giskard | 94.3% | 94.3% | 0.0 |
-| Jailbreak-CLS | 89.2% | 94.0% | +4.8 |
-| HackAPrompt | 72.0% | 74.9% | +2.9 |
-| JailbreakBench | 29.0% | 31.0% | +2.0 |
-| deepset | 20.2% | 24.6% | +4.4 |
-| Mosscap | 17.8% | 18.8% | +1.0 |
-| **Overall** | **59.5%** | **61.9%** | **+2.4** |
-| **FP rate** | **0.04%** | **0.04%** | **0.0** |
-
-The 86M model gains +1-5pp recall across every dataset with no increase in false positives. The largest gains are on medium-difficulty datasets (Jailbreak-CLS +4.8, deepset +4.4). Both models share the same weakness on indirect/obfuscated attacks (JailbreakBench, Mosscap).
-
-### Which model to use
-
-- **pg2-22m**: Default for production blocking. Dynamic padding puts short queries around 11 ms median with strong recall/precision.
-- **pg2-86m**: Use when latency budget allows and +2.4pp recall is worth roughly 2.7x-3.4x slower inference.
-
-## How L2a works
-
-```
-Data payload arrives (tool result, retrieved doc)
-  -> Segment extraction (split into scannable chunks)
-  -> Prompt Guard 2 ONNX inference (malicious probability per segment)
-  -> Structural heuristic scan (instruction patterns, role markers)
-  -> Sensor fusion (weighted combination of PG2 + heuristic scores)
-  -> In block mode, block if fused score >= block_threshold
-```
-
-L2a only scans **untrusted data payloads** -- tool results, retrieved documents, and other content that could contain injected instructions. It does not scan user messages (that's L1's job) or system prompts (those are trusted).
-
-## Build requirements
-
-L2a requires the `l2a` cargo feature and MSVC toolchain on Windows:
-
-```bash
-# Build
-cargo +stable-x86_64-pc-windows-msvc build --features l2a,eval --release
-
-# Run tests
-cargo +stable-x86_64-pc-windows-msvc test --features l2a
-
-# Run eval
-parapet/target/release/parapet-eval.exe \
-  --config schema/eval/eval_config_l2a_only.yaml \
-  --dataset schema/eval/
-```
-
-## Eval datasets
-
-| Dataset | Source | Type | Cases |
-|---------|--------|------|------:|
-| Gandalf | [Lakera Gandalf](https://gandalf.lakera.ai/) | Attack | 1,000 |
-| Giskard | [Giskard LLM Scan](https://github.com/Giskard-AI/giskard) | Attack | 35 |
-| Jailbreak-CLS | [Jailbreak Classification](https://huggingface.co/datasets/jackhhao/jailbreak-classification) | Attack | 666 |
-| HackAPrompt | [HackAPrompt Competition](https://huggingface.co/datasets/hackaprompt/hackaprompt-dataset) | Attack | 2,000 |
-| JailbreakBench | [JailbreakBench](https://jailbreakbench.github.io/) | Attack | 100 |
-| deepset | [deepset prompt injections](https://huggingface.co/datasets/deepset/prompt-injections) | Attack | 203 |
-| Mosscap | [Mosscap](https://huggingface.co/datasets/Mosscap/prompt_injection) | Attack | 1,743 |
-| HC3 | [HC3 (Human ChatGPT Comparison)](https://huggingface.co/datasets/Hello-SimpleAI/HC3) | Benign | 4,399 |
-| deepset | [deepset prompt injections](https://huggingface.co/datasets/deepset/prompt-injections) | Benign | 343 |
+See `strategy/current_direction.md` for the program-level summary of why this change happened.

@@ -23,7 +23,7 @@ If you only need the high-level model, the request path is:
 ```text
 L0 normalize
 -> L1 lightweight classifier
--> L2a optional payload scanner
+-> L2a optional payload analysis
 -> L3_inbound pattern scanning
 -> L4 multi-turn risk scoring
 -> upstream model
@@ -110,7 +110,7 @@ Prompt injection attempts should block. Ordinary traffic should pass through.
 |--------|-------|--------|
 | Encoding tricks (Unicode, zero-width, HTML entities) | L0 normalize | Strip before scanning |
 | Prompt injection (broad) | L1 classifier | Block (403) |
-| Injection in data payloads (tool results, RAG docs) | L2a scanner | Block (403) |
+| Injection in data payloads (tool results, RAG docs) | L2a optional payload analysis | Block (403) |
 | Prompt injection patterns (DAN, jailbreaks, extraction) | L3 inbound | Block (403) |
 | Multi-turn attacks (seeding, role confusion, escalation) | L4 multi-turn | Block |
 | Unauthorized tool calls | L3 outbound | Block |
@@ -192,6 +192,8 @@ Current paper:
 - [publications/mirror/paper.pdf](publications/mirror/paper.pdf)
 
 The broader research and layer notes live under [strategy/](strategy).
+
+For the current detection direction, including the move away from Prompt Guard 2 as the strategic `L2a` path, see [strategy/current_direction.md](strategy/current_direction.md).
 
 ## Building From Source
 

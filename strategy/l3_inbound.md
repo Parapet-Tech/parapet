@@ -52,4 +52,4 @@ From `implement/v3/baseline_evals.md`:
 2. Recall: `14.1%`
 3. FP rate: `0.11%`
 
-This is expected behavior for a high-precision regex layer. L2a/L1/L4 provide additional coverage.
+This is expected behavior for a high-precision regex layer. `L1`, optional `L2a`, and `L4` provide additional coverage.

@@ -6,7 +6,7 @@ Experiment orchestration for prompt injection classifier training.
 
 **Runner wiring complete.**
 
-What works today: DI-based experiment runner, threshold calibration, PG2 baseline adapter, runtime identity collection, semantic parity hashing, concrete split/trainer/evaluator wiring, and CLI entrypoint.
+What works today: DI-based experiment runner, threshold calibration, optional baseline adapters, runtime identity collection, semantic parity hashing, concrete split/trainer/evaluator wiring, and CLI entrypoint.
 
 ## Architecture
 
@@ -26,7 +26,7 @@ ThresholdCalibrator --- grid search over val split (F1 maximization)
 Evaluator ------- runs parapet-eval on holdout with calibrated threshold
     |
     v
-BaselineProvider --- runs PG2 on same holdout for comparison
+BaselineProvider --- runs optional comparison baselines on the same holdout
     |
     v
 ErrorAnalyzer --- writes YAML error summary with deltas
@@ -55,9 +55,9 @@ All boxes above are **Protocol interfaces**. The runner owns orchestration; adap
 - **CurationManifest**: Imported from parapet-data when available, falls back to minimal stub.
 - **compute_semantic_parity_hash()**: Delegates to parapet-data's canonical implementation when installed. Strict validation -- rejects malformed per-cell dicts (missing keys, unknown keys, string backfill_sources).
 
-### baseline.py -- PG2 baseline adapter
+### baseline.py -- Baseline adapters
 
-- **PG2BaselineRunner**: Runs PromptGuard 2 evaluation via injectable `CommandExecutor`.
+- **PG2BaselineRunner**: Runs the legacy Prompt Guard 2 comparison path via injectable `CommandExecutor`.
 - **parse_eval_result_json()**: Flexible JSON parser with recursive key lookup for eval output.
 - Subprocess boundary fully injectable for testing.
 
@@ -82,7 +82,7 @@ All boxes above are **Protocol interfaces**. The runner owns orchestration; adap
 3. Train model
 4. Calibrate threshold on val (if CALIBRATE_F1)
 5. Evaluate on holdout
-6. Run PG2 baseline on same holdout
+6. Run enabled comparison baselines on the same holdout
 7. Compute metric deltas
 8. Write error analysis YAML
 9. Compute semantic parity hash
@@ -148,7 +148,7 @@ python -m parapet_runner.runner run \
 | `--output-dir` | yes | Where run artifacts go. Can be relative to cwd. |
 | `--parapet-eval-bin` | yes | Absolute path to compiled `parapet-eval` binary. |
 | `--skip-recompile` | no | Skip Rust binary rebuild (use when iterating on data, not weights). |
-| `--pg2-mode on` | no | Enable PG2/L2A baseline comparison. Off by default. |
+| `--pg2-mode on` | no | Enable the legacy PG2 comparison baseline. Off by default. |
 | `--protectai-mode protectai_size_matched` | no | Enable ProtectAI baseline. Off by default. |
 | `--random-mode on` | no | Enable random-sample baseline. Off by default. |
 
