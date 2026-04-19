@@ -70,10 +70,23 @@ def sync_verified(
 
     - staging_dir is not mutated
     - verified_dir is created if missing
-    - only .yaml files are processed
+    - only .yaml files are processed (JSONL support lands in bounded-retention
+      Phase 3; ``sync_verified`` raises if it finds JSONL it would silently
+      ignore so callers never lose rows unnoticed)
     """
     verified_dir.mkdir(parents=True, exist_ok=True)
     stats = SyncStats()
+
+    staged_jsonl = sorted(staging_dir.glob("*.jsonl"))
+    if staged_jsonl:
+        sample = ", ".join(p.name for p in staged_jsonl[:3])
+        more = "" if len(staged_jsonl) <= 3 else f" (+{len(staged_jsonl) - 3} more)"
+        raise ValueError(
+            f"verified-sync does not yet support .jsonl staged artifacts "
+            f"(found {len(staged_jsonl)} in {staging_dir}: {sample}{more}). "
+            f"JSONL verified-sync lands in Phase 3 of the bounded-retention "
+            f"plan. Re-stage with --format yaml, or wait for Phase 3."
+        )
 
     staged_files = sorted(staging_dir.glob("*.yaml"))
     for i, staged_file in enumerate(staged_files, 1):
