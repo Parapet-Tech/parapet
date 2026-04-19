@@ -18,9 +18,7 @@ import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Sequence
-
-import yaml
+from typing import Iterator, Sequence
 
 from .classifiers import classify_reason
 from .extractors import get_extractor
@@ -40,13 +38,9 @@ from .models import (
     SourceRef,
     Supplement,
 )
+from .staged_artifact import iter_staged_rows
 
 logger = logging.getLogger(__name__)
-
-try:
-    _YAML_LOADER = yaml.CSafeLoader
-except AttributeError:
-    _YAML_LOADER = yaml.SafeLoader
 
 
 # ---------------------------------------------------------------------------
@@ -111,51 +105,33 @@ def classify_format(text: str) -> FormatBin:
 # ---------------------------------------------------------------------------
 
 
-def _load_yaml(path: Path) -> list[dict]:
-    """Load a YAML file and return list of dicts."""
-    with open(path, "r", encoding="utf-8") as f:
-        data = yaml.load(f, Loader=_YAML_LOADER)
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict):
-        return [data]
-    return []
-
-
-_source_cache: dict[Path, list[dict]] = {}
-
-
 def load_source(
     source: SourceRef,
     base_dir: Path | None = None,
-) -> list[dict]:
-    """Load raw rows from a source, resolving relative paths.
+) -> Iterator[dict]:
+    """Yield raw rows from a source, resolving relative paths.
 
-    Results are cached by resolved path so repeated loads of the same
-    file (across cells/languages) hit memory instead of re-parsing YAML.
-    Returns a shallow copy so callers can't mutate the cache.
+    Returns an iterator (not a list) so per-source extraction can early-exit
+    at ``source.max_samples`` without materializing the rest of the file.
+    Note: this is bounded retention — for each source we still load the
+    underlying file once, but rows are not retained across sources and
+    there is no cross-run cache. PyYAML cannot stream a top-level list,
+    so within a single source the file is fully parsed once before rows
+    are yielded.
     """
     path = source.path
     if not path.is_absolute() and base_dir is not None:
         path = (base_dir / path).resolve()
     if not path.exists():
         logger.warning("Source %s not found at %s, skipping", source.name, path)
-        return []
-
-    resolved = path.resolve()
-    if resolved in _source_cache:
-        return list(_source_cache[resolved])
+        return
 
     if path.is_dir():
-        rows: list[dict] = []
-        for yaml_file in sorted(path.glob("*.yaml")) + sorted(path.glob("*.yml")):
-            rows.extend(_load_yaml(yaml_file))
-    else:
-        rows = _load_yaml(path)
+        for staged_file in sorted(path.glob("*.yaml")) + sorted(path.glob("*.yml")):
+            yield from iter_staged_rows(staged_file)
+        return
 
-    _source_cache[resolved] = rows
-    logger.debug("Cached %d rows from %s", len(rows), resolved)
-    return list(rows)
+    yield from iter_staged_rows(path)
 
 
 @dataclass

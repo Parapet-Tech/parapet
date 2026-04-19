@@ -3,13 +3,16 @@ import sys, os, json, re
 from collections import Counter, defaultdict
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from parapet_data.curated_artifact import load_curated_entries
+
 # Use env var to locate data
 base = Path(os.environ.get("DQ_BASE", Path(__file__).resolve().parent.parent))
 target = base / "curated" / "v3_19k_clean" / "curated.yaml"
-
-# Use pyyaml
-import yaml
-data = yaml.safe_load(open(target, encoding="utf-8"))
+data = load_curated_entries(target)
 
 result = {}
 

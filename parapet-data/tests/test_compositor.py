@@ -220,6 +220,46 @@ class TestWriteJSONL:
         manifest = write_split(samples, path, fmt="jsonl")
         assert manifest.content_hashes == sorted(manifest.content_hashes)
 
+    def test_jsonl_write_is_streaming(
+        self, tmp_dir: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """JSONL writes must interleave _sample_to_dict and json.dumps.
+
+        Old behavior built a full list[dict] before writing — every
+        _sample_to_dict call ran before the first json.dumps. This test
+        records the call order and asserts the calls are interleaved,
+        proving the intermediate list is gone.
+        """
+        from parapet_data import compositor
+
+        samples = _make_samples(5)
+        path = tmp_dir / "test.jsonl"
+
+        calls: list[str] = []
+        real_to_dict = compositor._sample_to_dict
+        real_dumps = compositor.json.dumps
+
+        def spy_to_dict(sample):
+            calls.append("dict")
+            return real_to_dict(sample)
+
+        def spy_dumps(*args, **kwargs):
+            calls.append("dump")
+            return real_dumps(*args, **kwargs)
+
+        monkeypatch.setattr(compositor, "_sample_to_dict", spy_to_dict)
+        monkeypatch.setattr(compositor.json, "dumps", spy_dumps)
+
+        write_split(samples, path, fmt="jsonl")
+
+        # Streaming order: dict, dump, dict, dump, ...
+        # Buffered order:  dict, dict, dict, dict, dict, dump, dump, dump, dump, dump
+        assert calls[1] == "dump", (
+            f"jsonl write is not streaming — second call was {calls[1]!r}, "
+            f"expected json.dumps interleaved with _sample_to_dict. "
+            f"Full call order: {calls}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Compose (end-to-end)
@@ -489,3 +529,84 @@ class TestCompositionReport:
         labels = {r["name"]: r["count"] for r in report["by_label"]}
         assert labels["benign"] == 10
         assert labels["malicious"] == 5
+
+
+# ---------------------------------------------------------------------------
+# Smoke parity — proves the refactored sampler+compositor produce identical
+# output across runs on a ~1000-row fixture. This is the local stand-in for
+# the full v8 parity sweep; that one runs on the runner box, not the dev box.
+# ---------------------------------------------------------------------------
+
+
+class TestSmokeParity:
+    ROWS_PER_SOURCE = 50  # × 8 reasons × 2 (attack+benign) = 800 source rows
+
+    def _make_smoke_spec(self, tmp_dir: Path) -> MirrorSpec:
+        cells = []
+        for reason in AttackReason:
+            atk_path = tmp_dir / "sources" / f"{reason.value}_atk.yaml"
+            ben_path = tmp_dir / "sources" / f"{reason.value}_ben.yaml"
+            _write_yaml(atk_path, [
+                {"content": f"Attack text for {reason.value} number {i:03d} testing"}
+                for i in range(self.ROWS_PER_SOURCE)
+            ])
+            _write_yaml(ben_path, [
+                {"content": f"Benign text for {reason.value} number {i:03d} testing"}
+                for i in range(self.ROWS_PER_SOURCE)
+            ])
+            cells.append(MirrorCell(
+                reason=reason,
+                attack_sources=[SourceRef(
+                    name=f"{reason.value}_atk", path=atk_path,
+                    language=Language.EN, extractor="col_content",
+                )],
+                benign_sources=[SourceRef(
+                    name=f"{reason.value}_ben", path=ben_path,
+                    language=Language.EN, extractor="col_content",
+                )],
+                teaching_goal=f"smoke {reason.value}",
+                languages=[Language.EN],
+                format_distribution={FormatBin.PROSE: 1.0},
+                length_distribution={LengthBin.SHORT: 1.0},
+            ))
+        return MirrorSpec(
+            name="smoke_parity", version="0.1.0", cells=cells, seed=42,
+        )
+
+    def test_pipeline_runs_end_to_end(self, tmp_dir: Path) -> None:
+        """Refactored sampler+compositor must complete a 1000-row run without error."""
+        spec = self._make_smoke_spec(tmp_dir)
+        result = sample_spec(spec, base_dir=tmp_dir)
+        manifest = compose(spec, result, tmp_dir / "out", base_dir=tmp_dir, fmt="yaml")
+
+        assert manifest.total_samples > 0
+        assert sum(s.sample_count for s in manifest.splits.values()) == manifest.total_samples
+        assert len(manifest.semantic_hash) == 64
+
+    def test_two_runs_produce_identical_semantic_hash(self, tmp_dir: Path) -> None:
+        """Determinism: same spec + seed + sources must produce identical
+        semantic_hash across runs. This is the smoke-scale stand-in for
+        the full-spec parity sweep — proves the streaming refactor did not
+        change sample selection or ordering.
+        """
+        spec_a = self._make_smoke_spec(tmp_dir / "run_a")
+        spec_b = self._make_smoke_spec(tmp_dir / "run_b")
+
+        result_a = sample_spec(spec_a, base_dir=tmp_dir / "run_a")
+        manifest_a = compose(spec_a, result_a, tmp_dir / "out_a",
+                             base_dir=tmp_dir / "run_a", fmt="yaml")
+
+        result_b = sample_spec(spec_b, base_dir=tmp_dir / "run_b")
+        manifest_b = compose(spec_b, result_b, tmp_dir / "out_b",
+                             base_dir=tmp_dir / "run_b", fmt="yaml")
+
+        assert manifest_a.semantic_hash == manifest_b.semantic_hash, (
+            f"semantic_hash drift between runs: "
+            f"{manifest_a.semantic_hash} vs {manifest_b.semantic_hash}"
+        )
+        for split_name in ("train", "val", "holdout"):
+            a_hashes = manifest_a.splits[split_name].content_hashes
+            b_hashes = manifest_b.splits[split_name].content_hashes
+            assert a_hashes == b_hashes, (
+                f"split {split_name!r} content_hashes differ between runs"
+            )

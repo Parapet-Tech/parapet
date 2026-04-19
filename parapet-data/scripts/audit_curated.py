@@ -23,6 +23,12 @@ import yaml
 from collections import Counter, defaultdict
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from parapet_data.curated_artifact import load_curated_entries
+
 
 CURATED_PATH = Path(__file__).resolve().parent.parent / "curated" / "v3_19k_clean" / "curated.yaml"
 
@@ -74,8 +80,7 @@ COMPILED_PI_PATTERNS = [(re.compile(p, re.IGNORECASE), cat) for p, cat in PI_PAT
 def load_curated(path: Path) -> list[dict]:
     """Load the curated YAML dataset."""
     print(f"Loading {path} ...")
-    with open(path, "r", encoding="utf-8") as f:
-        data = yaml.safe_load(f)
+    data = load_curated_entries(path)
     print(f"  Loaded {len(data)} samples.")
     return data
 

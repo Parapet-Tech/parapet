@@ -19,6 +19,8 @@ from pathlib import Path
 from .compositor import OutputFormat, compose, composition_report
 from .models import MirrorSpec, VerifiedSyncManifest
 from .sampler import sample_spec
+from .scope_audit import add_subparser as add_scope_audit_subparser, cmd_scope_audit
+from .scope_rollup import add_subparser as add_scope_rollup_subparser, cmd_scope_rollup
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -449,6 +451,9 @@ def main() -> None:
         help="Path to adjudication ledger YAML file",
     )
 
+    add_scope_audit_subparser(subparsers)
+    add_scope_rollup_subparser(subparsers)
+
     args = parser.parse_args()
     _setup_logging(args.verbose)
 
@@ -458,6 +463,10 @@ def main() -> None:
         cmd_stage(args)
     elif args.command == "verified-sync":
         cmd_verified_sync(args)
+    elif args.command == "scope-audit":
+        cmd_scope_audit(args)
+    elif args.command == "scope-rollup":
+        cmd_scope_rollup(args)
     else:
         parser.print_help()
         sys.exit(1)

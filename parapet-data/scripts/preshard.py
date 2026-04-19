@@ -25,7 +25,11 @@ import random
 import sys
 from pathlib import Path
 
-import yaml
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from parapet_data.staged_artifact import load_staged_rows
 
 
 def content_hash(text: str) -> str:
@@ -40,8 +44,7 @@ def load_staged_hashes(staged_files: list[Path]) -> set[str]:
         if not path.exists():
             print(f"  WARN: staged file not found: {path}", file=sys.stderr)
             continue
-        with open(path, encoding="utf-8") as f:
-            rows = yaml.safe_load(f) or []
+        rows = load_staged_rows(path)
         for row in rows:
             h = row.get("content_hash")
             if h:
@@ -60,8 +63,7 @@ def load_pooled_rows(pooled_files: list[Path]) -> list[dict]:
             print(f"  WARN: pooled file not found: {path}", file=sys.stderr)
             continue
         dataset_name = path.stem
-        with open(path, encoding="utf-8") as f:
-            rows = yaml.safe_load(f) or []
+        rows = load_staged_rows(path)
         for i, row in enumerate(rows):
             text = row.get("content", "")
             if not text or not text.strip():

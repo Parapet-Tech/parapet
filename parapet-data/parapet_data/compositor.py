@@ -226,29 +226,47 @@ def _sample_to_dict(sample: Sample) -> dict:
     }
 
 
+def _write_rows(
+    samples: list[Sample],
+    output_path: Path,
+    fmt: OutputFormat,
+) -> list[str]:
+    """Serialize samples to ``output_path`` and return content_hashes in input order.
+
+    JSONL writes stream — one row dict materialized at a time, written and
+    discarded before the next row is converted. This avoids holding a full
+    list[dict] alongside the input list[Sample].
+
+    YAML writes buffer — PyYAML cannot stream a top-level list, so we still
+    build the row list before ``yaml.dump``.
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    content_hashes: list[str] = []
+
+    if fmt == "jsonl":
+        with open(output_path, "w", encoding="utf-8") as f:
+            for sample in samples:
+                content_hashes.append(sample.content_hash)
+                f.write(json.dumps(_sample_to_dict(sample), ensure_ascii=False) + "\n")
+        return content_hashes
+
+    rows: list[dict] = []
+    for sample in samples:
+        content_hashes.append(sample.content_hash)
+        rows.append(_sample_to_dict(sample))
+    with open(output_path, "w", encoding="utf-8") as f:
+        yaml.dump(rows, f, default_flow_style=False, allow_unicode=True,
+                  sort_keys=False, width=200)
+    return content_hashes
+
+
 def write_split(
     samples: list[Sample],
     output_path: Path,
     fmt: OutputFormat = "yaml",
 ) -> SplitManifest:
     """Write samples to disk and return a SplitManifest."""
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    content_hashes: list[str] = []
-    rows = []
-    for sample in samples:
-        content_hashes.append(sample.content_hash)
-        rows.append(_sample_to_dict(sample))
-
-    if fmt == "jsonl":
-        with open(output_path, "w", encoding="utf-8") as f:
-            for row in rows:
-                f.write(json.dumps(row, ensure_ascii=False) + "\n")
-    else:
-        with open(output_path, "w", encoding="utf-8") as f:
-            yaml.dump(rows, f, default_flow_style=False, allow_unicode=True,
-                      sort_keys=False, width=200)
-
+    content_hashes = _write_rows(samples, output_path, fmt)
     return SplitManifest(
         name=output_path.stem,
         sample_count=len(samples),
@@ -318,15 +336,7 @@ def compose(
 
     # Write combined dataset too
     combined_path = output_dir / f"curated{ext}"
-    rows = [_sample_to_dict(s) for s in all_samples]
-    if fmt == "jsonl":
-        with open(combined_path, "w", encoding="utf-8") as f:
-            for row in rows:
-                f.write(json.dumps(row, ensure_ascii=False) + "\n")
-    else:
-        with open(combined_path, "w", encoding="utf-8") as f:
-            yaml.dump(rows, f, default_flow_style=False, allow_unicode=True,
-                      sort_keys=False, width=200)
+    _write_rows(all_samples, combined_path, fmt)
 
     # Source hashes
     source_hashes: dict[str, str] = {}

@@ -63,21 +63,21 @@ def main() -> int:
     # Run A: old sampler
     print("=" * 50)
     old_sampler._source_cache.clear()
-    new_sampler._source_cache.clear()
+    # new_sampler._source_cache removed in streaming refactor — no per-run cache to clear.
     result_a = old_sampler.sample_spec(spec, base_dir=base_dir)
     info_a = summarize(result_a, "A: old sampler")
 
     # Run B: new sampler, no ledger
     print("=" * 50)
     old_sampler._source_cache.clear()
-    new_sampler._source_cache.clear()
+    # new_sampler._source_cache removed in streaming refactor — no per-run cache to clear.
     result_b = new_sampler.sample_spec(spec, base_dir=base_dir, ledger=None)
     info_b = summarize(result_b, "B: new sampler, no ledger")
 
     # Run C: new sampler, with ledger
     print("=" * 50)
     old_sampler._source_cache.clear()
-    new_sampler._source_cache.clear()
+    # new_sampler._source_cache removed in streaming refactor — no per-run cache to clear.
     result_c = new_sampler.sample_spec(spec, base_dir=base_dir, ledger=ledger)
     info_c = summarize(result_c, "C: new sampler, WITH ledger")
 
