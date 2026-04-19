@@ -346,3 +346,46 @@ class TestSyncHashComputation:
         out = yaml.safe_load((verified / "benign.yaml").read_text(encoding="utf-8"))
         assert "content_hash" in out[0]
         assert out[0]["content_hash"] == content_hash("missing hash field")
+
+
+# ---------------------------------------------------------------------------
+# Guardrail: JSONL staged inputs are explicitly rejected (Phase 1 boundary)
+# ---------------------------------------------------------------------------
+
+
+class TestJsonlGuardrail:
+    """verified-sync must refuse .jsonl staged inputs until Phase 3 lands."""
+
+    def test_raises_when_staging_contains_jsonl(self, tmp_dir: Path) -> None:
+        staging = tmp_dir / "staging"
+        verified = tmp_dir / "verified"
+        staging.mkdir(parents=True)
+        (staging / "en_ds_attacks_staged.jsonl").write_text(
+            '{"content":"x","label":"malicious","content_hash":"h","source":"s","reason":"r","language":"EN"}\n',
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValueError, match="does not yet support .jsonl"):
+            sync_verified(staging, verified, _make_ledger([]))
+
+    def test_error_message_points_to_phase_3(self, tmp_dir: Path) -> None:
+        staging = tmp_dir / "staging"
+        verified = tmp_dir / "verified"
+        staging.mkdir(parents=True)
+        (staging / "en_x.jsonl").write_text('{"content":"x"}\n', encoding="utf-8")
+
+        with pytest.raises(ValueError, match="Phase 3"):
+            sync_verified(staging, verified, _make_ledger([]))
+
+    def test_raises_even_when_yaml_also_present(self, tmp_dir: Path) -> None:
+        """Mixed staging dirs still fail — prevents partial silent processing."""
+        staging = tmp_dir / "staging"
+        verified = tmp_dir / "verified"
+        _write_staged(staging / "en_yaml_staged.yaml", [_staged_row("yaml survivor")])
+        (staging / "en_jsonl_staged.jsonl").write_text('{"content":"x"}\n', encoding="utf-8")
+
+        with pytest.raises(ValueError, match="does not yet support .jsonl"):
+            sync_verified(staging, verified, _make_ledger([]))
+
+        # Verified dir must not have been written to partially.
+        assert not (verified / "en_yaml_staged.yaml").exists()

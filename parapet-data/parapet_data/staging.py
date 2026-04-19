@@ -20,9 +20,16 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, Sequence, TextIO
+from typing import Any, Iterator, Literal, Sequence, TextIO
 
 import yaml
+
+from .staged_artifact import (
+    STAGED_FORMATS,
+    StagedFormat,
+    staged_extension,
+    write_staged_rows,
+)
 
 from .classifiers import (
     BENIGN_CONFIDENCE_FLOOR,
@@ -1039,33 +1046,77 @@ def stage_dataset(
 
 
 # ---------------------------------------------------------------------------
-# Output: staged YAMLs
+# Output: staged artifacts (yaml or jsonl)
 # ---------------------------------------------------------------------------
 
 
-def write_staged_yaml(
-    samples: list[StagedSample],
-    output_path: Path,
+_StagedKind = Literal["attacks", "benign", "benign_background"]
+
+_STAGED_KIND_SUFFIX: dict[_StagedKind, str] = {
+    "attacks": "attacks_staged",
+    "benign": "benign_staged",
+    "benign_background": "benign_background_staged",
+}
+
+
+def staged_filename(
+    lang: str,
+    config_name: str,
+    kind: _StagedKind,
+    fmt: StagedFormat,
 ) -> str:
-    """Write staged samples as col_content YAML. Returns SHA256 of output."""
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    """Return the canonical staged artifact filename for (lang, config, kind, fmt)."""
+    return f"{lang}_{config_name}_{_STAGED_KIND_SUFFIX[kind]}.{staged_extension(fmt)}"
 
-    rows = [
-        {
-            "content": s.content,
-            "label": s.label,
-            "language": s.language,
-            "source": s.source,
-            "reason": s.reason,
-            "content_hash": s.content_hash,
-        }
-        for s in samples
-    ]
 
-    with open(output_path, "w", encoding="utf-8") as f:
-        yaml.dump(rows, f, allow_unicode=True, default_flow_style=False, width=2000)
+def _project_staged_sample(s: StagedSample) -> dict[str, Any]:
+    """Project a StagedSample into the on-disk row schema (col_content + metadata)."""
+    return {
+        "content": s.content,
+        "label": s.label,
+        "language": s.language,
+        "source": s.source,
+        "reason": s.reason,
+        "content_hash": s.content_hash,
+    }
 
-    return hashlib.sha256(output_path.read_bytes()).hexdigest()
+
+_ALL_STAGED_KINDS: tuple[_StagedKind, ...] = ("attacks", "benign", "benign_background")
+
+
+def _sweep_stale_staged_artifacts(
+    output_dir: Path,
+    lang: str,
+    config_name: str,
+    produced: set[tuple[_StagedKind, StagedFormat]],
+    output_hashes: dict[str, str],
+) -> None:
+    """Remove prior-run staged artifacts this run did not produce.
+
+    Runs AFTER all successful writes for the dataset. Handles three cases
+    cleanly in one sweep:
+
+    - Format switch — e.g. prior run was yaml, current is jsonl: the yaml
+      sibling for a kind produced in jsonl this run is stale.
+    - Disappearing kind — e.g. prior run produced background benign, current
+      produces none: both yaml and jsonl prior artifacts are stale.
+    - Manual leftovers — any artifact for (lang, config, kind, fmt) not in
+      ``produced`` gets swept from disk and from ``output_hashes``.
+
+    Ordering matters: because this runs after writes succeed, a mid-write
+    failure leaves the old artifact intact — callers don't end up with
+    neither-old-nor-new state for the same (kind, fmt).
+    """
+    for kind in _ALL_STAGED_KINDS:
+        for stale_fmt in STAGED_FORMATS:
+            if (kind, stale_fmt) in produced:
+                continue
+            stale_name = staged_filename(lang, config_name, kind, stale_fmt)
+            stale_path = output_dir / stale_name
+            if stale_path.exists():
+                stale_path.unlink()
+                log.info("removed stale staged artifact %s", stale_name)
+            output_hashes.pop(stale_name, None)
 
 
 # ---------------------------------------------------------------------------
@@ -1135,8 +1186,14 @@ def _accumulate_manifest(
 
     merged_datasets = list(existing_datasets.values())
 
-    # Merge output hashes (new wins on conflict)
+    # Merge output hashes (new wins on conflict), then drop any whose artifact
+    # no longer exists on disk. This self-heals after format switches and
+    # manual deletions so the manifest can't claim artifacts that aren't there.
     merged_hashes = {**existing.get("output_hashes", {}), **new_manifest.get("output_hashes", {})}
+    output_dir = manifest_path.parent
+    merged_hashes = {
+        name: h for name, h in merged_hashes.items() if (output_dir / name).exists()
+    }
 
     return {
         "timestamp": new_manifest["timestamp"],
@@ -1162,6 +1219,7 @@ def stage_all(
     max_rows_per_dataset: int | None = None,
     checkpoint_every_rows: int = 5000,
     checkpoint_dir: Path | None = None,
+    fmt: StagedFormat = "yaml",
 ) -> dict[str, Any]:
     """Run the full staging pipeline.
 
@@ -1247,6 +1305,20 @@ def stage_all(
                     p.unlink()
 
         if not result.staged:
+            # Sweep stale artifacts for this dataset even though we staged
+            # nothing — otherwise prior-run outputs linger and the manifest
+            # keeps claiming them. checkpoint_lang is config-resolved so it
+            # is available here even with zero rows.
+            if checkpoint_lang is not None:
+                _sweep_stale_staged_artifacts(
+                    output_dir, checkpoint_lang, config.name, set(), output_hashes
+                )
+            else:
+                log.warning(
+                    "%s: staged zero rows and language could not be resolved; "
+                    "skipping stale-artifact sweep",
+                    config.name,
+                )
             continue
 
         # Group staged samples by label for separate output files
@@ -1255,25 +1327,48 @@ def stage_all(
 
         lang = result.staged[0].language.lower()
 
+        # Write all kinds first; only after every write succeeds do we sweep
+        # stale artifacts. A failure mid-way leaves prior outputs intact.
+        produced: set[tuple[_StagedKind, StagedFormat]] = set()
+
         if attacks:
-            fname = f"{lang}_{config.name}_attacks_staged.yaml"
-            h = write_staged_yaml(attacks, output_dir / fname)
+            fname = staged_filename(lang, config.name, "attacks", fmt)
+            h = write_staged_rows(
+                output_dir / fname,
+                (_project_staged_sample(s) for s in attacks),
+                fmt=fmt,
+            )
             output_hashes[fname] = h
+            produced.add(("attacks", fmt))
             log.info("wrote %d attacks → %s", len(attacks), fname)
 
         if benign:
             routed = [s for s in benign if s.reason is not None]
             background = [s for s in benign if s.reason is None]
             if routed:
-                fname = f"{lang}_{config.name}_benign_staged.yaml"
-                h = write_staged_yaml(routed, output_dir / fname)
+                fname = staged_filename(lang, config.name, "benign", fmt)
+                h = write_staged_rows(
+                    output_dir / fname,
+                    (_project_staged_sample(s) for s in routed),
+                    fmt=fmt,
+                )
                 output_hashes[fname] = h
+                produced.add(("benign", fmt))
                 log.info("wrote %d benign (routed) → %s", len(routed), fname)
             if background:
-                fname = f"{lang}_{config.name}_benign_background_staged.yaml"
-                h = write_staged_yaml(background, output_dir / fname)
+                fname = staged_filename(lang, config.name, "benign_background", fmt)
+                h = write_staged_rows(
+                    output_dir / fname,
+                    (_project_staged_sample(s) for s in background),
+                    fmt=fmt,
+                )
                 output_hashes[fname] = h
+                produced.add(("benign_background", fmt))
                 log.info("wrote %d benign (background) → %s", len(background), fname)
+
+        _sweep_stale_staged_artifacts(
+            output_dir, lang, config.name, produced, output_hashes
+        )
 
         # Write quarantine if any
         if result.quarantined:

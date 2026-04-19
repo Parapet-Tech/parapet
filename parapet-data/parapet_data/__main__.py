@@ -259,6 +259,7 @@ def cmd_stage(args: argparse.Namespace) -> None:
         print(f"Checkpoint every rows: {args.checkpoint_every_rows}", file=sys.stderr)
     if args.checkpoint_dir:
         print(f"Checkpoint dir: {args.checkpoint_dir}", file=sys.stderr)
+    print(f"Staged format: {args.format}", file=sys.stderr)
 
     manifest = stage_all(
         index_path=index_path,
@@ -268,6 +269,7 @@ def cmd_stage(args: argparse.Namespace) -> None:
         max_rows_per_dataset=args.max_rows_per_dataset,
         checkpoint_every_rows=args.checkpoint_every_rows,
         checkpoint_dir=Path(args.checkpoint_dir) if args.checkpoint_dir else None,
+        fmt=args.format,
     )
 
     print(f"\nStaged: {manifest['total_staged']:,}", file=sys.stderr)
@@ -429,6 +431,12 @@ def main() -> None:
         "--checkpoint-dir",
         default=None,
         help="Optional directory for partial checkpoint files (default: --output)",
+    )
+    stage_parser.add_argument(
+        "--format",
+        choices=("yaml", "jsonl"),
+        default="yaml",
+        help="Staged artifact format (default: yaml; jsonl enables streaming writes)",
     )
 
     vsync_parser = subparsers.add_parser(
