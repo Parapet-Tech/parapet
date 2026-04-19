@@ -220,9 +220,19 @@ def run_fold(
 ) -> Path | None:
     """Train on fold's train, eval on fold's holdout. Returns eval.json path or None."""
     fold_dir = output_dir / f"fold_{fold_id}"
-    eval_json = fold_dir / "run" / "_eval_holdout_0p0" / "eval.json"
+    run_dir = fold_dir / "run"
 
-    if eval_json.exists():
+    # Find eval.json at whatever threshold was calibrated
+    eval_json = None
+    if run_dir.exists():
+        for d in sorted(run_dir.iterdir()):
+            if d.is_dir() and d.name.startswith("_eval_holdout_"):
+                candidate = d / "eval.json"
+                if candidate.exists():
+                    eval_json = candidate
+                    break
+
+    if eval_json is not None and eval_json.exists():
         print(f"  [fold_{fold_id}] SKIP (cached)")
         return eval_json
 
@@ -266,7 +276,17 @@ def run_fold(
         f.write("\n\n## stderr\n")
         f.write(proc.stderr or "")
 
-    if proc.returncode == 0 and eval_json.exists():
+    # Re-find eval.json after the run (threshold may vary)
+    eval_json = None
+    if proc.returncode == 0 and run_dir.exists():
+        for d in sorted(run_dir.iterdir()):
+            if d.is_dir() and d.name.startswith("_eval_holdout_"):
+                candidate = d / "eval.json"
+                if candidate.exists():
+                    eval_json = candidate
+                    break
+
+    if eval_json is not None:
         print(f"  [fold_{fold_id}] OK ({elapsed:.0f}s, {len(holdout_samples)} holdout)")
         return eval_json
     else:
@@ -286,9 +306,38 @@ def parse_eval_results(
     eval_data = json.loads(eval_json_path.read_text(encoding="utf-8"))
     results = eval_data["results"]
 
-    # Build index from holdout samples by position (eval preserves order)
+    if len(results) != len(holdout_samples):
+        raise ValueError(
+            f"{eval_json_path}: expected {len(holdout_samples)} results, got {len(results)}"
+        )
+
+    # The harness may emit results in a different order from the holdout YAML.
+    # Join by case_id ("holdout_<1-based-index>") rather than by position.
+    indexed_results: dict[int, dict[str, Any]] = {}
+    for result in results:
+        case_id = str(result.get("case_id") or "")
+        prefix, _, suffix = case_id.rpartition("_")
+        if prefix != "holdout" or not suffix.isdigit():
+            raise ValueError(f"{eval_json_path}: unexpected case_id format: {case_id!r}")
+        sample_index = int(suffix) - 1
+        if sample_index < 0 or sample_index >= len(holdout_samples):
+            raise ValueError(
+                f"{eval_json_path}: case_id {case_id!r} out of bounds for "
+                f"{len(holdout_samples)} holdout samples"
+            )
+        if sample_index in indexed_results:
+            raise ValueError(f"{eval_json_path}: duplicate case_id {case_id!r}")
+        indexed_results[sample_index] = result
+
+    if len(indexed_results) != len(holdout_samples):
+        raise ValueError(
+            f"{eval_json_path}: indexed {len(indexed_results)} results for "
+            f"{len(holdout_samples)} holdout samples"
+        )
+
     rows = []
-    for i, (result, sample) in enumerate(zip(results, holdout_samples)):
+    for i, sample in enumerate(holdout_samples):
+        result = indexed_results[i]
         expected = result["expected"]  # "blocked" or "allowed"
         actual = result["actual"]
 

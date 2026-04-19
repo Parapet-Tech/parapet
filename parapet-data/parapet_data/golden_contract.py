@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import yaml
+from .curated_artifact import load_curated_entries
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -16,11 +16,7 @@ def _load_json(path: Path) -> dict[str, Any]:
 
 
 def _load_curated_entries(curated_dir: Path) -> list[dict[str, Any]]:
-    curated_path = curated_dir / "curated.yaml"
-    entries = yaml.safe_load(curated_path.read_text(encoding="utf-8"))
-    if not isinstance(entries, list):
-        raise ValueError(f"Expected list in {curated_path}")
-    return entries
+    return load_curated_entries(curated_dir)
 
 
 def _normalize_rel(path: Path, project_root: Path | None) -> str:

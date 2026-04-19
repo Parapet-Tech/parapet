@@ -22,13 +22,12 @@ import time
 import yaml
 
 try:
-    _YAML_LOADER = yaml.CSafeLoader
     _YAML_DUMPER = yaml.CSafeDumper
 except AttributeError:
-    _YAML_LOADER = yaml.SafeLoader  # type: ignore[assignment]
     _YAML_DUMPER = yaml.SafeDumper  # type: ignore[assignment]
 
 from parapet_data.ledger import Ledger, apply_ledger_to_row
+from parapet_data.staged_artifact import load_staged_rows
 
 log = logging.getLogger(__name__)
 
@@ -86,11 +85,8 @@ def sync_verified(
         )
 
         t0 = time.perf_counter()
-        with open(staged_file, "r", encoding="utf-8") as f:
-            raw = yaml.load(f, Loader=_YAML_LOADER)
+        raw = load_staged_rows(staged_file)
         t_load = time.perf_counter()
-        if not raw:
-            raw = []
 
         before = stats.total_input
         output = _sync_file(raw, ledger, stats)

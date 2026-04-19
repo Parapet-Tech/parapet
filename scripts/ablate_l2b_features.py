@@ -35,7 +35,6 @@ from typing import Any
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
-
 CONFIGS = [
     {"name": "A_harness_only", "features": "harness", "max_tfidf": 0},
     {"name": "B_harness_structural", "features": "harness+structural", "max_tfidf": 0},

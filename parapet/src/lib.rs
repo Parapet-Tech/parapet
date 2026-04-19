@@ -3,6 +3,7 @@
 
 pub mod config;
 pub mod constraint;
+pub mod defang;
 pub mod engine;
 #[cfg(feature = "eval")]
 pub mod eval;
@@ -13,6 +14,7 @@ pub mod model_path;
 pub mod normalize;
 pub mod provider;
 pub mod proxy;
+pub mod sensor;
 pub mod session;
 pub mod signal;
 pub(crate) mod stream;

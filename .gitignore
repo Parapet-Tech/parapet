@@ -68,6 +68,9 @@ parapet-data/archive/curated/
 parapet-data/archive/curated_baseline/
 parapet-data/tests/.tmp_temp/
 
+# Generated specs (expanded from *.compact.yaml via generate_spec.py)
+parapet-data/specs/mirror_spec_*.yaml
+
 # parapet-runner generated outputs (do not commit run artifacts/datasets)
 parapet-runner/.pytest_cache/
 parapet-runner/runs/

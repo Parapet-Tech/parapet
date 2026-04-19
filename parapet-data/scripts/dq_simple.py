@@ -1,13 +1,19 @@
 """Simple data quality stats - writes JSON output."""
-import yaml, json, hashlib, re
+import json, hashlib, re, sys
 from collections import Counter, defaultdict
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from parapet_data.curated_artifact import load_curated_entries
 
 p = Path("C:/Users/anyth/MINE/dev/DefenseSector/parapet/parapet-data/curated/v3_19k_clean/curated.yaml")
 out = Path("C:/Users/anyth/MINE/dev/DefenseSector/parapet/parapet-data/scripts/dq_result.json")
 
 print("Loading...")
-data = yaml.safe_load(open(p, encoding="utf-8"))
+data = load_curated_entries(p)
 print(f"Loaded {len(data)} samples")
 
 r = {}

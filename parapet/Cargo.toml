@@ -22,6 +22,10 @@ path = "src/bin/parapet_fetch.rs"
 name = "pg2-diag"
 path = "src/bin/pg2_diag.rs"
 
+[[bin]]
+name = "parapet-scope-audit"
+path = "src/bin/parapet_scope_audit.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
 axum = "0.8"

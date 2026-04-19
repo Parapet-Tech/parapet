@@ -135,7 +135,7 @@ class TestLoadSource:
         source = SourceRef(
             name="test", path=path, language=Language.EN, extractor="col_content",
         )
-        rows = load_source(source)
+        rows = list(load_source(source))
         assert len(rows) == 2
 
     def test_loads_yaml_directory(self, tmp_dir: Path) -> None:
@@ -144,7 +144,7 @@ class TestLoadSource:
         source = SourceRef(
             name="test", path=tmp_dir, language=Language.EN, extractor="col_content",
         )
-        rows = load_source(source)
+        rows = list(load_source(source))
         assert len(rows) == 2
 
     def test_missing_source_returns_empty(self, tmp_dir: Path) -> None:
@@ -152,7 +152,7 @@ class TestLoadSource:
             name="missing", path=tmp_dir / "nope.yaml",
             language=Language.EN, extractor="col_content",
         )
-        rows = load_source(source)
+        rows = list(load_source(source))
         assert rows == []
 
     def test_relative_path_with_base_dir(self, tmp_dir: Path) -> None:
@@ -161,8 +161,86 @@ class TestLoadSource:
             name="test", path=Path("data.yaml"),
             language=Language.EN, extractor="col_content",
         )
-        rows = load_source(source, base_dir=tmp_dir)
+        rows = list(load_source(source, base_dir=tmp_dir))
         assert len(rows) == 1
+
+    def test_no_global_raw_row_cache_attribute(self) -> None:
+        """The retired _source_cache must not creep back."""
+        from parapet_data import sampler
+
+        assert not hasattr(sampler, "_source_cache"), (
+            "_source_cache was removed in the streaming refactor; "
+            "do not reintroduce it without revisiting the memory contract."
+        )
+
+    def test_load_source_is_a_generator(self, tmp_dir: Path) -> None:
+        """load_source must be lazy so max_samples can short-circuit it."""
+        path = _write_yaml(tmp_dir / "x.yaml", [{"content": "a"}, {"content": "b"}])
+        source = SourceRef(
+            name="test", path=path, language=Language.EN, extractor="col_content",
+        )
+        result = load_source(source)
+
+        import types
+
+        assert isinstance(result, types.GeneratorType), (
+            f"load_source must return an iterator/generator, got {type(result).__name__}"
+        )
+
+    def test_repeated_calls_do_not_share_state(self, tmp_dir: Path) -> None:
+        """Two calls for the same source must not depend on cached rows."""
+        path = _write_yaml(tmp_dir / "x.yaml", [{"content": "a"}, {"content": "b"}])
+        source = SourceRef(
+            name="test", path=path, language=Language.EN, extractor="col_content",
+        )
+
+        first = list(load_source(source))
+        # Mutate the file between calls — without a raw-row cache, the
+        # second call must observe the new contents.
+        _write_yaml(path, [{"content": "c"}])
+        second = list(load_source(source))
+
+        assert [r["content"] for r in first] == ["a", "b"]
+        assert [r["content"] for r in second] == ["c"]
+
+    def test_max_samples_short_circuits_iteration(
+        self, tmp_dir: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Extraction must stop pulling rows once max_samples is hit.
+
+        Without short-circuit, this would pull all 100 rows even though
+        only 3 are needed — defeating the bounded-retention contract.
+        """
+        from parapet_data import sampler as sampler_module
+
+        rows = [{"content": f"sample text number {i} here"} for i in range(100)]
+        path = _write_yaml(tmp_dir / "big.yaml", rows)
+        source = SourceRef(
+            name="test", path=path,
+            language=Language.EN, extractor="col_content",
+            max_samples=3,
+        )
+
+        real_iter = sampler_module.iter_staged_rows
+        pulled = 0
+
+        def counting_iter(p):
+            nonlocal pulled
+            for row in real_iter(p):
+                pulled += 1
+                yield row
+
+        monkeypatch.setattr(sampler_module, "iter_staged_rows", counting_iter)
+
+        samples = extract_samples_from_source(source, label="benign", reason="test")
+
+        assert len(samples) == 3
+        # Each row passes filters and yields a sample, so we should pull
+        # exactly max_samples=3 rows. Allow up to +1 for any iteration
+        # bookkeeping a future refactor might introduce.
+        assert pulled <= 4, (
+            f"pulled {pulled} rows for max_samples=3 — short-circuit broken"
+        )
 
 
 # ---------------------------------------------------------------------------

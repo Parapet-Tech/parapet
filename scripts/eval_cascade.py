@@ -1,12 +1,16 @@
-"""Evaluate the L1 -> L2b cascade end-to-end on the Phase 4 challenge set.
+"""Evaluate the L1 -> L2 cascade end-to-end on the Phase 4 challenge set.
 
 Simulates the cascade routing:
   1. L1 scores every sample (from Phase 4 eval.json)
-  2. Routing: confident allow / confident block / route to L2b
-  3. L2b decides on routed traffic
+  2. Routing: confident allow / confident block / route to L2
+  3. L2 decides on routed traffic (backend selectable)
   4. Reports end-to-end metrics by source family
 
-Routing thresholds are swept to find the operating point.
+Backends:
+  --l2-backend l2b        XGBoost/RF/LR over L1 harness + structural + TF-IDF
+                          (requires --l2b-model-dir)
+  --l2-backend tinybert   TinyBERT ONNX sequence classifier
+                          (requires --tinybert-dir)
 
 Usage:
     cd parapet
@@ -14,8 +18,8 @@ Usage:
       --phase4-eval parapet-runner/runs/phase4_final/run/_eval_holdout_0p0/eval.json \
       --challenge-attack schema/eval/challenges/tough_attack_v2/tough_attack_v6_novel.yaml \
       --challenge-neutral schema/eval/challenges/tough_neutral_v2/tough_neutral_v6_novel.yaml \
-      --l2b-model-dir parapet-runner/runs/l2b_models \
-      --output-dir parapet-runner/runs/cascade_eval
+      --l2-backend tinybert --tinybert-dir models/tinybert_l2 \
+      --output-dir parapet-runner/runs/cascade_eval_tinybert
 """
 
 from __future__ import annotations
@@ -282,17 +286,107 @@ def compute_metrics(
 
 
 # ---------------------------------------------------------------------------
+# L2 backends
+# ---------------------------------------------------------------------------
+
+
+class TinyBertONNXModel:
+    """Sklearn-shaped wrapper around a TinyBERT ONNX model directory.
+
+    Expects `<model_dir>/model.onnx` and a HuggingFace tokenizer dump
+    (tokenizer.json + tokenizer_config.json). Pair with
+    `tinybert_extract_fn` so `simulate_cascade` can reuse the same code
+    path as the L2b backend.
+    """
+
+    def __init__(
+        self,
+        model_dir: Path,
+        max_length: int = 512,
+        batch_size: int = 32,
+        threshold: float = 0.5,
+    ) -> None:
+        import onnxruntime as ort
+        from transformers import AutoTokenizer
+
+        self.tokenizer = AutoTokenizer.from_pretrained(str(model_dir))
+        self.session = ort.InferenceSession(str(Path(model_dir) / "model.onnx"))
+        self.max_length = max_length
+        self.batch_size = batch_size
+        self.threshold = threshold
+
+    def _probs(self, samples: list[dict]) -> np.ndarray:
+        texts = [s["content"] for s in samples]
+        out = np.zeros(len(texts), dtype=np.float32)
+        for i in range(0, len(texts), self.batch_size):
+            batch = texts[i : i + self.batch_size]
+            enc = self.tokenizer(
+                batch,
+                return_tensors="np",
+                padding=True,
+                truncation=True,
+                max_length=self.max_length,
+            )
+            logits = self.session.run(
+                None,
+                {
+                    "input_ids": enc["input_ids"].astype(np.int64),
+                    "attention_mask": enc["attention_mask"].astype(np.int64),
+                },
+            )[0]
+            ex = np.exp(logits - logits.max(axis=1, keepdims=True))
+            out[i : i + self.batch_size] = ex[:, 1] / ex.sum(axis=1)
+        return out
+
+    def predict_proba(self, samples: list[dict]) -> np.ndarray:
+        p = self._probs(samples)
+        return np.column_stack([1.0 - p, p])
+
+    def predict(self, samples: list[dict]) -> np.ndarray:
+        return (self._probs(samples) >= self.threshold).astype(int)
+
+
+def tinybert_extract_fn(samples, families, tfidf, fit=False):
+    """Pass-through extractor: TinyBertONNXModel consumes sample dicts directly."""
+    return samples, None, None
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Evaluate L1+L2b cascade end-to-end")
+    parser = argparse.ArgumentParser(description="Evaluate L1+L2 cascade end-to-end")
     parser.add_argument("--phase4-eval", type=Path, required=True)
     parser.add_argument("--challenge-attack", type=Path, required=True)
     parser.add_argument("--challenge-neutral", type=Path, required=True)
-    parser.add_argument("--l2b-model-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--l2-backend",
+        choices=["l2b", "tinybert"],
+        default="l2b",
+        help="L2 scorer: 'l2b' = XGBoost/RF/LR, 'tinybert' = ONNX transformer",
+    )
+    parser.add_argument("--l2b-model-dir", type=Path, default=None,
+                        help="Required when --l2-backend=l2b")
+    parser.add_argument("--tinybert-dir", type=Path, default=None,
+                        help="Required when --l2-backend=tinybert")
+    parser.add_argument("--tinybert-threshold", type=float, default=0.5)
+    parser.add_argument("--tinybert-batch-size", type=int, default=32)
+    parser.add_argument("--tinybert-max-length", type=int, default=512)
+    parser.add_argument(
+        "--standalone",
+        action="store_true",
+        help="Evaluate the L2 backend alone, bypassing L1 routing. "
+             "Scores every challenge sample and reports per-source metrics. "
+             "This is the right mode for answering 'is this L2 model any good?'",
+    )
     args = parser.parse_args()
+
+    if args.l2_backend == "l2b" and args.l2b_model_dir is None:
+        parser.error("--l2b-model-dir required when --l2-backend=l2b")
+    if args.l2_backend == "tinybert" and args.tinybert_dir is None:
+        parser.error("--tinybert-dir required when --l2-backend=tinybert")
 
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -309,52 +403,113 @@ def main() -> int:
     n_benign = sum(1 for s in samples if s["true_label"] == "benign")
     print(f"  {n_attack} attack, {n_benign} benign")
 
-    # Load L2b model and feature config
-    print("\nLoading L2b model...")
-    model_dir = Path(args.l2b_model_dir).resolve()
-
-    # Auto-detect model type
-    model = None
-    model_name = "unknown"
-    for name, path in [("xgb", "xgb_model.pkl"), ("rf", "rf_model.pkl"), ("lr", "lr_model.pkl")]:
-        model_path = model_dir / path
-        if model_path.exists():
-            with open(model_path, "rb") as f:
-                model = pickle.load(f)
-            model_name = name
-            break
-    if model is None:
-        print("ERROR: no model found in", model_dir, file=sys.stderr)
-        return 1
-    print(f"  Loaded {model_name} model")
-
-    # Load feature config
-    feature_config_path = model_dir / "feature_config.json"
-    if feature_config_path.exists():
-        feature_config = json.loads(feature_config_path.read_text(encoding="utf-8"))
-        families = set(feature_config["families"])
-    else:
-        families = {"harness", "structural", "tfidf"}
-        print("  WARNING: no feature_config.json, assuming all families")
-
-    # Load TF-IDF if needed
+    # Load L2 backend
     tfidf = None
-    if "tfidf" in families:
-        tfidf_path = model_dir / "tfidf.pkl"
-        if tfidf_path.exists():
-            with open(tfidf_path, "rb") as f:
-                tfidf = pickle.load(f)
+    families: set[str] = set()
+    extract_fn: Any = None
+
+    if args.l2_backend == "l2b":
+        print("\nLoading L2b model...")
+        model_dir = Path(args.l2b_model_dir).resolve()
+
+        # Auto-detect model type
+        model = None
+        model_name = "unknown"
+        for name, path in [("xgb", "xgb_model.pkl"), ("rf", "rf_model.pkl"), ("lr", "lr_model.pkl")]:
+            model_path = model_dir / path
+            if model_path.exists():
+                with open(model_path, "rb") as f:
+                    model = pickle.load(f)
+                model_name = name
+                break
+        if model is None:
+            print("ERROR: no model found in", model_dir, file=sys.stderr)
+            return 1
+        print(f"  Loaded {model_name} model")
+
+        # Load feature config
+        feature_config_path = model_dir / "feature_config.json"
+        if feature_config_path.exists():
+            feature_config = json.loads(feature_config_path.read_text(encoding="utf-8"))
+            families = set(feature_config["families"])
         else:
-            print("  WARNING: tfidf family requested but tfidf.pkl missing")
-            families.discard("tfidf")
+            families = {"harness", "structural", "tfidf"}
+            print("  WARNING: no feature_config.json, assuming all families")
 
-    # Import extract_features from train_l2b
-    scripts_dir = Path(__file__).resolve().parent
-    if str(scripts_dir) not in sys.path:
-        sys.path.insert(0, str(scripts_dir))
-    from train_l2b import extract_features
+        # Load TF-IDF if needed
+        if "tfidf" in families:
+            tfidf_path = model_dir / "tfidf.pkl"
+            if tfidf_path.exists():
+                with open(tfidf_path, "rb") as f:
+                    tfidf = pickle.load(f)
+            else:
+                print("  WARNING: tfidf family requested but tfidf.pkl missing")
+                families.discard("tfidf")
 
-    rf_model = model  # keep variable name for simulate_cascade
+        # Import extract_features from train_l2b
+        scripts_dir = Path(__file__).resolve().parent
+        if str(scripts_dir) not in sys.path:
+            sys.path.insert(0, str(scripts_dir))
+        from train_l2b import extract_features
+        extract_fn = extract_features
+        rf_model = model
+    else:
+        print(f"\nLoading TinyBERT ONNX from {args.tinybert_dir}...")
+        onnx_model = TinyBertONNXModel(
+            Path(args.tinybert_dir).resolve(),
+            max_length=args.tinybert_max_length,
+            batch_size=args.tinybert_batch_size,
+            threshold=args.tinybert_threshold,
+        )
+        extract_fn = tinybert_extract_fn
+        print(f"  threshold={args.tinybert_threshold} "
+              f"max_length={args.tinybert_max_length} "
+              f"batch_size={args.tinybert_batch_size}")
+
+        # Pre-score every sample that could possibly be routed, ONCE.
+        # In cascade mode: only samples inside the widest routing window matter.
+        # In standalone mode: L2 decides every sample, so score them all.
+        import time
+        sweep_t_allow_min = -1.0
+        sweep_t_block_max = 3.0
+        if args.standalone:
+            routable = samples
+        else:
+            routable = [
+                s for s in samples
+                if sweep_t_allow_min <= s["raw_score"] < sweep_t_block_max
+            ]
+        print(f"  Pre-scoring {len(routable)}/{len(samples)} routable samples "
+              f"(raw_score in [{sweep_t_allow_min}, {sweep_t_block_max}))...")
+        t0 = time.time()
+        precomputed = onnx_model._probs(routable) if routable else np.zeros(0, dtype=np.float32)
+        dt = time.time() - t0
+        print(f"  done in {dt:.1f}s "
+              f"({dt/max(len(routable),1)*1000:.1f}ms/sample)")
+
+        prob_by_id = {s["case_id"]: float(precomputed[i]) for i, s in enumerate(routable)}
+
+        class _CachedTinyBert:
+            """Lookup-only L2 scorer backed by precomputed TinyBERT probabilities."""
+
+            def __init__(self, probs: dict[str, float], threshold: float) -> None:
+                self._probs = probs
+                self._threshold = threshold
+
+            def _lookup(self, batch: list[dict]) -> np.ndarray:
+                return np.array(
+                    [self._probs.get(s["case_id"], 0.0) for s in batch],
+                    dtype=np.float32,
+                )
+
+            def predict_proba(self, batch: list[dict]) -> np.ndarray:
+                p = self._lookup(batch)
+                return np.column_stack([1.0 - p, p])
+
+            def predict(self, batch: list[dict]) -> np.ndarray:
+                return (self._lookup(batch) >= self._threshold).astype(int)
+
+        rf_model = _CachedTinyBert(prob_by_id, args.tinybert_threshold)
 
     # L1 standalone baseline
     print("\n=== L1 Standalone (Phase 4 result) ===")
@@ -365,6 +520,46 @@ def main() -> int:
     ], label="L1 standalone")
     print(f"  F1={l1_baseline['f1']:.4f}  P={l1_baseline['precision']:.4f}  "
           f"R={l1_baseline['recall']:.4f}  FPR={l1_baseline['fpr']:.4f}")
+
+    # --- Standalone L2 mode: skip the sweep, evaluate L2 on every sample. ---
+    if args.standalone:
+        print("\n=== L2 Standalone (L1 bypassed; every sample scored by L2) ===")
+        standalone = simulate_cascade(
+            samples, rf_model, tfidf,
+            t_allow=float("-inf"), t_block=float("inf"),
+            families=families, extract_fn=extract_fn,
+        )
+        m = compute_metrics(standalone, label="L2 standalone")
+        print(f"  F1={m['f1']:.4f}  P={m['precision']:.4f}  "
+              f"R={m['recall']:.4f}  FPR={m['fpr']:.4f}")
+        print(f"  TP={m['tp']}  FP={m['fp']}  FN={m['fn']}  TN={m['tn']}")
+        print(f"  vs L1: d_F1={m['f1']-l1_baseline['f1']:+.4f}  "
+              f"d_FPR={m['fpr']-l1_baseline['fpr']:+.4f}")
+
+        print("\n=== Per-Source Breakdown (L2 standalone) ===")
+        by_source: dict[str, list[dict]] = defaultdict(list)
+        for r in standalone:
+            by_source[r["source"]].append(r)
+
+        print(f"{'Source':<40} {'N':>5} {'TP':>4} {'FP':>4} {'FN':>4} {'TN':>4} "
+              f"{'FPR':>6} {'Recall':>6}")
+        print("-" * 85)
+        for source in sorted(by_source.keys()):
+            rows = by_source[source]
+            sm = compute_metrics(rows, label=source)
+            fpr_str = f"{sm['fpr']:.2f}" if (sm['tn'] + sm['fp']) > 0 else "n/a"
+            rec_str = f"{sm['recall']:.2f}" if (sm['tp'] + sm['fn']) > 0 else "n/a"
+            print(f"{source:<40} {sm['n']:>5} {sm['tp']:>4} {sm['fp']:>4} "
+                  f"{sm['fn']:>4} {sm['tn']:>4} {fpr_str:>6} {rec_str:>6}")
+
+        (output_dir / "l2_standalone.json").write_text(
+            json.dumps(m, indent=2), encoding="utf-8"
+        )
+        (output_dir / "l1_baseline.json").write_text(
+            json.dumps(l1_baseline, indent=2), encoding="utf-8"
+        )
+        print(f"\nResults saved to {output_dir}")
+        return 0
 
     # Sweep routing thresholds
     print("\n=== Cascade Threshold Sweep ===")
@@ -378,7 +573,7 @@ def main() -> int:
             if t_allow >= t_block:
                 continue
 
-            cascade = simulate_cascade(samples, rf_model, tfidf, t_allow, t_block, families=families, extract_fn=extract_features)
+            cascade = simulate_cascade(samples, rf_model, tfidf, t_allow, t_block, families=families, extract_fn=extract_fn)
             m = compute_metrics(cascade, label=f"t_allow={t_allow},t_block={t_block}")
 
             delta_f1 = m["f1"] - l1_baseline["f1"]
@@ -413,7 +608,7 @@ def main() -> int:
     print(f"\n=== Per-Source Breakdown (best point) ===")
     cascade_best = simulate_cascade(
         samples, rf_model, tfidf, best["t_allow"], best["t_block"],
-        families=families, extract_fn=extract_features,
+        families=families, extract_fn=extract_fn,
     )
 
     by_source: dict[str, list[dict]] = defaultdict(list)
