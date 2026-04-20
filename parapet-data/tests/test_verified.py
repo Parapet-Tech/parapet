@@ -496,3 +496,191 @@ class TestJsonlInputSupport:
         assert stats.total_input == 5
         assert stats.passed == 5
         assert stats.dropped == 0
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: JSONL sync is end-to-end streaming (never materializes a list)
+# ---------------------------------------------------------------------------
+
+
+class TestJsonlStreaming:
+    """The JSONL path must not call ``load_staged_rows`` or otherwise
+    materialize the input/output as a list. All row survival decisions plus
+    writes happen one row at a time."""
+
+    def test_jsonl_sync_does_not_call_load_staged_rows(
+        self, tmp_dir: Path, monkeypatch
+    ) -> None:
+        """Structural proof of streaming: monkeypatch the materializing
+        loader to raise. If the JSONL path is truly row-streaming, the sync
+        still succeeds because it uses iter_staged_rows, not load_staged_rows."""
+        from parapet_data import verified as verified_mod
+
+        staging = tmp_dir / "staging"
+        verified = tmp_dir / "verified"
+        rows = [_staged_row(f"sample {i}") for i in range(10)]
+        _write_staged_jsonl(staging / "en_attacks_staged.jsonl", rows)
+
+        def exploding_load(_path):
+            raise AssertionError(
+                "load_staged_rows must not be called on the JSONL sync path"
+            )
+
+        monkeypatch.setattr(verified_mod, "load_staged_rows", exploding_load)
+
+        stats = sync_verified(staging, verified, _make_ledger([]))
+
+        assert stats.total_input == 10
+        assert stats.passed == 10
+        out_rows = _read_jsonl(verified / "en_attacks_staged.jsonl")
+        assert len(out_rows) == 10
+
+    def test_yaml_sync_still_uses_materializing_loader(
+        self, tmp_dir: Path, monkeypatch
+    ) -> None:
+        """YAML path must still call load_staged_rows — PyYAML cannot stream
+        a top-level sequence. This locks the contract so a future refactor
+        can't accidentally regress YAML behavior."""
+        from parapet_data import verified as verified_mod
+
+        staging = tmp_dir / "staging"
+        verified = tmp_dir / "verified"
+        rows = [_staged_row("only row")]
+        _write_staged(staging / "en_attacks_staged.yaml", rows)
+
+        original = verified_mod.load_staged_rows
+        calls: list[Path] = []
+
+        def tracked_load(path):
+            calls.append(path)
+            return original(path)
+
+        monkeypatch.setattr(verified_mod, "load_staged_rows", tracked_load)
+
+        sync_verified(staging, verified, _make_ledger([]))
+
+        assert len(calls) == 1
+        assert calls[0].name == "en_attacks_staged.yaml"
+
+    def test_multi_file_jsonl_sync_processes_all(self, tmp_dir: Path) -> None:
+        staging = tmp_dir / "staging"
+        verified = tmp_dir / "verified"
+        for idx, prefix in enumerate(("en_one", "en_two", "en_three"), start=1):
+            _write_staged_jsonl(
+                staging / f"{prefix}_attacks_staged.jsonl",
+                [_staged_row(f"{prefix} sample {i}") for i in range(idx)],
+            )
+
+        stats = sync_verified(staging, verified, _make_ledger([]))
+
+        assert stats.files_processed == 3
+        assert stats.total_input == 1 + 2 + 3
+        assert stats.passed == stats.total_input
+        for prefix, count in zip(("en_one", "en_two", "en_three"), (1, 2, 3)):
+            rows = _read_jsonl(verified / f"{prefix}_attacks_staged.jsonl")
+            assert len(rows) == count
+
+    def test_all_ledger_actions_parity_across_formats(self, tmp_dir: Path) -> None:
+        """Same inputs + same ledger on YAML vs JSONL produce identical
+        surviving rows and identical stats deltas across every action."""
+        from parapet_data.ledger import LedgerEntry
+
+        rows = [
+            _staged_row("pass through me", source="src"),
+            _staged_row("drop me", source="src"),
+            _staged_row("quarantine me", source="src"),
+            _staged_row(
+                "reroute me", source="src", reason="instruction_override"
+            ),
+            _staged_row("relabel me", source="src"),
+        ]
+        entries = [
+            LedgerEntry(
+                content_hash=content_hash("drop me"),
+                source="src",
+                action=LedgerAction.DROP,
+                adjudication=AdjudicationReason.MISLABEL,
+            ),
+            LedgerEntry(
+                content_hash=content_hash("quarantine me"),
+                source="src",
+                action=LedgerAction.QUARANTINE,
+                adjudication=AdjudicationReason.MALFORMED_TEXT,
+            ),
+            LedgerEntry(
+                content_hash=content_hash("reroute me"),
+                source="src",
+                action=LedgerAction.REROUTE_REASON,
+                adjudication=AdjudicationReason.ROUTING_DEFECT,
+                reroute_to="obfuscation",
+            ),
+            LedgerEntry(
+                content_hash=content_hash("relabel me"),
+                source="src",
+                action=LedgerAction.RELABEL_CLASS,
+                adjudication=AdjudicationReason.MISLABEL,
+                relabel_to="benign",
+            ),
+        ]
+
+        yaml_staging = tmp_dir / "yaml_s"
+        yaml_verified = tmp_dir / "yaml_v"
+        _write_staged(yaml_staging / "en_attacks_staged.yaml", rows)
+        yaml_stats = sync_verified(yaml_staging, yaml_verified, _make_ledger(entries))
+
+        jsonl_staging = tmp_dir / "jsonl_s"
+        jsonl_verified = tmp_dir / "jsonl_v"
+        _write_staged_jsonl(jsonl_staging / "en_attacks_staged.jsonl", rows)
+        jsonl_stats = sync_verified(
+            jsonl_staging, jsonl_verified, _make_ledger(entries)
+        )
+
+        # All five counter fields should match exactly across formats.
+        assert yaml_stats.total_input == jsonl_stats.total_input == 5
+        assert yaml_stats.passed == jsonl_stats.passed
+        assert yaml_stats.dropped == jsonl_stats.dropped
+        assert yaml_stats.quarantined == jsonl_stats.quarantined
+        assert yaml_stats.rerouted == jsonl_stats.rerouted
+        assert yaml_stats.relabeled == jsonl_stats.relabeled
+
+        # Row-level output parity.
+        yaml_out = yaml.safe_load(
+            (yaml_verified / "en_attacks_staged.yaml").read_text(encoding="utf-8")
+        )
+        jsonl_out = _read_jsonl(jsonl_verified / "en_attacks_staged.jsonl")
+        assert yaml_out == jsonl_out
+
+        # Specific action semantics survive through streaming:
+        out_by_content = {r["content"]: r for r in jsonl_out}
+        assert "pass through me" in out_by_content
+        assert "drop me" not in out_by_content
+        assert "quarantine me" not in out_by_content
+        assert out_by_content["reroute me"]["reason"] == "obfuscation"
+        assert out_by_content["relabel me"]["label"] == "benign"
+
+    def test_jsonl_sync_accepts_pure_generator_input(
+        self, tmp_dir: Path
+    ) -> None:
+        """Unit test for the streaming core: _sync_rows on a generator
+        produces a generator, not a list, and only consumes on iteration."""
+        from parapet_data.verified import _sync_rows
+
+        stats = SyncStats()
+        consumed: list[int] = []
+
+        def source():
+            for i, content in enumerate(("a", "b", "c")):
+                consumed.append(i)
+                yield _staged_row(content)
+
+        gen = _sync_rows(source(), _make_ledger([]), stats)
+
+        # Not a list — the input hasn't been touched until we iterate.
+        assert iter(gen) is gen
+        assert consumed == []
+
+        out = list(gen)
+        assert consumed == [0, 1, 2]
+        assert len(out) == 3
+        assert stats.total_input == 3
+        assert stats.passed == 3
