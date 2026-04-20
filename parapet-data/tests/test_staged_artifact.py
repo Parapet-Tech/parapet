@@ -10,6 +10,8 @@ import pytest
 import yaml
 
 from parapet_data.staged_artifact import (
+    is_staged_artifact_path,
+    iter_staged_artifact_paths,
     iter_staged_rows,
     load_staged_rows,
     staged_extension,
@@ -258,6 +260,87 @@ def test_write_staged_rows_creates_parent_dir(tmp_dir: Path) -> None:
 
     assert path.exists()
     assert path.parent.is_dir()
+
+
+def test_is_staged_artifact_path_accepts_staged_naming(tmp_dir: Path) -> None:
+    for name in (
+        "en_ds_attacks_staged.yaml",
+        "en_ds_benign_staged.yml",
+        "en_ds_benign_background_staged.jsonl",
+        "ru_other_attacks_staged.jsonl",
+    ):
+        p = tmp_dir / name
+        p.write_text("[]\n", encoding="utf-8")
+        assert is_staged_artifact_path(p), f"{name} should be a staged artifact"
+
+
+def test_is_staged_artifact_path_rejects_known_sidecars(tmp_dir: Path) -> None:
+    for name in (
+        # Per-dataset quarantine output:
+        "ds_quarantine.jsonl",
+        "tiny_dataset_quarantine.jsonl",
+        # Global rejection log:
+        "staging_rejected.jsonl",
+        # In-flight checkpoint shards stage_dataset writes between flushes:
+        "en_ds_attacks_staged.partial.jsonl",
+        "en_ds_benign_staged.partial.jsonl",
+        # Manifest/progress sidecars are excluded by suffix anyway:
+        "staging_manifest.json",
+        "ds_progress.json",
+    ):
+        p = tmp_dir / name
+        p.write_text("[]\n", encoding="utf-8")
+        assert not is_staged_artifact_path(p), f"{name} must not be treated as staged"
+
+
+def test_is_staged_artifact_path_accepts_hand_named_artifacts(tmp_dir: Path) -> None:
+    """Non-sidecar files with staged extensions still count — staged-naming
+    convention is preferred but not enforced, so test fixtures and any
+    legacy hand-named artifacts continue to load."""
+    for name in (
+        "attacks.yaml",
+        "rows.yml",
+        "raw.jsonl",
+        "manual_notes.yaml",
+    ):
+        p = tmp_dir / name
+        p.write_text("[]\n", encoding="utf-8")
+        assert is_staged_artifact_path(p), f"{name} should be treated as staged"
+
+
+def test_iter_staged_artifact_paths_filters_sidecars(tmp_dir: Path) -> None:
+    """Sidecars in a staging dir must not appear in the dir-mode loader's view."""
+    keep = [
+        tmp_dir / "en_ds_attacks_staged.yaml",
+        tmp_dir / "en_ds_benign_staged.jsonl",
+    ]
+    sidecars = [
+        tmp_dir / "ds_quarantine.jsonl",
+        tmp_dir / "staging_rejected.jsonl",
+        tmp_dir / "staging_manifest.json",
+        tmp_dir / "en_ds_attacks_staged.partial.jsonl",
+    ]
+    for p in keep + sidecars:
+        p.write_text("[]\n", encoding="utf-8")
+
+    found = iter_staged_artifact_paths(tmp_dir)
+
+    assert sorted(found) == sorted(keep)
+    assert not any(p in found for p in sidecars)
+
+
+def test_iter_staged_artifact_paths_returns_sorted(tmp_dir: Path) -> None:
+    names = [
+        "z_ds_attacks_staged.jsonl",
+        "a_ds_attacks_staged.yaml",
+        "m_ds_benign_staged.jsonl",
+    ]
+    for n in names:
+        (tmp_dir / n).write_text("[]\n", encoding="utf-8")
+
+    found = iter_staged_artifact_paths(tmp_dir)
+
+    assert [p.name for p in found] == sorted(names)
 
 
 def test_write_staged_rows_jsonl_and_yaml_have_different_bytes(tmp_dir: Path) -> None:

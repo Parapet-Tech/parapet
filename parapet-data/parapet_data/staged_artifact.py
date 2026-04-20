@@ -39,6 +39,44 @@ def staged_extension(fmt: StagedFormat) -> str:
     raise ValueError(f"unsupported staged artifact format: {fmt!r}")
 
 
+_STAGED_SUFFIXES: tuple[str, ...] = (".yaml", ".yml", ".jsonl")
+
+# Known sidecar files that stage_all writes into the same directory as
+# staged artifacts. These must NEVER be treated as staged-row sources by
+# dir-mode loaders. Add to this list when staging.py grows new sidecars.
+_SIDECAR_EXACT_NAMES: frozenset[str] = frozenset({"staging_rejected.jsonl"})
+_SIDECAR_NAME_SUFFIXES: tuple[str, ...] = (
+    "_quarantine.jsonl",   # per-dataset quarantine
+    ".partial.jsonl",      # in-flight checkpoint files
+)
+
+
+def is_staged_artifact_path(path: Path) -> bool:
+    """True if ``path`` is a staged artifact, not a control-plane sidecar.
+
+    Filters by extension AND by sidecar exclusion. Files in a staging
+    directory that share an extension with staged artifacts but are
+    structurally different — quarantine logs, rejection logs, in-flight
+    checkpoint shards — are explicitly excluded so dir-mode loaders never
+    slurp them as sample rows.
+    """
+    if not path.is_file():
+        return False
+    if path.suffix.lower() not in _STAGED_SUFFIXES:
+        return False
+    name = path.name.lower()
+    if name in _SIDECAR_EXACT_NAMES:
+        return False
+    if any(name.endswith(suffix) for suffix in _SIDECAR_NAME_SUFFIXES):
+        return False
+    return True
+
+
+def iter_staged_artifact_paths(directory: Path) -> list[Path]:
+    """Return staged artifact paths from ``directory``, sorted by path."""
+    return sorted(p for p in directory.iterdir() if is_staged_artifact_path(p))
+
+
 def iter_staged_rows(path: Path) -> Iterator[dict[str, Any]]:
     """Yield staged rows from a single staged artifact file.
 

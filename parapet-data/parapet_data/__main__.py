@@ -435,8 +435,9 @@ def main() -> None:
     stage_parser.add_argument(
         "--format",
         choices=("yaml", "jsonl"),
-        default="yaml",
-        help="Staged artifact format (default: yaml; jsonl enables streaming writes)",
+        default="jsonl",
+        help="Staged artifact format (default: jsonl — streaming writes; "
+             "use yaml for legacy compatibility)",
     )
 
     vsync_parser = subparsers.add_parser(
