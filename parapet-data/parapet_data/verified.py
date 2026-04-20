@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Iterable, Iterator
 
 import sys
 import time
@@ -30,6 +31,7 @@ from parapet_data.ledger import Ledger, apply_ledger_to_row
 from parapet_data.staged_artifact import (
     StagedFormat,
     iter_staged_artifact_paths,
+    iter_staged_rows,
     load_staged_rows,
     write_staged_rows,
 )
@@ -49,10 +51,18 @@ class SyncStats:
     rerouted: int = 0
     relabeled: int = 0
 
-def _sync_file(rows: list[dict], ledger: Ledger, stats: SyncStats) -> list[dict]:
-    """Apply ledger actions to a list of staged rows. Returns surviving rows."""
-    output: list[dict] = []
-    for row in rows:
+def _sync_rows(
+    row_stream: Iterable[dict],
+    ledger: Ledger,
+    stats: SyncStats,
+) -> Iterator[dict]:
+    """Apply ledger actions to each input row, yielding surviving rows.
+
+    Streaming core for the JSONL verified-sync path: one row at a time, no
+    intermediate list. The YAML path materializes by wrapping the caller in
+    ``list(_sync_rows(...))`` — PyYAML cannot stream a top-level sequence.
+    """
+    for row in row_stream:
         stats.total_input += 1
         result = apply_ledger_to_row(row, ledger)
         stats.passed += result.passed
@@ -61,9 +71,17 @@ def _sync_file(rows: list[dict], ledger: Ledger, stats: SyncStats) -> list[dict]
         stats.rerouted += result.rerouted
         stats.relabeled += result.relabeled
         if result.row is not None:
-            output.append(result.row)
+            yield result.row
 
-    return output
+
+def _sync_file(rows: list[dict], ledger: Ledger, stats: SyncStats) -> list[dict]:
+    """Backwards-compatible list-based sync — thin adapter over ``_sync_rows``.
+
+    Retained so that callers wanting materialized output (and tests from
+    earlier phases) continue to work unchanged. New code paths should prefer
+    ``_sync_rows`` so JSONL stays bounded-retention.
+    """
+    return list(_sync_rows(iter(rows), ledger, stats))
 
 
 def _staged_format_from_suffix(path: Path) -> StagedFormat:
@@ -107,8 +125,10 @@ def sync_verified(
     - staging_dir is not mutated
     - verified_dir is created if missing
     - both .yaml/.yml and .jsonl staged artifacts are processed; each verified
-      output is written in the same format as its input (Phase 3 will make the
-      JSONL path streaming — today it is correct but not yet bounded-retention)
+      output is written in the same format as its input
+    - the JSONL path is end-to-end streaming: one row read, ledger applied,
+      surviving row written, row discarded — no list[dict] is ever built
+    - the YAML path materializes (PyYAML cannot stream a top-level sequence)
     """
     verified_dir.mkdir(parents=True, exist_ok=True)
     stats = SyncStats()
@@ -122,25 +142,36 @@ def sync_verified(
             flush=True,
         )
 
-        t0 = time.perf_counter()
-        raw = load_staged_rows(staged_file)
-        t_load = time.perf_counter()
-
-        before = stats.total_input
-        output = _sync_file(raw, ledger, stats)
-        t_sync = time.perf_counter()
-        stats.files_processed += 1
-        n_in = stats.total_input - before
-        n_dropped = n_in - len(output)
-
         out_path = verified_dir / staged_file.name
         fmt = _staged_format_from_suffix(staged_file)
-        _write_verified(out_path, output, fmt)
-        t_dump = time.perf_counter()
+        before_input = stats.total_input
+        before_passed = stats.passed
+
+        t0 = time.perf_counter()
+        if fmt == "jsonl":
+            # Bounded-retention path: read, ledger, write, discard per row.
+            write_staged_rows(
+                out_path,
+                _sync_rows(iter_staged_rows(staged_file), ledger, stats),
+                fmt="jsonl",
+            )
+            t_load = t_sync = t_dump = time.perf_counter()
+        else:
+            raw = load_staged_rows(staged_file)
+            t_load = time.perf_counter()
+            output = list(_sync_rows(iter(raw), ledger, stats))
+            t_sync = time.perf_counter()
+            _write_verified(out_path, output, fmt)
+            t_dump = time.perf_counter()
+
+        stats.files_processed += 1
+        n_in = stats.total_input - before_input
+        n_out = stats.passed - before_passed
+        n_dropped = n_in - n_out
 
         if n_dropped:
             print(
-                f"           -> {n_in} in, {len(output)} out ({n_dropped} removed)",
+                f"           -> {n_in} in, {n_out} out ({n_dropped} removed)",
                 file=sys.stderr,
             )
         print(
