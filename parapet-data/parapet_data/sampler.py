@@ -38,7 +38,7 @@ from .models import (
     SourceRef,
     Supplement,
 )
-from .staged_artifact import iter_staged_rows
+from .staged_artifact import iter_staged_artifact_paths, iter_staged_rows
 
 logger = logging.getLogger(__name__)
 
@@ -127,7 +127,7 @@ def load_source(
         return
 
     if path.is_dir():
-        for staged_file in sorted(path.glob("*.yaml")) + sorted(path.glob("*.yml")):
+        for staged_file in iter_staged_artifact_paths(path):
             yield from iter_staged_rows(staged_file)
         return
 

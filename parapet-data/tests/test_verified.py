@@ -349,43 +349,150 @@ class TestSyncHashComputation:
 
 
 # ---------------------------------------------------------------------------
-# Guardrail: JSONL staged inputs are explicitly rejected (Phase 1 boundary)
+# Format compatibility: sync_verified handles both .yaml and .jsonl inputs
+# and writes output in the matching format per file.
 # ---------------------------------------------------------------------------
 
 
-class TestJsonlGuardrail:
-    """verified-sync must refuse .jsonl staged inputs until Phase 3 lands."""
+def _write_staged_jsonl(path: Path, rows: list[dict]) -> Path:
+    import json as _json
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "".join(_json.dumps(r, ensure_ascii=False) + "\n" for r in rows),
+        encoding="utf-8",
+    )
+    return path
 
-    def test_raises_when_staging_contains_jsonl(self, tmp_dir: Path) -> None:
+
+def _read_jsonl(path: Path) -> list[dict]:
+    import json as _json
+    return [
+        _json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+class TestJsonlInputSupport:
+    """Phase 2: sync_verified accepts .jsonl staged inputs."""
+
+    def test_jsonl_input_produces_jsonl_output(self, tmp_dir: Path) -> None:
         staging = tmp_dir / "staging"
         verified = tmp_dir / "verified"
-        staging.mkdir(parents=True)
-        (staging / "en_ds_attacks_staged.jsonl").write_text(
-            '{"content":"x","label":"malicious","content_hash":"h","source":"s","reason":"r","language":"EN"}\n',
+        rows = [_staged_row("attack one"), _staged_row("attack two")]
+        _write_staged_jsonl(staging / "en_attacks_staged.jsonl", rows)
+
+        stats = sync_verified(staging, verified, _make_ledger([]))
+
+        out_path = verified / "en_attacks_staged.jsonl"
+        assert out_path.exists()
+        assert not (verified / "en_attacks_staged.yaml").exists()
+        out_rows = _read_jsonl(out_path)
+        assert len(out_rows) == 2
+        assert stats.passed == 2
+
+    def test_mixed_yaml_and_jsonl_preserve_format_per_file(self, tmp_dir: Path) -> None:
+        """Each verified output matches its input extension, side by side."""
+        staging = tmp_dir / "staging"
+        verified = tmp_dir / "verified"
+        yaml_rows = [_staged_row("yaml row a"), _staged_row("yaml row b")]
+        jsonl_rows = [_staged_row("jsonl row a"), _staged_row("jsonl row b")]
+        _write_staged(staging / "en_yaml_staged.yaml", yaml_rows)
+        _write_staged_jsonl(staging / "en_jsonl_staged.jsonl", jsonl_rows)
+
+        stats = sync_verified(staging, verified, _make_ledger([]))
+
+        yaml_out = verified / "en_yaml_staged.yaml"
+        jsonl_out = verified / "en_jsonl_staged.jsonl"
+        assert yaml_out.exists() and jsonl_out.exists()
+        assert yaml.safe_load(yaml_out.read_text(encoding="utf-8")) == yaml_rows
+        assert _read_jsonl(jsonl_out) == jsonl_rows
+        # No cross-contamination: yaml input doesn't produce a jsonl output and vice-versa.
+        assert not (verified / "en_yaml_staged.jsonl").exists()
+        assert not (verified / "en_jsonl_staged.yaml").exists()
+        assert stats.passed == 4
+        assert stats.files_processed == 2
+
+    def test_ledger_actions_identical_across_formats(self, tmp_dir: Path) -> None:
+        """Same rows + same ledger = same passed/dropped counts regardless of input format."""
+        rows = [
+            _staged_row("keep me"),
+            _staged_row("drop me"),
+            _staged_row("also keep"),
+        ]
+        drop_entry = LedgerEntry(
+            content_hash=content_hash("drop me"),
+            source="test_src",
+            action=LedgerAction.DROP,
+            adjudication=AdjudicationReason.MISLABEL,
+        )
+        ledger = _make_ledger([drop_entry])
+
+        yaml_staging = tmp_dir / "yaml_staging"
+        yaml_verified = tmp_dir / "yaml_verified"
+        _write_staged(yaml_staging / "en_attacks_staged.yaml", rows)
+        yaml_stats = sync_verified(yaml_staging, yaml_verified, ledger)
+
+        jsonl_staging = tmp_dir / "jsonl_staging"
+        jsonl_verified = tmp_dir / "jsonl_verified"
+        _write_staged_jsonl(jsonl_staging / "en_attacks_staged.jsonl", rows)
+        jsonl_stats = sync_verified(jsonl_staging, jsonl_verified, _make_ledger([drop_entry]))
+
+        assert yaml_stats.total_input == jsonl_stats.total_input
+        assert yaml_stats.passed == jsonl_stats.passed
+        assert yaml_stats.dropped == jsonl_stats.dropped
+        assert yaml_stats.quarantined == jsonl_stats.quarantined
+        assert yaml_stats.rerouted == jsonl_stats.rerouted
+        assert yaml_stats.relabeled == jsonl_stats.relabeled
+        assert yaml_stats.files_processed == jsonl_stats.files_processed
+
+        yaml_out = yaml.safe_load(
+            (yaml_verified / "en_attacks_staged.yaml").read_text(encoding="utf-8")
+        )
+        jsonl_out = _read_jsonl(jsonl_verified / "en_attacks_staged.jsonl")
+        assert yaml_out == jsonl_out
+
+    def test_ignores_quarantine_and_rejection_sidecars(self, tmp_dir: Path) -> None:
+        """Regression: sync_verified must skip stage_all's sidecar JSONL files."""
+        staging = tmp_dir / "staging"
+        verified = tmp_dir / "verified"
+        _write_staged_jsonl(
+            staging / "en_ds_attacks_staged.jsonl",
+            [_staged_row("real attack")],
+        )
+        # Sidecars that share the .jsonl extension but are not staged artifacts:
+        (staging.parent / "_init_marker").mkdir(parents=True, exist_ok=True)
+        (staging / "ds_quarantine.jsonl").write_text(
+            '{"content":"QUARANTINE_LEAK","source":"x","reason":"x"}\n',
+            encoding="utf-8",
+        )
+        (staging / "staging_rejected.jsonl").write_text(
+            '{"source":"x","gate":"x","detail":"x","preview":"REJECTED_LEAK"}\n',
             encoding="utf-8",
         )
 
-        with pytest.raises(ValueError, match="does not yet support .jsonl"):
-            sync_verified(staging, verified, _make_ledger([]))
+        stats = sync_verified(staging, verified, _make_ledger([]))
 
-    def test_error_message_points_to_phase_3(self, tmp_dir: Path) -> None:
+        assert stats.files_processed == 1
+        assert stats.total_input == 1
+        assert (verified / "en_ds_attacks_staged.jsonl").exists()
+        # Sidecars must not be copied into verified output dir.
+        assert not (verified / "ds_quarantine.jsonl").exists()
+        assert not (verified / "staging_rejected.jsonl").exists()
+
+    def test_stats_unchanged_except_filenames(self, tmp_dir: Path) -> None:
+        """Stats contract unchanged regardless of input format."""
         staging = tmp_dir / "staging"
         verified = tmp_dir / "verified"
-        staging.mkdir(parents=True)
-        (staging / "en_x.jsonl").write_text('{"content":"x"}\n', encoding="utf-8")
+        _write_staged_jsonl(
+            staging / "en_attacks_staged.jsonl",
+            [_staged_row(f"sample {i}") for i in range(5)],
+        )
 
-        with pytest.raises(ValueError, match="Phase 3"):
-            sync_verified(staging, verified, _make_ledger([]))
+        stats = sync_verified(staging, verified, _make_ledger([]))
 
-    def test_raises_even_when_yaml_also_present(self, tmp_dir: Path) -> None:
-        """Mixed staging dirs still fail — prevents partial silent processing."""
-        staging = tmp_dir / "staging"
-        verified = tmp_dir / "verified"
-        _write_staged(staging / "en_yaml_staged.yaml", [_staged_row("yaml survivor")])
-        (staging / "en_jsonl_staged.jsonl").write_text('{"content":"x"}\n', encoding="utf-8")
-
-        with pytest.raises(ValueError, match="does not yet support .jsonl"):
-            sync_verified(staging, verified, _make_ledger([]))
-
-        # Verified dir must not have been written to partially.
-        assert not (verified / "en_yaml_staged.yaml").exists()
+        assert isinstance(stats, SyncStats)
+        assert stats.files_processed == 1
+        assert stats.total_input == 5
+        assert stats.passed == 5
+        assert stats.dropped == 0

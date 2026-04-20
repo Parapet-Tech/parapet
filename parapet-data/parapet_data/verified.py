@@ -27,7 +27,12 @@ except AttributeError:
     _YAML_DUMPER = yaml.SafeDumper  # type: ignore[assignment]
 
 from parapet_data.ledger import Ledger, apply_ledger_to_row
-from parapet_data.staged_artifact import load_staged_rows
+from parapet_data.staged_artifact import (
+    StagedFormat,
+    iter_staged_artifact_paths,
+    load_staged_rows,
+    write_staged_rows,
+)
 
 log = logging.getLogger(__name__)
 
@@ -61,34 +66,54 @@ def _sync_file(rows: list[dict], ledger: Ledger, stats: SyncStats) -> list[dict]
     return output
 
 
+def _staged_format_from_suffix(path: Path) -> StagedFormat:
+    suffix = path.suffix.lower()
+    if suffix in (".yaml", ".yml"):
+        return "yaml"
+    if suffix == ".jsonl":
+        return "jsonl"
+    raise ValueError(f"{path}: unsupported staged artifact suffix {suffix}")
+
+
+def _write_verified(path: Path, rows: list[dict], fmt: StagedFormat) -> None:
+    """Write verified output in the same format as the input.
+
+    JSONL uses the shared streaming writer. YAML preserves the prior verified
+    dumper settings (CSafeDumper, sort_keys=False) so existing consumers see
+    byte-identical output on that path.
+    """
+    if fmt == "jsonl":
+        write_staged_rows(path, rows, fmt="jsonl")
+        return
+    with open(path, "w", encoding="utf-8") as f:
+        yaml.dump(
+            rows,
+            f,
+            Dumper=_YAML_DUMPER,
+            allow_unicode=True,
+            default_flow_style=False,
+            sort_keys=False,
+            width=2000,
+        )
+
+
 def sync_verified(
     staging_dir: Path,
     verified_dir: Path,
     ledger: Ledger,
 ) -> SyncStats:
-    """Sync all YAML files from staging_dir to verified_dir through the ledger.
+    """Sync staged artifacts from staging_dir to verified_dir through the ledger.
 
     - staging_dir is not mutated
     - verified_dir is created if missing
-    - only .yaml files are processed (JSONL support lands in bounded-retention
-      Phase 3; ``sync_verified`` raises if it finds JSONL it would silently
-      ignore so callers never lose rows unnoticed)
+    - both .yaml/.yml and .jsonl staged artifacts are processed; each verified
+      output is written in the same format as its input (Phase 3 will make the
+      JSONL path streaming — today it is correct but not yet bounded-retention)
     """
     verified_dir.mkdir(parents=True, exist_ok=True)
     stats = SyncStats()
 
-    staged_jsonl = sorted(staging_dir.glob("*.jsonl"))
-    if staged_jsonl:
-        sample = ", ".join(p.name for p in staged_jsonl[:3])
-        more = "" if len(staged_jsonl) <= 3 else f" (+{len(staged_jsonl) - 3} more)"
-        raise ValueError(
-            f"verified-sync does not yet support .jsonl staged artifacts "
-            f"(found {len(staged_jsonl)} in {staging_dir}: {sample}{more}). "
-            f"JSONL verified-sync lands in Phase 3 of the bounded-retention "
-            f"plan. Re-stage with --format yaml, or wait for Phase 3."
-        )
-
-    staged_files = sorted(staging_dir.glob("*.yaml"))
+    staged_files = iter_staged_artifact_paths(staging_dir)
     for i, staged_file in enumerate(staged_files, 1):
         size_mb = staged_file.stat().st_size / (1024 * 1024)
         print(
@@ -109,10 +134,8 @@ def sync_verified(
         n_dropped = n_in - len(output)
 
         out_path = verified_dir / staged_file.name
-        with open(out_path, "w", encoding="utf-8") as f:
-            yaml.dump(output, f, Dumper=_YAML_DUMPER,
-                      allow_unicode=True, default_flow_style=False,
-                      sort_keys=False, width=2000)
+        fmt = _staged_format_from_suffix(staged_file)
+        _write_verified(out_path, output, fmt)
         t_dump = time.perf_counter()
 
         if n_dropped:

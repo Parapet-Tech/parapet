@@ -1219,7 +1219,7 @@ def stage_all(
     max_rows_per_dataset: int | None = None,
     checkpoint_every_rows: int = 5000,
     checkpoint_dir: Path | None = None,
-    fmt: StagedFormat = "yaml",
+    fmt: StagedFormat = "jsonl",
 ) -> dict[str, Any]:
     """Run the full staging pipeline.
 
