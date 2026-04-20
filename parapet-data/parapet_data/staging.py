@@ -155,6 +155,7 @@ class DatasetResult:
     staged: list[StagedSample] = field(default_factory=list)
     rejected: list[RejectionRecord] = field(default_factory=list)
     quarantined: list[QuarantineRecord] = field(default_factory=list)
+    schema_resolution: "SchemaResolutionReport | None" = None
 
     @property
     def rejection_counts(self) -> dict[str, int]:
@@ -177,6 +178,569 @@ class DatasetResult:
         for s in self.staged:
             counts[s.language] = counts.get(s.language, 0) + 1
         return counts
+
+
+# ---------------------------------------------------------------------------
+# Schema resolution: reconcile INDEX-declared columns vs actual file schema
+# ---------------------------------------------------------------------------
+
+
+# Explicit, role-specific fallback lists. No fuzzy matching.
+# Order matters: earlier candidates win when multiple could match.
+TEXT_FALLBACKS: tuple[str, ...] = (
+    "prompt",
+    "content",
+    "user_input",
+    "query",
+    "text",
+    "input",
+    "instruction",
+)
+LABEL_FALLBACKS: tuple[str, ...] = (
+    "label",
+    "class",
+    "is_attack",
+    "is_prompt_injection",
+    "attack_attempt",
+    "group",
+    "data_type",
+)
+REASON_FALLBACKS: tuple[str, ...] = (
+    "attack_type",
+    "reason",
+    "category",
+    "injection_type",
+)
+
+
+@dataclass(frozen=True)
+class FileSchemaProbe:
+    """Schema read from a single data file.
+
+    ``source`` records how the column set was obtained:
+    - ``parquet_metadata`` / ``csv_header``: formal schema, zero rows read.
+    - ``jsonl_inferred`` / ``json_inferred``: inferred from the first
+      ``sample_rows_read`` rows. Columns appearing only in later rows
+      will not be seen — callers must account for sparse JSONL fields.
+    """
+
+    path: Path
+    source: str  # parquet_metadata | csv_header | jsonl_inferred | json_inferred
+    columns: tuple[str, ...]
+    sample_rows_read: int
+
+
+@dataclass(frozen=True)
+class SchemaColumnResolution:
+    """Resolution decision for one column role (text, label, or reason)."""
+
+    role: str  # "text" | "label" | "reason"
+    declared: str | None
+    resolved: str | None
+    status: str  # declared_present | declared_missing_fallback_used | declared_none_intentional
+    fallback_candidates: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class SchemaResolutionReport:
+    """Auditable record of reconciling INDEX columns against real schema.
+
+    Kept separate from the resolved DatasetConfig so the declared-vs-resolved
+    audit trail survives into the staging manifest.
+    """
+
+    dataset: str
+    files_probed: int
+    file_probes: tuple[FileSchemaProbe, ...]
+    columns_seen: tuple[str, ...]
+    columns_common: tuple[str, ...]
+    resolutions: tuple[SchemaColumnResolution, ...]
+
+
+def _probe_file_schema(path: Path, *, sample_rows: int) -> FileSchemaProbe:
+    """Read the column set of a single data file.
+
+    Parquet/CSV give a formal schema. JSONL/JSON are inferred from the first
+    ``sample_rows`` records — fields appearing only in later rows are invisible
+    to this probe; the ``source`` field makes that explicit.
+    """
+    suffix = path.suffix.lower()
+
+    if suffix == ".parquet":
+        import pyarrow.parquet as pq  # type: ignore[import-not-found]
+        schema = pq.ParquetFile(str(path)).schema_arrow
+        return FileSchemaProbe(
+            path=path,
+            source="parquet_metadata",
+            columns=tuple(sorted(schema.names)),
+            sample_rows_read=0,
+        )
+
+    if suffix in (".csv", ".tsv"):
+        import pandas as pd
+        sep = "\t" if suffix == ".tsv" else ","
+        header = pd.read_csv(path, sep=sep, nrows=0).columns.tolist()
+        return FileSchemaProbe(
+            path=path,
+            source="csv_header",
+            columns=tuple(sorted(header)),
+            sample_rows_read=0,
+        )
+
+    if suffix == ".jsonl":
+        keys: set[str] = set()
+        n = 0
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                if n >= sample_rows:
+                    break
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    row = json.loads(stripped)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(row, dict):
+                    keys.update(row.keys())
+                n += 1
+        return FileSchemaProbe(
+            path=path,
+            source="jsonl_inferred",
+            columns=tuple(sorted(keys)),
+            sample_rows_read=n,
+        )
+
+    if suffix == ".json":
+        keys, n_rows = _probe_json_streaming(path, sample_rows=sample_rows)
+        return FileSchemaProbe(
+            path=path,
+            source="json_inferred",
+            columns=tuple(sorted(keys)),
+            sample_rows_read=n_rows,
+        )
+
+    raise ValueError(f"{path}: unsupported format for schema probe")
+
+
+def _probe_json_streaming(path: Path, *, sample_rows: int) -> tuple[set[str], int]:
+    """Bounded-retention schema probe for .json files.
+
+    JSON is polymorphic — a file may be a top-level array, a wrapper dict
+    (``{"data": [...]}``), a keyed-records dict (``{"row content": {...}}``),
+    or line-delimited JSON dressed as ``.json``. This probe streams via
+    ``ijson`` so it never materializes the full document, matching the
+    "infer from first ``sample_rows``" contract that ``FileSchemaProbe``
+    advertises.
+
+    Mirrors the shape dispatch in :func:`iter_records` so the probed keys
+    reflect what downstream extractors actually see (including the synthetic
+    ``content`` / ``_record_key`` from keyed-records expansion).
+    """
+    import ijson
+
+    keys: set[str] = set()
+
+    # Line-delimited JSON dressed as `.json`: detect by requiring TWO
+    # non-empty lines that BOTH parse as complete JSON objects. One-line
+    # compact JSON documents (e.g. ``{"data": [...]}``) would otherwise be
+    # misclassified as JSONL and probed row-by-row, missing the real shape.
+    with open(path, encoding="utf-8") as f:
+        line1 = f.readline().strip()
+        line2 = f.readline().strip()
+    is_line_delimited = False
+    if line1 and line2:
+        try:
+            obj1 = json.loads(line1)
+            obj2 = json.loads(line2)
+            if isinstance(obj1, dict) and isinstance(obj2, dict):
+                is_line_delimited = True
+        except json.JSONDecodeError:
+            pass
+    if is_line_delimited:
+        n = 0
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                if n >= sample_rows:
+                    break
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    row = json.loads(stripped)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(row, dict):
+                    keys.update(row.keys())
+                n += 1
+        return keys, n
+
+    # Identify the top-level shape from the first parse event so we can
+    # dispatch to the right streaming iterator without rewinding blind.
+    with open(path, "rb") as f:
+        events = ijson.parse(f)
+        try:
+            _, first_event, _ = next(events)
+        except StopIteration:
+            return keys, 0
+
+    n = 0
+
+    if first_event == "start_array":
+        with open(path, "rb") as f:
+            for item in ijson.items(f, "item"):
+                if n >= sample_rows:
+                    break
+                if isinstance(item, dict):
+                    keys.update(item.keys())
+                n += 1
+        return keys, n
+
+    if first_event == "start_map":
+        # Wrapper detection via events — identifies a top-level key whose
+        # value is an array WITHOUT materializing the array or any nested
+        # values. Runtime dispatches on isinstance(payload[key], list)
+        # BEFORE checking whether the list is non-empty, so the probe must
+        # treat ``{"data": []}`` as a (zero-row) wrapper, not as a
+        # single-row map whose row happens to be the empty list.
+        _WRAPPERS = ("data", "records", "items", "examples")
+        wrappers_with_arrays: set[str] = set()
+        awaiting_value_for: str | None = None
+        with open(path, "rb") as f:
+            for prefix, event, value in ijson.parse(f):
+                if prefix == "" and event == "end_map":
+                    break
+                if prefix == "" and event == "map_key":
+                    awaiting_value_for = value
+                    continue
+                if awaiting_value_for is not None and prefix == awaiting_value_for:
+                    if event == "start_array" and awaiting_value_for in _WRAPPERS:
+                        wrappers_with_arrays.add(awaiting_value_for)
+                        # Highest-priority wrapper hit — no reason to scan
+                        # further events just to confirm lower-priority ones.
+                        if awaiting_value_for == _WRAPPERS[0]:
+                            awaiting_value_for = None
+                            break
+                    awaiting_value_for = None
+
+        detected_wrapper = next(
+            (w for w in _WRAPPERS if w in wrappers_with_arrays), None
+        )
+
+        if detected_wrapper is not None:
+            with open(path, "rb") as f:
+                items_iter = ijson.items(f, f"{detected_wrapper}.item")
+                for item in items_iter:
+                    if n >= sample_rows:
+                        break
+                    if isinstance(item, dict):
+                        keys.update(item.keys())
+                    n += 1
+            return keys, n  # n == 0 for empty wrapper — valid zero-row shape
+
+        # Not a wrapper shape. The runtime (iter_records +
+        # _looks_like_keyed_records) chooses between two shapes for a
+        # top-level map:
+        #   - any value is a list        -> yield the map AS ONE ROW
+        #   - otherwise (all non-list)   -> keyed-records expansion
+        # The probe mirrors that dispatch by scanning up to ``sample_rows``
+        # top-level entries. Accumulates both interpretations concurrently
+        # and commits based on whether a list value was seen in the sample.
+        single_row_keys: set[str] = set()
+        keyed_record_keys: set[str] = set()
+        n_keyed = 0
+        has_list_value = False
+
+        with open(path, "rb") as f:
+            for record_key, record_val in ijson.kvitems(f, ""):
+                if n_keyed >= sample_rows:
+                    break
+                single_row_keys.add(record_key)
+                if isinstance(record_val, list):
+                    has_list_value = True
+                    break
+                keyed_record_keys.add("content")
+                keyed_record_keys.add("_record_key")
+                if isinstance(record_val, dict):
+                    keyed_record_keys.update(record_val.keys())
+                else:
+                    keyed_record_keys.add("value")
+                n_keyed += 1
+
+        if has_list_value:
+            # Single-row shape — the whole map is one row. Collect the
+            # remaining top-level keys via event-level parse so that a
+            # large list value inside the row does not get materialized.
+            with open(path, "rb") as f:
+                for prefix, event, val in ijson.parse(f):
+                    if event == "map_key" and prefix == "":
+                        single_row_keys.add(val)
+            return single_row_keys, 1
+
+        return keyed_record_keys, n_keyed
+
+    # Scalar top-level — genuinely no rows to probe.
+    return keys, 0
+
+
+def _resolve_text_columns(
+    declared: str,
+    columns_common: set[str],
+) -> tuple[str, SchemaColumnResolution]:
+    """Resolve the text_column role. Comma-split fields get no fallback."""
+    fields = [c.strip() for c in declared.split(",")]
+
+    if len(fields) > 1:
+        # Multi-field concatenation: author specified an extraction contract
+        # that can't be honored with partial columns. Fail closed.
+        missing = [f for f in fields if f not in columns_common]
+        if missing:
+            raise ValueError(
+                f"text_column {declared!r}: fields {missing} missing in "
+                f"common schema (present in every shard: {sorted(columns_common)}). "
+                f"Comma-split text_column has no fallback — fix INDEX.yaml."
+            )
+        return declared, SchemaColumnResolution(
+            role="text",
+            declared=declared,
+            resolved=declared,
+            status="declared_present",
+        )
+
+    single = fields[0]
+    if single in columns_common:
+        return single, SchemaColumnResolution(
+            role="text",
+            declared=single,
+            resolved=single,
+            status="declared_present",
+        )
+
+    for candidate in TEXT_FALLBACKS:
+        if candidate == single:
+            continue
+        if candidate in columns_common:
+            return candidate, SchemaColumnResolution(
+                role="text",
+                declared=single,
+                resolved=candidate,
+                status="declared_missing_fallback_used",
+                fallback_candidates=(candidate,),
+            )
+
+    raise ValueError(
+        f"text_column {single!r} not found in common schema "
+        f"(available: {sorted(columns_common)}) and no role-specific "
+        f"fallback matched {TEXT_FALLBACKS}"
+    )
+
+
+def _resolve_label_column(
+    declared: str | None,
+    columns_common: set[str],
+) -> tuple[str | None, SchemaColumnResolution]:
+    """Resolve the label_column role. ``None`` is a valid declaration
+    (Pattern B: dataset-level labels via ``label_values``) — preserved as-is."""
+    if declared is None:
+        return None, SchemaColumnResolution(
+            role="label",
+            declared=None,
+            resolved=None,
+            status="declared_none_intentional",
+        )
+
+    if declared in columns_common:
+        return declared, SchemaColumnResolution(
+            role="label",
+            declared=declared,
+            resolved=declared,
+            status="declared_present",
+        )
+
+    for candidate in LABEL_FALLBACKS:
+        if candidate == declared:
+            continue
+        if candidate in columns_common:
+            return candidate, SchemaColumnResolution(
+                role="label",
+                declared=declared,
+                resolved=candidate,
+                status="declared_missing_fallback_used",
+                fallback_candidates=(candidate,),
+            )
+
+    raise ValueError(
+        f"label_column {declared!r} not found in common schema "
+        f"(available: {sorted(columns_common)}) and no role-specific "
+        f"fallback matched {LABEL_FALLBACKS}. If this dataset has no "
+        f"per-row labels, set label_column: null and label_values to a "
+        f"dataset-level tag like 'all attacks'."
+    )
+
+
+def _resolve_reason_column(
+    declared: str | None,
+    columns_common: set[str],
+) -> tuple[str | None, SchemaColumnResolution]:
+    """Resolve reason_column. Ambiguous fallback is a hard error (unlike
+    text/label, where priority order picks a winner). Reason routing is
+    semantically too important to guess at silently."""
+    if declared is None:
+        return None, SchemaColumnResolution(
+            role="reason",
+            declared=None,
+            resolved=None,
+            status="declared_none_intentional",
+        )
+
+    if declared in columns_common:
+        return declared, SchemaColumnResolution(
+            role="reason",
+            declared=declared,
+            resolved=declared,
+            status="declared_present",
+        )
+
+    matches = tuple(
+        c for c in REASON_FALLBACKS if c != declared and c in columns_common
+    )
+
+    if len(matches) == 1:
+        picked = matches[0]
+        return picked, SchemaColumnResolution(
+            role="reason",
+            declared=declared,
+            resolved=picked,
+            status="declared_missing_fallback_used",
+            fallback_candidates=matches,
+        )
+
+    if len(matches) > 1:
+        raise ValueError(
+            f"reason_column {declared!r} not found and multiple role-specific "
+            f"fallback candidates match common schema: {list(matches)}. "
+            f"Ambiguous — pick one explicitly in INDEX.yaml."
+        )
+
+    raise ValueError(
+        f"reason_column {declared!r} not found in common schema "
+        f"(available: {sorted(columns_common)}) and no role-specific "
+        f"fallback matched {REASON_FALLBACKS}."
+    )
+
+
+def resolve_dataset_schema(
+    config: DatasetConfig,
+    files: list[Path],
+    *,
+    jsonl_sample_rows: int = 100,
+) -> tuple[DatasetConfig, SchemaResolutionReport]:
+    """Reconcile INDEX-declared columns against real file schemas.
+
+    Returns a new ``DatasetConfig`` (original untouched) with ``text_column``,
+    ``label_column``, ``reason_column`` replaced by resolved values, plus an
+    auditable ``SchemaResolutionReport`` recording per-role declared-vs-resolved.
+
+    Raises ``ValueError`` when:
+    - no files provided
+    - multi-shard schema drift (resolved column not present in every shard)
+    - declared column missing and no role-specific fallback matches
+    - comma-split text_column has any missing field
+    - reason_column fallback is ambiguous (>1 candidate)
+    """
+    if not files:
+        raise ValueError(f"{config.name}: no files provided to resolve_dataset_schema")
+
+    probes = tuple(
+        _probe_file_schema(f, sample_rows=jsonl_sample_rows) for f in files
+    )
+
+    # Files that probed as zero-row / zero-column (e.g. an empty wrapper
+    # ``{"data": []}``) contribute no schema information — runtime yields
+    # nothing from them either. Exclude them from the consistency check so
+    # one empty shard can't poison the intersection.
+    non_empty_probes = [p for p in probes if p.columns]
+
+    if not non_empty_probes:
+        # Entire dataset is empty across all files. Skip column resolution
+        # entirely — stage_dataset will produce an empty result when it
+        # iterates zero rows. Return the original config unchanged.
+        return config, SchemaResolutionReport(
+            dataset=config.name,
+            files_probed=len(files),
+            file_probes=probes,
+            columns_seen=(),
+            columns_common=(),
+            resolutions=(),
+        )
+
+    per_file_sets = [set(p.columns) for p in non_empty_probes]
+    columns_seen = tuple(sorted(set().union(*per_file_sets)))
+    columns_common = tuple(sorted(set.intersection(*per_file_sets)))
+    common_set = set(columns_common)
+
+    text_resolved, text_resolution = _resolve_text_columns(
+        config.text_column, common_set
+    )
+    label_resolved, label_resolution = _resolve_label_column(
+        config.label_column, common_set
+    )
+    reason_resolved, reason_resolution = _resolve_reason_column(
+        config.reason_column, common_set
+    )
+
+    # Deterministic order: text, label, reason.
+    resolutions = (text_resolution, label_resolution, reason_resolution)
+
+    report = SchemaResolutionReport(
+        dataset=config.name,
+        files_probed=len(files),
+        file_probes=probes,
+        columns_seen=columns_seen,
+        columns_common=columns_common,
+        resolutions=resolutions,
+    )
+
+    from dataclasses import replace as _dc_replace
+    resolved_config = _dc_replace(
+        config,
+        text_column=text_resolved,
+        label_column=label_resolved,
+        reason_column=reason_resolved,
+    )
+
+    return resolved_config, report
+
+
+def _schema_resolution_report_to_dict(
+    report: SchemaResolutionReport,
+) -> dict[str, Any]:
+    """Serialize a SchemaResolutionReport for inclusion in the manifest JSON."""
+    return {
+        "dataset": report.dataset,
+        "files_probed": report.files_probed,
+        "file_probes": [
+            {
+                "path": str(p.path),
+                "source": p.source,
+                "columns": list(p.columns),
+                "sample_rows_read": p.sample_rows_read,
+            }
+            for p in report.file_probes
+        ],
+        "columns_seen": list(report.columns_seen),
+        "columns_common": list(report.columns_common),
+        "resolutions": [
+            {
+                "role": r.role,
+                "declared": r.declared,
+                "resolved": r.resolved,
+                "status": r.status,
+                "fallback_candidates": list(r.fallback_candidates),
+            }
+            for r in report.resolutions
+        ],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -823,6 +1387,22 @@ def stage_dataset(
         log.warning("no data files found in %s", dataset_dir)
         return result
 
+    # Reconcile INDEX-declared columns against the real file schema before
+    # any row iteration. Fails fast with an actionable error if the INDEX
+    # entry drifted from the dataset — no more silent mass-rejection with
+    # cryptic gate names like `label_resolution: 1000`.
+    resolved_config, schema_report = resolve_dataset_schema(config, files)
+    result.schema_resolution = schema_report
+    if config is not resolved_config:
+        for res in schema_report.resolutions:
+            if res.status == "declared_missing_fallback_used":
+                log.info(
+                    "%s: %s_column declared %r not in schema; using %r "
+                    "(fallback candidate)",
+                    config.name, res.role, res.declared, res.resolved,
+                )
+    config = resolved_config  # shadow for the rest of the function
+
     language = resolve_language(config)
     if language is None:
         log.warning(
@@ -1147,6 +1727,11 @@ def build_manifest(
                 "rejection_reasons": r.rejection_counts,
                 "by_reason": r.by_reason,
                 "by_language": r.by_language,
+                "schema_resolution": (
+                    _schema_resolution_report_to_dict(r.schema_resolution)
+                    if r.schema_resolution is not None
+                    else None
+                ),
             }
             for r in results
         ],
