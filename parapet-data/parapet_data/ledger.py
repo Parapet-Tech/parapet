@@ -115,6 +115,14 @@ class Ledger:
     def lookup(self, content_hash: str) -> LedgerEntry | None:
         return self._index.get(content_hash)
 
+    def relabel_hashes(self) -> frozenset[str]:
+        """Return content hashes with cross-class relabel actions."""
+        return frozenset(
+            content_hash
+            for content_hash, entry in self._index.items()
+            if entry.action == LedgerAction.RELABEL_CLASS
+        )
+
     def __len__(self) -> int:
         return len(self._index)
 
