@@ -1,5 +1,5 @@
 """
-TheWall staging pipeline: read raw datasets, validate, label, emit staged YAMLs.
+TheWall staging pipeline: read raw datasets, validate, label, emit staged JSONL.
 
 Reads TheWall INDEX.yaml, applies quality gates, runs reason classification
 on attacks, and writes mirror-ready source YAMLs that sampler.py can consume.
@@ -24,12 +24,7 @@ from typing import Any, Iterator, Literal, Sequence, TextIO
 
 import yaml
 
-from .staged_artifact import (
-    STAGED_FORMATS,
-    StagedFormat,
-    staged_extension,
-    write_staged_rows,
-)
+from .staged_artifact import write_staged_rows
 
 from .classifiers import (
     BENIGN_CONFIDENCE_FLOOR,
@@ -1643,10 +1638,18 @@ def staged_filename(
     lang: str,
     config_name: str,
     kind: _StagedKind,
-    fmt: StagedFormat,
 ) -> str:
-    """Return the canonical staged artifact filename for (lang, config, kind, fmt)."""
-    return f"{lang}_{config_name}_{_STAGED_KIND_SUFFIX[kind]}.{staged_extension(fmt)}"
+    """Return the canonical staged artifact filename for (lang, config, kind).
+
+    Active staging is JSONL-only. The suffix is always ``.jsonl``.
+    """
+    return f"{lang}_{config_name}_{_STAGED_KIND_SUFFIX[kind]}.jsonl"
+
+
+# Suffixes the stale-artifact sweep recognizes when reaping prior-run outputs.
+# Includes legacy YAML so reruns still clean up pre-Phase-5 staging files.
+# This is a cleanup-only constant — the writer never emits YAML.
+_SWEEP_SUFFIXES: tuple[str, ...] = ("jsonl", "yaml", "yml")
 
 
 def _project_staged_sample(s: StagedSample) -> dict[str, Any]:
@@ -1668,7 +1671,7 @@ def _sweep_stale_staged_artifacts(
     output_dir: Path,
     lang: str,
     config_name: str,
-    produced: set[tuple[_StagedKind, StagedFormat]],
+    produced: set[_StagedKind],
     output_hashes: dict[str, str],
 ) -> None:
     """Remove prior-run staged artifacts this run did not produce.
@@ -1676,22 +1679,35 @@ def _sweep_stale_staged_artifacts(
     Runs AFTER all successful writes for the dataset. Handles three cases
     cleanly in one sweep:
 
-    - Format switch — e.g. prior run was yaml, current is jsonl: the yaml
-      sibling for a kind produced in jsonl this run is stale.
+    - Format carryover — a legacy ``*_staged.yaml`` from a pre-Phase-5 run
+      is reaped when the current run produces the JSONL sibling.
     - Disappearing kind — e.g. prior run produced background benign, current
-      produces none: both yaml and jsonl prior artifacts are stale.
-    - Manual leftovers — any artifact for (lang, config, kind, fmt) not in
+      produces none: prior artifacts (any suffix) for that kind are stale.
+    - Manual leftovers — any artifact for (lang, config, kind) not in
       ``produced`` gets swept from disk and from ``output_hashes``.
 
     Ordering matters: because this runs after writes succeed, a mid-write
     failure leaves the old artifact intact — callers don't end up with
-    neither-old-nor-new state for the same (kind, fmt).
+    neither-old-nor-new state for the same kind.
     """
     for kind in _ALL_STAGED_KINDS:
-        for stale_fmt in STAGED_FORMATS:
-            if (kind, stale_fmt) in produced:
-                continue
-            stale_name = staged_filename(lang, config_name, kind, stale_fmt)
+        if kind in produced:
+            # Even when this run produced JSONL for `kind`, sweep any legacy
+            # YAML siblings of the same kind so they don't linger.
+            for legacy_suffix in ("yaml", "yml"):
+                stale_name = (
+                    f"{lang}_{config_name}_{_STAGED_KIND_SUFFIX[kind]}.{legacy_suffix}"
+                )
+                stale_path = output_dir / stale_name
+                if stale_path.exists():
+                    stale_path.unlink()
+                    log.info("removed stale staged artifact %s", stale_name)
+                output_hashes.pop(stale_name, None)
+            continue
+        for stale_suffix in _SWEEP_SUFFIXES:
+            stale_name = (
+                f"{lang}_{config_name}_{_STAGED_KIND_SUFFIX[kind]}.{stale_suffix}"
+            )
             stale_path = output_dir / stale_name
             if stale_path.exists():
                 stale_path.unlink()
@@ -1804,13 +1820,12 @@ def stage_all(
     max_rows_per_dataset: int | None = None,
     checkpoint_every_rows: int = 5000,
     checkpoint_dir: Path | None = None,
-    fmt: StagedFormat = "jsonl",
 ) -> dict[str, Any]:
     """Run the full staging pipeline.
 
     Args:
         index_path: Path to TheWall INDEX.yaml.
-        output_dir: Where to write staged YAMLs and manifest.
+        output_dir: Where to write staged JSONL and manifest.
         holdout_paths: Eval/tough sets to exclude (required).
         dataset_filter: If set, only process these dataset names (for pilot).
         max_rows_per_dataset: Optional hard cap on rows processed per dataset.
@@ -1914,41 +1929,38 @@ def stage_all(
 
         # Write all kinds first; only after every write succeeds do we sweep
         # stale artifacts. A failure mid-way leaves prior outputs intact.
-        produced: set[tuple[_StagedKind, StagedFormat]] = set()
+        produced: set[_StagedKind] = set()
 
         if attacks:
-            fname = staged_filename(lang, config.name, "attacks", fmt)
+            fname = staged_filename(lang, config.name, "attacks")
             h = write_staged_rows(
                 output_dir / fname,
                 (_project_staged_sample(s) for s in attacks),
-                fmt=fmt,
             )
             output_hashes[fname] = h
-            produced.add(("attacks", fmt))
+            produced.add("attacks")
             log.info("wrote %d attacks → %s", len(attacks), fname)
 
         if benign:
             routed = [s for s in benign if s.reason is not None]
             background = [s for s in benign if s.reason is None]
             if routed:
-                fname = staged_filename(lang, config.name, "benign", fmt)
+                fname = staged_filename(lang, config.name, "benign")
                 h = write_staged_rows(
                     output_dir / fname,
                     (_project_staged_sample(s) for s in routed),
-                    fmt=fmt,
                 )
                 output_hashes[fname] = h
-                produced.add(("benign", fmt))
+                produced.add("benign")
                 log.info("wrote %d benign (routed) → %s", len(routed), fname)
             if background:
-                fname = staged_filename(lang, config.name, "benign_background", fmt)
+                fname = staged_filename(lang, config.name, "benign_background")
                 h = write_staged_rows(
                     output_dir / fname,
                     (_project_staged_sample(s) for s in background),
-                    fmt=fmt,
                 )
                 output_hashes[fname] = h
-                produced.add(("benign_background", fmt))
+                produced.add("benign_background")
                 log.info("wrote %d benign (background) → %s", len(background), fname)
 
         _sweep_stale_staged_artifacts(

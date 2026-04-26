@@ -259,8 +259,6 @@ def cmd_stage(args: argparse.Namespace) -> None:
         print(f"Checkpoint every rows: {args.checkpoint_every_rows}", file=sys.stderr)
     if args.checkpoint_dir:
         print(f"Checkpoint dir: {args.checkpoint_dir}", file=sys.stderr)
-    print(f"Staged format: {args.format}", file=sys.stderr)
-
     manifest = stage_all(
         index_path=index_path,
         output_dir=output_dir,
@@ -269,7 +267,6 @@ def cmd_stage(args: argparse.Namespace) -> None:
         max_rows_per_dataset=args.max_rows_per_dataset,
         checkpoint_every_rows=args.checkpoint_every_rows,
         checkpoint_dir=Path(args.checkpoint_dir) if args.checkpoint_dir else None,
-        fmt=args.format,
     )
 
     print(f"\nStaged: {manifest['total_staged']:,}", file=sys.stderr)
@@ -401,7 +398,7 @@ def main() -> None:
     stage_parser.add_argument(
         "--output",
         required=True,
-        help="Output directory for staged YAMLs and manifest",
+        help="Output directory for staged JSONL and manifest",
     )
     stage_parser.add_argument(
         "--holdout-sets",
@@ -432,13 +429,6 @@ def main() -> None:
         default=None,
         help="Optional directory for partial checkpoint files (default: --output)",
     )
-    stage_parser.add_argument(
-        "--format",
-        choices=("yaml", "jsonl"),
-        default="jsonl",
-        help="Staged artifact format (default: jsonl — streaming writes; "
-             "use yaml for legacy compatibility)",
-    )
 
     vsync_parser = subparsers.add_parser(
         "verified-sync",
@@ -447,12 +437,12 @@ def main() -> None:
     vsync_parser.add_argument(
         "--staging-dir",
         required=True,
-        help="Directory containing staged YAML files",
+        help="Directory containing staged JSONL files",
     )
     vsync_parser.add_argument(
         "--verified-dir",
         required=True,
-        help="Output directory for verified YAML files",
+        help="Output directory for verified JSONL files",
     )
     vsync_parser.add_argument(
         "--ledger",
