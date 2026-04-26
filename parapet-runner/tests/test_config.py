@@ -13,8 +13,8 @@ def test_iteration_mode_rejects_cv_folds() -> None:
 
 
 def test_iteration_mode_rejects_large_feature_set() -> None:
-    with pytest.raises(ValueError, match="max_features <= 15000"):
-        TrainConfig(mode="iteration", max_features=20_000)
+    with pytest.raises(ValueError, match="max_features <= 25000"):
+        TrainConfig(mode="iteration", max_features=30_000)
 
 
 def test_final_mode_requires_cv() -> None:
