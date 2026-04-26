@@ -46,10 +46,10 @@ language_quota:
 background:
   budget_fraction: 0.15
   sources:
-    - {name: en_background_trivia_qa, path: schema/eval/staging/en_trivia-qa_benign_background_staged.yaml, language: EN, route_policy: background}
-    - {name: en_background_wildchat, path: schema/eval/staging/en_WildChat-1M_benign_background_staged.yaml, language: EN, route_policy: background}
-    - {name: en_background_writingprompts, path: schema/eval/staging/en_writingprompts_benign_background_staged.yaml, language: EN, route_policy: background}
-    - {name: ar_background_arabguard, path: schema/eval/staging/ar_ArabGuard-Egyptian-V1_benign_background_staged.yaml, language: AR, route_policy: background}
+    - {name: en_background_trivia_qa, path: schema/eval/staging/en_trivia-qa_benign_background_staged.jsonl, language: EN, route_policy: background}
+    - {name: en_background_wildchat, path: schema/eval/staging/en_WildChat-1M_benign_background_staged.jsonl, language: EN, route_policy: background}
+    - {name: en_background_writingprompts, path: schema/eval/staging/en_writingprompts_benign_background_staged.jsonl, language: EN, route_policy: background}
+    - {name: ar_background_arabguard, path: schema/eval/staging/ar_ArabGuard-Egyptian-V1_benign_background_staged.jsonl, language: AR, route_policy: background}
 
 # ---------------------------------------------------------------------------
 # Hard-negative benign (using the discussion_benign lane).
@@ -80,10 +80,10 @@ discussion_benign:
     - {name: en_hn_wildguardmix, path: schema/eval/benign/opensource_wildguardmix_benign.yaml, language: EN, route_policy: discussion_benign}
     - {name: en_hn_atlas_neg, path: schema/eval/benign/thewall_atlas_neg.yaml, language: EN, route_policy: discussion_benign}
     - {name: en_hn_bipia, path: schema/eval/benign/opensource_bipia_benign.yaml, language: EN, route_policy: discussion_benign}
-    - {name: en_hn_wildjailbreak, path: schema/eval/staging/en_wildjailbreak_benign_staged.yaml, language: EN, route_policy: discussion_benign}
-    - {name: en_hn_wildchat, path: schema/eval/staging/en_WildChat-1M_benign_staged.yaml, language: EN, route_policy: discussion_benign}
-    - {name: en_hn_dolly, path: schema/eval/staging/en_databricks-dolly-15k_benign_staged.yaml, language: EN, route_policy: discussion_benign}
-    - {name: en_hn_spml, path: schema/eval/staging/en_SPML_Chatbot_Prompt_Injection_benign_staged.yaml, language: EN, route_policy: discussion_benign}
+    - {name: en_hn_wildjailbreak, path: schema/eval/staging/en_wildjailbreak_benign_staged.jsonl, language: EN, route_policy: discussion_benign}
+    - {name: en_hn_wildchat, path: schema/eval/staging/en_WildChat-1M_benign_staged.jsonl, language: EN, route_policy: discussion_benign}
+    - {name: en_hn_dolly, path: schema/eval/staging/en_databricks-dolly-15k_benign_staged.jsonl, language: EN, route_policy: discussion_benign}
+    - {name: en_hn_spml, path: schema/eval/staging/en_SPML_Chatbot_Prompt_Injection_benign_staged.jsonl, language: EN, route_policy: discussion_benign}
 
 # ---------------------------------------------------------------------------
 # No base attack sources — pooled sources go to supplements.
@@ -123,7 +123,7 @@ base_benign_sources:
 
 staged_attacks:
   ru_russian_prompt_injections:
-    path: schema/eval/staging/ru_russian_prompt_injections_attacks_staged.yaml
+    path: schema/eval/staging/ru_russian_prompt_injections_attacks_staged.jsonl
     language: RU
     max_samples: 20000
     reasons: [instruction_override, roleplay_jailbreak, adversarial_suffix, obfuscation]
@@ -132,7 +132,7 @@ staged_attacks:
     reason_provenance: source_label
     applicability_scope: in_domain
   ar_arabguard:
-    path: schema/eval/staging/ar_ArabGuard-Egyptian-V1_attacks_staged.yaml
+    path: schema/eval/staging/ar_ArabGuard-Egyptian-V1_attacks_staged.jsonl
     language: AR
     reasons: [instruction_override, roleplay_jailbreak, exfiltration, indirect_injection, obfuscation, constraint_bypass]
     grounding_mode: reason_grounded
@@ -140,7 +140,7 @@ staged_attacks:
     reason_provenance: source_label
     applicability_scope: in_domain
   ar_swarm_reviewed:
-    path: schema/eval/staging/ar_swarm_reviewed_attacks_staged.yaml
+    path: schema/eval/staging/ar_swarm_reviewed_attacks_staged.jsonl
     language: AR
     reasons: [meta_probe]
     grounding_mode: reason_grounded
@@ -148,7 +148,7 @@ staged_attacks:
     reason_provenance: source_label
     applicability_scope: in_domain
   zh_swarm_reviewed:
-    path: schema/eval/staging/zh_swarm_reviewed_attacks_staged.yaml
+    path: schema/eval/staging/zh_swarm_reviewed_attacks_staged.jsonl
     language: ZH
     reasons: [instruction_override, indirect_injection, obfuscation]
     grounding_mode: reason_grounded
@@ -164,19 +164,19 @@ staged_benign_en:
   reasons: [roleplay_jailbreak, meta_probe, exfiltration, adversarial_suffix, indirect_injection, obfuscation, constraint_bypass]
   datasets:
     dolly:
-      path: schema/eval/staging/en_databricks-dolly-15k_benign_staged.yaml
+      path: schema/eval/staging/en_databricks-dolly-15k_benign_staged.jsonl
       route_policy: mirror
     codealpaca:
-      path: schema/eval/staging/en_evol-codealpaca-v1_benign_staged.yaml
+      path: schema/eval/staging/en_evol-codealpaca-v1_benign_staged.jsonl
       route_policy: mirror
     writingprompts:
-      path: schema/eval/staging/en_writingprompts_benign_staged.yaml
+      path: schema/eval/staging/en_writingprompts_benign_staged.jsonl
       route_policy: mirror
     wildchat:
-      path: schema/eval/staging/en_WildChat-1M_benign_staged.yaml
+      path: schema/eval/staging/en_WildChat-1M_benign_staged.jsonl
       route_policy: mirror
     chatbot_arena:
-      path: schema/eval/staging/en_chatbot_arena_conversations_benign_staged.yaml
+      path: schema/eval/staging/en_chatbot_arena_conversations_benign_staged.jsonl
       route_policy: mirror
 
 # ---------------------------------------------------------------------------
@@ -185,19 +185,19 @@ staged_benign_en:
 
 staged_benign_multilingual:
   ru_turbo_saiga:
-    path: schema/eval/staging/ru_ru_turbo_saiga_benign_staged.yaml
+    path: schema/eval/staging/ru_ru_turbo_saiga_benign_staged.jsonl
     language: RU
     max_samples: 20000
     reasons: [instruction_override, roleplay_jailbreak, meta_probe]
     route_policy: mirror
   zh_stem_instruction:
-    path: schema/eval/staging/zh_stem_zh_instruction_benign_staged.yaml
+    path: schema/eval/staging/zh_stem_zh_instruction_benign_staged.jsonl
     language: ZH
     max_samples: 20000
     reasons: [instruction_override, meta_probe]
     route_policy: mirror
   ar_arabic_chatml:
-    path: schema/eval/staging/ar_arabic-fine-tuning-chatML_benign_staged.yaml
+    path: schema/eval/staging/ar_arabic-fine-tuning-chatML_benign_staged.jsonl
     language: AR
     reasons: [instruction_override, roleplay_jailbreak, meta_probe]
     route_policy: mirror
@@ -228,7 +228,7 @@ cells:
         reason_provenance: manual_map
         applicability_scope: in_domain
       - name: zh_instruction_override_micro
-        path: schema/eval/staging/zh_instruction_override_micro_attacks_staged.yaml
+        path: schema/eval/staging/zh_instruction_override_micro_attacks_staged.jsonl
         language: ZH
         route_policy: mirror
         grounding_mode: reason_grounded
@@ -248,7 +248,7 @@ cells:
         reason_provenance: manual_map
         applicability_scope: in_domain
       - name: zh_roleplay_jailbreak_micro
-        path: schema/eval/staging/zh_roleplay_jailbreak_micro_attacks_staged.yaml
+        path: schema/eval/staging/zh_roleplay_jailbreak_micro_attacks_staged.jsonl
         language: ZH
         route_policy: mirror
         grounding_mode: reason_grounded
@@ -268,14 +268,14 @@ cells:
         reason_provenance: manual_map
         applicability_scope: in_domain
       - name: zh_meta_probe_micro
-        path: schema/eval/staging/zh_meta_probe_micro_attacks_staged.yaml
+        path: schema/eval/staging/zh_meta_probe_micro_attacks_staged.jsonl
         language: ZH
         route_policy: mirror
         grounding_mode: reason_grounded
         reason_provenance: adjudicated
         applicability_scope: in_domain
       - name: ru_meta_probe_micro
-        path: schema/eval/staging/ru_meta_probe_micro_attacks_staged.yaml
+        path: schema/eval/staging/ru_meta_probe_micro_attacks_staged.jsonl
         language: RU
         route_policy: mirror
         grounding_mode: reason_grounded
@@ -295,14 +295,14 @@ cells:
         reason_provenance: manual_map
         applicability_scope: in_domain
       - name: zh_exfiltration_micro
-        path: schema/eval/staging/zh_exfiltration_micro_attacks_staged.yaml
+        path: schema/eval/staging/zh_exfiltration_micro_attacks_staged.jsonl
         language: ZH
         route_policy: mirror
         grounding_mode: reason_grounded
         reason_provenance: adjudicated
         applicability_scope: in_domain
       - name: ru_exfiltration_micro
-        path: schema/eval/staging/ru_exfiltration_micro_attacks_staged.yaml
+        path: schema/eval/staging/ru_exfiltration_micro_attacks_staged.jsonl
         language: RU
         route_policy: mirror
         grounding_mode: reason_grounded
@@ -322,14 +322,14 @@ cells:
         reason_provenance: manual_map
         applicability_scope: in_domain
       - name: zh_adversarial_suffix_micro
-        path: schema/eval/staging/zh_adversarial_suffix_micro_attacks_staged.yaml
+        path: schema/eval/staging/zh_adversarial_suffix_micro_attacks_staged.jsonl
         language: ZH
         route_policy: mirror
         grounding_mode: reason_grounded
         reason_provenance: adjudicated
         applicability_scope: in_domain
       - name: ar_adversarial_suffix_micro
-        path: schema/eval/staging/ar_adversarial_suffix_micro_attacks_staged.yaml
+        path: schema/eval/staging/ar_adversarial_suffix_micro_attacks_staged.jsonl
         language: AR
         route_policy: mirror
         grounding_mode: reason_grounded
@@ -344,28 +344,28 @@ cells:
     length: {short: 0.2, medium: 0.4, long: 0.4}
     extra_attack_sources:
       - name: en_indirect_injection
-        path: schema/eval/staging/en_indirect_injection_attacks_staged.yaml
+        path: schema/eval/staging/en_indirect_injection_attacks_staged.jsonl
         language: EN
         route_policy: mirror
         grounding_mode: reason_grounded
         reason_provenance: manual_map
         applicability_scope: in_domain
       - name: zh_indirect_injection_micro
-        path: schema/eval/staging/zh_indirect_injection_micro_attacks_staged.yaml
+        path: schema/eval/staging/zh_indirect_injection_micro_attacks_staged.jsonl
         language: ZH
         route_policy: mirror
         grounding_mode: reason_grounded
         reason_provenance: adjudicated
         applicability_scope: in_domain
       - name: ru_indirect_injection_micro
-        path: schema/eval/staging/ru_indirect_injection_micro_attacks_staged.yaml
+        path: schema/eval/staging/ru_indirect_injection_micro_attacks_staged.jsonl
         language: RU
         route_policy: mirror
         grounding_mode: reason_grounded
         reason_provenance: adjudicated
         applicability_scope: in_domain
       - name: ar_indirect_injection_micro
-        path: schema/eval/staging/ar_indirect_injection_micro_attacks_staged.yaml
+        path: schema/eval/staging/ar_indirect_injection_micro_attacks_staged.jsonl
         language: AR
         route_policy: mirror
         grounding_mode: reason_grounded
@@ -385,7 +385,7 @@ cells:
         reason_provenance: manual_map
         applicability_scope: in_domain
       - name: zh_obfuscation_micro
-        path: schema/eval/staging/zh_obfuscation_micro_attacks_staged.yaml
+        path: schema/eval/staging/zh_obfuscation_micro_attacks_staged.jsonl
         language: ZH
         route_policy: mirror
         grounding_mode: reason_grounded
@@ -405,7 +405,7 @@ cells:
         reason_provenance: manual_map
         applicability_scope: in_domain
       - name: zh_constraint_bypass_micro
-        path: schema/eval/staging/zh_constraint_bypass_micro_attacks_staged.yaml
+        path: schema/eval/staging/zh_constraint_bypass_micro_attacks_staged.jsonl
         language: ZH
         route_policy: mirror
         grounding_mode: reason_grounded
