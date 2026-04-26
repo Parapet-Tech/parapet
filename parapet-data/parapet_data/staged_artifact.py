@@ -20,11 +20,25 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator
 
 import yaml
+from yaml.events import (
+    AliasEvent,
+    DocumentEndEvent,
+    DocumentStartEvent,
+    MappingEndEvent,
+    MappingStartEvent,
+    ScalarEvent,
+    SequenceEndEvent,
+    SequenceStartEvent,
+    StreamEndEvent,
+    StreamStartEvent,
+)
 
 try:
     _YAML_LOADER = yaml.CSafeLoader  # type: ignore[attr-defined]
+    _YAML_DUMPER = yaml.CSafeDumper  # type: ignore[attr-defined]
 except AttributeError:
     _YAML_LOADER = yaml.SafeLoader  # type: ignore[assignment]
+    _YAML_DUMPER = yaml.SafeDumper  # type: ignore[assignment]
 
 
 _STAGED_SUFFIXES: tuple[str, ...] = (".yaml", ".yml", ".jsonl")
@@ -65,6 +79,77 @@ def iter_staged_artifact_paths(directory: Path) -> list[Path]:
     return sorted(p for p in directory.iterdir() if is_staged_artifact_path(p))
 
 
+def _collect_yaml_node_events(first_event: object, events: Iterator[object]) -> list[object]:
+    """Collect one YAML node's events from a top-level sequence stream."""
+    item_events = [first_event]
+    if not isinstance(first_event, (MappingStartEvent, SequenceStartEvent)):
+        return item_events
+
+    depth = 1
+    for event in events:
+        item_events.append(event)
+        if isinstance(event, (MappingStartEvent, SequenceStartEvent)):
+            depth += 1
+        elif isinstance(event, (MappingEndEvent, SequenceEndEvent)):
+            depth -= 1
+            if depth == 0:
+                break
+    return item_events
+
+
+def _construct_yaml_node(events: list[object]) -> Any:
+    """Construct one YAML node from a slice of parser events."""
+    document_events = [
+        StreamStartEvent(),
+        DocumentStartEvent(),
+        *events,
+        DocumentEndEvent(),
+        StreamEndEvent(),
+    ]
+    return yaml.load(
+        yaml.emit(document_events, Dumper=_YAML_DUMPER),
+        Loader=_YAML_LOADER,
+    )
+
+
+def _iter_yaml_sequence_rows(path: Path) -> Iterator[dict[str, Any]]:
+    """Stream mapping rows from a top-level YAML sequence."""
+    with open(path, encoding="utf-8") as handle:
+        events = iter(yaml.parse(handle, Loader=_YAML_LOADER))
+        for event in events:
+            if isinstance(event, SequenceStartEvent):
+                break
+            if isinstance(event, StreamEndEvent):
+                return
+            if isinstance(event, ScalarEvent) and event.value in {"", None}:
+                return
+            if isinstance(event, (StreamStartEvent, DocumentStartEvent)):
+                continue
+            if isinstance(event, DocumentEndEvent):
+                return
+            raise ValueError(f"{path}: expected top-level YAML list")
+        else:
+            return
+
+        anchored_rows: dict[str, dict[str, Any]] = {}
+        for index, event in enumerate(events, start=1):
+            if isinstance(event, SequenceEndEvent):
+                return
+            if isinstance(event, AliasEvent):
+                row = anchored_rows.get(event.anchor)
+                if row is None:
+                    raise ValueError(f"{path}:{index}: undefined YAML alias {event.anchor!r}")
+                yield dict(row)
+                continue
+            row = _construct_yaml_node(_collect_yaml_node_events(event, events))
+            if not isinstance(row, dict):
+                raise ValueError(f"{path}:{index}: expected mapping row")
+            anchor = getattr(event, "anchor", None)
+            if anchor:
+                anchored_rows[anchor] = row
+            yield row
+
+
 def iter_staged_rows(path: Path) -> Iterator[dict[str, Any]]:
     """Yield staged rows from a single staged artifact file.
 
@@ -90,16 +175,7 @@ def iter_staged_rows(path: Path) -> Iterator[dict[str, Any]]:
         return
 
     if suffix in {".yaml", ".yml"}:
-        with open(path, encoding="utf-8") as handle:
-            rows = yaml.load(handle, Loader=_YAML_LOADER)
-        if rows is None:
-            return
-        if not isinstance(rows, list):
-            raise ValueError(f"{path}: expected top-level YAML list")
-        for index, row in enumerate(rows, start=1):
-            if not isinstance(row, dict):
-                raise ValueError(f"{path}:{index}: expected mapping row")
-            yield row
+        yield from _iter_yaml_sequence_rows(path)
         return
 
     raise ValueError(f"{path}: unsupported staged artifact suffix {suffix}")

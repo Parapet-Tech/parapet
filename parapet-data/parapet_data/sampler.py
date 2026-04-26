@@ -145,13 +145,36 @@ class SourceExtractResult:
     ledger_relabeled: int = 0
 
 
+@dataclass(frozen=True)
+class PreparedSourceCandidate:
+    """Reason-neutral candidate extracted from a source once per run."""
+
+    content: str
+    content_hash: str
+    language: str
+    format_bin: str
+    length_bin: str
+    heuristic_reason: str | None = None
+
+
+@dataclass
+class PreparedSourceResult:
+    """Reason-neutral candidates for a source extraction shape."""
+
+    candidates: list[PreparedSourceCandidate]
+
+
+SourceExtractCacheKey = tuple[str, str, str, str, str, str, str]
+PreparedSourceCacheKey = tuple[str, str, str, str, str, str, str]
+
+
 def _source_extract_cache_key(
     source: SourceRef,
     *,
     label: str,
     reason: str,
     base_dir: Path | None,
-) -> tuple[str, str, str, str, str, str, str]:
+) -> SourceExtractCacheKey:
     path = source.path
     if not path.is_absolute() and base_dir is not None:
         path = (base_dir / path).resolve()
@@ -165,6 +188,212 @@ def _source_extract_cache_key(
         repr(source.label_filter),
         str(source.max_samples),
         source.reason_provenance.value if source.reason_provenance is not None else "unset",
+    )
+
+
+def _prepared_source_cache_key(
+    source: SourceRef,
+    *,
+    label: str,
+    base_dir: Path | None,
+) -> PreparedSourceCacheKey:
+    path = source.path
+    if not path.is_absolute() and base_dir is not None:
+        path = (base_dir / path).resolve()
+    else:
+        path = path.resolve()
+    return (
+        str(path),
+        label,
+        source.extractor,
+        source.language.value,
+        repr(source.label_filter),
+        str(source.max_samples),
+        source.reason_provenance.value if source.reason_provenance is not None else "unset",
+    )
+
+
+def _ledger_excludes_candidate(content_hash_value: str, ledger: Ledger | None) -> bool:
+    if ledger is None:
+        return False
+    entry = ledger.lookup(content_hash_value)
+    return entry.action.excludes_from_training if entry is not None else False
+
+
+def _prepare_source_candidates(
+    source: SourceRef,
+    *,
+    label: str,
+    base_dir: Path | None = None,
+    ledger: Ledger | None = None,
+) -> PreparedSourceResult:
+    """Extract reason-neutral source candidates for per-run reuse.
+
+    ``load_source`` remains streaming and uncached for direct callers.  This
+    helper is only used inside ``sample_spec`` where v8-style mirror specs
+    reuse the same large physical sources across multiple cell reasons.
+    """
+    rows = load_source(source, base_dir=base_dir)
+    extractor = get_extractor(source.extractor)
+    candidates: list[PreparedSourceCandidate] = []
+
+    max_samples = source.max_samples
+    applies_heuristic_reason = (
+        label == "malicious"
+        and source.reason_provenance == ReasonProvenance.HEURISTIC
+    )
+    retained_for_max = 0
+
+    for row in rows:
+        if not passes_label_filter(row, source.label_filter):
+            continue
+
+        text = extractor(row)
+        if not text:
+            continue
+
+        heuristic_reason: str | None = None
+        if applies_heuristic_reason:
+            classification = classify_reason(text)
+            if classification is None:
+                continue
+            heuristic_reason = (
+                classification.reason.value
+                if hasattr(classification.reason, "value")
+                else str(classification.reason)
+            )
+
+        hash_value = content_hash(text)
+        candidates.append(PreparedSourceCandidate(
+            content=text,
+            content_hash=hash_value,
+            language=source.language.value,
+            format_bin=classify_format(text).value,
+            length_bin=classify_length(text).value,
+            heuristic_reason=heuristic_reason,
+        ))
+
+        # Non-heuristic sources apply max_samples to the same ordered stream
+        # for every reason. Heuristic sources must keep the full classified
+        # pool because max_samples applies after filtering by requested reason.
+        if max_samples is not None and not applies_heuristic_reason:
+            if not _ledger_excludes_candidate(hash_value, ledger):
+                retained_for_max += 1
+            if retained_for_max >= max_samples:
+                break
+
+    return PreparedSourceResult(candidates=candidates)
+
+
+def _get_prepared_source_result(
+    source: SourceRef,
+    *,
+    label: str,
+    base_dir: Path | None,
+    ledger: Ledger | None,
+    prepared_source_cache: dict[PreparedSourceCacheKey, PreparedSourceResult] | None,
+) -> PreparedSourceResult:
+    if prepared_source_cache is None:
+        return _prepare_source_candidates(
+            source=source,
+            label=label,
+            base_dir=base_dir,
+            ledger=ledger,
+        )
+
+    key = _prepared_source_cache_key(
+        source,
+        label=label,
+        base_dir=base_dir,
+    )
+    cached = prepared_source_cache.get(key)
+    if cached is not None:
+        return cached
+
+    prepared = _prepare_source_candidates(
+        source=source,
+        label=label,
+        base_dir=base_dir,
+        ledger=ledger,
+    )
+    prepared_source_cache[key] = prepared
+    return prepared
+
+
+def _materialize_prepared_source_with_ledger(
+    source: SourceRef,
+    *,
+    label: str,
+    reason: str,
+    prepared: PreparedSourceResult,
+    ledger: Ledger | None = None,
+    content_hash_filter: frozenset[str] | None = None,
+) -> SourceExtractResult:
+    """Apply reason and ledger semantics to prepared source candidates."""
+    samples: list[Sample] = []
+    ledger_dropped = 0
+    ledger_quarantined = 0
+    ledger_rerouted = 0
+    ledger_relabeled = 0
+
+    max_samples = source.max_samples
+    applies_heuristic_reason = (
+        label == "malicious"
+        and source.reason_provenance == ReasonProvenance.HEURISTIC
+    )
+
+    for candidate in prepared.candidates:
+        if (
+            content_hash_filter is not None
+            and candidate.content_hash not in content_hash_filter
+        ):
+            continue
+
+        assigned_reason = reason
+        if applies_heuristic_reason:
+            if candidate.heuristic_reason != reason:
+                continue
+            assigned_reason = candidate.heuristic_reason
+
+        normalized_row = {
+            "content": candidate.content,
+            "label": label,
+            "reason": assigned_reason,
+            "source": source.name,
+            "language": candidate.language,
+            "content_hash": candidate.content_hash,
+        }
+
+        if ledger is not None:
+            ledger_result = apply_ledger_to_row(normalized_row, ledger)
+            ledger_dropped += ledger_result.dropped
+            ledger_quarantined += ledger_result.quarantined
+            ledger_rerouted += ledger_result.rerouted
+            ledger_relabeled += ledger_result.relabeled
+            if ledger_result.row is None:
+                continue
+            normalized_row = ledger_result.row
+
+        samples.append(Sample(
+            content=normalized_row["content"],
+            content_hash=normalized_row["content_hash"],
+            label=normalized_row["label"],
+            reason=normalized_row["reason"],
+            source_name=source.name,
+            language=candidate.language,
+            format_bin=candidate.format_bin,
+            length_bin=candidate.length_bin,
+        ))
+
+        if max_samples is not None and len(samples) >= max_samples:
+            break
+
+    return SourceExtractResult(
+        samples=samples,
+        ledger_dropped=ledger_dropped,
+        ledger_quarantined=ledger_quarantined,
+        ledger_rerouted=ledger_rerouted,
+        ledger_relabeled=ledger_relabeled,
     )
 
 
@@ -282,7 +511,8 @@ def _get_source_extract_result(
     reason: str,
     base_dir: Path | None,
     ledger: Ledger | None,
-    source_extract_cache: dict[tuple[str, str, str, str, str, str, str], SourceExtractResult] | None,
+    source_extract_cache: dict[SourceExtractCacheKey, SourceExtractResult] | None,
+    prepared_source_cache: dict[PreparedSourceCacheKey, PreparedSourceResult] | None = None,
 ) -> SourceExtractResult:
     """Get extracted samples, optionally reusing a per-run cache."""
     if source_extract_cache is None:
@@ -304,11 +534,18 @@ def _get_source_extract_result(
     if cached is not None:
         return cached
 
-    extracted = _extract_samples_from_source_with_ledger(
+    prepared = _get_prepared_source_result(
+        source=source,
+        label=label,
+        base_dir=base_dir,
+        ledger=ledger,
+        prepared_source_cache=prepared_source_cache,
+    )
+    extracted = _materialize_prepared_source_with_ledger(
         source=source,
         label=label,
         reason=reason,
-        base_dir=base_dir,
+        prepared=prepared,
         ledger=ledger,
     )
     source_extract_cache[key] = extracted
@@ -632,7 +869,9 @@ def sample_cell(
     allowed_languages: set[str] | None = None,
     ledger: Ledger | None = None,
     ledger_totals: dict[str, int] | None = None,
-    source_extract_cache: dict[tuple[str, str, str, str, str, str, str], SourceExtractResult] | None = None,
+    source_extract_cache: dict[SourceExtractCacheKey, SourceExtractResult] | None = None,
+    prepared_source_cache: dict[PreparedSourceCacheKey, PreparedSourceResult] | None = None,
+    ledger_counted_extract_keys: set[SourceExtractCacheKey] | None = None,
     extra_candidates: Sequence[Sample] | None = None,
 ) -> CellSampleResult:
     """Sample one side (attack or benign) of a mirror cell.
@@ -654,6 +893,12 @@ def sample_cell(
         # they cannot consume dedup budget for other language passes.
         if allowed_languages is not None and source.language.value not in allowed_languages:
             continue
+        cache_key = _source_extract_cache_key(
+            source,
+            label=label,
+            reason=reason,
+            base_dir=base_dir,
+        )
         extracted = _get_source_extract_result(
             source,
             label=label,
@@ -661,8 +906,16 @@ def sample_cell(
             base_dir=base_dir,
             ledger=ledger,
             source_extract_cache=source_extract_cache,
+            prepared_source_cache=prepared_source_cache,
         )
-        if ledger_totals is not None and source_extract_cache is None:
+        should_record_ledger = False
+        if ledger_totals is not None:
+            if ledger_counted_extract_keys is None:
+                should_record_ledger = True
+            elif cache_key not in ledger_counted_extract_keys:
+                ledger_counted_extract_keys.add(cache_key)
+                should_record_ledger = True
+        if should_record_ledger:
             ledger_totals["dropped"] += extracted.ledger_dropped
             ledger_totals["quarantined"] += extracted.ledger_quarantined
             ledger_totals["rerouted"] += extracted.ledger_rerouted
@@ -895,14 +1148,14 @@ def sample_spec(
         "rerouted": 0,
         "relabeled": 0,
     }
-    source_extract_cache: dict[
-        tuple[str, str, str, str, str, str, str],
-        SourceExtractResult,
-    ] = {}
+    source_extract_cache: dict[SourceExtractCacheKey, SourceExtractResult] = {}
+    prepared_source_cache: dict[PreparedSourceCacheKey, PreparedSourceResult] = {}
+    ledger_counted_extract_keys: set[SourceExtractCacheKey] = set()
     relabeled_candidates: dict[str, dict[str, list[Sample]]] = {
         "malicious": defaultdict(list),
         "benign": defaultdict(list),
     }
+    relabel_hashes = ledger.relabel_hashes() if ledger is not None else frozenset()
 
     def _record_extract_counts(extracted: SourceExtractResult) -> None:
         ledger_totals["dropped"] += extracted.ledger_dropped
@@ -916,26 +1169,44 @@ def sample_spec(
         label: str,
         reason: str,
     ) -> None:
+        if not relabel_hashes:
+            return
+        prepared = _get_prepared_source_result(
+            source=source,
+            label=label,
+            base_dir=base_dir,
+            ledger=ledger,
+            prepared_source_cache=prepared_source_cache,
+        )
+        extracted = _materialize_prepared_source_with_ledger(
+            source=source,
+            label=label,
+            reason=reason,
+            prepared=prepared,
+            ledger=ledger,
+            content_hash_filter=relabel_hashes,
+        )
+        for sample in extracted.samples:
+            if sample.label != label:
+                relabeled_candidates[sample.label][sample.reason].append(sample)
+
+    def _record_source_extract_once(
+        *,
+        source: SourceRef,
+        label: str,
+        reason: str,
+        extracted: SourceExtractResult,
+    ) -> None:
         key = _source_extract_cache_key(
             source,
             label=label,
             reason=reason,
             base_dir=base_dir,
         )
-        extracted = source_extract_cache.get(key)
-        if extracted is None:
-            extracted = _get_source_extract_result(
-                source,
-                label=label,
-                reason=reason,
-                base_dir=base_dir,
-                ledger=ledger,
-                source_extract_cache=source_extract_cache,
-            )
-            _record_extract_counts(extracted)
-        for sample in extracted.samples:
-            if sample.label != label:
-                relabeled_candidates[sample.label][sample.reason].append(sample)
+        if key in ledger_counted_extract_keys:
+            return
+        ledger_counted_extract_keys.add(key)
+        _record_extract_counts(extracted)
 
     for cell in spec.cells:
         for source in cell.attack_sources:
@@ -1000,6 +1271,13 @@ def sample_spec(
                 base_dir=base_dir,
                 ledger=ledger,
                 source_extract_cache=source_extract_cache,
+                prepared_source_cache=prepared_source_cache,
+            )
+            _record_source_extract_once(
+                source=source,
+                label=label,
+                reason=reason,
+                extracted=extracted,
             )
             for sample in extracted.samples:
                 if sample.label != label:
@@ -1032,6 +1310,13 @@ def sample_spec(
                 base_dir=base_dir,
                 ledger=ledger,
                 source_extract_cache=source_extract_cache,
+                prepared_source_cache=prepared_source_cache,
+            )
+            _record_source_extract_once(
+                source=source,
+                label="benign",
+                reason=lane_name,
+                extracted=extracted,
             )
             for sample in extracted.samples:
                 if sample.label != "benign":
@@ -1065,7 +1350,10 @@ def sample_spec(
                 filter_benign_attacks=filter_benign_attacks,
                 allowed_languages=allowed_languages,
                 ledger=ledger,
+                ledger_totals=ledger_totals,
                 source_extract_cache=source_extract_cache,
+                prepared_source_cache=prepared_source_cache,
+                ledger_counted_extract_keys=ledger_counted_extract_keys,
                 extra_candidates=relabeled_candidates[label].get(cell.reason, []),
             )
 
@@ -1095,7 +1383,10 @@ def sample_spec(
                 filter_benign_attacks=filter_benign_attacks,
                 allowed_languages={lang},
                 ledger=ledger,
+                ledger_totals=ledger_totals,
                 source_extract_cache=source_extract_cache,
+                prepared_source_cache=prepared_source_cache,
+                ledger_counted_extract_keys=ledger_counted_extract_keys,
                 extra_candidates=relabeled_candidates[label].get(cell.reason, []),
             )
             merged_samples.extend(lang_result.samples)
