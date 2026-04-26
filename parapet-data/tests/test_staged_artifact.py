@@ -14,7 +14,6 @@ from parapet_data.staged_artifact import (
     iter_staged_artifact_paths,
     iter_staged_rows,
     load_staged_rows,
-    staged_extension,
     write_staged_rows,
 )
 
@@ -29,6 +28,11 @@ def tmp_dir() -> Path:
 
 
 def _write_yaml(path: Path, rows) -> Path:
+    """Write a YAML staged artifact via PyYAML directly.
+
+    Test-only helper. Active staging code never writes YAML — this is here
+    only so the read-path tests have legacy/historical fixtures to load.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(yaml.safe_dump(rows, sort_keys=False), encoding="utf-8")
     return path
@@ -41,6 +45,11 @@ def _write_jsonl(path: Path, rows: list[dict]) -> Path:
         encoding="utf-8",
     )
     return path
+
+
+# ---------------------------------------------------------------------------
+# iter_staged_rows — read path (YAML legacy + JSONL active)
+# ---------------------------------------------------------------------------
 
 
 def test_iter_staged_rows_from_yaml(tmp_dir: Path) -> None:
@@ -129,7 +138,7 @@ def test_load_staged_rows_returns_full_list(tmp_dir: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# write_staged_rows
+# write_staged_rows — JSONL-only write path
 # ---------------------------------------------------------------------------
 
 
@@ -161,28 +170,10 @@ _SAMPLE_ROWS = [
 ]
 
 
-def test_staged_extension_maps_fmt() -> None:
-    assert staged_extension("yaml") == "yaml"
-    assert staged_extension("jsonl") == "jsonl"
-
-    with pytest.raises(ValueError, match="unsupported staged artifact format"):
-        staged_extension("parquet")  # type: ignore[arg-type]
-
-
 def test_write_staged_rows_jsonl_round_trip(tmp_dir: Path) -> None:
     path = tmp_dir / "a_staged.jsonl"
 
-    returned_hash = write_staged_rows(path, iter(_SAMPLE_ROWS), fmt="jsonl")
-
-    rows = list(iter_staged_rows(path))
-    assert rows == _SAMPLE_ROWS
-    assert returned_hash == hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def test_write_staged_rows_yaml_row_parity(tmp_dir: Path) -> None:
-    path = tmp_dir / "a_staged.yaml"
-
-    returned_hash = write_staged_rows(path, iter(_SAMPLE_ROWS), fmt="yaml")
+    returned_hash = write_staged_rows(path, iter(_SAMPLE_ROWS))
 
     rows = list(iter_staged_rows(path))
     assert rows == _SAMPLE_ROWS
@@ -193,8 +184,8 @@ def test_write_staged_rows_jsonl_is_deterministic(tmp_dir: Path) -> None:
     first = tmp_dir / "first.jsonl"
     second = tmp_dir / "second.jsonl"
 
-    h1 = write_staged_rows(first, iter(_SAMPLE_ROWS), fmt="jsonl")
-    h2 = write_staged_rows(second, iter(_SAMPLE_ROWS), fmt="jsonl")
+    h1 = write_staged_rows(first, iter(_SAMPLE_ROWS))
+    h2 = write_staged_rows(second, iter(_SAMPLE_ROWS))
 
     assert h1 == h2
     assert first.read_bytes() == second.read_bytes()
@@ -204,7 +195,7 @@ def test_write_staged_rows_jsonl_has_lf_line_endings(tmp_dir: Path) -> None:
     """JSONL writes must be byte-stable across platforms (no CRLF translation)."""
     path = tmp_dir / "a_staged.jsonl"
 
-    write_staged_rows(path, iter(_SAMPLE_ROWS), fmt="jsonl")
+    write_staged_rows(path, iter(_SAMPLE_ROWS))
 
     raw = path.read_bytes()
     assert b"\r\n" not in raw
@@ -223,7 +214,7 @@ def test_write_staged_rows_jsonl_consumes_generator_without_materializing(
             consumed.append(index)
             yield row
 
-    write_staged_rows(path, gen(), fmt="jsonl")
+    write_staged_rows(path, gen())
 
     assert consumed == list(range(len(_SAMPLE_ROWS)))
     assert len(list(iter_staged_rows(path))) == len(_SAMPLE_ROWS)
@@ -232,7 +223,7 @@ def test_write_staged_rows_jsonl_consumes_generator_without_materializing(
 def test_write_staged_rows_empty_jsonl(tmp_dir: Path) -> None:
     path = tmp_dir / "empty.jsonl"
 
-    returned_hash = write_staged_rows(path, iter([]), fmt="jsonl")
+    returned_hash = write_staged_rows(path, iter([]))
 
     assert path.exists()
     assert path.read_bytes() == b""
@@ -243,23 +234,43 @@ def test_write_staged_rows_rejects_non_mapping_row(tmp_dir: Path) -> None:
     path = tmp_dir / "bad.jsonl"
 
     with pytest.raises(TypeError, match="expected mapping row"):
-        write_staged_rows(path, iter([{"ok": 1}, "not a dict"]), fmt="jsonl")  # type: ignore[list-item]
+        write_staged_rows(path, iter([{"ok": 1}, "not a dict"]))  # type: ignore[list-item]
 
 
-def test_write_staged_rows_rejects_unsupported_fmt(tmp_dir: Path) -> None:
+def test_write_staged_rows_rejects_yaml_suffix(tmp_dir: Path) -> None:
+    """Active staging is JSONL-only; the writer must refuse YAML output."""
+    path = tmp_dir / "a_staged.yaml"
+
+    with pytest.raises(ValueError, match="only emits JSONL"):
+        write_staged_rows(path, iter(_SAMPLE_ROWS))
+
+
+def test_write_staged_rows_rejects_yml_suffix(tmp_dir: Path) -> None:
+    path = tmp_dir / "a_staged.yml"
+
+    with pytest.raises(ValueError, match="only emits JSONL"):
+        write_staged_rows(path, iter(_SAMPLE_ROWS))
+
+
+def test_write_staged_rows_rejects_other_suffix(tmp_dir: Path) -> None:
     path = tmp_dir / "x.parquet"
 
-    with pytest.raises(ValueError, match="unsupported staged artifact format"):
-        write_staged_rows(path, iter(_SAMPLE_ROWS), fmt="parquet")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="only emits JSONL"):
+        write_staged_rows(path, iter(_SAMPLE_ROWS))
 
 
 def test_write_staged_rows_creates_parent_dir(tmp_dir: Path) -> None:
     path = tmp_dir / "nested" / "deep" / "a_staged.jsonl"
 
-    write_staged_rows(path, iter(_SAMPLE_ROWS), fmt="jsonl")
+    write_staged_rows(path, iter(_SAMPLE_ROWS))
 
     assert path.exists()
     assert path.parent.is_dir()
+
+
+# ---------------------------------------------------------------------------
+# is_staged_artifact_path / iter_staged_artifact_paths
+# ---------------------------------------------------------------------------
 
 
 def test_is_staged_artifact_path_accepts_staged_naming(tmp_dir: Path) -> None:
@@ -341,15 +352,3 @@ def test_iter_staged_artifact_paths_returns_sorted(tmp_dir: Path) -> None:
     found = iter_staged_artifact_paths(tmp_dir)
 
     assert [p.name for p in found] == sorted(names)
-
-
-def test_write_staged_rows_jsonl_and_yaml_have_different_bytes(tmp_dir: Path) -> None:
-    jsonl_path = tmp_dir / "a.jsonl"
-    yaml_path = tmp_dir / "a.yaml"
-
-    write_staged_rows(jsonl_path, iter(_SAMPLE_ROWS), fmt="jsonl")
-    write_staged_rows(yaml_path, iter(_SAMPLE_ROWS), fmt="yaml")
-
-    # Sanity: different formats, different bytes, but same logical rows round-trip.
-    assert jsonl_path.read_bytes() != yaml_path.read_bytes()
-    assert list(iter_staged_rows(jsonl_path)) == list(iter_staged_rows(yaml_path))

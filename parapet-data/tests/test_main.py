@@ -90,9 +90,16 @@ def _write_spec(path: Path, base_dir: Path) -> Path:
 class TestCmdCurateVerifiedPreflight:
     def test_curate_materializes_verified_and_records_manifest(self, tmp_dir: Path) -> None:
         spec_path = _write_spec(tmp_dir / "spec.yaml", tmp_dir)
-        _write_yaml(
-            tmp_dir / "schema" / "eval" / "staging" / "staged.yaml",
-            [{"content": "staged row for verified preflight", "label": "malicious", "reason": "instruction_override"}],
+        # Active staging is JSONL-only (post-Phase-5).
+        staged_path = tmp_dir / "schema" / "eval" / "staging" / "staged.jsonl"
+        staged_path.parent.mkdir(parents=True, exist_ok=True)
+        staged_path.write_text(
+            json.dumps({
+                "content": "staged row for verified preflight",
+                "label": "malicious",
+                "reason": "instruction_override",
+            }) + "\n",
+            encoding="utf-8",
         )
         ledger_path = tmp_dir / "ledger.yaml"
         ledger_path.write_text("[]\n", encoding="utf-8")
@@ -117,7 +124,7 @@ class TestCmdCurateVerifiedPreflight:
         assert manifest["verified_sync"]["total_input"] == 1
         assert manifest["verified_sync"]["staging_dir"].endswith("schema\\eval\\staging")
         assert manifest["verified_sync"]["verified_dir"].endswith("schema\\eval\\verified")
-        assert (tmp_dir / "schema" / "eval" / "verified" / "staged.yaml").exists()
+        assert (tmp_dir / "schema" / "eval" / "verified" / "staged.jsonl").exists()
         assert (tmp_dir / "schema" / "eval" / "verified" / "sync_stats.json").exists()
 
     def test_curate_rejects_verified_preflight_without_ledger(self, tmp_dir: Path) -> None:

@@ -1,14 +1,15 @@
-"""Shared reader/writer for staged artifact files (per-source staged YAML/JSONL).
+"""Shared reader/writer for staged artifact files.
 
 Staged artifacts live one-per-source under the staging directory (e.g.
-``en_attacks_merged_attacks_staged.yaml``). They are intermediate outputs
-of the staging pipeline and inputs to verified-sync, sampling, and
-several reporting scripts.
+``en_attacks_merged_attacks_staged.jsonl``). They are intermediate outputs
+of the staging pipeline and inputs to verified-sync, sampling, and several
+reporting scripts.
 
-Callers should prefer :func:`iter_staged_rows` / :func:`write_staged_rows`
-and only fall back to :func:`load_staged_rows` when a concrete list is
-genuinely required — this keeps the door open for bounded-retention
-streaming on the JSONL path.
+Active staging is JSONL-only. YAML read support is retained for historical
+artifacts — frozen run snapshots, review bundles, and hand-named source
+files — but the writer never produces YAML. Callers should prefer
+:func:`iter_staged_rows` / :func:`write_staged_rows` and only fall back to
+:func:`load_staged_rows` when a concrete list is genuinely required.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Literal
+from typing import Any, Iterable, Iterator
 
 import yaml
 
@@ -24,19 +25,6 @@ try:
     _YAML_LOADER = yaml.CSafeLoader  # type: ignore[attr-defined]
 except AttributeError:
     _YAML_LOADER = yaml.SafeLoader  # type: ignore[assignment]
-
-StagedFormat = Literal["yaml", "jsonl"]
-
-STAGED_FORMATS: tuple[StagedFormat, ...] = ("yaml", "jsonl")
-
-
-def staged_extension(fmt: StagedFormat) -> str:
-    """Return the filename extension (without leading dot) for a staged format."""
-    if fmt == "jsonl":
-        return "jsonl"
-    if fmt == "yaml":
-        return "yaml"
-    raise ValueError(f"unsupported staged artifact format: {fmt!r}")
 
 
 _STAGED_SUFFIXES: tuple[str, ...] = (".yaml", ".yml", ".jsonl")
@@ -80,11 +68,10 @@ def iter_staged_artifact_paths(directory: Path) -> list[Path]:
 def iter_staged_rows(path: Path) -> Iterator[dict[str, Any]]:
     """Yield staged rows from a single staged artifact file.
 
-    Supports ``.jsonl`` (true streaming) and ``.yaml``/``.yml`` (currently
-    full-load — PyYAML cannot stream a top-level list without a custom
-    event-driven parser). The iterator interface is the contract; the
-    backing implementation can swap to streaming when staged outputs
-    migrate to JSONL.
+    Supports ``.jsonl`` (true streaming) and ``.yaml``/``.yml`` (full-load —
+    PyYAML cannot stream a top-level list without a custom event-driven
+    parser). YAML support is retained for historical artifacts only; the
+    writer never produces YAML.
     """
     suffix = path.suffix.lower()
 
@@ -123,53 +110,34 @@ def load_staged_rows(path: Path) -> list[dict[str, Any]]:
     return list(iter_staged_rows(path))
 
 
-def write_staged_rows(
-    path: Path,
-    rows: Iterable[dict[str, Any]],
-    fmt: StagedFormat = "yaml",
-) -> str:
-    """Write staged rows in ``fmt`` and return the sha256 of the file bytes.
+def write_staged_rows(path: Path, rows: Iterable[dict[str, Any]]) -> str:
+    """Stream staged rows as JSONL and return the sha256 of the file bytes.
 
-    ``jsonl`` streams row-by-row — the writer never materializes the full
+    Rows are written one-by-one — the writer never materializes the full
     list, and the returned hash is computed incrementally over the exact
     bytes written to disk.
 
-    ``yaml`` materializes internally because PyYAML cannot stream a top-level
-    list; byte-level formatting matches the prior staging writer so existing
-    hashes remain stable.
+    Only ``.jsonl`` output paths are accepted. Active staging is JSONL-only;
+    historical YAML artifacts are read-only via :func:`iter_staged_rows`.
     """
+    if path.suffix.lower() != ".jsonl":
+        raise ValueError(
+            f"{path}: write_staged_rows only emits JSONL "
+            f"(got suffix {path.suffix!r})"
+        )
+
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    if fmt == "jsonl":
-        hasher = hashlib.sha256()
-        with open(path, "wb") as handle:
-            for row in rows:
-                if not isinstance(row, dict):
-                    raise TypeError(
-                        f"{path}: expected mapping row, got {type(row).__name__}"
-                    )
-                line_bytes = (
-                    json.dumps(row, ensure_ascii=False) + "\n"
-                ).encode("utf-8")
-                handle.write(line_bytes)
-                hasher.update(line_bytes)
-        return hasher.hexdigest()
-
-    if fmt == "yaml":
-        rows_list = list(rows)
-        for index, row in enumerate(rows_list, start=1):
+    hasher = hashlib.sha256()
+    with open(path, "wb") as handle:
+        for row in rows:
             if not isinstance(row, dict):
                 raise TypeError(
-                    f"{path}:{index}: expected mapping row, got {type(row).__name__}"
+                    f"{path}: expected mapping row, got {type(row).__name__}"
                 )
-        with open(path, "w", encoding="utf-8") as handle:
-            yaml.dump(
-                rows_list,
-                handle,
-                allow_unicode=True,
-                default_flow_style=False,
-                width=2000,
-            )
-        return hashlib.sha256(path.read_bytes()).hexdigest()
-
-    raise ValueError(f"unsupported staged artifact format: {fmt!r}")
+            line_bytes = (
+                json.dumps(row, ensure_ascii=False) + "\n"
+            ).encode("utf-8")
+            handle.write(line_bytes)
+            hasher.update(line_bytes)
+    return hasher.hexdigest()
