@@ -123,6 +123,18 @@ class Ledger:
             if entry.action == LedgerAction.RELABEL_CLASS
         )
 
+    def relabel_hashes_by_source(self) -> dict[str, frozenset[str]]:
+        """Return relabel hashes grouped by their adjudicated source name."""
+        grouped: dict[str, set[str]] = {}
+        for content_hash, entry in self._index.items():
+            if entry.action != LedgerAction.RELABEL_CLASS:
+                continue
+            grouped.setdefault(entry.source, set()).add(content_hash)
+        return {
+            source: frozenset(hashes)
+            for source, hashes in grouped.items()
+        }
+
     def __len__(self) -> int:
         return len(self._index)
 
