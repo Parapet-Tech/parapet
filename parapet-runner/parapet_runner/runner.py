@@ -230,6 +230,31 @@ def _write_yaml_entries(path: Path, entries: Sequence[Mapping[str, Any]]) -> Non
     )
 
 
+_LABELED_DATASET_SUFFIXES = frozenset({".jsonl", ".yaml", ".yml"})
+_LABELED_DATASET_SKIP_EXACT = frozenset({"staging_rejected.jsonl", "sync_stats.json"})
+_LABELED_DATASET_SKIP_SUFFIXES = ("_quarantine.jsonl", ".partial.jsonl")
+
+
+def _iter_labeled_dataset_files(dataset: Path) -> list[Path]:
+    """Return candidate labeled data files from an eval/staged directory."""
+    files: list[Path] = []
+    for path in dataset.iterdir():
+        if not path.is_file():
+            continue
+        suffix = path.suffix.lower()
+        if suffix not in _LABELED_DATASET_SUFFIXES:
+            continue
+        name = path.name.lower()
+        if name.startswith("eval_config"):
+            continue
+        if name in _LABELED_DATASET_SKIP_EXACT:
+            continue
+        if any(name.endswith(skip) for skip in _LABELED_DATASET_SKIP_SUFFIXES):
+            continue
+        files.append(path)
+    return sorted(files)
+
+
 def _resolve_relative_path(path: Path, *, base_dir: Path | None) -> Path:
     if path.is_absolute():
         return path
@@ -1506,33 +1531,31 @@ def _cli_eval(args: argparse.Namespace) -> int:
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load all YAMLs from the dataset directory and convert to eval format
+    # Load all labeled artifacts from the dataset directory and convert to eval YAML.
     import sys
     converted_dir = output_dir / "_eval_dataset"
     converted_dir.mkdir(parents=True, exist_ok=True)
 
     total_cases = 0
     skipped = 0
-    for yaml_file in sorted(dataset.glob("*.yaml")):
-        if yaml_file.name.startswith("eval_config") or yaml_file.name == "sync_stats.json":
-            continue
-        out_path = converted_dir / yaml_file.name
+    for data_file in _iter_labeled_dataset_files(dataset):
+        out_path = converted_dir / data_file.with_suffix(".yaml").name
         if args.skip_converted and out_path.exists():
-            print(f"  {yaml_file.name}: skip", file=sys.stderr)
+            print(f"  {data_file.name}: skip", file=sys.stderr)
             continue
         try:
-            entries = _load_labeled_entries(yaml_file)
+            entries = _load_labeled_entries(data_file)
         except Exception as exc:
-            print(f"  SKIP {yaml_file.name}: {exc}", file=sys.stderr)
+            print(f"  SKIP {data_file.name}: {exc}", file=sys.stderr)
             skipped += 1
             continue
         if not entries:
             continue
-        split_name = yaml_file.stem
+        split_name = data_file.stem
         cases = _build_eval_cases(entries, split_name=split_name)
-        _write_yaml_entries(converted_dir / yaml_file.name, cases)
+        _write_yaml_entries(out_path, cases)
         total_cases += len(cases)
-        print(f"  {yaml_file.name}: {len(cases)} cases", file=sys.stderr)
+        print(f"  {data_file.name}: {len(cases)} cases", file=sys.stderr)
 
     print(f"Converted {total_cases} cases from {dataset} ({skipped} files skipped)", file=sys.stderr)
 

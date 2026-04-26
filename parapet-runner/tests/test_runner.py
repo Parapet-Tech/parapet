@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import shutil
 
 import pytest
+import yaml
 
 from parapet_runner.config import ThresholdPolicy, TrainConfig
 from parapet_runner.manifest import CurationManifest, EvalResult, RuntimeIdentity
@@ -18,6 +20,7 @@ from parapet_runner.runner import (
     ResolvedSplits,
     _build_parser,
     _install_weights_and_rebuild,
+    _iter_labeled_dataset_files,
     assert_no_leakage,
 )
 
@@ -186,6 +189,41 @@ def _new_output_dir(case_name: str) -> Path:
     shutil.rmtree(output_dir, ignore_errors=True)
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir
+
+
+def test_eval_dataset_discovery_includes_jsonl_and_skips_sidecars() -> None:
+    dataset = _new_output_dir("eval_dataset_discovery") / "dataset"
+    dataset.mkdir()
+
+    labeled_jsonl = dataset / "b_staged.jsonl"
+    labeled_jsonl.write_text(
+        json.dumps({"content": "attack", "label": "malicious"}) + "\n",
+        encoding="utf-8",
+    )
+    labeled_yaml = dataset / "a_staged.yaml"
+    labeled_yaml.write_text(
+        yaml.safe_dump([{"content": "benign", "label": "benign"}]),
+        encoding="utf-8",
+    )
+    labeled_yml = dataset / "c_staged.yml"
+    labeled_yml.write_text(
+        yaml.safe_dump([{"content": "other", "label": "benign"}]),
+        encoding="utf-8",
+    )
+
+    for sidecar in (
+        "eval_config.yaml",
+        "sync_stats.json",
+        "staging_rejected.jsonl",
+        "sample_quarantine.jsonl",
+        "sample_staged.partial.jsonl",
+        "notes.txt",
+    ):
+        (dataset / sidecar).write_text("{}\n", encoding="utf-8")
+
+    discovered = [path.name for path in _iter_labeled_dataset_files(dataset)]
+
+    assert discovered == ["a_staged.yaml", "b_staged.jsonl", "c_staged.yml"]
 
 
 def test_runner_calibrates_on_val_then_evaluates_holdout() -> None:
