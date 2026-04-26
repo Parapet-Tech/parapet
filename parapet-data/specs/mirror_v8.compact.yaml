@@ -76,10 +76,10 @@ background:
 discussion_benign:
   budget_fraction: 0.35
   sources:
-    - {name: en_hn_notinject, path: schema/eval/benign/opensource_notinject_benign.yaml, language: EN, route_policy: discussion_benign}
-    - {name: en_hn_wildguardmix, path: schema/eval/benign/opensource_wildguardmix_benign.yaml, language: EN, route_policy: discussion_benign}
-    - {name: en_hn_atlas_neg, path: schema/eval/benign/thewall_atlas_neg.yaml, language: EN, route_policy: discussion_benign}
-    - {name: en_hn_bipia, path: schema/eval/benign/opensource_bipia_benign.yaml, language: EN, route_policy: discussion_benign}
+    - {name: en_hn_notinject, path: schema/eval/benign/opensource_notinject_benign.jsonl, language: EN, route_policy: discussion_benign}
+    - {name: en_hn_wildguardmix, path: schema/eval/benign/opensource_wildguardmix_benign.jsonl, language: EN, route_policy: discussion_benign}
+    - {name: en_hn_atlas_neg, path: schema/eval/benign/thewall_atlas_neg.jsonl, language: EN, route_policy: discussion_benign}
+    - {name: en_hn_bipia, path: schema/eval/benign/opensource_bipia_benign.jsonl, language: EN, route_policy: discussion_benign}
     - {name: en_hn_wildjailbreak, path: schema/eval/staging/en_wildjailbreak_benign_staged.jsonl, language: EN, route_policy: discussion_benign}
     - {name: en_hn_wildchat, path: schema/eval/staging/en_WildChat-1M_benign_staged.jsonl, language: EN, route_policy: discussion_benign}
     - {name: en_hn_dolly, path: schema/eval/staging/en_databricks-dolly-15k_benign_staged.jsonl, language: EN, route_policy: discussion_benign}
@@ -93,7 +93,7 @@ discussion_benign:
 
 base_attack_sources:
   - name: en_attacks_merged
-    path: schema/eval/malicious/attacks_121624.yaml
+    path: schema/eval/malicious/attacks_121624.jsonl
     language: EN
     max_samples: 20000
     label_filter: {column: label, allowed: [malicious]}
@@ -101,21 +101,21 @@ base_attack_sources:
     grounding_mode: reason_grounded
     reason_provenance: heuristic
     applicability_scope: in_domain
-  - {name: zh_attacks_corpus, path: schema/eval/training/multilingual/attacks_121624_zh.yaml, language: ZH, route_policy: mirror, grounding_mode: reason_grounded, reason_provenance: heuristic, applicability_scope: in_domain}
-  - {name: zh_attacks_novel, path: schema/eval/training/multilingual/zh_attacks.yaml, language: ZH, route_policy: mirror, grounding_mode: reason_grounded, reason_provenance: heuristic, applicability_scope: in_domain}
-  - {name: ar_attacks_corpus, path: schema/eval/training/multilingual/attacks_121624_ar.yaml, language: AR, route_policy: mirror, grounding_mode: reason_grounded, reason_provenance: heuristic, applicability_scope: in_domain}
-  - {name: ar_attacks_novel, path: schema/eval/training/multilingual/ar_attacks.yaml, language: AR, route_policy: mirror, grounding_mode: reason_grounded, reason_provenance: heuristic, applicability_scope: in_domain}
-  - {name: ru_attacks_corpus, path: schema/eval/training/multilingual/attacks_121624_ru.yaml, language: RU, route_policy: mirror, grounding_mode: reason_grounded, reason_provenance: heuristic, applicability_scope: in_domain}
-  - {name: ru_attacks_novel, path: schema/eval/training/multilingual/ru_attacks.yaml, language: RU, route_policy: mirror, grounding_mode: reason_grounded, reason_provenance: heuristic, applicability_scope: in_domain}
+  - {name: zh_attacks_corpus, path: schema/eval/training/multilingual/attacks_121624_zh.jsonl, language: ZH, route_policy: mirror, grounding_mode: reason_grounded, reason_provenance: heuristic, applicability_scope: in_domain}
+  - {name: zh_attacks_novel, path: schema/eval/training/multilingual/zh_attacks.jsonl, language: ZH, route_policy: mirror, grounding_mode: reason_grounded, reason_provenance: heuristic, applicability_scope: in_domain}
+  - {name: ar_attacks_corpus, path: schema/eval/training/multilingual/attacks_121624_ar.jsonl, language: AR, route_policy: mirror, grounding_mode: reason_grounded, reason_provenance: heuristic, applicability_scope: in_domain}
+  - {name: ar_attacks_novel, path: schema/eval/training/multilingual/ar_attacks.jsonl, language: AR, route_policy: mirror, grounding_mode: reason_grounded, reason_provenance: heuristic, applicability_scope: in_domain}
+  - {name: ru_attacks_corpus, path: schema/eval/training/multilingual/attacks_121624_ru.jsonl, language: RU, route_policy: mirror, grounding_mode: reason_grounded, reason_provenance: heuristic, applicability_scope: in_domain}
+  - {name: ru_attacks_novel, path: schema/eval/training/multilingual/ru_attacks.jsonl, language: RU, route_policy: mirror, grounding_mode: reason_grounded, reason_provenance: heuristic, applicability_scope: in_domain}
 
 base_benign_sources:
-  - {name: en_benign_curated, path: schema/eval/training/global_benign_curated.yaml, language: EN, max_samples: 20000, route_policy: mirror}
-  - {name: zh_benign_wikipedia, path: schema/eval/benign/opensource_wikipedia_zh_benign.yaml, language: ZH, route_policy: mirror}
-  - {name: zh_benign_xquad, path: schema/eval/benign/opensource_xquad_zh_benign.yaml, language: ZH, route_policy: mirror}
-  - {name: ar_benign_wikipedia, path: schema/eval/benign/opensource_wikipedia_ar_benign.yaml, language: AR, route_policy: mirror}
-  - {name: ar_benign_xquad, path: schema/eval/benign/opensource_xquad_ar_benign.yaml, language: AR, route_policy: mirror}
-  - {name: ru_benign_wikipedia, path: schema/eval/benign/opensource_wikipedia_ru_benign.yaml, language: RU, route_policy: mirror}
-  - {name: ru_benign_xquad, path: schema/eval/benign/opensource_xquad_ru_benign.yaml, language: RU, route_policy: mirror}
+  - {name: en_benign_curated, path: schema/eval/training/global_benign_curated.jsonl, language: EN, max_samples: 20000, route_policy: mirror}
+  - {name: zh_benign_wikipedia, path: schema/eval/benign/opensource_wikipedia_zh_benign.jsonl, language: ZH, route_policy: mirror}
+  - {name: zh_benign_xquad, path: schema/eval/benign/opensource_xquad_zh_benign.jsonl, language: ZH, route_policy: mirror}
+  - {name: ar_benign_wikipedia, path: schema/eval/benign/opensource_wikipedia_ar_benign.jsonl, language: AR, route_policy: mirror}
+  - {name: ar_benign_xquad, path: schema/eval/benign/opensource_xquad_ar_benign.jsonl, language: AR, route_policy: mirror}
+  - {name: ru_benign_wikipedia, path: schema/eval/benign/opensource_wikipedia_ru_benign.jsonl, language: RU, route_policy: mirror}
+  - {name: ru_benign_xquad, path: schema/eval/benign/opensource_xquad_ru_benign.jsonl, language: RU, route_policy: mirror}
 
 # ---------------------------------------------------------------------------
 # Staged attack sources — reason-grounded, expand into matching cells
@@ -221,7 +221,7 @@ cells:
     length: {short: 0.5, medium: 0.3, long: 0.2}
     extra_attack_sources:
       - name: en_instruction_override
-        path: schema/eval/malicious/instruction_override_attacks.yaml
+        path: schema/eval/malicious/instruction_override_attacks.jsonl
         language: EN
         route_policy: mirror
         grounding_mode: reason_grounded
@@ -241,7 +241,7 @@ cells:
     length: {short: 0.3, medium: 0.4, long: 0.3}
     extra_attack_sources:
       - name: en_roleplay_jailbreak
-        path: schema/eval/malicious/roleplay_jailbreak_attacks.yaml
+        path: schema/eval/malicious/roleplay_jailbreak_attacks.jsonl
         language: EN
         route_policy: mirror
         grounding_mode: reason_grounded
@@ -261,7 +261,7 @@ cells:
     length: {short: 0.6, medium: 0.3, long: 0.1}
     extra_attack_sources:
       - name: en_meta_probe
-        path: schema/eval/malicious/meta_probe_attacks.yaml
+        path: schema/eval/malicious/meta_probe_attacks.jsonl
         language: EN
         route_policy: mirror
         grounding_mode: reason_grounded
@@ -288,7 +288,7 @@ cells:
     length: {short: 0.5, medium: 0.3, long: 0.2}
     extra_attack_sources:
       - name: en_exfiltration
-        path: schema/eval/malicious/exfiltration_attacks.yaml
+        path: schema/eval/malicious/exfiltration_attacks.jsonl
         language: EN
         route_policy: mirror
         grounding_mode: reason_grounded
@@ -315,7 +315,7 @@ cells:
     length: {short: 0.3, medium: 0.4, long: 0.3}
     extra_attack_sources:
       - name: en_thewall_amplegcg_adversarial_suffix
-        path: schema/eval/malicious/thewall_amplegcg_pos.yaml
+        path: schema/eval/malicious/thewall_amplegcg_pos.jsonl
         language: EN
         route_policy: mirror
         grounding_mode: reason_grounded
@@ -336,7 +336,7 @@ cells:
         reason_provenance: adjudicated
         applicability_scope: in_domain
     extra_benign_sources:
-      - {name: en_benign_code, path: schema/eval/benign/code_samples.yaml, language: EN, route_policy: mirror}
+      - {name: en_benign_code, path: schema/eval/benign/code_samples.jsonl, language: EN, route_policy: mirror}
 
   indirect_injection:
     teaching_goal: "Neutralize 'embedded instructions in context = attack' correlation across EN/RU/ZH/AR"
@@ -378,7 +378,7 @@ cells:
     length: {short: 0.4, medium: 0.4, long: 0.2}
     extra_attack_sources:
       - name: en_obfuscation
-        path: schema/eval/malicious/obfuscation_attacks.yaml
+        path: schema/eval/malicious/obfuscation_attacks.jsonl
         language: EN
         route_policy: mirror
         grounding_mode: reason_grounded
@@ -398,7 +398,7 @@ cells:
     length: {short: 0.5, medium: 0.3, long: 0.2}
     extra_attack_sources:
       - name: en_constraint_bypass
-        path: schema/eval/malicious/constraint_bypass_attacks.yaml
+        path: schema/eval/malicious/constraint_bypass_attacks.jsonl
         language: EN
         route_policy: mirror
         grounding_mode: reason_grounded
