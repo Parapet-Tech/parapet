@@ -131,6 +131,29 @@ def cmd_curate(args: argparse.Namespace) -> None:
         file=sys.stderr,
     )
 
+    telemetry = sampling_result.telemetry
+    if telemetry is not None:
+        print(
+            f"  Sampling: {telemetry.sampling_seconds:.1f}s "
+            f"(reads={telemetry.source_reads}, "
+            f"cache_hits={telemetry.source_cache_hits}, "
+            f"read_time={telemetry.source_read_seconds:.1f}s)",
+            file=sys.stderr,
+        )
+        if telemetry.phase_seconds:
+            phases = ", ".join(
+                f"{name}={seconds:.1f}s"
+                for name, seconds in telemetry.phase_seconds.items()
+            )
+            print(f"  Phases:   {phases}", file=sys.stderr)
+        slow = telemetry.slow_sources()[:5]
+        if slow:
+            print(
+                f"  Slowest:  "
+                + ", ".join(f"{name}({seconds:.1f}s)" for name, seconds in slow),
+                file=sys.stderr,
+            )
+
     if sampling_result.gaps:
         print(f"\nGaps ({len(sampling_result.gaps)}):", file=sys.stderr)
         for gap in sampling_result.gaps:

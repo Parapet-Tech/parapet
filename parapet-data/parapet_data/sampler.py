@@ -12,9 +12,11 @@ This module owns the transition from MirrorSpec -> list[Sample].
 
 from __future__ import annotations
 
+import heapq
 import logging
 import random
 import re
+import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -143,6 +145,50 @@ class SourceExtractResult:
     ledger_quarantined: int = 0
     ledger_rerouted: int = 0
     ledger_relabeled: int = 0
+
+
+@dataclass
+class SamplerTelemetry:
+    """Per-run sampler observability. Cheap to populate; never affects output.
+
+    All fields are mutated in place during sampling. Phase timings are wall-
+    clock seconds. Slow-source tracking keeps a bounded top-K to avoid the
+    O(N) sort cost on big specs.
+    """
+
+    sampling_seconds: float = 0.0
+    source_cache_hits: int = 0
+    source_reads: int = 0
+    source_read_seconds: float = 0.0
+    phase_seconds: dict[str, float] = field(default_factory=dict)
+    # Bounded top-K slowest sources, kept as a min-heap of (seconds, name).
+    # Use ``slow_sources()`` to materialize a sorted descending view.
+    _slow_heap: list[tuple[float, str]] = field(default_factory=list)
+    slow_sources_capacity: int = 10
+
+    def record_cache_hit(self) -> None:
+        self.source_cache_hits += 1
+
+    def record_source_read(self, source_name: str, seconds: float) -> None:
+        self.source_reads += 1
+        self.source_read_seconds += seconds
+        if self.slow_sources_capacity <= 0:
+            return
+        if len(self._slow_heap) < self.slow_sources_capacity:
+            heapq.heappush(self._slow_heap, (seconds, source_name))
+        elif seconds > self._slow_heap[0][0]:
+            heapq.heapreplace(self._slow_heap, (seconds, source_name))
+
+    def record_phase(self, name: str, seconds: float) -> None:
+        # Phases may run multiple times (e.g., per-cell); accumulate.
+        self.phase_seconds[name] = self.phase_seconds.get(name, 0.0) + seconds
+
+    def slow_sources(self) -> list[tuple[str, float]]:
+        """Return the top-K slowest sources, descending by seconds."""
+        return [
+            (name, seconds)
+            for seconds, name in sorted(self._slow_heap, reverse=True)
+        ]
 
 
 @dataclass(frozen=True)
@@ -292,6 +338,7 @@ def _get_prepared_source_result(
     base_dir: Path | None,
     ledger: Ledger | None,
     prepared_source_cache: dict[PreparedSourceCacheKey, PreparedSourceResult] | None,
+    telemetry: SamplerTelemetry | None = None,
 ) -> PreparedSourceResult:
     if prepared_source_cache is None:
         return _prepare_source_candidates(
@@ -308,15 +355,21 @@ def _get_prepared_source_result(
     )
     cached = prepared_source_cache.get(key)
     if cached is not None:
+        if telemetry is not None:
+            telemetry.record_cache_hit()
         return cached
 
+    started = time.perf_counter()
     prepared = _prepare_source_candidates(
         source=source,
         label=label,
         base_dir=base_dir,
         ledger=ledger,
     )
+    elapsed = time.perf_counter() - started
     prepared_source_cache[key] = prepared
+    if telemetry is not None:
+        telemetry.record_source_read(source.name, elapsed)
     return prepared
 
 
@@ -327,7 +380,6 @@ def _materialize_prepared_source_with_ledger(
     reason: str,
     prepared: PreparedSourceResult,
     ledger: Ledger | None = None,
-    content_hash_filter: frozenset[str] | None = None,
 ) -> SourceExtractResult:
     """Apply reason and ledger semantics to prepared source candidates."""
     samples: list[Sample] = []
@@ -343,12 +395,6 @@ def _materialize_prepared_source_with_ledger(
     )
 
     for candidate in prepared.candidates:
-        if (
-            content_hash_filter is not None
-            and candidate.content_hash not in content_hash_filter
-        ):
-            continue
-
         assigned_reason = reason
         if applies_heuristic_reason:
             if candidate.heuristic_reason != reason:
@@ -383,6 +429,97 @@ def _materialize_prepared_source_with_ledger(
             language=candidate.language,
             format_bin=candidate.format_bin,
             length_bin=candidate.length_bin,
+        ))
+
+        if max_samples is not None and len(samples) >= max_samples:
+            break
+
+    return SourceExtractResult(
+        samples=samples,
+        ledger_dropped=ledger_dropped,
+        ledger_quarantined=ledger_quarantined,
+        ledger_rerouted=ledger_rerouted,
+        ledger_relabeled=ledger_relabeled,
+    )
+
+
+def _extract_relabel_candidates_from_source(
+    source: SourceRef,
+    *,
+    label: str,
+    reason: str,
+    relabel_hashes: frozenset[str],
+    base_dir: Path | None = None,
+    ledger: Ledger | None = None,
+) -> SourceExtractResult:
+    """Scan one source for ledger relabel rows without full reason prep."""
+    rows = load_source(source, base_dir=base_dir)
+    extractor = get_extractor(source.extractor)
+    samples: list[Sample] = []
+    ledger_dropped = 0
+    ledger_quarantined = 0
+    ledger_rerouted = 0
+    ledger_relabeled = 0
+
+    max_samples = source.max_samples
+    applies_heuristic_reason = (
+        label == "malicious"
+        and source.reason_provenance == ReasonProvenance.HEURISTIC
+    )
+
+    for row in rows:
+        if not passes_label_filter(row, source.label_filter):
+            continue
+
+        text = extractor(row)
+        if not text:
+            continue
+
+        hash_value = content_hash(text)
+        if hash_value not in relabel_hashes:
+            continue
+
+        assigned_reason = reason
+        if applies_heuristic_reason:
+            classification = classify_reason(text)
+            if classification is None:
+                continue
+            assigned_reason = (
+                classification.reason.value
+                if hasattr(classification.reason, "value")
+                else str(classification.reason)
+            )
+            if assigned_reason != reason:
+                continue
+
+        normalized_row = {
+            "content": text,
+            "label": label,
+            "reason": assigned_reason,
+            "source": source.name,
+            "language": source.language.value,
+            "content_hash": hash_value,
+        }
+
+        if ledger is not None:
+            ledger_result = apply_ledger_to_row(normalized_row, ledger)
+            ledger_dropped += ledger_result.dropped
+            ledger_quarantined += ledger_result.quarantined
+            ledger_rerouted += ledger_result.rerouted
+            ledger_relabeled += ledger_result.relabeled
+            if ledger_result.row is None:
+                continue
+            normalized_row = ledger_result.row
+
+        samples.append(Sample(
+            content=normalized_row["content"],
+            content_hash=normalized_row["content_hash"],
+            label=normalized_row["label"],
+            reason=normalized_row["reason"],
+            source_name=source.name,
+            language=source.language.value,
+            format_bin=classify_format(normalized_row["content"]).value,
+            length_bin=classify_length(normalized_row["content"]).value,
         ))
 
         if max_samples is not None and len(samples) >= max_samples:
@@ -513,6 +650,7 @@ def _get_source_extract_result(
     ledger: Ledger | None,
     source_extract_cache: dict[SourceExtractCacheKey, SourceExtractResult] | None,
     prepared_source_cache: dict[PreparedSourceCacheKey, PreparedSourceResult] | None = None,
+    telemetry: SamplerTelemetry | None = None,
 ) -> SourceExtractResult:
     """Get extracted samples, optionally reusing a per-run cache."""
     if source_extract_cache is None:
@@ -532,6 +670,8 @@ def _get_source_extract_result(
     )
     cached = source_extract_cache.get(key)
     if cached is not None:
+        if telemetry is not None:
+            telemetry.record_cache_hit()
         return cached
 
     prepared = _get_prepared_source_result(
@@ -540,6 +680,7 @@ def _get_source_extract_result(
         base_dir=base_dir,
         ledger=ledger,
         prepared_source_cache=prepared_source_cache,
+        telemetry=telemetry,
     )
     extracted = _materialize_prepared_source_with_ledger(
         source=source,
@@ -873,6 +1014,7 @@ def sample_cell(
     prepared_source_cache: dict[PreparedSourceCacheKey, PreparedSourceResult] | None = None,
     ledger_counted_extract_keys: set[SourceExtractCacheKey] | None = None,
     extra_candidates: Sequence[Sample] | None = None,
+    telemetry: SamplerTelemetry | None = None,
 ) -> CellSampleResult:
     """Sample one side (attack or benign) of a mirror cell.
 
@@ -907,6 +1049,7 @@ def sample_cell(
             ledger=ledger,
             source_extract_cache=source_extract_cache,
             prepared_source_cache=prepared_source_cache,
+            telemetry=telemetry,
         )
         should_record_ledger = False
         if ledger_totals is not None:
@@ -1029,6 +1172,7 @@ class SamplingResult:
     ledger_quarantined: int = 0
     ledger_rerouted: int = 0
     ledger_relabeled: int = 0
+    telemetry: SamplerTelemetry | None = None
 
 
 def _language_targets_for_cell(
@@ -1091,6 +1235,8 @@ def sample_spec(
     ledger: Ledger | None = None,
 ) -> SamplingResult:
     """Sample all cells in a MirrorSpec, producing labeled samples."""
+    telemetry = SamplerTelemetry()
+    sampling_started = time.perf_counter()
     rng = random.Random(spec.seed)
     dedup = ContentDeduplicator()
 
@@ -1156,6 +1302,15 @@ def sample_spec(
         "benign": defaultdict(list),
     }
     relabel_hashes = ledger.relabel_hashes() if ledger is not None else frozenset()
+    relabel_hashes_by_source = (
+        ledger.relabel_hashes_by_source() if ledger is not None else {}
+    )
+    relabel_extract_cache: dict[SourceExtractCacheKey, SourceExtractResult] = {}
+    logger.info(
+        "sample_spec start: cells=%d total_target=%s",
+        len(spec.cells),
+        spec.total_target,
+    )
 
     def _record_extract_counts(extracted: SourceExtractResult) -> None:
         ledger_totals["dropped"] += extracted.ledger_dropped
@@ -1169,23 +1324,33 @@ def sample_spec(
         label: str,
         reason: str,
     ) -> None:
-        if not relabel_hashes:
+        source_relabel_hashes = relabel_hashes_by_source.get(source.name)
+        if not source_relabel_hashes:
             return
-        prepared = _get_prepared_source_result(
-            source=source,
-            label=label,
-            base_dir=base_dir,
-            ledger=ledger,
-            prepared_source_cache=prepared_source_cache,
-        )
-        extracted = _materialize_prepared_source_with_ledger(
-            source=source,
+        key = _source_extract_cache_key(
+            source,
             label=label,
             reason=reason,
-            prepared=prepared,
-            ledger=ledger,
-            content_hash_filter=relabel_hashes,
+            base_dir=base_dir,
         )
+        extracted = relabel_extract_cache.get(key)
+        if extracted is None:
+            started = time.perf_counter()
+            extracted = _extract_relabel_candidates_from_source(
+                source=source,
+                label=label,
+                reason=reason,
+                relabel_hashes=source_relabel_hashes,
+                base_dir=base_dir,
+                ledger=ledger,
+            )
+            relabel_extract_cache[key] = extracted
+            telemetry.record_source_read(
+                f"{source.name}:relabel",
+                time.perf_counter() - started,
+            )
+        else:
+            telemetry.record_cache_hit()
         for sample in extracted.samples:
             if sample.label != label:
                 relabeled_candidates[sample.label][sample.reason].append(sample)
@@ -1208,6 +1373,7 @@ def sample_spec(
         ledger_counted_extract_keys.add(key)
         _record_extract_counts(extracted)
 
+    relabel_prep_started = time.perf_counter()
     for cell in spec.cells:
         for source in cell.attack_sources:
             _register_relabeled_candidates(
@@ -1249,6 +1415,13 @@ def sample_spec(
                 label="benign",
                 reason="discussion_benign",
             )
+    relabel_prep_elapsed = time.perf_counter() - relabel_prep_started
+    telemetry.record_phase("relabel_prep", relabel_prep_elapsed)
+    logger.info(
+        "phase relabel_prep: %.2fs (relabel_hashes=%d)",
+        relabel_prep_elapsed,
+        len(relabel_hashes),
+    )
 
     def _sample_supplement_sources(
         *,
@@ -1272,6 +1445,7 @@ def sample_spec(
                 ledger=ledger,
                 source_extract_cache=source_extract_cache,
                 prepared_source_cache=prepared_source_cache,
+                telemetry=telemetry,
             )
             _record_source_extract_once(
                 source=source,
@@ -1311,6 +1485,7 @@ def sample_spec(
                 ledger=ledger,
                 source_extract_cache=source_extract_cache,
                 prepared_source_cache=prepared_source_cache,
+                telemetry=telemetry,
             )
             _record_source_extract_once(
                 source=source,
@@ -1355,6 +1530,7 @@ def sample_spec(
                 prepared_source_cache=prepared_source_cache,
                 ledger_counted_extract_keys=ledger_counted_extract_keys,
                 extra_candidates=relabeled_candidates[label].get(cell.reason, []),
+                telemetry=telemetry,
             )
 
         language_targets = _language_targets_for_cell(
@@ -1388,6 +1564,7 @@ def sample_spec(
                 prepared_source_cache=prepared_source_cache,
                 ledger_counted_extract_keys=ledger_counted_extract_keys,
                 extra_candidates=relabeled_candidates[label].get(cell.reason, []),
+                telemetry=telemetry,
             )
             merged_samples.extend(lang_result.samples)
             merged_available.extend(lang_result.available_pool)
@@ -1431,7 +1608,9 @@ def sample_spec(
         )
 
     # Phase 1: Attack sampling
+    phase_attack_started = time.perf_counter()
     for cell in spec.cells:
+        cell_started = time.perf_counter()
         result = _sample_cell_with_optional_quota(
             cell=cell,
             label="malicious",
@@ -1450,6 +1629,15 @@ def sample_spec(
             available_by_reason["malicious"][sample.reason].append(sample)
             available_by_language["malicious"][sample.language].append(sample)
         all_gaps.extend(result.gaps)
+        logger.info(
+            "  cell %s/malicious: %d samples in %.2fs",
+            cell.cell_id,
+            len(result.samples),
+            time.perf_counter() - cell_started,
+        )
+    phase_attack_elapsed = time.perf_counter() - phase_attack_started
+    telemetry.record_phase("attack_sampling", phase_attack_elapsed)
+    logger.info("phase attack_sampling: %.2fs", phase_attack_elapsed)
 
     # Phase 2: Register attack hashes for cross-contamination
     attack_hashes = [s.content_hash for s in all_attack]
@@ -1465,7 +1653,9 @@ def sample_spec(
     # attack↔benign cross-contamination via registered attack hashes.
     benign_duplicates_dropped = 0
     benign_cross_contamination_dropped = 0
+    phase_benign_started = time.perf_counter()
     for cell in spec.cells:
+        cell_started = time.perf_counter()
         cell_benign_dedup = ContentDeduplicator()
         cell_benign_dedup.register_attack_hashes(attack_hashes)
         result = _sample_cell_with_optional_quota(
@@ -1489,8 +1679,18 @@ def sample_spec(
             available_by_reason["benign"][sample.reason].append(sample)
             available_by_language["benign"][sample.language].append(sample)
         all_gaps.extend(result.gaps)
+        logger.info(
+            "  cell %s/benign: %d samples in %.2fs",
+            cell.cell_id,
+            len(result.samples),
+            time.perf_counter() - cell_started,
+        )
+    phase_benign_elapsed = time.perf_counter() - phase_benign_started
+    telemetry.record_phase("benign_sampling", phase_benign_elapsed)
+    logger.info("phase benign_sampling: %.2fs", phase_benign_elapsed)
 
     # Phase 4a: legacy same_reason_any_language backfill (kept for compatibility)
+    phase_backfill_started = time.perf_counter()
     if spec.backfill.strategy == "same_reason_any_language" and per_cell_benign is not None:
         for cell in spec.cells:
             key = f"{cell.cell_id}_benign"
@@ -1590,6 +1790,12 @@ def sample_spec(
                 if gaps:
                     all_gaps.extend(gaps)
 
+    phase_backfill_elapsed = time.perf_counter() - phase_backfill_started
+    telemetry.record_phase("backfill", phase_backfill_elapsed)
+    logger.info("phase backfill: %.2fs", phase_backfill_elapsed)
+
+    phase_lanes_started = time.perf_counter()
+
     # Phase 5a: Supplement attack lane
     if spec.supplements:
         supplement_per = (
@@ -1683,6 +1889,26 @@ def sample_spec(
                 supp_benign = rng.sample(supp_benign, cap)
             all_benign.extend(supp_benign)
 
+    phase_lanes_elapsed = time.perf_counter() - phase_lanes_started
+    telemetry.record_phase("lanes_and_supplements", phase_lanes_elapsed)
+    logger.info("phase lanes_and_supplements: %.2fs", phase_lanes_elapsed)
+
+    telemetry.sampling_seconds = time.perf_counter() - sampling_started
+    logger.info(
+        "sample_spec done: %.2fs, source_reads=%d, source_cache_hits=%d, "
+        "source_read_seconds=%.2f",
+        telemetry.sampling_seconds,
+        telemetry.source_reads,
+        telemetry.source_cache_hits,
+        telemetry.source_read_seconds,
+    )
+    if telemetry.slow_sources():
+        slow = ", ".join(
+            f"{name}={seconds:.2f}s"
+            for name, seconds in telemetry.slow_sources()[:5]
+        )
+        logger.info("slowest sources: %s", slow)
+
     return SamplingResult(
         attack_samples=all_attack,
         benign_samples=all_benign,
@@ -1698,4 +1924,5 @@ def sample_spec(
         ledger_quarantined=ledger_totals["quarantined"],
         ledger_rerouted=ledger_totals["rerouted"],
         ledger_relabeled=ledger_totals["relabeled"],
+        telemetry=telemetry,
     )
