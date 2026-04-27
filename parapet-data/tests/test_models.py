@@ -20,6 +20,7 @@ from parapet_data.models import (
     LanguageQuota,
     LanguageQuotaMode,
     LengthBin,
+    MIRROR_ATTACK_REASONS,
     MirrorCell,
     MirrorSpec,
     ReasonProvenance,
@@ -88,8 +89,8 @@ def _cell(
 
 
 def _full_cells() -> list[MirrorCell]:
-    """One cell per AttackReason — complete mirror."""
-    return [_cell(reason=r) for r in AttackReason]
+    """One cell per calibrated mirror reason."""
+    return [_cell(reason=r) for r in AttackReason if r in MIRROR_ATTACK_REASONS]
 
 
 def _strict_cell(reason: AttackReason = AttackReason.INSTRUCTION_OVERRIDE) -> MirrorCell:
@@ -228,11 +229,17 @@ class TestMirrorSpec:
             version="0.1.0",
             cells=_full_cells(),
         )
-        assert len(spec.cells) == len(AttackReason)
-        assert spec.mirror_reason_categories == [reason.value for reason in AttackReason]
+        expected = [
+            reason.value for reason in AttackReason if reason in MIRROR_ATTACK_REASONS
+        ]
+        assert len(spec.cells) == len(MIRROR_ATTACK_REASONS)
+        assert spec.mirror_reason_categories == expected
 
     def test_rejects_incomplete_mirror(self) -> None:
-        incomplete = [_cell(reason=r) for r in list(AttackReason)[:3]]
+        mirror_reasons = [
+            reason for reason in AttackReason if reason in MIRROR_ATTACK_REASONS
+        ]
+        incomplete = [_cell(reason=r) for r in mirror_reasons[:3]]
         with pytest.raises(ValueError, match="Mirror incomplete"):
             MirrorSpec(
                 name="incomplete",
@@ -589,6 +596,67 @@ class TestMirrorSpec:
             allow_heuristic_mirror_attacks=True,
         )
         assert spec.allow_heuristic_mirror_attacks is True
+
+    def test_strict_source_contracts_allow_heuristic_staged_mirror_attack_with_opt_in(self) -> None:
+        dirty_cells = _strict_full_cells()
+        dirty_cells[0] = MirrorCell(
+            reason=dirty_cells[0].reason,
+            attack_sources=[
+                SourceRef(
+                    name="heuristic_staged_atk",
+                    path=DUMMY_PATH,
+                    language=Language.EN,
+                    extractor="passthrough",
+                    grounding_mode=SourceGroundingMode.REASON_GROUNDED,
+                    route_policy=SourceRoutePolicy.MIRROR,
+                    reason_provenance=ReasonProvenance.HEURISTIC_STAGED,
+                    applicability_scope=ApplicabilityScope.IN_DOMAIN,
+                )
+            ],
+            benign_sources=[_mirror_benign_source()],
+            teaching_goal=dirty_cells[0].teaching_goal,
+            languages=dirty_cells[0].languages,
+            format_distribution=dirty_cells[0].format_distribution,
+            length_distribution=dirty_cells[0].length_distribution,
+        )
+        spec = MirrorSpec(
+            name="strict_heuristic_staged_ok",
+            version="0.1.0",
+            cells=dirty_cells,
+            enforce_source_contracts=True,
+            allow_heuristic_mirror_attacks=True,
+        )
+        assert spec.allow_heuristic_mirror_attacks is True
+
+    def test_strict_source_contracts_reject_heuristic_staged_without_opt_in(self) -> None:
+        dirty_cells = _strict_full_cells()
+        dirty_cells[0] = MirrorCell(
+            reason=dirty_cells[0].reason,
+            attack_sources=[
+                SourceRef(
+                    name="heuristic_staged_atk",
+                    path=DUMMY_PATH,
+                    language=Language.EN,
+                    extractor="passthrough",
+                    grounding_mode=SourceGroundingMode.REASON_GROUNDED,
+                    route_policy=SourceRoutePolicy.MIRROR,
+                    reason_provenance=ReasonProvenance.HEURISTIC_STAGED,
+                    applicability_scope=ApplicabilityScope.IN_DOMAIN,
+                )
+            ],
+            benign_sources=[_mirror_benign_source()],
+            teaching_goal=dirty_cells[0].teaching_goal,
+            languages=dirty_cells[0].languages,
+            format_distribution=dirty_cells[0].format_distribution,
+            length_distribution=dirty_cells[0].length_distribution,
+        )
+        with pytest.raises(ValueError, match="non-heuristic reason_provenance"):
+            MirrorSpec(
+                name="strict_heuristic_staged_bad",
+                version="0.1.0",
+                cells=dirty_cells,
+                enforce_source_contracts=True,
+            )
 
     def test_strict_source_contracts_reject_mixed_scope_mirror_attack(self) -> None:
         dirty_cells = _strict_full_cells()

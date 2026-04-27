@@ -51,7 +51,18 @@ class LengthBin(str, Enum):
 
 
 class AttackReason(str, Enum):
-    """Legacy/default prompt-injection mirror taxonomy."""
+    """Prompt-injection mirror taxonomy + a routing bucket for residual rows.
+
+    The first eight values are the calibrated mirror reasons — each pairs with
+    a benign mirror cell in the spec and is used for reason-grounded sampling.
+
+    ``UNCATEGORIZED`` is intentionally NOT a mirror taxonomy peer. It is a
+    routing bucket for known-malicious rows that ``classify_reason()`` could
+    not score above the confidence floor. Pre-classifying these rows with
+    ``reason: uncategorized`` preserves their training signal without forcing
+    a fake mirror cell. Specs SHOULD consume them through a supplement lane
+    or other non-cell mechanism — not as a reason cell with a teaching goal.
+    """
 
     INSTRUCTION_OVERRIDE = "instruction_override"
     ROLEPLAY_JAILBREAK = "roleplay_jailbreak"
@@ -61,6 +72,23 @@ class AttackReason(str, Enum):
     INDIRECT_INJECTION = "indirect_injection"
     OBFUSCATION = "obfuscation"
     CONSTRAINT_BYPASS = "constraint_bypass"
+    UNCATEGORIZED = "uncategorized"
+
+
+# Mirror taxonomy: the calibrated reasons used as cell ``reason`` values.
+# Excludes ``UNCATEGORIZED`` deliberately — that is a routing bucket, not
+# a mirror peer. Code that needs "the set of valid cell reasons" should
+# use this constant rather than iterating the full enum.
+MIRROR_ATTACK_REASONS: frozenset[AttackReason] = frozenset({
+    AttackReason.INSTRUCTION_OVERRIDE,
+    AttackReason.ROLEPLAY_JAILBREAK,
+    AttackReason.META_PROBE,
+    AttackReason.EXFILTRATION,
+    AttackReason.ADVERSARIAL_SUFFIX,
+    AttackReason.INDIRECT_INJECTION,
+    AttackReason.OBFUSCATION,
+    AttackReason.CONSTRAINT_BYPASS,
+})
 
 
 class LanguageQuotaMode(str, Enum):
@@ -94,6 +122,7 @@ class ReasonProvenance(str, Enum):
     MANUAL_MAP = "manual_map"
     ADJUDICATED = "adjudicated"
     HEURISTIC = "heuristic"
+    HEURISTIC_STAGED = "heuristic_staged"
     NONE = "none"
 
 
@@ -105,7 +134,9 @@ class ApplicabilityScope(str, Enum):
     UNKNOWN = "unknown"
 
 
-DEFAULT_REASON_CATEGORIES: tuple[str, ...] = tuple(reason.value for reason in AttackReason)
+DEFAULT_REASON_CATEGORIES: tuple[str, ...] = tuple(
+    reason.value for reason in AttackReason if reason in MIRROR_ATTACK_REASONS
+)
 
 
 def _normalize_category_name(value: str | AttackReason, *, field_name: str) -> str:
@@ -226,6 +257,11 @@ _STRICT_MIRROR_REASON_PROVENANCE = {
     ReasonProvenance.SOURCE_LABEL,
     ReasonProvenance.MANUAL_MAP,
     ReasonProvenance.ADJUDICATED,
+}
+
+_HEURISTIC_MIRROR_REASON_PROVENANCE = {
+    ReasonProvenance.HEURISTIC,
+    ReasonProvenance.HEURISTIC_STAGED,
 }
 
 
@@ -569,7 +605,7 @@ class MirrorSpec(BaseModel):
                     )
                 allow_heuristic = (
                     self.allow_heuristic_mirror_attacks
-                    and source.reason_provenance == ReasonProvenance.HEURISTIC
+                    and source.reason_provenance in _HEURISTIC_MIRROR_REASON_PROVENANCE
                 )
                 if (
                     source.reason_provenance not in _STRICT_MIRROR_REASON_PROVENANCE

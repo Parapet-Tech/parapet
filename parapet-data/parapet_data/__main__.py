@@ -50,6 +50,16 @@ def _write_verified_sync_stats(verified_dir: Path, stats: object) -> Path:
     return stats_path
 
 
+def _load_mirror_spec(spec_path: Path) -> MirrorSpec:
+    spec_text = spec_path.read_text(encoding="utf-8")
+    if spec_path.suffix == ".json":
+        return MirrorSpec.model_validate_json(spec_text)
+
+    import yaml
+
+    return MirrorSpec.model_validate(yaml.safe_load(spec_text))
+
+
 def cmd_curate(args: argparse.Namespace) -> None:
     """Run the full curation pipeline: spec -> sample -> compose -> manifest."""
     spec_path = Path(args.spec)
@@ -59,12 +69,7 @@ def cmd_curate(args: argparse.Namespace) -> None:
     verified_sync_manifest: VerifiedSyncManifest | None = None
 
     # Load spec
-    spec_text = spec_path.read_text(encoding="utf-8")
-    if spec_path.suffix == ".json":
-        spec = MirrorSpec.model_validate_json(spec_text)
-    else:
-        import yaml
-        spec = MirrorSpec.model_validate(yaml.safe_load(spec_text))
+    spec = _load_mirror_spec(spec_path)
 
     print(f"Spec: {spec.name} v{spec.version}", file=sys.stderr)
     print(f"Cells: {len(spec.cells)}, seed: {spec.seed}", file=sys.stderr)
@@ -304,6 +309,49 @@ def cmd_stage(args: argparse.Namespace) -> None:
                 print(f"    {gate}: {count}", file=sys.stderr)
 
 
+def cmd_preclassify_reasons(args: argparse.Namespace) -> None:
+    """Preclassify heuristic attack sources into explicit-reason JSONL."""
+    from .reason_preclassify import (
+        preclassify_reason_sources_from_spec,
+        reports_to_json,
+    )
+
+    spec_path = Path(args.spec)
+    output_dir = Path(args.output)
+    base_dir = Path(args.base_dir) if args.base_dir else spec_path.parent
+    spec = _load_mirror_spec(spec_path)
+
+    print(f"Spec: {spec.name} v{spec.version}", file=sys.stderr)
+    print(f"Output: {output_dir}", file=sys.stderr)
+    print(f"Base dir: {base_dir}", file=sys.stderr)
+    if args.sources:
+        print(f"Sources: {args.sources}", file=sys.stderr)
+
+    reports = preclassify_reason_sources_from_spec(
+        spec,
+        output_dir,
+        base_dir=base_dir,
+        source_names=args.sources or None,
+    )
+    report_path = output_dir / "preclassify_reasons_report.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(reports_to_json(reports) + "\n", encoding="utf-8")
+
+    total_read = sum(report.rows_read for report in reports)
+    total_written = sum(report.rows_written for report in reports)
+    print("\nPreclassified:", file=sys.stderr)
+    print(f"  Sources: {len(reports)}", file=sys.stderr)
+    print(f"  Rows read: {total_read:,}", file=sys.stderr)
+    print(f"  Rows written: {total_written:,}", file=sys.stderr)
+    print(f"  Report: {report_path}", file=sys.stderr)
+    for report in reports:
+        print(
+            f"  {report.source_name}: {report.rows_written:,}/"
+            f"{report.rows_with_text:,} kept -> {report.output_path}",
+            file=sys.stderr,
+        )
+
+
 def cmd_verified_sync(args: argparse.Namespace) -> None:
     """Sync staging through the adjudication ledger to produce verified output."""
     from .ledger import Ledger
@@ -453,6 +501,32 @@ def main() -> None:
         help="Optional directory for partial checkpoint files (default: --output)",
     )
 
+    preclassify_parser = subparsers.add_parser(
+        "preclassify-reasons",
+        help="Preclassify heuristic attack sources into explicit-reason JSONL",
+    )
+    preclassify_parser.add_argument(
+        "--spec",
+        required=True,
+        help="Path to MirrorSpec JSON or YAML file",
+    )
+    preclassify_parser.add_argument(
+        "--output",
+        required=True,
+        help="Output directory for preclassified JSONL artifacts",
+    )
+    preclassify_parser.add_argument(
+        "--base-dir",
+        default=None,
+        help="Base directory for resolving relative source paths (default: spec parent dir)",
+    )
+    preclassify_parser.add_argument(
+        "--sources",
+        nargs="+",
+        default=None,
+        help="Optional heuristic source names to preclassify",
+    )
+
     vsync_parser = subparsers.add_parser(
         "verified-sync",
         help="Sync staging through adjudication ledger to verified output",
@@ -483,6 +557,8 @@ def main() -> None:
         cmd_curate(args)
     elif args.command == "stage":
         cmd_stage(args)
+    elif args.command == "preclassify-reasons":
+        cmd_preclassify_reasons(args)
     elif args.command == "verified-sync":
         cmd_verified_sync(args)
     elif args.command == "scope-audit":

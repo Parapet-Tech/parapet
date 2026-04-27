@@ -27,6 +27,7 @@ from .extractors import get_extractor
 from .filters import ContentDeduplicator, content_hash, looks_like_attack, passes_label_filter
 from .ledger import Ledger, apply_ledger_to_row
 from .models import (
+    AttackReason,
     BackfillPolicy,
     BackgroundLane,
     CellFillRecord,
@@ -210,6 +211,78 @@ class PreparedSourceResult:
     candidates: list[PreparedSourceCandidate]
 
 
+_ATTACK_REASON_VALUES = frozenset(reason.value for reason in AttackReason)
+
+
+def _uses_dynamic_heuristic_reason(source: SourceRef, *, label: str) -> bool:
+    return (
+        label == "malicious"
+        and source.reason_provenance == ReasonProvenance.HEURISTIC
+    )
+
+
+def _uses_staged_heuristic_reason(source: SourceRef, *, label: str) -> bool:
+    return (
+        label == "malicious"
+        and source.reason_provenance == ReasonProvenance.HEURISTIC_STAGED
+    )
+
+
+def _uses_any_heuristic_reason(source: SourceRef, *, label: str) -> bool:
+    return (
+        _uses_dynamic_heuristic_reason(source, label=label)
+        or _uses_staged_heuristic_reason(source, label=label)
+    )
+
+
+def _normalize_reason_value(reason: object) -> str | None:
+    if hasattr(reason, "value"):
+        reason = getattr(reason, "value")
+    if not isinstance(reason, str):
+        return None
+    normalized = reason.strip()
+    return normalized or None
+
+
+def _classification_reason_value(classification: object) -> str:
+    normalized = _normalize_reason_value(getattr(classification, "reason", None))
+    if normalized is None:
+        raise ValueError("classify_reason returned a classification without a reason")
+    return normalized
+
+
+def _staged_heuristic_reason_value(source: SourceRef, row: dict) -> str:
+    normalized = _normalize_reason_value(row.get("reason"))
+    if normalized is None:
+        raise ValueError(
+            f"{source.name}: heuristic_staged source row must include "
+            "a non-empty reason"
+        )
+    if normalized not in _ATTACK_REASON_VALUES:
+        raise ValueError(
+            f"{source.name}: heuristic_staged source row has unknown "
+            f"reason {normalized!r}"
+        )
+    return normalized
+
+
+def _heuristic_reason_for_row(
+    source: SourceRef,
+    row: dict,
+    text: str,
+    *,
+    label: str,
+) -> str | None:
+    if _uses_dynamic_heuristic_reason(source, label=label):
+        classification = classify_reason(text)
+        if classification is None:
+            return None
+        return _classification_reason_value(classification)
+    if _uses_staged_heuristic_reason(source, label=label):
+        return _staged_heuristic_reason_value(source, row)
+    return None
+
+
 SourceExtractCacheKey = tuple[str, str, str, str, str, str, str]
 PreparedSourceCacheKey = tuple[str, str, str, str, str, str, str]
 
@@ -284,10 +357,7 @@ def _prepare_source_candidates(
     candidates: list[PreparedSourceCandidate] = []
 
     max_samples = source.max_samples
-    applies_heuristic_reason = (
-        label == "malicious"
-        and source.reason_provenance == ReasonProvenance.HEURISTIC
-    )
+    applies_heuristic_reason = _uses_any_heuristic_reason(source, label=label)
     retained_for_max = 0
 
     for row in rows:
@@ -300,14 +370,14 @@ def _prepare_source_candidates(
 
         heuristic_reason: str | None = None
         if applies_heuristic_reason:
-            classification = classify_reason(text)
-            if classification is None:
-                continue
-            heuristic_reason = (
-                classification.reason.value
-                if hasattr(classification.reason, "value")
-                else str(classification.reason)
+            heuristic_reason = _heuristic_reason_for_row(
+                source,
+                row,
+                text,
+                label=label,
             )
+            if heuristic_reason is None:
+                continue
 
         hash_value = content_hash(text)
         candidates.append(PreparedSourceCandidate(
@@ -389,10 +459,7 @@ def _materialize_prepared_source_with_ledger(
     ledger_relabeled = 0
 
     max_samples = source.max_samples
-    applies_heuristic_reason = (
-        label == "malicious"
-        and source.reason_provenance == ReasonProvenance.HEURISTIC
-    )
+    applies_heuristic_reason = _uses_any_heuristic_reason(source, label=label)
 
     for candidate in prepared.candidates:
         assigned_reason = reason
@@ -462,10 +529,7 @@ def _extract_relabel_candidates_from_source(
     ledger_relabeled = 0
 
     max_samples = source.max_samples
-    applies_heuristic_reason = (
-        label == "malicious"
-        and source.reason_provenance == ReasonProvenance.HEURISTIC
-    )
+    applies_heuristic_reason = _uses_any_heuristic_reason(source, label=label)
 
     for row in rows:
         if not passes_label_filter(row, source.label_filter):
@@ -481,14 +545,14 @@ def _extract_relabel_candidates_from_source(
 
         assigned_reason = reason
         if applies_heuristic_reason:
-            classification = classify_reason(text)
-            if classification is None:
-                continue
-            assigned_reason = (
-                classification.reason.value
-                if hasattr(classification.reason, "value")
-                else str(classification.reason)
+            assigned_reason = _heuristic_reason_for_row(
+                source,
+                row,
+                text,
+                label=label,
             )
+            if assigned_reason is None:
+                continue
             if assigned_reason != reason:
                 continue
 
@@ -551,6 +615,7 @@ def _extract_samples_from_source_with_ledger(
     ledger_relabeled = 0
 
     max_samples = source.max_samples
+    applies_heuristic_reason = _uses_any_heuristic_reason(source, label=label)
     for row in rows:
         if not passes_label_filter(row, source.label_filter):
             continue
@@ -560,18 +625,15 @@ def _extract_samples_from_source_with_ledger(
             continue
 
         assigned_reason = reason
-        if (
-            label == "malicious"
-            and source.reason_provenance == ReasonProvenance.HEURISTIC
-        ):
-            classification = classify_reason(text)
-            if classification is None:
-                continue
-            classified_reason = (
-                classification.reason.value
-                if hasattr(classification.reason, "value")
-                else str(classification.reason)
+        if applies_heuristic_reason:
+            classified_reason = _heuristic_reason_for_row(
+                source,
+                row,
+                text,
+                label=label,
             )
+            if classified_reason is None:
+                continue
             if classified_reason != reason:
                 continue
             assigned_reason = classified_reason
