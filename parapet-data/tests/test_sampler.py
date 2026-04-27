@@ -332,6 +332,157 @@ class TestExtractSamples:
         assert len(meta_probe_samples) == 1
         assert meta_probe_samples[0].reason == AttackReason.META_PROBE.value
 
+    def test_heuristic_staged_source_uses_stored_reason(
+        self,
+        tmp_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from parapet_data import sampler as sampler_module
+
+        data = [
+            {
+                "content": "Stored instruction override row for sampling",
+                "reason": AttackReason.INSTRUCTION_OVERRIDE.value,
+            },
+            {
+                "content": "Stored meta probe row for sampling",
+                "reason": AttackReason.META_PROBE.value,
+            },
+        ]
+        path = _write_yaml(tmp_dir / "heuristic_staged.yaml", data)
+        source = SourceRef(
+            name="heuristic_staged_atk",
+            path=path,
+            language=Language.EN,
+            extractor="col_content",
+            grounding_mode=SourceGroundingMode.REASON_GROUNDED,
+            route_policy=SourceRoutePolicy.MIRROR,
+            reason_provenance=ReasonProvenance.HEURISTIC_STAGED,
+            applicability_scope=ApplicabilityScope.IN_DOMAIN,
+        )
+
+        def fail_classifier(text: str):
+            raise AssertionError(f"classifier should not run for {text!r}")
+
+        monkeypatch.setattr(sampler_module, "classify_reason", fail_classifier)
+
+        samples = extract_samples_from_source(
+            source,
+            label="malicious",
+            reason=AttackReason.INSTRUCTION_OVERRIDE.value,
+        )
+
+        assert [sample.content for sample in samples] == [
+            "Stored instruction override row for sampling"
+        ]
+        assert samples[0].reason == AttackReason.INSTRUCTION_OVERRIDE.value
+
+    def test_heuristic_staged_source_rejects_missing_reason(self, tmp_dir: Path) -> None:
+        data = [{"content": "Stored row without explicit reason"}]
+        path = _write_yaml(tmp_dir / "heuristic_staged_missing.yaml", data)
+        source = SourceRef(
+            name="heuristic_staged_atk",
+            path=path,
+            language=Language.EN,
+            extractor="col_content",
+            grounding_mode=SourceGroundingMode.REASON_GROUNDED,
+            route_policy=SourceRoutePolicy.MIRROR,
+            reason_provenance=ReasonProvenance.HEURISTIC_STAGED,
+            applicability_scope=ApplicabilityScope.IN_DOMAIN,
+        )
+
+        with pytest.raises(ValueError, match="heuristic_staged.*reason"):
+            extract_samples_from_source(
+                source,
+                label="malicious",
+                reason=AttackReason.INSTRUCTION_OVERRIDE.value,
+            )
+
+    def test_sample_spec_heuristic_staged_reuses_stored_reason(
+        self,
+        tmp_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from parapet_data import sampler as sampler_module
+
+        attack = _write_yaml(
+            tmp_dir / "heuristic_staged_shared.yaml",
+            [
+                {
+                    "content": f"Stored instruction override row {i}",
+                    "reason": AttackReason.INSTRUCTION_OVERRIDE.value,
+                }
+                for i in range(6)
+            ] + [
+                {
+                    "content": f"Stored meta probe row {i}",
+                    "reason": AttackReason.META_PROBE.value,
+                }
+                for i in range(6)
+            ],
+        )
+        benign = _write_yaml(
+            tmp_dir / "benign.yaml",
+            [{"content": f"Ordinary benign reference text {i}"} for i in range(12)],
+        )
+        attack_source = SourceRef(
+            name="heuristic_staged_shared",
+            path=attack,
+            language=Language.EN,
+            extractor="col_content",
+            grounding_mode=SourceGroundingMode.REASON_GROUNDED,
+            route_policy=SourceRoutePolicy.MIRROR,
+            reason_provenance=ReasonProvenance.HEURISTIC_STAGED,
+            applicability_scope=ApplicabilityScope.IN_DOMAIN,
+        )
+        benign_source = SourceRef(
+            name="benign",
+            path=benign,
+            language=Language.EN,
+            extractor="col_content",
+        )
+        spec = MirrorSpec(
+            name="heuristic_staged_spec",
+            version="0.1.0",
+            cells=[
+                MirrorCell(
+                    reason=AttackReason.INSTRUCTION_OVERRIDE,
+                    attack_sources=[attack_source],
+                    benign_sources=[benign_source],
+                    teaching_goal="instruction",
+                    languages=[Language.EN],
+                    format_distribution={FormatBin.PROSE: 1.0},
+                    length_distribution={LengthBin.SHORT: 1.0},
+                ),
+                MirrorCell(
+                    reason=AttackReason.META_PROBE,
+                    attack_sources=[attack_source],
+                    benign_sources=[benign_source],
+                    teaching_goal="meta",
+                    languages=[Language.EN],
+                    format_distribution={FormatBin.PROSE: 1.0},
+                    length_distribution={LengthBin.SHORT: 1.0},
+                ),
+            ],
+            total_target=12,
+            seed=42,
+            allow_partial_mirror=True,
+            allow_heuristic_mirror_attacks=True,
+        )
+
+        def fail_classifier(text: str):
+            raise AssertionError(f"classifier should not run for {text!r}")
+
+        monkeypatch.setattr(sampler_module, "classify_reason", fail_classifier)
+
+        result = sample_spec(spec, base_dir=tmp_dir)
+
+        attack_reasons = {sample.reason for sample in result.attack_samples}
+        assert attack_reasons == {
+            AttackReason.INSTRUCTION_OVERRIDE.value,
+            AttackReason.META_PROBE.value,
+        }
+
     def test_skips_empty_extractions(self, tmp_dir: Path) -> None:
         data = [{"content": ""}, {"content": "ab"}, {"content": "valid text here"}]
         path = _write_yaml(tmp_dir / "src.yaml", data)
