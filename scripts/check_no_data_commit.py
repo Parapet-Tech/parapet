@@ -27,6 +27,7 @@ BLOCKED_PREFIXES = (
     "schema/eval/challenges/",
     "schema/eval/heuristic_staged/",
     "TheWall/",
+    "curated/",
     "parapet-data/curated/",
     "parapet-data/curated_",
     "parapet-runner/runs/",
