@@ -33,7 +33,7 @@ total_target: 35000
 allow_partial_mirror: false
 enforce_source_contracts: true
 allow_heuristic_mirror_attacks: true
-supplement_ratio: 0.0
+supplement_ratio: 0.05
 
 backfill:
   strategy: ngram_safe
@@ -92,21 +92,26 @@ discussion_benign:
 # ---------------------------------------------------------------------------
 
 base_attack_sources:
+  # Mirror cells consume preclassified rows directly — classify_reason is no
+  # longer invoked at curate time. ``reason_provenance: heuristic_staged``
+  # signals to the sampler that ``row["reason"]`` is authoritative. Rebuild
+  # via ``python -m parapet_data preclassify-reasons --spec ...`` whenever
+  # the classifier or upstream sources change.
   - name: en_attacks_merged
-    path: schema/eval/malicious/attacks_121624.jsonl
+    path: schema/eval/heuristic_staged/en_en_attacks_merged_heuristic_staged.jsonl
     language: EN
     max_samples: 20000
     label_filter: {column: label, allowed: [malicious]}
     route_policy: mirror
     grounding_mode: reason_grounded
-    reason_provenance: heuristic
+    reason_provenance: heuristic_staged
     applicability_scope: in_domain
-  - {name: zh_attacks_corpus, path: schema/eval/training/multilingual/attacks_121624_zh.jsonl, language: ZH, route_policy: mirror, grounding_mode: reason_grounded, reason_provenance: heuristic, applicability_scope: in_domain}
-  - {name: zh_attacks_novel, path: schema/eval/training/multilingual/zh_attacks.jsonl, language: ZH, route_policy: mirror, grounding_mode: reason_grounded, reason_provenance: heuristic, applicability_scope: in_domain}
-  - {name: ar_attacks_corpus, path: schema/eval/training/multilingual/attacks_121624_ar.jsonl, language: AR, route_policy: mirror, grounding_mode: reason_grounded, reason_provenance: heuristic, applicability_scope: in_domain}
-  - {name: ar_attacks_novel, path: schema/eval/training/multilingual/ar_attacks.jsonl, language: AR, route_policy: mirror, grounding_mode: reason_grounded, reason_provenance: heuristic, applicability_scope: in_domain}
-  - {name: ru_attacks_corpus, path: schema/eval/training/multilingual/attacks_121624_ru.jsonl, language: RU, route_policy: mirror, grounding_mode: reason_grounded, reason_provenance: heuristic, applicability_scope: in_domain}
-  - {name: ru_attacks_novel, path: schema/eval/training/multilingual/ru_attacks.jsonl, language: RU, route_policy: mirror, grounding_mode: reason_grounded, reason_provenance: heuristic, applicability_scope: in_domain}
+  - {name: zh_attacks_corpus, path: schema/eval/heuristic_staged/zh_zh_attacks_corpus_heuristic_staged.jsonl, language: ZH, route_policy: mirror, grounding_mode: reason_grounded, reason_provenance: heuristic_staged, applicability_scope: in_domain}
+  - {name: zh_attacks_novel, path: schema/eval/heuristic_staged/zh_zh_attacks_novel_heuristic_staged.jsonl, language: ZH, route_policy: mirror, grounding_mode: reason_grounded, reason_provenance: heuristic_staged, applicability_scope: in_domain}
+  - {name: ar_attacks_corpus, path: schema/eval/heuristic_staged/ar_ar_attacks_corpus_heuristic_staged.jsonl, language: AR, route_policy: mirror, grounding_mode: reason_grounded, reason_provenance: heuristic_staged, applicability_scope: in_domain}
+  - {name: ar_attacks_novel, path: schema/eval/heuristic_staged/ar_ar_attacks_novel_heuristic_staged.jsonl, language: AR, route_policy: mirror, grounding_mode: reason_grounded, reason_provenance: heuristic_staged, applicability_scope: in_domain}
+  - {name: ru_attacks_corpus, path: schema/eval/heuristic_staged/ru_ru_attacks_corpus_heuristic_staged.jsonl, language: RU, route_policy: mirror, grounding_mode: reason_grounded, reason_provenance: heuristic_staged, applicability_scope: in_domain}
+  - {name: ru_attacks_novel, path: schema/eval/heuristic_staged/ru_ru_attacks_novel_heuristic_staged.jsonl, language: RU, route_policy: mirror, grounding_mode: reason_grounded, reason_provenance: heuristic_staged, applicability_scope: in_domain}
 
 base_benign_sources:
   - {name: en_benign_curated, path: schema/eval/training/global_benign_curated.jsonl, language: EN, max_samples: 20000, route_policy: mirror}
@@ -411,3 +416,42 @@ cells:
         grounding_mode: reason_grounded
         reason_provenance: adjudicated
         applicability_scope: in_domain
+
+# ---------------------------------------------------------------------------
+# Supplements — uncategorized known-malicious rows.
+#
+# The heuristic classifier returns None for ~91% of corpus attack rows.
+# Those rows are real malicious data — the calibrated mirror taxonomy just
+# can't sub-route them. Preclassification preserves them as
+# ``reason: uncategorized`` in the same staged JSONL files used by mirror
+# cells. This supplement consumes them via ``label_filter`` so they
+# contribute to L1 training without forcing a fake mirror cell.
+#
+# Budget:
+#   supplement_ratio=0.05 of total_target=35000 → 1750 total, split per
+#   side (sampler divides by 2). Result: ~875 uncategorized attack rows
+#   plus ~0 benign (no benign supplement sources). Empty benign list is
+#   intentional — uncategorized is an attack-only routing bucket.
+#
+# Provenance discipline:
+#   - ``route_policy: residual`` so the sampler treats these as a non-cell
+#     pool, not part of the mirror taxonomy.
+#   - No ``reason_provenance`` set on these refs — provenance belongs on
+#     the mirror-cell refs that read the same files.
+#   - ``label_filter`` selects only rows the preclassifier wrote with
+#     ``reason: uncategorized``; classified rows stay reserved for cells.
+# ---------------------------------------------------------------------------
+
+supplements:
+  - name: uncategorized_attacks
+    weakness: "Known-malicious rows the heuristic classifier could not score above the confidence floor; preserves training signal that would otherwise be discarded by the mirror taxonomy."
+    max_samples: 875
+    attack_sources:
+      - {name: en_uncategorized, path: schema/eval/heuristic_staged/en_en_attacks_merged_heuristic_staged.jsonl, language: EN, route_policy: residual, label_filter: {column: reason, allowed: [uncategorized]}}
+      - {name: zh_corpus_uncategorized, path: schema/eval/heuristic_staged/zh_zh_attacks_corpus_heuristic_staged.jsonl, language: ZH, route_policy: residual, label_filter: {column: reason, allowed: [uncategorized]}}
+      - {name: zh_novel_uncategorized, path: schema/eval/heuristic_staged/zh_zh_attacks_novel_heuristic_staged.jsonl, language: ZH, route_policy: residual, label_filter: {column: reason, allowed: [uncategorized]}}
+      - {name: ar_corpus_uncategorized, path: schema/eval/heuristic_staged/ar_ar_attacks_corpus_heuristic_staged.jsonl, language: AR, route_policy: residual, label_filter: {column: reason, allowed: [uncategorized]}}
+      - {name: ar_novel_uncategorized, path: schema/eval/heuristic_staged/ar_ar_attacks_novel_heuristic_staged.jsonl, language: AR, route_policy: residual, label_filter: {column: reason, allowed: [uncategorized]}}
+      - {name: ru_corpus_uncategorized, path: schema/eval/heuristic_staged/ru_ru_attacks_corpus_heuristic_staged.jsonl, language: RU, route_policy: residual, label_filter: {column: reason, allowed: [uncategorized]}}
+      - {name: ru_novel_uncategorized, path: schema/eval/heuristic_staged/ru_ru_attacks_novel_heuristic_staged.jsonl, language: RU, route_policy: residual, label_filter: {column: reason, allowed: [uncategorized]}}
+    benign_sources: []
