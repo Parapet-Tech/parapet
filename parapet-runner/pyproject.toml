@@ -11,11 +11,24 @@ license = "Apache-2.0"
 dependencies = [
   "pydantic>=2.7",
   "pyyaml>=6.0",
+  "numpy>=1.26",
 ]
 
 [project.optional-dependencies]
 dev = [
   "pytest>=8",
+]
+bench = [
+  # Real ONNX runtime + HuggingFace tokenizer adapters for the L2 latency
+  # bench (see parapet_runner/latency_onnx.py). Install with:
+  #   pip install -e ".[bench]"
+  #
+  # onnxruntime-gpu is intentionally NOT pinned here. On Kaggle/Colab GPU
+  # runtimes, install `onnxruntime-gpu` in the notebook header instead of
+  # `onnxruntime`. Locally and in CI, `onnxruntime` (CPU) is sufficient.
+  "onnxruntime>=1.17",
+  "transformers>=4.40",
+  "sentencepiece>=0.2",
 ]
 
 [tool.pytest.ini_options]
