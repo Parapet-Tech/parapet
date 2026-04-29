@@ -54,16 +54,51 @@ class CorpusFormatError(ValueError):
 
 
 def load_corpus(path: Path, text_field: str = "content") -> Iterator[str]:
-    """Yield text strings from a corpus file."""
+    """Yield text strings from a corpus file (projection of full-row loader)."""
 
     if not text_field:
         raise ValueError("text_field must be non-empty")
 
+    for row in load_corpus_rows(path):
+        if isinstance(row, str):
+            # YAML list-of-strings shape — text is the row itself.
+            if not row.strip():
+                # Already validated in load_corpus_rows, but defensive.
+                continue
+            yield row
+            continue
+        # Mapping row — extract the requested text field.
+        if text_field not in row:
+            raise CorpusFormatError(
+                f"{path} row missing field {text_field!r}"
+            )
+        value = row[text_field]
+        if not isinstance(value, str):
+            raise CorpusFormatError(
+                f"{path} field {text_field!r} must be str, got {type(value).__name__}"
+            )
+        if not value.strip():
+            raise CorpusFormatError(
+                f"{path} field {text_field!r} is empty or whitespace-only"
+            )
+        yield value
+
+
+def load_corpus_rows(path: Path) -> Iterator[Mapping[str, Any] | str]:
+    """Yield full corpus rows preserving metadata (label, language, source, ...).
+
+    Object rows come back as dicts; bare-string YAML rows come back as
+    strings. Callers that only need text should use ``load_corpus`` instead.
+
+    Strict shape validation matches ``load_corpus``: malformed JSON,
+    non-mapping JSONL rows, mixed YAML list shapes all fail closed.
+    """
+
     suffix = path.suffix.lower()
     if suffix == ".jsonl":
-        yield from _load_jsonl(path, text_field)
+        yield from _load_jsonl_rows(path)
     elif suffix in (".yaml", ".yml"):
-        yield from _load_yaml(path, text_field)
+        yield from _load_yaml_rows(path)
     else:
         raise CorpusFormatError(
             f"Unsupported corpus extension {suffix!r} (path={path}); "
@@ -71,7 +106,7 @@ def load_corpus(path: Path, text_field: str = "content") -> Iterator[str]:
         )
 
 
-def _load_jsonl(path: Path, text_field: str) -> Iterator[str]:
+def _load_jsonl_rows(path: Path) -> Iterator[Mapping[str, Any]]:
     with path.open("r", encoding="utf-8") as handle:
         for line_no, line in enumerate(handle, start=1):
             if not line.strip():
@@ -86,10 +121,10 @@ def _load_jsonl(path: Path, text_field: str) -> Iterator[str]:
                 raise CorpusFormatError(
                     f"{path}:{line_no} expected JSON object, got {type(row).__name__}"
                 )
-            yield _extract_text(row, text_field, where=f"{path}:{line_no}")
+            yield row
 
 
-def _load_yaml(path: Path, text_field: str) -> Iterator[str]:
+def _load_yaml_rows(path: Path) -> Iterator[Mapping[str, Any] | str]:
     with path.open("r", encoding="utf-8") as handle:
         data = yaml.safe_load(handle)
 
@@ -110,8 +145,7 @@ def _load_yaml(path: Path, text_field: str) -> Iterator[str]:
                     f"{path}[{i}] mixed list shape: expected str (matched first row), "
                     f"got {type(row).__name__}"
                 )
-            text = row.strip()
-            if not text:
+            if not row.strip():
                 raise CorpusFormatError(f"{path}[{i}] empty or whitespace-only string")
             yield row
     elif isinstance(first, Mapping):
@@ -121,26 +155,11 @@ def _load_yaml(path: Path, text_field: str) -> Iterator[str]:
                     f"{path}[{i}] mixed list shape: expected object (matched first row), "
                     f"got {type(row).__name__}"
                 )
-            yield _extract_text(row, text_field, where=f"{path}[{i}]")
+            yield row
     else:
         raise CorpusFormatError(
             f"{path}[0] expected str or object, got {type(first).__name__}"
         )
-
-
-def _extract_text(row: Mapping[str, Any], text_field: str, *, where: str) -> str:
-    if text_field not in row:
-        raise CorpusFormatError(f"{where} missing field {text_field!r}")
-    value = row[text_field]
-    if not isinstance(value, str):
-        raise CorpusFormatError(
-            f"{where} field {text_field!r} must be str, got {type(value).__name__}"
-        )
-    if not value.strip():
-        raise CorpusFormatError(
-            f"{where} field {text_field!r} is empty or whitespace-only"
-        )
-    return value
 
 
 # ---------------------------------------------------------------------------
