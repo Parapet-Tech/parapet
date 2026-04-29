@@ -27,9 +27,13 @@
 # the bench against an existing artifact, you can skip it.
 
 # %%
-# !pip install -q "git+https://github.com/<org>/parapet.git#subdirectory=parapet-runner&egg=parapet-runner[bench]"
-# !pip install -q "optimum[exporters]>=1.20"
-# # On a GPU runtime, prefer onnxruntime-gpu and uninstall the CPU build first:
+# # Pin to the parapet HEAD commit you tested against for reproducibility
+# # (replace <commit_sha> with `git rev-parse HEAD` from your local clone).
+# !pip install -q "git+https://github.com/Parapet-Tech/parapet.git@<commit_sha>#subdirectory=parapet-runner&egg=parapet-runner[bench]"
+# !pip install -q "optimum[exporters]>=1.20" "huggingface_hub>=0.25"
+# # CPU is the right runtime for direction.md's Phase 0.6 gate (single-thread,
+# # no batching). Stick with onnxruntime (CPU). Only switch to onnxruntime-gpu
+# # if you are explicitly running an exploratory GPU comparison:
 # # !pip uninstall -y onnxruntime
 # # !pip install -q onnxruntime-gpu
 
@@ -79,13 +83,21 @@
 # " | tee /kaggle/working/mdeberta-onnx/model.int8.sha256
 
 # %% [markdown]
-# ## 5. Pin the corpus
+# ## 5. Pin the corpus + model revision
 #
-# Real curated train/val text, not holdout. Replace the dataset/file names
-# with whatever you mounted as a Kaggle input.
+# Corpus: the stratified v8 train/val sample built locally via
+# `python scripts/build_l2_latency_corpus.py`, uploaded to Kaggle as a
+# private dataset. Real curated train/val text — NOT holdout, NOT challenge
+# (see direction.md Phase 3 split discipline).
+#
+# Model revision: resolved from the Hub at run time so the manifest pins to
+# a real commit SHA rather than 'main'.
 
 # %%
-# CORPUS_PATH = "/kaggle/input/<your-curated-train-dataset>/train.jsonl"
+# from huggingface_hub import HfApi
+# CORPUS_PATH = "/kaggle/input/<your-corpus-slug>/l2_latency_v8_train_val_stratified.jsonl"
+# HF_REVISION = HfApi().model_info("microsoft/mdeberta-v3-base").sha
+# print(f"resolved mDeBERTa revision: {HF_REVISION}")
 
 # %% [markdown]
 # ## 6. Run the bench
@@ -95,14 +107,14 @@
 
 # %%
 # import subprocess
-# result = subprocess.run([
+# subprocess.run([
 #     "python", "-m", "parapet_runner.latency_bench",
 #     "--model-path", "/kaggle/working/mdeberta-onnx/model.int8.onnx",
 #     "--tokenizer-path", "/kaggle/working/mdeberta-onnx",
-#     "--model-revision", "microsoft/mdeberta-v3-base@<git_sha_from_HF>",
+#     "--model-revision", f"microsoft/mdeberta-v3-base@{HF_REVISION}",
 #     "--onnx-sha256", open("/kaggle/working/mdeberta-onnx/model.int8.sha256").read().strip(),
 #     "--quant", "int8",
-#     "--provider", "CPUExecutionProvider",   # or CUDAExecutionProvider on GPU runtimes
+#     "--provider", "CPUExecutionProvider",
 #     "--corpus", CORPUS_PATH,
 #     "--output", "/kaggle/working/latency_result.json",
 #     "--environment", "kaggle",

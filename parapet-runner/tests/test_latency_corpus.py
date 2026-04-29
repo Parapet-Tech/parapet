@@ -12,6 +12,7 @@ from parapet_runner.latency_corpus import (
     CorpusFormatError,
     compute_corpus_sha256,
     load_corpus,
+    load_corpus_rows,
     synthetic_length_stratified,
 )
 
@@ -345,3 +346,62 @@ def test_corpus_hash_empty_corpus_is_valid() -> None:
 def test_corpus_hash_rejects_non_string() -> None:
     with pytest.raises(TypeError, match="must be str"):
         compute_corpus_sha256(["ok", 42])  # type: ignore[list-item]
+
+
+# ---------------------------------------------------------------------------
+# load_corpus_rows
+# ---------------------------------------------------------------------------
+
+
+def test_load_rows_yields_full_object_from_jsonl(tmp_path: Path) -> None:
+    path = _write(
+        tmp_path / "c.jsonl",
+        '{"content": "hello", "label": "benign", "language": "EN"}\n'
+        '{"content": "world", "label": "malicious", "language": "RU"}\n',
+    )
+    rows = list(load_corpus_rows(path))
+    assert len(rows) == 2
+    assert rows[0]["content"] == "hello"
+    assert rows[0]["label"] == "benign"
+    assert rows[0]["language"] == "EN"
+    assert rows[1]["language"] == "RU"
+
+
+def test_load_rows_yields_full_object_from_yaml(tmp_path: Path) -> None:
+    path = _write(
+        tmp_path / "c.yaml",
+        yaml.safe_dump(
+            [
+                {"content": "alpha", "label": "benign", "source": "test_a"},
+                {"content": "beta", "label": "malicious", "source": "test_b"},
+            ]
+        ),
+    )
+    rows = list(load_corpus_rows(path))
+    assert rows[0]["source"] == "test_a"
+    assert rows[1]["label"] == "malicious"
+
+
+def test_load_rows_yields_bare_strings_from_yaml(tmp_path: Path) -> None:
+    path = _write(tmp_path / "c.yaml", yaml.safe_dump(["one", "two"]))
+    rows = list(load_corpus_rows(path))
+    assert rows == ["one", "two"]
+
+
+def test_load_rows_does_not_validate_text_field(tmp_path: Path) -> None:
+    # load_corpus_rows is shape-only; text_field validation is load_corpus's job.
+    path = _write(tmp_path / "c.jsonl", '{"other_field": "x"}\n')
+    rows = list(load_corpus_rows(path))
+    assert rows == [{"other_field": "x"}]
+
+
+def test_load_rows_still_fails_on_malformed_jsonl(tmp_path: Path) -> None:
+    path = _write(tmp_path / "c.jsonl", "{not json\n")
+    with pytest.raises(CorpusFormatError, match="malformed JSON"):
+        list(load_corpus_rows(path))
+
+
+def test_load_rows_still_fails_on_mixed_yaml_shapes(tmp_path: Path) -> None:
+    path = _write(tmp_path / "c.yaml", yaml.safe_dump(["x", {"content": "y"}]))
+    with pytest.raises(CorpusFormatError, match="mixed list shape"):
+        list(load_corpus_rows(path))
