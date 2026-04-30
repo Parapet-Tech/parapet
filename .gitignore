@@ -78,6 +78,7 @@ parapet-data/specs/mirror_spec_*.yaml
 parapet-runner/.pytest_cache/
 parapet-runner/runs/
 parapet-runner/tests/.tmp_outputs/
+parapet-runner/dist/
 
 # Inner cargo crate's tests/.tmp_outputs (pytest scratch space)
 tests/.tmp_outputs/
