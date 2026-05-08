@@ -22,16 +22,17 @@ If you only need the high-level model, the request path is:
 
 ```text
 L0 normalize
--> L1 lightweight classifier
--> L2a optional payload analysis
--> L3_inbound pattern scanning
+-> L1 deterministic pattern gate
+-> L2 lightweight lexical classifier
+-> L3 orthogonal sensors / router
 -> L4 multi-turn risk scoring
 -> upstream model
--> L3_outbound tool constraints
--> L5a output redaction
+-> L5 outbound tool constraints
+-> L6 output redaction
 ```
 
-For the canonical layer definitions, see [strategy/layers.md](strategy/layers.md).
+Implementation names are still in transition. For the canonical target taxonomy
+and current implementation mapping, see [strategy/layers.md](strategy/layers.md).
 
 ## Quick Start
 
@@ -109,14 +110,14 @@ Prompt injection attempts should block. Ordinary traffic should pass through.
 | Threat | Layer | Action |
 |--------|-------|--------|
 | Encoding tricks (Unicode, zero-width, HTML entities) | L0 normalize | Strip before scanning |
-| Prompt injection (broad) | L1 classifier | Block (403) |
-| Injection in data payloads (tool results, RAG docs) | L2a optional payload analysis | Block (403) |
-| Prompt injection patterns (DAN, jailbreaks, extraction) | L3 inbound | Block (403) |
+| Prompt injection patterns (DAN, jailbreaks, extraction) | L1 pattern gate | Block (403) |
+| Prompt injection (broad lexical signal) | L2 lexical classifier | Block (403) |
+| Obfuscation, structure, entropy, sizing anomalies | L3 orthogonal sensors | Block or route by policy |
 | Multi-turn attacks (seeding, role confusion, escalation) | L4 multi-turn | Block |
-| Unauthorized tool calls | L3 outbound | Block |
-| Dangerous tool arguments (path traversal, shell injection) | L3 outbound | Block |
-| API keys / secrets in LLM output | L5a redact | Replace with `[REDACTED]` |
-| System prompt leakage | L5a canary | Detect via canary tokens |
+| Unauthorized tool calls | L5 outbound constraints | Block |
+| Dangerous tool arguments (path traversal, shell injection) | L5 outbound constraints | Block |
+| API keys / secrets in LLM output | L6 redaction | Replace with `[REDACTED]` |
+| System prompt leakage | L6 canary | Detect via canary tokens |
 
 ## Deployment Modes
 
@@ -185,7 +186,8 @@ LiteLLM chaining is documented separately in [use/litellm.md](use/litellm.md).
 
 ## Research Notes
 
-Parapet includes ongoing work on multi-turn attack detection and prompt-injection classifiers.
+Parapet includes ongoing work on multi-turn attack detection, lexical
+classifiers, and deterministic orthogonal sensors.
 
 Current paper:
 
@@ -193,7 +195,9 @@ Current paper:
 
 The broader research and layer notes live under [strategy/](strategy).
 
-For the current detection direction, including the move away from Prompt Guard 2 as the strategic `L2a` path, see [strategy/current_direction.md](strategy/current_direction.md).
+For the current detection direction, including the closure of the inline
+semantic-transformer hot-path slot, see
+[strategy/current_direction.md](strategy/current_direction.md).
 
 ## Building From Source
 
@@ -201,7 +205,7 @@ For the current detection direction, including the move away from Prompt Guard 2
 # Rust engine
 cd parapet && cargo build --release && cargo test
 
-# With optional L2a support
+# With optional legacy L2a support
 cd parapet && cargo build --features l2a --release
 
 # Python SDK
