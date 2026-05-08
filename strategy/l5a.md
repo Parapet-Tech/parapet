@@ -1,5 +1,9 @@
 # L5a: Output Redaction
 
+Naming note: this is the current implementation doc for output redaction,
+which maps to target `L6` in `strategy/layers.md`. The code and config still
+use legacy `L5a` names until the runtime rename lands.
+
 L5a scans model responses for canary tokens and sensitive patterns, then redacts matches as `[REDACTED]`.
 
 ## Config

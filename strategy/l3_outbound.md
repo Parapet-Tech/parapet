@@ -1,5 +1,9 @@
 # L3 Outbound: Tool Call Constraints
 
+Naming note: this is the current implementation doc for outbound tool-call
+constraints, which maps to target `L5` in `strategy/layers.md`. The code and
+config still use legacy `L3_outbound` names until the runtime rename lands.
+
 L3 outbound validates model-emitted tool calls against contract policy before tool execution.
 
 It enforces allowlists and argument constraints using a deterministic 9-predicate DSL.

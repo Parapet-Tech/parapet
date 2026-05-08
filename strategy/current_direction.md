@@ -1,76 +1,81 @@
 # Current Detection Direction
 
-This note summarizes the current public strategy direction for Parapet's prompt-injection detection stack.
-
-It exists to capture stable conclusions from recent research without importing local experiment notes into the canonical docs.
+This note summarizes the current public strategy direction for Parapet's
+prompt-injection detection stack. It captures stable conclusions without
+importing local experiment artifacts into canonical docs.
 
 ## Program Truth
 
-- `L1` remains the fast lexical front door.
-- `L2a` remains the optional heavier analysis slot.
-- `L2b` is experimental, not a canonical public layer.
-- The strategic direction is away from Prompt Guard 2 as the future of `L2a`.
+- The inline semantic-transformer L2 path is closed for the hot path.
+- The target inbound stack is `L0 -> L1 -> L2 -> L3 -> L4 -> upstream`.
+- `L1` is the deterministic pattern gate.
+- `L2` is the lightweight lexical classifier, currently the compiled char
+  n-gram SVM still implemented under legacy `L1` names.
+- `L3` is the orthogonal sensor/router layer. It is sensor-first, deterministic,
+  and returns only `allow` or `block`.
+- There is no specialist/escalation branch in the current target architecture.
+- Legacy `L2a` / Prompt Guard style payload analysis is not the strategic path.
 
 ## What Recent Research Established
 
-### 1. L1 is useful, but should not be treated as a standalone final gate
+### 1. L1/L2 naming changed, but the useful parts remain
 
-Recent work reinforced that `L1` is best understood as a fast lexical sensor:
+The old stack used `L1` for the SVM and `L3_inbound` for pattern scanning.
+The target taxonomy moves the cheaper deterministic pattern gate ahead of the
+SVM:
 
-- it provides cheap coverage and strong routing signal
-- it catches obvious prompt-injection language well
-- harder benign families remain challenging when text is attack-shaped but not malicious
+1. pattern scanning is cheaper and more explainable
+2. pattern evidence is useful input to later layers
+3. the SVM is better understood as a lightweight lexical sensor, not the first
+   logical gate
 
-That means the right optimization target for `L1` is useful coverage and routing quality, not "solve the whole problem alone."
+Implementation names will lag the target taxonomy until a deliberate rename
+lands. `strategy/layers.md` is the mapping source of truth during that
+transition.
 
-### 2. Lexical follow-on stages help, but do not fully solve the hard benign problem
+### 2. Small inline transformers did not earn the hot-path budget
 
-Experimental lexical second stages improved some precision and routing behavior, but they did not fully eliminate the remaining hard benign families.
+Residual testing showed that the latency-feasible transformer envelope depended
+on aggressive truncation/threading assumptions and failed effectiveness on the
+hard tail. Larger DeBERTa-class models exceeded the CPU latency budget by a
+wide margin.
 
-This keeps lexical helper stages in play for:
+The conclusion is narrow but load-bearing: Parapet should not keep reopening
+the inline transformer ladder as the default L2 fallback.
 
-- precision recovery
-- route-rate control
-- latency shielding
+### 3. Orthogonal sensors are the next deployable bet
 
-But it also motivates the move toward a semantic `L2a`.
+The next useful layer is not another semantic model. It is a set of fast,
+mechanically different sensors over normalized text and upstream layer evidence:
 
-### 3. One prior CTF benign conclusion was invalidated by a data-labeling bug
+- entropy and compression shape
+- structural/markup shape
+- obfuscation indicators
+- sizing and line/span features
+- optional token-shape features only if their runtime cost is justified
 
-Recent dataset debugging found that a previously used SaTML-derived "benign" challenge family was overwhelmingly attack traffic mislabeled as benign during staging.
+The router should be deterministic policy code. Offline trees may help discover
+rules, but production should prefer auditable rules and config-hashed
+thresholds over an opaque second classifier.
 
-That means:
+### 4. Product fallback is simplification, not escalation
 
-- that family should not be treated as a valid benign quality gate
-- earlier conclusions drawn from that family need to be interpreted carefully
-- the remaining benign evaluation focus should stay on genuinely benign but difficult families
-
-### 4. The main remaining benign problem is now clearer
-
-The current benign focus is concentrated in families such as:
-
-- `notinject`
-- `atlas_neg`
-- `wildguardmix`
-- `bipia`
-
-These represent different failure modes, including:
-
-- trigger-word overfire
-- quoted-attack use-vs-mention confusion
-- indirect task-over-context confusion
-- broad safety-topic confusion
+If `L3` sensors do not materially move the residual, the fallback is to simplify
+around `L1 + L2 + policy/reporting`, not to add an inline specialist model.
+Coverage gaps should be reported per language and per attack family rather than
+hidden behind an unbounded model ladder.
 
 ## Current Near-Term Work
 
-The active research path is:
-
-1. improve `L1` data composition, especially benign ratio and benign family mix
-2. preserve lexical helper stages only where they buy precision or latency
-3. continue validating a Rust-first semantic `L2a`
-
-The working question is no longer "should Parapet stay on PG2?" The answer there is effectively no.
+1. Keep the naming transition explicit in docs and configs.
+2. Simulate orthogonal sensors against the Phase 1 residual.
+3. Promote only sensors that clear both gates:
+   - at least 30% targeted FN-family reduction at acceptable FP cost
+   - about 1pp absolute stack improvement or comparable routed-volume reduction
+4. Do not port a sensor to Rust until the Python simulation earns it.
 
 The working question is:
 
-"How far can improved `L1` composition plus an optional semantic `L2a` carry the stack before larger-model escalation becomes necessary?"
+"How much deployable coverage can deterministic patterns, the lexical SVM, and
+orthogonal sensors provide before the product should simplify around reporting
+and policy rather than add another inline model?"
