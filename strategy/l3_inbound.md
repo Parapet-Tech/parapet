@@ -1,5 +1,9 @@
 # L3 Inbound: Pattern Enforcement And Evidence
 
+Naming note: this is the current implementation doc for the deterministic
+pattern gate, which maps to target `L1` in `strategy/layers.md`. The code and
+config still use legacy `L3_inbound` names until the runtime rename lands.
+
 L3 inbound scans inbound messages for known injection patterns and enforces untrusted content-size policy.
 
 It is a deterministic regex/policy layer with high precision and lower recall than model-based layers.

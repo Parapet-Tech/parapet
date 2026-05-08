@@ -1,86 +1,44 @@
-# L2a: Optional Payload Analysis
+# L2a: Historical Payload Analysis Slot
 
-L2a is Parapet's optional heavier-weight analysis slot for untrusted payloads and routed traffic.
+`L2a` is a legacy optional payload-analysis slot. It is not the current
+strategic path after the 2026-05-08 inline-transformer closure decision.
 
-Typical inputs:
+Current target taxonomy:
+
+- target `L1`: deterministic pattern gate
+- target `L2`: lightweight lexical classifier, currently implemented under
+  legacy `L1` names
+- target `L3`: orthogonal sensors and deterministic router
+
+See `strategy/layers.md` for the active layer map.
+
+## Historical Role
+
+`L2a` was originally Parapet's optional heavier-weight analysis slot for
+untrusted payloads and routed traffic.
+
+Typical inputs were:
 
 - tool results
 - retrieved documents
 - API responses
 - other untrusted payload-like text
-- traffic escalated from `L1` when a deeper read is worth the latency
+- traffic routed from the lightweight classifier when deeper analysis was worth
+  the latency
 
-## Strategic Role
+Prompt Guard 2 and later semantic-transformer candidates lived in or near this
+slot during earlier research.
 
-L2a exists to do work that `L1` should not try to do alone:
+## Closure
 
-- disambiguate harder contextual cases
-- analyze attack-like content inside larger payloads
-- add a richer signal before final policy decisions
+The slot is closed as a hot-path strategy because:
 
-L2a is optional and should remain off by default unless the runtime budget and operating mode justify it.
+1. Prompt Guard 2 is not the long-term Parapet-owned detection path.
+2. MiniLM-class inline transformers only fit latency under constraints that
+   failed residual effectiveness.
+3. DeBERTa-class models missed the CPU latency budget by a wide margin.
+4. The target runtime has no specialist/escalation branch.
 
-## Current Direction
-
-The active direction is away from Prompt Guard 2 and toward a Parapet-owned semantic implementation in the `L2a` slot.
-
-Why:
-
-- the old PG2 path is no longer the strategic bet
-- recent research showed that lexical-only follow-on models help, but do not fully solve the harder benign families
-- Parapet needs a Rust-first, CPU-viable semantic stage that fits the stack and can evolve with the rest of the system
-
-Prompt Guard 2 should now be treated as historical background, not the canonical future of `L2a`.
-
-## Current Candidate Shapes
-
-The current working candidates are:
-
-1. `L1 -> L2a`
-2. `L1 -> L2b -> L2a`
-
-Where:
-
-- `L2a` is the semantic stage in the official stack
-- `L2b` is an experimental lexical helper stage, not a canonical public layer
-
-`L2b` may still be useful when:
-
-- it reduces routed volume
-- it improves precision on known lexical false-positive families
-- it acts as a latency shield before semantic inference
-
-## Runtime Requirements
-
-The current `L2a` direction is designed around:
-
-- Rust-owned inference and routing
-- CPU-only operation
-- explicit model assets
-- bounded latency suitable for routed traffic, not full-stream always-on inference
-
-The design target is an optional semantic stage that stays compatible with Parapet's existing deployment model.
-
-## What L2a Should And Should Not Do
-
-L2a should:
-
-- analyze untrusted payload-like content that deserves more context than `L1` can provide
-- complement deterministic layers such as `L3_inbound`
-- improve stack behavior on context-sensitive cases without requiring a large-model dependency
-
-L2a should not:
-
-- replace `L0`, `L3_inbound`, `L3_outbound`, or `L5a`
-- be treated as mandatory for every deployment
-- depend on a GPU or an external inference service
-
-## Status
-
-Current status is research and implementation transition:
-
-- PG2-based `L2a` is no longer the long-term strategy
-- semantic `L2a` is the active implementation direction
-- exact model choice, routing shape, and latency tradeoffs are still being validated
-
-See `strategy/current_direction.md` for the program-level summary of why this change happened.
+Future work should not add a new model under `L2a` unless the layer strategy is
+explicitly reopened. The active work is target `L3`: orthogonal deterministic
+sensors over `L0`, `L1`, and `L2` evidence.
