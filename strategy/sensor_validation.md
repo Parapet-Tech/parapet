@@ -33,7 +33,10 @@ reviewable corpus artifact exercises that pattern, `escape_sequence_blob`
 should be described as synthetic-regression/runtime-hypothesis coverage rather
 than real-corpus validated coverage.
 
+A local feasibility check found proxy design notes for future JSONL verdict
+logs, but no concrete runtime proxy request/response log artifact. Promotion
+should wait for a real log path plus explicit sampling approval.
+
 This policy also applies to future zero-width rule splits. Script-dependent
 joiner behavior needs real or reviewable hard negatives before precision claims
 are made for multilingual text.
-
