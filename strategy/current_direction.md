@@ -72,7 +72,11 @@ hidden behind an unbounded model ladder.
 3. Promote only sensors that clear both gates:
    - at least 30% targeted FN-family reduction at acceptable FP cost
    - about 1pp absolute stack improvement or comparable routed-volume reduction
-4. Do not port a sensor to Rust until the Python simulation earns it.
+4. Mark each sensor's validation class explicitly. Synthetic-only fixtures are
+   useful regression checks, but they do not support corpus precision/recall
+   claims when the public corpus has no footprint for the target pattern. See
+   `strategy/sensor_validation.md`.
+5. Do not port a sensor to Rust until the Python simulation earns it.
 
 The working question is:
 
