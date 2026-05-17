@@ -15,21 +15,26 @@ pub mod extractor;
 // ---------------------------------------------------------------------------
 
 /// Identifies which layer produced a signal.
+///
+/// Variants use semantic layer names rather than legacy numeric names. Not all
+/// variants are live in every build or configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LayerId {
-    L1,
-    L2a,
-    L3,
-    L4,
+    PatternGate,
+    LexicalClassifier,
+    PayloadScan,
+    HeuristicSignal,
+    MultiTurnRisk,
 }
 
 impl std::fmt::Display for LayerId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LayerId::L1 => write!(f, "L1"),
-            LayerId::L2a => write!(f, "L2a"),
-            LayerId::L3 => write!(f, "L3"),
-            LayerId::L4 => write!(f, "L4"),
+            LayerId::PatternGate => write!(f, "PatternGate"),
+            LayerId::LexicalClassifier => write!(f, "LexicalClassifier"),
+            LayerId::PayloadScan => write!(f, "PayloadScan"),
+            LayerId::HeuristicSignal => write!(f, "HeuristicSignal"),
+            LayerId::MultiTurnRisk => write!(f, "MultiTurnRisk"),
         }
     }
 }
@@ -152,38 +157,38 @@ mod tests {
 
     #[test]
     fn signal_new_clamps_nan_to_zero() {
-        let s = Signal::new(LayerId::L1, SignalKind::Evidence, None, f32::NAN, f32::NAN);
+        let s = Signal::new(LayerId::LexicalClassifier, SignalKind::Evidence, None, f32::NAN, f32::NAN);
         assert_eq!(s.score, 0.0);
         assert_eq!(s.confidence, 0.0);
     }
 
     #[test]
     fn signal_new_clamps_neg_infinity_to_zero() {
-        let s = Signal::new(LayerId::L1, SignalKind::Evidence, None, f32::NEG_INFINITY, 0.5);
+        let s = Signal::new(LayerId::LexicalClassifier, SignalKind::Evidence, None, f32::NEG_INFINITY, 0.5);
         assert_eq!(s.score, 0.0);
     }
 
     #[test]
     fn signal_new_clamps_infinity_to_one() {
-        let s = Signal::new(LayerId::L1, SignalKind::Evidence, None, f32::INFINITY, 0.5);
+        let s = Signal::new(LayerId::LexicalClassifier, SignalKind::Evidence, None, f32::INFINITY, 0.5);
         assert_eq!(s.score, 1.0);
     }
 
     #[test]
     fn signal_new_clamps_negative_to_zero() {
-        let s = Signal::new(LayerId::L1, SignalKind::Evidence, None, -0.5, 0.5);
+        let s = Signal::new(LayerId::LexicalClassifier, SignalKind::Evidence, None, -0.5, 0.5);
         assert_eq!(s.score, 0.0);
     }
 
     #[test]
     fn signal_new_clamps_above_one() {
-        let s = Signal::new(LayerId::L1, SignalKind::Evidence, None, 1.5, 0.5);
+        let s = Signal::new(LayerId::LexicalClassifier, SignalKind::Evidence, None, 1.5, 0.5);
         assert_eq!(s.score, 1.0);
     }
 
     #[test]
     fn signal_new_preserves_valid_values() {
-        let s = Signal::new(LayerId::L1, SignalKind::Evidence, None, 0.7, 0.9);
+        let s = Signal::new(LayerId::LexicalClassifier, SignalKind::Evidence, None, 0.7, 0.9);
         assert!((s.score - 0.7).abs() < f32::EPSILON);
         assert!((s.confidence - 0.9).abs() < f32::EPSILON);
     }

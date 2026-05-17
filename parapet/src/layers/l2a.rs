@@ -518,7 +518,7 @@ impl L2aScanner for DefaultL2aScanner {
                 // Defensive: score > 0 but no categories (shouldn't happen
                 // given fusion logic). Emit one signal with category: None.
                 let mut signal = Signal::new(
-                    LayerId::L2a,
+                    LayerId::PayloadScan,
                     SignalKind::Evidence,
                     None,
                     score,
@@ -532,7 +532,7 @@ impl L2aScanner for DefaultL2aScanner {
                 // One signal per category.
                 for cat in categories {
                     let mut signal = Signal::new(
-                        LayerId::L2a,
+                        LayerId::PayloadScan,
                         SignalKind::Evidence,
                         Some(cat),
                         score,
@@ -1350,7 +1350,7 @@ mod tests {
 
         // All signals are L2a Evidence
         for sig in &signals {
-            assert_eq!(sig.layer, LayerId::L2a);
+            assert_eq!(sig.layer, LayerId::PayloadScan);
             assert_eq!(sig.kind, SignalKind::Evidence);
             assert_eq!(sig.message_index, Some(0));
             assert!(sig.segment_id.is_some());

@@ -2086,7 +2086,7 @@ fn l2a_test_config() -> L2aConfig {
 
 fn l2a_signal(score: f32, category: &str) -> Signal {
     Signal {
-        layer: LayerId::L2a,
+        layer: LayerId::PayloadScan,
         kind: SignalKind::Evidence,
         score,
         confidence: 0.9,
