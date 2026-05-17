@@ -54,7 +54,7 @@ impl SignalExtractor for DefaultSignalExtractor {
             .filter(|m| m.calibrated > 0.0)
             .map(|m| {
                 Signal::new(
-                    LayerId::L1,
+                    LayerId::LexicalClassifier,
                     SignalKind::Evidence,
                     m.specialist_name.clone(),
                     m.calibrated,
@@ -83,7 +83,7 @@ impl SignalExtractor for DefaultSignalExtractor {
             };
 
             let mut primary = Signal::new(
-                LayerId::L1,
+                LayerId::LexicalClassifier,
                 SignalKind::Evidence,
                 category,
                 primary_score,
@@ -97,7 +97,7 @@ impl SignalExtractor for DefaultSignalExtractor {
             // Compared against original score, not dampened score.
             if s.squash_score > s.score + OBFUSCATION_SCORE_GAP {
                 let mut obfusc = Signal::new(
-                    LayerId::L1,
+                    LayerId::LexicalClassifier,
                     SignalKind::Evidence,
                     Some("obfuscation".to_string()),
                     s.squash_score,
@@ -128,7 +128,7 @@ impl SignalExtractor for DefaultSignalExtractor {
                     0.6
                 };
                 Some(Signal::new(
-                    LayerId::L3,
+                    LayerId::PatternGate,
                     kind,
                     pattern.category.clone(),
                     pattern.weight as f32, // clamped by Signal::new
@@ -144,7 +144,7 @@ impl SignalExtractor for DefaultSignalExtractor {
         // Aggregate risk score
         if result.risk_score > 0.0 {
             signals.push(Signal::new(
-                LayerId::L4,
+                LayerId::MultiTurnRisk,
                 SignalKind::Evidence,
                 None,
                 result.risk_score as f32,
@@ -156,7 +156,7 @@ impl SignalExtractor for DefaultSignalExtractor {
         for cat in &result.matched_categories {
             if cat.weight > 0.0 {
                 signals.push(Signal::new(
-                    LayerId::L4,
+                    LayerId::MultiTurnRisk,
                     SignalKind::Evidence,
                     Some(cat.category.clone()),
                     cat.weight as f32, // clamped by Signal::new
@@ -335,7 +335,7 @@ mod tests {
         let signals = extractor.extract_l4(&result);
         assert_eq!(signals.len(), 3); // 1 aggregate + 2 categories
         // Aggregate
-        assert_eq!(signals[0].layer, LayerId::L4);
+        assert_eq!(signals[0].layer, LayerId::MultiTurnRisk);
         assert!(signals[0].category.is_none());
         assert!((signals[0].score - 0.6).abs() < f32::EPSILON);
         assert!((signals[0].confidence - 1.0).abs() < f32::EPSILON);
@@ -401,7 +401,7 @@ mod tests {
         let extracted = extractor.extract_l1_signals(&signals);
         assert_eq!(extracted.len(), 1);
         assert_eq!(extracted[0].message_index, Some(7));
-        assert_eq!(extracted[0].layer, LayerId::L1);
+        assert_eq!(extracted[0].layer, LayerId::LexicalClassifier);
         assert_eq!(extracted[0].kind, SignalKind::Evidence);
     }
 
