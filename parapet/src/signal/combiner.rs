@@ -242,6 +242,26 @@ mod tests {
     }
 
     #[test]
+    fn heuristic_signal_does_not_join_three_signal_cross_layer_boost() {
+        let combiner = DefaultVerdictCombiner::new();
+        let signals = vec![
+            evidence(LayerId::LexicalClassifier, 0.6, 1.0),
+            evidence(LayerId::PatternGate, 0.4, 1.0),
+            evidence(LayerId::HeuristicSignal, 1.0, 1.0),
+        ];
+        let verdict = combiner.combine(&signals);
+        // Only LexicalClassifier and PatternGate can agree, so the
+        // HeuristicSignal does not affect baseline, boost, or contributions.
+        assert_eq!(verdict.action, VerdictAction::Block);
+        assert!((verdict.composite_score - 0.8).abs() < f32::EPSILON);
+        assert_eq!(verdict.contributing.len(), 2);
+        assert!(verdict
+            .contributing
+            .iter()
+            .all(|c| c.layer != LayerId::HeuristicSignal));
+    }
+
+    #[test]
     fn atomic_fast_path_returns_block() {
         let combiner = DefaultVerdictCombiner::new();
         let verdict = combiner.combine(&[atomic(LayerId::PatternGate)]);
