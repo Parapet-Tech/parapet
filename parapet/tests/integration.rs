@@ -22,6 +22,7 @@ use parapet::layers::l5a::L5aScanner;
 use parapet::message::Message;
 use parapet::normalize::L0Normalizer;
 use parapet::proxy::{self, Provider};
+use parapet::routing::NoopOrthogonalSensorRouter;
 use parapet::signal::combiner::DefaultVerdictCombiner;
 use parapet::signal::extractor::DefaultSignalExtractor;
 use parapet::trust::RoleTrustAssigner;
@@ -110,6 +111,7 @@ fn build_test_engine(yaml: &str, mock_url: &str) -> EngineUpstreamClient {
         output_scanner: Arc::new(L5aScanner),
         session_store: None,
         multi_turn_scanner: None,
+        orthogonal_sensor_router: Arc::new(NoopOrthogonalSensorRouter::new()),
         signal_extractor: Arc::new(DefaultSignalExtractor),
         verdict_combiner: Arc::new(DefaultVerdictCombiner),
         emit_l1_signals: false,
@@ -680,6 +682,7 @@ fn build_test_engine_with_http(yaml: &str, http: Arc<dyn HttpSender>) -> EngineU
         output_scanner: Arc::new(L5aScanner),
         session_store: None,
         multi_turn_scanner: None,
+        orthogonal_sensor_router: Arc::new(NoopOrthogonalSensorRouter::new()),
         signal_extractor: Arc::new(DefaultSignalExtractor),
         verdict_combiner: Arc::new(DefaultVerdictCombiner),
         emit_l1_signals: false,
@@ -803,6 +806,7 @@ fn build_test_engine_with_panicking_inbound(yaml: &str, mock_url: &str) -> Engin
         output_scanner: Arc::new(L5aScanner),
         session_store: None,
         multi_turn_scanner: None,
+        orthogonal_sensor_router: Arc::new(NoopOrthogonalSensorRouter::new()),
         signal_extractor: Arc::new(DefaultSignalExtractor),
         verdict_combiner: Arc::new(DefaultVerdictCombiner),
         emit_l1_signals: false,

@@ -32,6 +32,7 @@ use crate::message::ToolCall;
 use crate::normalize::{neutralize_role_markers, normalize_messages_with_spans, L0Normalizer, Normalizer};
 use crate::provider::{adapter_for, ProviderAdapter, ProviderType};
 use crate::proxy::{ProxyError, ProxyRequest, ProxyResponse, Provider, UpstreamClient};
+use crate::routing::{NoopOrthogonalSensorRouter, OrthogonalSensorRouter, RoutingEvidenceContext};
 use crate::stream::{
     AnthropicChunkClassifier, OpenAiChunkClassifier, StreamProcessor, ToolCallBlockMode,
     ToolCallValidator, ValidationResult,
@@ -201,6 +202,7 @@ pub struct EngineDeps {
     pub output_scanner: Arc<dyn OutputScanner>,
     pub session_store: Option<Arc<dyn crate::session::SessionStore>>,
     pub multi_turn_scanner: Option<Arc<dyn MultiTurnScanner>>,
+    pub orthogonal_sensor_router: Arc<dyn OrthogonalSensorRouter>,
     pub signal_extractor: Arc<dyn SignalExtractor>,
     pub verdict_combiner: Arc<dyn VerdictCombiner>,
     /// Emit `x-parapet-l1-signals` JSON header on responses. Eval-only —
@@ -685,6 +687,24 @@ impl UpstreamClient for EngineUpstreamClient {
             } // if let Some(ref inbound_result)
         }
 
+        // 4.5) Target L3 routing scaffold.
+        //
+        // The default router is a no-op. It runs after normalized messages,
+        // lexical evidence, optional payload-scan signals, and PatternGate
+        // evidence are available, but before MultiTurnRisk. Future heuristic
+        // signals can enter the existing shadow combiner without changing
+        // enforcement behavior.
+        let routing_context = RoutingEvidenceContext::new(
+            &messages,
+            None,
+            l1_signals_opt.as_deref(),
+            l1_result_opt.as_ref(),
+            &l2a_signals,
+            inbound_result_opt.as_ref(),
+            &self.deps.config,
+        );
+        let heuristic_signals = self.deps.orthogonal_sensor_router.route(&routing_context);
+
         // 5) L4 multi-turn scanning (if enabled)
         if let (Some(scanner), Some(l4_config)) = (&self.deps.multi_turn_scanner, &self.deps.config.policy.layers.l4) {
             let l4_start = Instant::now();
@@ -772,6 +792,7 @@ impl UpstreamClient for EngineUpstreamClient {
                 signals.extend(self.deps.signal_extractor.extract_l1(l1r));
             }
             signals.extend(l2a_signals);
+            signals.extend(heuristic_signals);
             if let Some(ref l3r) = inbound_result_opt {
                 signals.extend(self.deps.signal_extractor.extract_l3(l3r, &*self.deps.config));
             }
@@ -1511,6 +1532,7 @@ pub fn build_engine_client(config: Arc<Config>) -> Result<EngineUpstreamClient, 
         output_scanner: Arc::new(L5aScanner),
         session_store,
         multi_turn_scanner,
+        orthogonal_sensor_router: Arc::new(NoopOrthogonalSensorRouter::new()),
         signal_extractor: Arc::new(DefaultSignalExtractor::new()),
         verdict_combiner: Arc::new(DefaultVerdictCombiner::new()),
         emit_l1_signals: false,
