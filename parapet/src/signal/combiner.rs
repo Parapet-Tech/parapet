@@ -49,8 +49,13 @@ const DAMPENER_FACTOR: f32 = 0.4;
 
 impl VerdictCombiner for DefaultVerdictCombiner {
     fn combine(&self, signals: &[Signal]) -> Verdict {
+        // HeuristicSignals are attribution-only: they may be emitted by the
+        // OrthogonalSensorRouter, but must not influence the recommended verdict.
         // Step 1: Atomic fast-path
         for s in signals {
+            if s.layer == LayerId::HeuristicSignal {
+                continue;
+            }
             if s.kind == SignalKind::AtomicBlock {
                 return Verdict {
                     action: VerdictAction::Block,
@@ -68,7 +73,11 @@ impl VerdictCombiner for DefaultVerdictCombiner {
         // Collect only Evidence signals (AtomicBlock already handled).
         let evidence: Vec<&Signal> = signals
             .iter()
-            .filter(|s| s.kind == SignalKind::Evidence && s.score > 0.0)
+            .filter(|s| {
+                s.layer != LayerId::HeuristicSignal
+                    && s.kind == SignalKind::Evidence
+                    && s.score > 0.0
+            })
             .collect();
 
         if evidence.is_empty() {
@@ -182,6 +191,54 @@ mod tests {
 
     fn atomic(layer: LayerId) -> Signal {
         Signal::new(layer, SignalKind::AtomicBlock, None, 1.0, 1.0)
+    }
+
+    #[test]
+    fn heuristic_signal_atomic_is_attribution_only() {
+        let combiner = DefaultVerdictCombiner::new();
+        let verdict = combiner.combine(&[atomic(LayerId::HeuristicSignal)]);
+        assert_eq!(verdict.action, VerdictAction::Allow);
+        assert!((verdict.composite_score - 0.0).abs() < f32::EPSILON);
+        assert!(verdict.contributing.is_empty());
+    }
+
+    #[test]
+    fn heuristic_atomic_does_not_mask_other_atomic_signals() {
+        let combiner = DefaultVerdictCombiner::new();
+
+        for signals in [
+            vec![atomic(LayerId::HeuristicSignal), atomic(LayerId::PatternGate)],
+            vec![atomic(LayerId::PatternGate), atomic(LayerId::HeuristicSignal)],
+        ] {
+            let verdict = combiner.combine(&signals);
+            assert_eq!(verdict.action, VerdictAction::Block);
+            assert!((verdict.composite_score - 1.0).abs() < f32::EPSILON);
+            assert_eq!(verdict.contributing.len(), 1);
+            assert_eq!(verdict.contributing[0].layer, LayerId::PatternGate);
+        }
+    }
+
+    #[test]
+    fn heuristic_signal_evidence_is_attribution_only() {
+        let combiner = DefaultVerdictCombiner::new();
+        let verdict = combiner.combine(&[evidence(LayerId::HeuristicSignal, 1.0, 1.0)]);
+        assert_eq!(verdict.action, VerdictAction::Allow);
+        assert!((verdict.composite_score - 0.0).abs() < f32::EPSILON);
+        assert!(verdict.contributing.is_empty());
+    }
+
+    #[test]
+    fn heuristic_signal_does_not_cross_layer_boost() {
+        let combiner = DefaultVerdictCombiner::new();
+        let signals = vec![
+            evidence(LayerId::PatternGate, 0.4, 1.0),
+            evidence(LayerId::HeuristicSignal, 1.0, 1.0),
+        ];
+        let verdict = combiner.combine(&signals);
+        assert_eq!(verdict.action, VerdictAction::Allow);
+        assert!((verdict.composite_score - 0.4).abs() < f32::EPSILON);
+        assert_eq!(verdict.contributing.len(), 1);
+        assert_eq!(verdict.contributing[0].layer, LayerId::PatternGate);
     }
 
     #[test]
