@@ -37,6 +37,7 @@ use crate::layers::l4::{DefaultMultiTurnScanner, MultiTurnScanner};
 use crate::layers::l5a::L5aScanner;
 use crate::normalize::L0Normalizer;
 use crate::proxy::{Provider, ProxyRequest, UpstreamClient};
+use crate::routing::NoopOrthogonalSensorRouter;
 use crate::trust::RoleTrustAssigner;
 
 // ---------------------------------------------------------------------------
@@ -365,6 +366,7 @@ pub fn build_eval_engine(config: Arc<Config>) -> (EngineUpstreamClient, Arc<Mock
         output_scanner: Arc::new(L5aScanner),
         session_store: None,
         multi_turn_scanner,
+        orthogonal_sensor_router: Arc::new(NoopOrthogonalSensorRouter::new()),
         signal_extractor: Arc::new(DefaultSignalExtractor),
         verdict_combiner: Arc::new(DefaultVerdictCombiner),
         emit_l1_signals: true,
