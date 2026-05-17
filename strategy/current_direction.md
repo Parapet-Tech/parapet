@@ -58,6 +58,24 @@ The router should be deterministic policy code. Offline trees may help discover
 rules, but production should prefer auditable rules and config-hashed
 thresholds over an opaque second classifier.
 
+### Sensor work status at v3
+
+The structural sensor surface is stable at `v3`. The current shipped baseline
+is the combined result of the mechanical blob detector (`v2`), the zero-width
+signal split (`v3`), and the documented validation caveats for Arabic public
+holdout coverage and `escape_sequence_blob` promotion.
+
+No further structural sensors are planned in the immediate term. New structural
+sensor proposals must be gated on measurement evidence, such as real eval misses
+involving the target pattern, not on pattern prevalence in benign corpora alone.
+Local research trail may exist under gitignored `implement/research-findings/`
+for parked ideas such as homoglyph recall gaps or fragmented visible text, but
+those files are not published artifacts or active implementation plans.
+
+The next program-level focus is stack measurement: how `L1`, `L2`, and `L3`
+interact, whether the merged sensors regress known hard negatives, and whether
+the stack improves enough to justify more structural surface area later.
+
 ### 4. Product fallback is simplification, not escalation
 
 If `L3` sensors do not materially move the residual, the fallback is to simplify
