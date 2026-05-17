@@ -14,6 +14,7 @@ pub mod model_path;
 pub mod normalize;
 pub mod provider;
 pub mod proxy;
+pub mod routing;
 pub mod sensor;
 pub mod session;
 pub mod signal;
