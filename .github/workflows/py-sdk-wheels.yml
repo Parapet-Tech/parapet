@@ -45,19 +45,43 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - name: Build wheel
+      - name: Build manylinux wheel
+        if: startsWith(matrix.platform, 'manylinux')
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --out dist
+          working-directory: parapet-py
+
+      - name: Build macOS wheel
+        if: startsWith(matrix.platform, 'macosx')
         uses: PyO3/maturin-action@v1
         env:
           MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macosx_deployment_target }}
         with:
           command: build
           target: ${{ matrix.target }}
-          manylinux: ${{ matrix.manylinux }}
+          args: --release --out dist
+          working-directory: parapet-py
+
+      - name: Build Windows wheel
+        if: matrix.platform == 'win_amd64'
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          target: ${{ matrix.target }}
           args: --release --out dist
           working-directory: parapet-py
 
