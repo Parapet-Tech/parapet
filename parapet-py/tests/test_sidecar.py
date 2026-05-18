@@ -147,19 +147,52 @@ class TestStopEngine:
 
 
 class TestResolveEngineBinary:
-    """_resolve_engine_binary uses 3-tier fallback."""
+    """_resolve_engine_binary uses the locked 4-step fallback."""
 
     def test_explicit_arg_wins(self, monkeypatch):
         monkeypatch.setenv("PARAPET_ENGINE_PATH", "/env/parapet-engine")
+        monkeypatch.setattr("parapet.sidecar.sysconfig.get_path", lambda key: "/installed/bin")
         assert _resolve_engine_binary("/explicit/bin") == "/explicit/bin"
 
-    def test_env_var_fallback(self, monkeypatch):
+    def test_env_var_wins_over_installed_script(self, monkeypatch):
         monkeypatch.setenv("PARAPET_ENGINE_PATH", "/env/parapet-engine")
+        monkeypatch.setattr("parapet.sidecar.sysconfig.get_path", lambda key: "/installed/bin")
+        monkeypatch.setattr("parapet.sidecar.Path.exists", lambda self: True)
         assert _resolve_engine_binary(None) == "/env/parapet-engine"
+
+    def test_installed_script_fallback(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("PARAPET_ENGINE_PATH", raising=False)
+        scripts_dir = tmp_path / "bin"
+        scripts_dir.mkdir()
+        engine = scripts_dir / "parapet-engine"
+        engine.write_text("")
+        monkeypatch.setattr("parapet.sidecar.sysconfig.get_path", lambda key: str(scripts_dir))
+
+        assert _resolve_engine_binary(None) == str(engine)
+
+    def test_installed_script_missing_falls_through(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("PARAPET_ENGINE_PATH", raising=False)
+        scripts_dir = tmp_path / "bin"
+        scripts_dir.mkdir()
+        monkeypatch.setattr("parapet.sidecar.sysconfig.get_path", lambda key: str(scripts_dir))
+
+        assert _resolve_engine_binary(None) == "parapet-engine"
 
     def test_bare_name_fallback(self, monkeypatch):
         monkeypatch.delenv("PARAPET_ENGINE_PATH", raising=False)
+        monkeypatch.setattr("parapet.sidecar.sysconfig.get_path", lambda key: None)
         assert _resolve_engine_binary(None) == "parapet-engine"
+
+    def test_windows_installed_script_suffix(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("PARAPET_ENGINE_PATH", raising=False)
+        scripts_dir = tmp_path / "Scripts"
+        scripts_dir.mkdir()
+        engine = scripts_dir / "parapet-engine.exe"
+        engine.write_text("")
+        monkeypatch.setattr("parapet.sidecar.sys.platform", "win32")
+        monkeypatch.setattr("parapet.sidecar.sysconfig.get_path", lambda key: str(scripts_dir))
+
+        assert _resolve_engine_binary(None) == str(engine)
 
 
 class TestEngineBinaryNotFound:

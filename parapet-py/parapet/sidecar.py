@@ -12,6 +12,8 @@ import atexit
 import logging
 import os
 import subprocess
+import sys
+import sysconfig
 import threading
 import time
 from dataclasses import dataclass, field
@@ -88,13 +90,20 @@ def _resolve_engine_binary(engine_bin: str | None) -> str:
     Resolution order:
       1. Explicit *engine_bin* argument.
       2. ``PARAPET_ENGINE_PATH`` environment variable.
-      3. Bare ``parapet-engine`` name (must be on ``PATH``).
+      3. Installed wheel script in the current environment.
+      4. Bare ``parapet-engine`` name (must be on ``PATH``).
     """
     if engine_bin:
         return engine_bin
     from_env = os.environ.get("PARAPET_ENGINE_PATH")
     if from_env:
         return from_env
+    executable = "parapet-engine.exe" if sys.platform == "win32" else "parapet-engine"
+    scripts_dir = sysconfig.get_path("scripts")
+    if scripts_dir:
+        installed_script = Path(scripts_dir) / executable
+        if installed_script.exists():
+            return str(installed_script)
     return "parapet-engine"
 
 
