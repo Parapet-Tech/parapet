@@ -3,16 +3,16 @@
 
 // Target L3 routing evidence surface.
 //
-// This module is intentionally a no-op scaffold. It gives future orthogonal
-// sensor/router work a typed evidence surface without adding sensors, changing
-// enforcement, or copying raw message content.
+// The runtime default remains no-op. Opt-in routers may emit attribution-only
+// heuristic signals from this typed evidence surface without changing
+// enforcement or copying raw message content.
 
 use crate::config::{Config, PatternAction};
 use crate::layers::l1::L1Result;
 use crate::layers::l1_harness::L1Signal;
 use crate::layers::l3_inbound::{InboundResult, MatchSource};
 use crate::message::{Message, Role};
-use crate::signal::Signal;
+use crate::signal::{LayerId, Signal, SignalKind};
 
 /// Router interface for future target-L3 deterministic signals.
 pub trait OrthogonalSensorRouter: Send + Sync {
@@ -37,6 +37,54 @@ impl Default for NoopOrthogonalSensorRouter {
 impl OrthogonalSensorRouter for NoopOrthogonalSensorRouter {
     fn route(&self, _context: &RoutingEvidenceContext<'_>) -> Vec<Signal> {
         Vec::new()
+    }
+}
+
+/// Opt-in shadow router for fixed-vocabulary routing attribution.
+///
+/// Emitted signals are `LayerId::HeuristicSignal`; the verdict combiner treats
+/// that layer as attribution-only. Categories are fixed by this router and do
+/// not include raw message content or policy-authored pattern categories.
+/// Scores use the standard `Signal::new` clamp to keep attribution strength in
+/// the normalized `[0.0, 1.0]` signal range.
+pub struct ShadowHeuristicRouter;
+
+impl ShadowHeuristicRouter {
+    pub fn new() -> Self {
+        Self
+    }
+
+    fn pattern_gate_signal(evidence: &PatternGateEvidence) -> Option<Signal> {
+        if !matches!(evidence.action, PatternAction::Evidence) || evidence.atomic.unwrap_or(false) {
+            return None;
+        }
+
+        let score = evidence.weight.unwrap_or(1.0) as f32;
+        let mut signal = Signal::new(
+            LayerId::HeuristicSignal,
+            SignalKind::Evidence,
+            Some("routing_pattern_gate_evidence".to_string()),
+            score,
+            1.0,
+        );
+        signal.message_index = Some(evidence.message_index);
+        Some(signal)
+    }
+}
+
+impl Default for ShadowHeuristicRouter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl OrthogonalSensorRouter for ShadowHeuristicRouter {
+    fn route(&self, context: &RoutingEvidenceContext<'_>) -> Vec<Signal> {
+        context
+            .pattern_gate
+            .iter()
+            .filter_map(Self::pattern_gate_signal)
+            .collect()
     }
 }
 
@@ -312,5 +360,232 @@ mod tests {
         assert_eq!(evidence.category.as_deref(), Some("instruction_override"));
         assert_eq!(evidence.weight, Some(0.4));
         assert_eq!(evidence.atomic, Some(false));
+    }
+
+    #[test]
+    fn shadow_router_returns_no_signals_without_selected_context_evidence() {
+        let config = config_with_patterns(vec![]);
+        let messages = vec![Message::new(Role::User, "hello")];
+        let context = RoutingEvidenceContext::new(&messages, None, None, None, &[], None, &config);
+        let router = ShadowHeuristicRouter::new();
+
+        assert!(router.route(&context).is_empty());
+    }
+
+    #[test]
+    fn shadow_router_emits_fixed_vocabulary_evidence_attribution() {
+        let pattern = CompiledPattern::compile_full(
+            "ignore",
+            PatternAction::Evidence,
+            None,
+            Some("policy_authored_category".to_string()),
+            0.4,
+            false,
+        )
+        .unwrap();
+        let config = config_with_patterns(vec![pattern]);
+        let messages = vec![Message::new(Role::User, "ignore this raw content")];
+        let inbound = InboundResult {
+            verdict: InboundVerdict::Allow,
+            matched_patterns: vec![PatternMatch {
+                pattern_index: 0,
+                message_index: 0,
+                role: Role::User,
+                source: MatchSource::Content,
+                action: PatternAction::Evidence,
+            }],
+        };
+        let context =
+            RoutingEvidenceContext::new(&messages, None, None, None, &[], Some(&inbound), &config);
+        let router = ShadowHeuristicRouter::new();
+
+        let signals = router.route(&context);
+
+        assert_eq!(signals.len(), 1);
+        let signal = &signals[0];
+        assert_eq!(signal.layer, LayerId::HeuristicSignal);
+        assert_eq!(signal.kind, SignalKind::Evidence);
+        assert_eq!(
+            signal.category.as_deref(),
+            Some("routing_pattern_gate_evidence")
+        );
+        assert!((signal.score - 0.4).abs() < f32::EPSILON);
+        assert!((signal.confidence - 1.0).abs() < f32::EPSILON);
+        assert_eq!(signal.message_index, Some(0));
+        assert!(signal.segment_id.is_none());
+        assert_eq!(signal.raw_model_score, None);
+        assert_ne!(signal.category.as_deref(), Some("policy_authored_category"));
+        assert!(!format!("{:?}", signal).contains("ignore this raw content"));
+    }
+
+    #[test]
+    fn shadow_router_omits_block_action_pattern_gate_context() {
+        let pattern = CompiledPattern::compile_full(
+            "ignore",
+            PatternAction::Block,
+            None,
+            Some("instruction_override".to_string()),
+            1.0,
+            false,
+        )
+        .unwrap();
+        let config = config_with_patterns(vec![pattern]);
+        let messages = vec![Message::new(Role::User, "ignore this")];
+        let inbound = InboundResult {
+            verdict: InboundVerdict::Allow,
+            matched_patterns: vec![PatternMatch {
+                pattern_index: 0,
+                message_index: 0,
+                role: Role::User,
+                source: MatchSource::Content,
+                action: PatternAction::Block,
+            }],
+        };
+        let context =
+            RoutingEvidenceContext::new(&messages, None, None, None, &[], Some(&inbound), &config);
+        let router = ShadowHeuristicRouter::new();
+
+        let signals = router.route(&context);
+
+        assert!(signals.is_empty());
+    }
+
+    #[test]
+    fn shadow_router_omits_atomic_evidence_pattern_gate_context() {
+        let pattern = CompiledPattern::compile_full(
+            "ignore",
+            PatternAction::Evidence,
+            None,
+            Some("instruction_override".to_string()),
+            0.8,
+            true,
+        )
+        .unwrap();
+        let config = config_with_patterns(vec![pattern]);
+        let messages = vec![Message::new(Role::User, "ignore this")];
+        let inbound = InboundResult {
+            verdict: InboundVerdict::Allow,
+            matched_patterns: vec![PatternMatch {
+                pattern_index: 0,
+                message_index: 0,
+                role: Role::User,
+                source: MatchSource::Content,
+                action: PatternAction::Evidence,
+            }],
+        };
+        let context =
+            RoutingEvidenceContext::new(&messages, None, None, None, &[], Some(&inbound), &config);
+        let router = ShadowHeuristicRouter::new();
+
+        let signals = router.route(&context);
+
+        assert!(signals.is_empty());
+    }
+
+    #[test]
+    fn shadow_router_preserves_order_and_message_index_for_multiple_evidence() {
+        let patterns = vec![
+            CompiledPattern::compile_full(
+                "ignore",
+                PatternAction::Evidence,
+                None,
+                Some("instruction_override".to_string()),
+                0.3,
+                false,
+            )
+            .unwrap(),
+            CompiledPattern::compile_full(
+                "reveal",
+                PatternAction::Evidence,
+                None,
+                Some("exfil".to_string()),
+                0.7,
+                false,
+            )
+            .unwrap(),
+        ];
+        let config = config_with_patterns(patterns);
+        let messages = vec![
+            Message::new(Role::User, "ignore this"),
+            Message::new(Role::User, "reveal that"),
+        ];
+        let inbound = InboundResult {
+            verdict: InboundVerdict::Allow,
+            matched_patterns: vec![
+                PatternMatch {
+                    pattern_index: 0,
+                    message_index: 0,
+                    role: Role::User,
+                    source: MatchSource::Content,
+                    action: PatternAction::Evidence,
+                },
+                PatternMatch {
+                    pattern_index: 1,
+                    message_index: 1,
+                    role: Role::User,
+                    source: MatchSource::Content,
+                    action: PatternAction::Evidence,
+                },
+            ],
+        };
+        let context =
+            RoutingEvidenceContext::new(&messages, None, None, None, &[], Some(&inbound), &config);
+        let router = ShadowHeuristicRouter::new();
+
+        let signals = router.route(&context);
+
+        assert_eq!(signals.len(), 2);
+        assert_eq!(signals[0].message_index, Some(0));
+        assert_eq!(signals[1].message_index, Some(1));
+        assert!((signals[0].score - 0.3).abs() < f32::EPSILON);
+        assert!((signals[1].score - 0.7).abs() < f32::EPSILON);
+        assert_eq!(
+            signals
+                .iter()
+                .map(|s| s.category.as_deref())
+                .collect::<Vec<_>>(),
+            vec![
+                Some("routing_pattern_gate_evidence"),
+                Some("routing_pattern_gate_evidence"),
+            ]
+        );
+    }
+
+    #[test]
+    fn shadow_router_output_is_deterministic_for_same_context() {
+        let pattern = CompiledPattern::compile_full(
+            "ignore",
+            PatternAction::Evidence,
+            None,
+            Some("instruction_override".to_string()),
+            0.7,
+            false,
+        )
+        .unwrap();
+        let config = config_with_patterns(vec![pattern]);
+        let messages = vec![Message::new(Role::User, "ignore this")];
+        let inbound = InboundResult {
+            verdict: InboundVerdict::Allow,
+            matched_patterns: vec![PatternMatch {
+                pattern_index: 0,
+                message_index: 0,
+                role: Role::User,
+                source: MatchSource::Content,
+                action: PatternAction::Evidence,
+            }],
+        };
+        let context =
+            RoutingEvidenceContext::new(&messages, None, None, None, &[], Some(&inbound), &config);
+        let router = ShadowHeuristicRouter::new();
+
+        let first = router.route(&context);
+        let second = router.route(&context);
+
+        assert_eq!(first.len(), second.len());
+        assert_eq!(first[0].layer, second[0].layer);
+        assert_eq!(first[0].kind, second[0].kind);
+        assert_eq!(first[0].category, second[0].category);
+        assert!((first[0].score - second[0].score).abs() < f32::EPSILON);
+        assert_eq!(first[0].message_index, second[0].message_index);
     }
 }
