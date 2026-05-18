@@ -23,6 +23,8 @@ pub enum LayerId {
     PatternGate,
     LexicalClassifier,
     PayloadScan,
+    /// Router-emitted attribution only. The default combiner excludes this
+    /// layer from atomic blocking, evidence scoring, boost, and contributions.
     HeuristicSignal,
     MultiTurnRisk,
 }
