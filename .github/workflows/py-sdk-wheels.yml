@@ -28,10 +28,10 @@ jobs:
             manylinux: "2_17"
             container: quay.io/pypa/manylinux2014_x86_64:latest
           - platform: manylinux_2_17_aarch64
-            os: ubuntu-latest
+            os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             manylinux: "2_17"
-            container: ghcr.io/rust-cross/manylinux2014-cross:aarch64
+            container: quay.io/pypa/manylinux2014_aarch64:latest
           - platform: macosx_11_0_arm64
             os: macos-14
             target: aarch64-apple-darwin
