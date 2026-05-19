@@ -151,7 +151,14 @@ impl<'a> RoutingEvidenceContext<'a> {
     }
 }
 
-/// Placeholder for future first-class L0 normalization evidence.
+/// First-class L0 normalization evidence.
+///
+/// Fixed numeric and boolean telemetry only: no message content, no byte
+/// ranges, no character offsets, no matched tokens, no policy vocabulary.
+/// Counts are bounded per message and intended to be derived deterministically
+/// from the L0 sanitize pass. Engine population is not wired yet; the field
+/// is reserved on `RoutingEvidenceContext` for future routing-evidence
+/// consumers and must not gate enforcement decisions in its first wire-up.
 #[derive(Debug, Clone, PartialEq)]
 pub struct L0Evidence {
     pub message_index: usize,
@@ -159,8 +166,8 @@ pub struct L0Evidence {
     pub post_char_len: usize,
     pub pre_byte_len: usize,
     pub post_byte_len: usize,
-    pub removed_control_count: usize,
     pub removed_invisible_count: usize,
+    pub confusable_replacement_count: usize,
     pub html_stripped: bool,
     pub role_marker_neutralized_count: usize,
 }
@@ -587,5 +594,59 @@ mod tests {
         assert_eq!(first[0].category, second[0].category);
         assert!((first[0].score - second[0].score).abs() < f32::EPSILON);
         assert_eq!(first[0].message_index, second[0].message_index);
+    }
+
+    #[test]
+    fn l0_evidence_preserves_fixed_numeric_and_bool_fields() {
+        let evidence = L0Evidence {
+            message_index: 2,
+            pre_char_len: 32,
+            post_char_len: 28,
+            pre_byte_len: 40,
+            post_byte_len: 30,
+            removed_invisible_count: 3,
+            confusable_replacement_count: 1,
+            html_stripped: true,
+            role_marker_neutralized_count: 2,
+        };
+
+        assert_eq!(evidence.message_index, 2);
+        assert_eq!(evidence.pre_char_len, 32);
+        assert_eq!(evidence.post_char_len, 28);
+        assert_eq!(evidence.pre_byte_len, 40);
+        assert_eq!(evidence.post_byte_len, 30);
+        assert_eq!(evidence.removed_invisible_count, 3);
+        assert_eq!(evidence.confusable_replacement_count, 1);
+        assert!(evidence.html_stripped);
+        assert_eq!(evidence.role_marker_neutralized_count, 2);
+    }
+
+    #[test]
+    fn l0_evidence_debug_format_is_content_free_by_construction() {
+        // Every field is usize or bool, so Debug output cannot carry raw
+        // message content, byte ranges, or matched tokens. This test pins
+        // that shape and confirms the contract field names are correct.
+        let evidence = L0Evidence {
+            message_index: 0,
+            pre_char_len: 7,
+            post_char_len: 5,
+            pre_byte_len: 9,
+            post_byte_len: 5,
+            removed_invisible_count: 2,
+            confusable_replacement_count: 0,
+            html_stripped: false,
+            role_marker_neutralized_count: 0,
+        };
+        let dbg = format!("{:?}", evidence);
+        let allowed = |c: char| {
+            c.is_ascii_alphanumeric() || matches!(c, '_' | ' ' | ':' | ',' | '{' | '}')
+        };
+        assert!(
+            dbg.chars().all(allowed),
+            "L0Evidence Debug output contained unexpected characters: {dbg}"
+        );
+        assert!(dbg.contains("removed_invisible_count"));
+        assert!(dbg.contains("confusable_replacement_count"));
+        assert!(!dbg.contains("removed_control_count"));
     }
 }
