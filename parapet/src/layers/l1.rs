@@ -189,20 +189,18 @@ fn extract_char_wb_ngrams(text: &str, ngram_range: (usize, usize)) -> Vec<String
 /// Mirrors sklearn's `CountVectorizer(analyzer='char', binary=True)`.
 fn extract_char_ngrams(text: &str, ngram_range: (usize, usize)) -> Vec<String> {
     let lower = text.to_lowercase();
-    let bytes = lower.as_bytes();
+    let chars: Vec<char> = lower.chars().collect();
     let mut seen = std::collections::HashSet::new();
     let mut ngrams = Vec::new();
 
     for n in ngram_range.0..=ngram_range.1 {
-        if bytes.len() < n {
+        if chars.len() < n {
             continue;
         }
-        for window in bytes.windows(n) {
-            if let Ok(ngram) = std::str::from_utf8(window) {
-                let s = ngram.to_string();
-                if seen.insert(s.clone()) {
-                    ngrams.push(s);
-                }
+        for window in chars.windows(n) {
+            let s: String = window.iter().collect();
+            if seen.insert(s.clone()) {
+                ngrams.push(s);
             }
         }
     }
@@ -1433,6 +1431,36 @@ mod tests {
         let ngrams = super::extract_ngrams("hello hello");
         let unique: std::collections::HashSet<_> = ngrams.iter().collect();
         assert_eq!(ngrams.len(), unique.len(), "n-grams should be deduplicated");
+    }
+
+    #[test]
+    fn extract_char_ngrams_ascii_matches_byte_windows() {
+        let ngrams = super::extract_char_ngrams("abcd", (1, 2));
+        assert_eq!(ngrams, vec!["a", "b", "c", "d", "ab", "bc", "cd"]);
+    }
+
+    #[test]
+    fn extract_char_ngrams_uses_unicode_scalar_windows() {
+        let ngrams = super::extract_char_ngrams("你好", (1, 2));
+        assert_eq!(ngrams, vec!["你", "好", "你好"]);
+    }
+
+    #[test]
+    fn extract_char_ngrams_mixed_ascii_cjk_windows() {
+        let ngrams = super::extract_char_ngrams("a你b", (2, 2));
+        assert_eq!(ngrams, vec!["a你", "你b"]);
+    }
+
+    #[test]
+    fn extract_char_ngrams_deduplicates_repeated_chars() {
+        let ngrams = super::extract_char_ngrams("aaa", (1, 2));
+        assert_eq!(ngrams, vec!["a", "aa"]);
+    }
+
+    #[test]
+    fn extract_char_ngrams_lowercases_before_windowing() {
+        let ngrams = super::extract_char_ngrams("A你B", (1, 1));
+        assert_eq!(ngrams, vec!["a", "你", "b"]);
     }
 
     #[test]
