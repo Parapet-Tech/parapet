@@ -1,49 +1,32 @@
-#!/usr/bin/env python3
-"""
-Bootstrap generator for the P3 carrier action-tool allowlist.
+"""Bootstrap generator for the reviewed P3 action-tool allowlist.
 
-Reference: parapet-runner/runs/p3_pilot/audit/carrier_integration_research.md
-           local-llm/.local/multiturn/generation_distribution_spec.md (section 4, liveness)
-
-Emits parapet-runner/configs/p3_action_tools.yaml: the authoritative set of
-state-mutating "action" tools used for the carrier liveness label.
-
-Two-part design, matching the agreed basis:
-  - CANDIDATE GENERATION (mechanical, recomputed here from the carrier repos):
-    for every tool actually called in the AgentDojo + AgentDyn runs, record two
-    candidate signals: ground_truth() membership and AST mutation-signature.
-  - FINAL INCLUSION (human review, encoded in REVIEWED_ACTIONS / NEARMISS below):
-    a tool is an action iff it causes a persistent, post-call-observable change
-    to environment state (see INCLUSION PRINCIPLE in the YAML header). Neither
-    candidate signal is trusted on its own: ground_truth() is goal-specific
-    (AgentDyn shopping/github collapse to {send_money}; other suites carry reads)
-    and mutation-signature is brittle (false positive search_product/get_webpage,
-    false negative delete_email/cancel_calendar_event).
+Two parts:
+  - CANDIDATE GENERATION (mechanical, recomputed from the carrier repos): for
+    every tool actually called in the runs, two candidate signals: ground_truth()
+    membership and AST mutation-signature.
+  - FINAL INCLUSION (human review, encoded in REVIEWED_ACTIONS / NEARMISS): a
+    tool is an action iff it causes a persistent, post-call-observable state
+    change (see INCLUSION PRINCIPLE in the YAML header). Neither candidate signal
+    is trusted alone: ground_truth() is goal-specific and mutation-signature is
+    brittle.
 
 BOOTSTRAP ONLY. After first generation the YAML is the hand-maintained source of
-truth; edit it directly and record the reason in each entry's rationale. Rerun
-this only to refresh candidate signals against updated carriers, and re-fold any
-hand edits back into REVIEWED_ACTIONS / NEARMISS here.
+truth; edit it directly. Rerun this only to refresh candidate signals against
+updated carriers, re-folding any hand edits into REVIEWED_ACTIONS / NEARMISS.
 
-No third-party deps, no installs. Reads the git-ignored carrier clones under
-runs/p3_pilot/sources/_repos by default.
+scripts/p3_gen_action_allowlist.py is a thin CLI over main() here.
 """
+from __future__ import annotations
+
 import argparse
 import ast
 import collections
 import glob
-import json
 import os
 import sys
 
-REPO_SUITES = {
-    "agentdojo": ["workspace", "banking", "slack", "travel"],
-    "AgentDyn": ["shopping", "dailylife", "github"],
-}
-MUT_METHODS = {
-    "append", "extend", "insert", "remove", "pop", "clear",
-    "update", "add", "discard", "setdefault", "popitem",
-}
+from p3carriers import schemas
+from p3carriers.action_allowlist import default_allowlist_path
 
 # --- FINAL INCLUSION (human review). Grouped by rationale. ---
 REVIEWED_ACTIONS = {
@@ -103,7 +86,8 @@ NEARMISS = {
 YAML_HEADER = '''# P3 carrier action-tool allowlist (Paper 3, multi-turn injection sensing)
 #
 # PURPOSE: authoritative set of state-mutating "action" tools for the carrier
-# liveness label. Consumed by scripts/p3_normalize_carriers.py.
+# liveness label. Consumed by p3carriers.action_allowlist.load_action_set and
+# the normalizer.
 #
 # LIVENESS RULE (locked, linear-downstream): event i is live iff a reviewed
 # suite-action tool call appears at position >= i in the executed linear trace.
@@ -131,14 +115,13 @@ YAML_HEADER = '''# P3 carrier action-tool allowlist (Paper 3, multi-turn injecti
 # positives are kept (reviewed_action: false) because they are the entries most
 # likely to be challenged later.
 #
-# Bootstrapped by scripts/p3_gen_action_allowlist.py; thereafter hand-maintained.
+# Bootstrapped by p3carriers/allowlist_generator.py; thereafter hand-maintained.
 # Edit this file directly to amend a call, recording the reason in rationale.
 '''
 
 
 def mutation_signature(fn: ast.FunctionDef) -> bool:
-    """True if the body assigns to / deletes / mutating-calls an attribute or
-    subscript (a candidate signal only, deliberately imprecise)."""
+    """Candidate-only: body assigns to / deletes / mutating-calls an attribute or subscript."""
     for n in ast.walk(fn):
         if isinstance(n, ast.Assign):
             if any(isinstance(t, (ast.Attribute, ast.Subscript)) for t in n.targets):
@@ -148,15 +131,16 @@ def mutation_signature(fn: ast.FunctionDef) -> bool:
         if isinstance(n, ast.Delete):
             if any(isinstance(t, (ast.Attribute, ast.Subscript)) for t in n.targets):
                 return True
-        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr in MUT_METHODS:
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr in schemas.MUT_METHODS:
             return True
     return False
 
 
-def scan_tool_modules(repos_root: str):
+def scan_tool_modules(repos_root: str) -> tuple[dict[str, str], dict[str, bool]]:
     """Return (docstring_first_line, mutation_signature) for every defined tool."""
-    doc, msig = {}, {}
-    for repo in REPO_SUITES:
+    doc: dict[str, str] = {}
+    msig: dict[str, bool] = {}
+    for repo in schemas.REPO_SUITES:
         for path in glob.glob(f"{repos_root}/{repo}/src/agentdojo/default_suites/v1/tools/*.py"):
             try:
                 tree = ast.parse(open(path).read())
@@ -171,8 +155,8 @@ def scan_tool_modules(repos_root: str):
     return doc, msig
 
 
-def ground_truth_union(repos_root: str, repo: str, suite: str):
-    funcs = set()
+def ground_truth_union(repos_root: str, repo: str, suite: str) -> set[str]:
+    funcs: set[str] = set()
     for fname in ("injection_tasks.py", "user_tasks.py"):
         p = f"{repos_root}/{repo}/src/agentdojo/default_suites/v1/{suite}/{fname}"
         if not os.path.exists(p):
@@ -185,10 +169,11 @@ def ground_truth_union(repos_root: str, repo: str, suite: str):
     return funcs
 
 
-def tools_called(repos_root: str, defined: set):
+def tools_called(repos_root: str, defined: set[str]) -> dict[str, set[str]]:
     """function name -> set of suites in which it is actually called in runs."""
-    called = collections.defaultdict(set)
-    for repo, suites in REPO_SUITES.items():
+    import json
+    called: dict[str, set[str]] = collections.defaultdict(set)
+    for repo, suites in schemas.REPO_SUITES.items():
         for f in glob.glob(f"{repos_root}/{repo}/runs/*/*/*/*/*.json"):
             try:
                 d = json.load(open(f))
@@ -205,35 +190,20 @@ def tools_called(repos_root: str, defined: set):
     return called
 
 
-def false_rationale(tool: str) -> str:
-    if tool in NEARMISS:
-        return NEARMISS[tool]
-    return "read/lookup: returns data, no persistent state change"
+def _false_rationale(tool: str) -> str:
+    return NEARMISS.get(tool, "read/lookup: returns data, no persistent state change")
 
 
-def yaml_quote(s: str) -> str:
+def _yaml_quote(s: str) -> str:
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def main(argv):
-    here = os.path.dirname(os.path.abspath(__file__))
-    default_repos = os.path.normpath(os.path.join(here, "..", "runs", "p3_pilot", "sources", "_repos"))
-    default_out = os.path.normpath(os.path.join(here, "..", "configs", "p3_action_tools.yaml"))
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--repos-root", default=default_repos, help="dir holding the agentdojo/ and AgentDyn/ clones")
-    ap.add_argument("--out", default=default_out)
-    ap.add_argument("--check", action="store_true",
-                    help="verify the on-disk YAML matches the encoded review; do not write. Exit 1 on drift.")
-    args = ap.parse_args(argv)
-
-    if not os.path.isdir(args.repos_root):
-        sys.exit(f"carrier clones not found at {args.repos_root}; clone agentdojo + AgentDyn there first")
-
-    doc, msig = scan_tool_modules(args.repos_root)
+def build_allowlist_yaml(repos_root: str) -> tuple[str, str]:
+    """Recompute candidate signals + emit the YAML content. Returns (content, summary)."""
+    doc, msig = scan_tool_modules(repos_root)
     defined = set(doc)
-    gt = {(r, su): ground_truth_union(args.repos_root, r, su) for r in REPO_SUITES for su in REPO_SUITES[r]}
-    called = tools_called(args.repos_root, defined)
-    # include any defined tool named in a ground_truth even if never called
+    gt = {(r, su): ground_truth_union(repos_root, r, su) for r in schemas.REPO_SUITES for su in schemas.REPO_SUITES[r]}
+    called = tools_called(repos_root, defined)
     for (r, su), fns in gt.items():
         for fn in fns:
             if fn in defined:
@@ -242,31 +212,49 @@ def main(argv):
     actions = set(ACTION_RATIONALE)
     missing = sorted(actions - set(called))
     if missing:
-        sys.exit(f"REVIEWED_ACTIONS references tools absent from the carriers (typo?): {missing}")
+        raise ValueError(f"REVIEWED_ACTIONS references tools absent from the carriers (typo?): {missing}")
 
     lines = [YAML_HEADER, "tools:"]
     n_action = 0
     for tool in sorted(called):
         suites = sorted(called[tool])
-        in_gt = any(tool in gt.get((r, su), set()) for r in REPO_SUITES for su in suites if su in REPO_SUITES[r])
+        in_gt = any(tool in gt.get((r, su), set()) for r in schemas.REPO_SUITES for su in suites if su in schemas.REPO_SUITES[r])
         is_action = tool in actions
         n_action += is_action
-        rationale = ACTION_RATIONALE[tool] if is_action else false_rationale(tool)
+        rationale = ACTION_RATIONALE[tool] if is_action else _false_rationale(tool)
         lines.append(f"  - tool: {tool}")
         lines.append(f"    suites: [{', '.join(suites)}]")
         lines.append(f"    candidate_mutation_signature: {str(msig.get(tool, False)).lower()}")
         lines.append(f"    candidate_in_ground_truth: {str(in_gt).lower()}")
         lines.append(f"    reviewed_action: {str(is_action).lower()}")
-        lines.append(f"    rationale: {yaml_quote(rationale)}")
+        lines.append(f"    rationale: {_yaml_quote(rationale)}")
     content = "\n".join(lines) + "\n"
     summary = f"{len(called)} tools, {n_action} actions, {len(called) - n_action} reads"
+    return content, summary
+
+
+def _body(s: str | None) -> str | None:
+    return s[s.index("tools:"):] if s and "tools:" in s else s
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description="Bootstrap/regenerate the reviewed P3 action-tool allowlist.")
+    ap.add_argument("--repos-root", default=schemas.default_repos_root(),
+                    help="dir holding the agentdojo/ and AgentDyn/ clones")
+    ap.add_argument("--out", default=default_allowlist_path())
+    ap.add_argument("--check", action="store_true",
+                    help="verify the on-disk YAML matches the encoded review; do not write. Exit 1 on drift.")
+    args = ap.parse_args(argv)
+
+    if not os.path.isdir(args.repos_root):
+        print(f"carrier clones not found at {args.repos_root}; clone agentdojo + AgentDyn there first")
+        return 1
+
+    content, summary = build_allowlist_yaml(args.repos_root)
 
     if args.check:
         existing = open(args.out).read() if os.path.exists(args.out) else None
-        # ignore the header (hand-maintained wording); compare from the tools: block down
-        def body(s):
-            return s[s.index("tools:"):] if s and "tools:" in s else s
-        if body(existing) == body(content):
+        if _body(existing) == _body(content):
             print(f"CHECK OK: {args.out} matches encoded review ({summary})")
             return 0
         print(f"CHECK DRIFT: {args.out} does not match encoded review ({summary}). Regenerate.", file=sys.stderr)
@@ -278,4 +266,4 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1:]))
+    raise SystemExit(main())
