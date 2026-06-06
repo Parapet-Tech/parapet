@@ -1,5 +1,5 @@
 """Tests for the reviewed action allowlist loader/validator."""
-from p3carriers.action_allowlist import (
+from parapet_data.p3.carriers.action_allowlist import (
     load_action_set,
     load_allowlist,
     validate_allowlist,

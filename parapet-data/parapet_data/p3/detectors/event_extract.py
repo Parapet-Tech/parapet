@@ -14,7 +14,7 @@ import os
 from dataclasses import dataclass
 from typing import Any, Iterator, Optional, Union
 
-from p3detectors.interface import EventContext
+from parapet_data.p3.detectors.interface import EventContext
 
 
 @dataclass
@@ -49,7 +49,7 @@ def string_values(args: Any) -> list[str]:
 
 
 def _source_tool_calls(messages: list) -> list:
-    """Ordered tool calls with args, mirroring p3carriers normalization order."""
+    """Ordered tool calls with args, mirroring parapet_data.p3.carriers normalization order."""
     seq = []
     for mi, m in enumerate(messages):
         for tc in (m.get("tool_calls") or []):

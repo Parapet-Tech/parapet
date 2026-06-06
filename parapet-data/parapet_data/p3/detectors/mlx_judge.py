@@ -16,11 +16,12 @@ from typing import Callable, Optional
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
-from p3detectors.interface import (
+from parapet_data.p3.detectors.interface import (
     FAMILY_GENERATIVE_MLX,
     DetectorResult,
     EventContext,
     clamp_unit,
+    loop_score_batch,
 )
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8080/v1"
@@ -182,3 +183,7 @@ class MLXJudge:
             return self._result(None, None, f"request_failed: {exc}")
         score, rationale, error = parse_judge_output(raw)
         return self._result(score, rationale, error)
+
+    def score_batch(self, texts: list, contexts=None) -> list:
+        """Per-event detector: no native batching, one endpoint call per event."""
+        return loop_score_batch(self, texts, contexts)

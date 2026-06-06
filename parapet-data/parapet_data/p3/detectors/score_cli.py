@@ -12,11 +12,11 @@ import os
 import sys
 from typing import Optional
 
-from p3carriers import schemas as carrier_schemas
+from parapet_data.p3.carriers import schemas as carrier_schemas
 
-from p3detectors.event_extract import SkippedEvent, events_from_staged
-from p3detectors.interface import Detector
-from p3detectors.mlx_judge import (
+from parapet_data.p3.detectors.event_extract import SkippedEvent, events_from_staged
+from parapet_data.p3.detectors.interface import Detector
+from parapet_data.p3.detectors.mlx_judge import (
     DEFAULT_BASE_URL,
     DEFAULT_MODEL_ID,
     DEFAULT_MODEL_REPO,
@@ -76,8 +76,8 @@ def main(argv: Optional[list] = None, judge: Optional[Detector] = None) -> int:
     ap = argparse.ArgumentParser(
         description="Score per-event tool-call argument strings from staged carriers with D_gen (MLX judge)."
     )
-    ap.add_argument("--staged", default=None, help="staged carrier dir (default: p3carriers staged out)")
-    ap.add_argument("--repos-root", default=None, help="carrier clones root (default: p3carriers repos root)")
+    ap.add_argument("--staged", default=None, help="staged carrier dir (default: parapet_data.p3.carriers staged out)")
+    ap.add_argument("--repos-root", default=None, help="carrier clones root (default: parapet_data.p3.carriers repos root)")
     ap.add_argument("--out", default=None, help="output JSONL path (default: <pool>/scores/dgen_mlx_judge.jsonl)")
     ap.add_argument("--limit", type=int, default=0, help="cap events scored (0 = all)")
     ap.add_argument("--base-url", default=DEFAULT_BASE_URL)

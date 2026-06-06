@@ -2,7 +2,7 @@
 
 A verification tool, NOT a transformer. For each staged artifact it re-reads the
 carrier source run, re-derives the normalized artifact with the CURRENT allowlist
-via p3carriers.normalize, and asserts the staged artifact still matches on the
+via parapet_data.p3.carriers.normalize, and asserts the staged artifact still matches on the
 geometry the liveness label depends on (tool-call sequence, action/live labels,
 derived counts) plus its source metadata.
 
@@ -30,9 +30,9 @@ import os
 from dataclasses import dataclass, field
 from typing import Any
 
-from p3carriers import schemas
-from p3carriers.action_allowlist import default_allowlist_path, load_action_set
-from p3carriers.normalize import _path_fields, normalize_run
+from parapet_data.p3.carriers import schemas
+from parapet_data.p3.carriers.action_allowlist import default_allowlist_path, load_action_set
+from parapet_data.p3.carriers.normalize import _path_fields, normalize_run
 
 # Per-event fields the liveness label is built from; equality of these is the core
 # guarantee (a single wrong is_action/live silently mislabels a carrier).

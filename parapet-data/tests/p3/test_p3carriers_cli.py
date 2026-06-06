@@ -2,7 +2,7 @@
 import json
 import os
 
-from p3carriers.normalize import main
+from parapet_data.p3.carriers.normalize import main
 
 
 def _write_run(repos_root, repo, model, suite, task, attack, inj, funcs):

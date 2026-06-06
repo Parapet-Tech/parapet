@@ -25,8 +25,8 @@ import glob
 import os
 import sys
 
-from p3carriers import schemas
-from p3carriers.action_allowlist import default_allowlist_path
+from parapet_data.p3.carriers import schemas
+from parapet_data.p3.carriers.action_allowlist import default_allowlist_path
 
 # --- FINAL INCLUSION (human review). Grouped by rationale. ---
 REVIEWED_ACTIONS = {
@@ -86,7 +86,7 @@ NEARMISS = {
 YAML_HEADER = '''# P3 carrier action-tool allowlist (Paper 3, multi-turn injection sensing)
 #
 # PURPOSE: authoritative set of state-mutating "action" tools for the carrier
-# liveness label. Consumed by p3carriers.action_allowlist.load_action_set and
+# liveness label. Consumed by parapet_data.p3.carriers.action_allowlist.load_action_set and
 # the normalizer.
 #
 # LIVENESS RULE (locked, linear-downstream): event i is live iff a reviewed
@@ -115,7 +115,7 @@ YAML_HEADER = '''# P3 carrier action-tool allowlist (Paper 3, multi-turn injecti
 # positives are kept (reviewed_action: false) because they are the entries most
 # likely to be challenged later.
 #
-# Bootstrapped by p3carriers/allowlist_generator.py; thereafter hand-maintained.
+# Bootstrapped by parapet_data.p3.carriers/allowlist_generator.py; thereafter hand-maintained.
 # Edit this file directly to amend a call, recording the reason in rationale.
 '''
 
