@@ -13,7 +13,7 @@ from typing import Any
 try:
     import yaml
 except ImportError as exc:  # pragma: no cover
-    raise ImportError("PyYAML is required for p3carriers.action_allowlist") from exc
+    raise ImportError("PyYAML is required for parapet_data.p3.carriers.action_allowlist") from exc
 
 REQUIRED_FIELDS = (
     "tool",
@@ -26,7 +26,9 @@ REQUIRED_FIELDS = (
 
 
 def default_allowlist_path() -> str:
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs", "p3_action_tools.yaml")
+    # configs/ is a sibling of carriers/ under parapet_data/p3/
+    p3_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(p3_dir, "configs", "p3_action_tools.yaml")
 
 
 def load_allowlist(path: str | None = None) -> list[dict[str, Any]]:

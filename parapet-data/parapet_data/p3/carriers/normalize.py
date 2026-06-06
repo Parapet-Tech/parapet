@@ -15,8 +15,8 @@ import json
 import os
 from typing import Any
 
-from p3carriers import schemas
-from p3carriers.action_allowlist import default_allowlist_path, load_action_set
+from parapet_data.p3.carriers import schemas
+from parapet_data.p3.carriers.action_allowlist import default_allowlist_path, load_action_set
 
 
 def tool_call_sequence(messages: list[dict[str, Any]], action_set: set[str]) -> list[dict[str, Any]]:

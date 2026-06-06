@@ -1,6 +1,6 @@
 """Tests for the MLX judge: parsing, scoring, preflight check. No live model."""
-from p3detectors.interface import EventContext
-from p3detectors.mlx_judge import (
+from parapet_data.p3.detectors.interface import EventContext
+from parapet_data.p3.detectors.mlx_judge import (
     DEFAULT_MODEL_ID,
     MLXJudge,
     build_user_prompt,

@@ -30,17 +30,22 @@ MUT_METHODS = frozenset({
 
 
 def parapet_root() -> str:
-    """Repo root that holds p3carriers/ and parapet-runner/."""
-    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    """Repo root (holds parapet-data/ and parapet-runner/).
 
-
-def default_repos_root() -> str:
-    """Where the AgentDojo/AgentDyn clones live (git-ignored data pool).
-
-    Kept under parapet-runner/runs/p3_pilot to avoid moving ~170k already-staged
-    files; overridable on every CLI. The clones are regenerable via git and the
-    staged pool via the normalizer, so this is data, not source.
+    This module lives at parapet-data/parapet_data/p3/carriers/schemas.py, so the
+    repo root is five directories up.
     """
+    here = os.path.abspath(__file__)
+    for _ in range(5):
+        here = os.path.dirname(here)
+    return here
+
+
+# Default data pool remains under parapet-runner/runs/p3_pilot for continuity with the
+# already materialized ignored carrier pool. The package owns the logic; the data path
+# is overrideable on every CLI.
+def default_repos_root() -> str:
+    """Where the AgentDojo/AgentDyn clones live (git-ignored data pool)."""
     return os.path.join(parapet_root(), "parapet-runner", "runs", "p3_pilot", "sources", "_repos")
 
 

@@ -8,9 +8,9 @@ and current shas agree (no sha noise) unless a test deliberately drifts the sha.
 import json
 import os
 
-from p3carriers.action_allowlist import default_allowlist_path
-from p3carriers.checkpoint import main, run_checkpoint
-from p3carriers.normalize import run_normalize
+from parapet_data.p3.carriers.action_allowlist import default_allowlist_path
+from parapet_data.p3.carriers.checkpoint import main, run_checkpoint
+from parapet_data.p3.carriers.normalize import run_normalize
 
 
 def _write_source_run(repos_root, repo, model, suite, task, funcs,
