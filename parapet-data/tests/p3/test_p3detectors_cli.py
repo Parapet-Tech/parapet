@@ -1,8 +1,8 @@
 """CLI tests with an injected fake judge (no live model, no endpoint)."""
 import json
 
-from p3detectors.interface import FAMILY_GENERATIVE_MLX, DetectorResult
-from p3detectors.score_cli import main
+from parapet_data.p3.detectors.interface import FAMILY_GENERATIVE_MLX, DetectorResult
+from parapet_data.p3.detectors.score_cli import main
 
 
 class FakeJudge:
