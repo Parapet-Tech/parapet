@@ -1,7 +1,8 @@
 # P3 carrier action-tool allowlist (Paper 3, multi-turn injection sensing)
 #
 # PURPOSE: authoritative set of state-mutating "action" tools for the carrier
-# liveness label. Consumed by scripts/p3_normalize_carriers.py.
+# liveness label. Consumed by p3carriers.action_allowlist.load_action_set and
+# the normalizer.
 #
 # LIVENESS RULE (locked, linear-downstream): event i is live iff a reviewed
 # suite-action tool call appears at position >= i in the executed linear trace.
@@ -29,7 +30,7 @@
 # positives are kept (reviewed_action: false) because they are the entries most
 # likely to be challenged later.
 #
-# Bootstrapped by scripts/p3_gen_action_allowlist.py; thereafter hand-maintained.
+# Bootstrapped by p3carriers/allowlist_generator.py; thereafter hand-maintained.
 # Edit this file directly to amend a call, recording the reason in rationale.
 
 tools:
