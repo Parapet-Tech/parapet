@@ -1,0 +1,731 @@
+# P3 carrier action-tool allowlist (Paper 3, multi-turn injection sensing)
+#
+# PURPOSE: authoritative set of state-mutating "action" tools for the carrier
+# liveness label. Consumed by scripts/p3_normalize_carriers.py.
+#
+# LIVENESS RULE (locked, linear-downstream): event i is live iff a reviewed
+# suite-action tool call appears at position >= i in the executed linear trace.
+#
+# ACTION-SET AUTHORITY: this checked-in file. NOT ground_truth() union (it is
+# goal-specific: AgentDyn shopping/github collapse to {send_money}, and other
+# suites include read tools), and NOT AST mutation inference (brittle: false
+# positives like search_product/get_webpage, false negatives like delete_email).
+#
+# CANDIDATE-GENERATION BASIS: union of ground_truth() function names and
+# AST mutation-signature, over the AgentDojo + AgentDyn carriers actually used.
+# FINAL INCLUSION BASIS: human review of true persistent state mutation.
+#
+# INCLUSION PRINCIPLE: a tool is an action iff executing it causes a persistent,
+# post-call-observable change to environment state (creates/deletes/modifies
+# stored data, transfers or schedules money, sends/posts a message or email,
+# changes credentials/permissions/ownership/membership, makes a reservation,
+# or writes to the local filesystem). Excluded: pure reads, searches, lookups,
+# computed summaries, and auth/session steps (login, account verification),
+# which are preconditions rather than consequential effects. Note: verify_transaction
+# IS included (it completes a pending transfer); verify_*_account is not (auth).
+#
+# Each entry records both candidate signals so the human call is auditable
+# without reopening the carrier repos. reads and mutation-signature false
+# positives are kept (reviewed_action: false) because they are the entries most
+# likely to be challenged later.
+#
+# Bootstrapped by scripts/p3_gen_action_allowlist.py; thereafter hand-maintained.
+# Edit this file directly to amend a call, recording the reason in rationale.
+
+tools:
+  - tool: add_calendar_event_participants
+    suites: [dailylife, github, shopping, workspace]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: true
+    rationale: "calendar: creates or modifies a calendar event"
+  - tool: add_user_to_channel
+    suites: [slack]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: true
+    reviewed_action: true
+    rationale: "membership: changes workspace or channel membership"
+  - tool: append_to_file
+    suites: [workspace]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: true
+    rationale: "file: creates, modifies, or deletes stored files"
+  - tool: cancel_calendar_event
+    suites: [dailylife, github, workspace]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: false
+    reviewed_action: true
+    rationale: "calendar: creates or modifies a calendar event"
+  - tool: cart_add_product
+    suites: [shopping]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: true
+    reviewed_action: true
+    rationale: "cart/order: modifies the cart or places an order"
+  - tool: cart_remove_product
+    suites: [shopping]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: true
+    reviewed_action: true
+    rationale: "cart/order: modifies the cart or places an order"
+  - tool: cart_total
+    suites: [shopping]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: false
+    reviewed_action: false
+    rationale: "compute: derives a sum, no persistent change"
+  - tool: check_restaurant_opening_hours
+    suites: [travel]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: checkout_selected_cart
+    suites: [shopping]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: true
+    reviewed_action: true
+    rationale: "cart/order: modifies the cart or places an order"
+  - tool: clear_cart
+    suites: [shopping]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: false
+    reviewed_action: true
+    rationale: "cart/order: modifies the cart or places an order"
+  - tool: copy_node
+    suites: [dailylife, github, shopping]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: false
+    reviewed_action: true
+    rationale: "file: creates, modifies, or deletes stored files"
+  - tool: create_calendar_event
+    suites: [dailylife, github, shopping, travel, workspace]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: true
+    rationale: "calendar: creates or modifies a calendar event"
+  - tool: create_dir
+    suites: [dailylife, github, shopping]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: true
+    reviewed_action: true
+    rationale: "file: creates, modifies, or deletes stored files"
+  - tool: create_file
+    suites: [dailylife, github, shopping, workspace]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: true
+    reviewed_action: true
+    rationale: "file: creates, modifies, or deletes stored files"
+  - tool: delete_email
+    suites: [dailylife, workspace]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: true
+    rationale: "email: deletes stored email"
+  - tool: delete_file
+    suites: [workspace]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: true
+    rationale: "file: creates, modifies, or deletes stored files"
+  - tool: delete_node
+    suites: [dailylife, github, shopping]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: true
+    reviewed_action: true
+    rationale: "file: creates, modifies, or deletes stored files"
+  - tool: download_file
+    suites: [dailylife, github]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: false
+    reviewed_action: true
+    rationale: "file: creates, modifies, or deletes stored files"
+  - tool: download_file_through_id
+    suites: [dailylife, github, shopping]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: true
+    rationale: "file: creates, modifies, or deletes stored files"
+  - tool: download_file_through_url
+    suites: [dailylife, github, shopping]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: true
+    rationale: "file: creates, modifies, or deletes stored files"
+  - tool: get_all_car_rental_companies_in_city
+    suites: [travel]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: get_all_hotels_in_city
+    suites: [travel]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: get_all_restaurants_in_city
+    suites: [travel]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: get_balance
+    suites: [banking, dailylife, shopping]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: get_car_fuel_options
+    suites: [travel]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: get_car_price_per_day
+    suites: [travel]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: get_car_rental_address
+    suites: [travel]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: false
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: get_car_types_available
+    suites: [travel]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: get_channels
+    suites: [slack]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: get_contact_information_for_restaurants
+    suites: [travel]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: false
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: get_cuisine_type_for_restaurants
+    suites: [travel]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: get_current_day
+    suites: [dailylife, github, shopping, workspace]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: get_day_calendar_events
+    suites: [dailylife, github, shopping, travel, workspace]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: get_dietary_restrictions_for_all_restaurants
+    suites: [travel]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: get_draft_emails
+    suites: [workspace]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: false
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: get_file_by_id
+    suites: [workspace]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: false
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: get_flight_information
+    suites: [travel]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: get_github_account_user_information
+    suites: [github]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: get_github_linked_unread_emails
+    suites: [github]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: get_github_repository_information
+    suites: [github]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: get_hotels_address
+    suites: [travel]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: get_hotels_prices
+    suites: [travel]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: get_iban
+    suites: [banking]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: false
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: get_invoice
+    suites: [shopping]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: get_logged_in_github_user_information
+    suites: [github]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: get_most_recent_transactions
+    suites: [banking]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: get_price_for_restaurants
+    suites: [travel]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: get_rating_reviews_for_car_rental
+    suites: [travel]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: get_rating_reviews_for_hotels
+    suites: [travel]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: get_rating_reviews_for_restaurants
+    suites: [travel]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: get_received_emails
+    suites: [dailylife, github, workspace]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: get_restaurants_address
+    suites: [travel]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: get_scheduled_transactions
+    suites: [banking]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: get_sent_emails
+    suites: [dailylife, github, workspace]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: false
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: get_shopping_account_user_information
+    suites: [shopping]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: false
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: get_shopping_linked_received_emails
+    suites: [shopping]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: false
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: get_shopping_linked_unread_emails
+    suites: [shopping]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: get_unread_emails
+    suites: [dailylife, github, workspace]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: get_user_info
+    suites: [banking, dailylife, github, shopping]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: false
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: get_user_information
+    suites: [dailylife, travel]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: get_users_in_channel
+    suites: [slack]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "read despite mutation-signature: builds a result list, no persistent change"
+  - tool: get_webpage
+    suites: [dailylife, github, shopping, slack]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "read despite incidental write: appends url to web_requests (request log), returns content"
+  - tool: git_add_ssh_key
+    suites: [github]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: true
+    reviewed_action: true
+    rationale: "creds/perms: changes credentials, permissions, or ownership"
+  - tool: git_clone
+    suites: [github]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: true
+    reviewed_action: true
+    rationale: "file: creates, modifies, or deletes stored files"
+  - tool: git_create_repo
+    suites: [github]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: true
+    reviewed_action: true
+    rationale: "repo: creates, modifies, or deletes repository state"
+  - tool: git_delete_repo
+    suites: [github]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: false
+    reviewed_action: true
+    rationale: "repo: creates, modifies, or deletes repository state"
+  - tool: git_delete_ssh_key
+    suites: [github]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: true
+    reviewed_action: true
+    rationale: "creds/perms: changes credentials, permissions, or ownership"
+  - tool: git_get_linked_ssh_keys
+    suites: [github]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "read despite mutation-signature: returns keys, no persistent change"
+  - tool: git_invite_collaborators
+    suites: [github]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: true
+    reviewed_action: true
+    rationale: "creds/perms: changes credentials, permissions, or ownership"
+  - tool: git_issue
+    suites: [github]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: false
+    reviewed_action: true
+    rationale: "repo: creates, modifies, or deletes repository state"
+  - tool: git_pull
+    suites: [github]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: true
+    reviewed_action: true
+    rationale: "file: creates, modifies, or deletes stored files"
+  - tool: git_push
+    suites: [github]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: true
+    reviewed_action: true
+    rationale: "repo: creates, modifies, or deletes repository state"
+  - tool: git_star
+    suites: [github]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: true
+    reviewed_action: true
+    rationale: "repo: creates, modifies, or deletes repository state"
+  - tool: git_transfer_repo_ownership
+    suites: [github]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: true
+    reviewed_action: true
+    rationale: "creds/perms: changes credentials, permissions, or ownership"
+  - tool: git_unstar
+    suites: [github]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: true
+    reviewed_action: true
+    rationale: "repo: creates, modifies, or deletes repository state"
+  - tool: invite_user_to_slack
+    suites: [slack]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: true
+    reviewed_action: true
+    rationale: "membership: changes workspace or channel membership"
+  - tool: list_directory
+    suites: [dailylife, github, shopping]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "read despite mutation-signature: builds a listing, no persistent change"
+  - tool: list_files
+    suites: [github, workspace]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: login_github_account
+    suites: [github]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "auth/session: sets current account, precondition not a consequential effect"
+  - tool: login_shopping_account
+    suites: [shopping]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "auth/session: sets current account, precondition not a consequential effect"
+  - tool: move_node
+    suites: [dailylife, github, shopping]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: true
+    reviewed_action: true
+    rationale: "file: creates, modifies, or deletes stored files"
+  - tool: post_webpage
+    suites: [slack]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: true
+    reviewed_action: true
+    rationale: "messaging: sends or posts a message visible to others"
+  - tool: read_channel_messages
+    suites: [slack]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: read_file
+    suites: [banking, dailylife, github, shopping]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: read_inbox
+    suites: [slack]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: refund_order
+    suites: [shopping]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: true
+    reviewed_action: true
+    rationale: "money: moves/schedules money or completes a financial transaction"
+  - tool: remove_user_from_slack
+    suites: [slack]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: true
+    reviewed_action: true
+    rationale: "membership: changes workspace or channel membership"
+  - tool: reschedule_calendar_event
+    suites: [dailylife, github, shopping, workspace]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: true
+    rationale: "calendar: creates or modifies a calendar event"
+  - tool: reserve_car_rental
+    suites: [travel]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: false
+    reviewed_action: true
+    rationale: "reservation: makes a binding reservation"
+  - tool: reserve_hotel
+    suites: [travel]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: true
+    reviewed_action: true
+    rationale: "reservation: makes a binding reservation"
+  - tool: reserve_restaurant
+    suites: [travel]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: false
+    reviewed_action: true
+    rationale: "reservation: makes a binding reservation"
+  - tool: schedule_transaction
+    suites: [banking]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: true
+    reviewed_action: true
+    rationale: "money: moves/schedules money or completes a financial transaction"
+  - tool: search_calendar_events
+    suites: [dailylife, github, shopping, travel, workspace]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: search_contacts_by_email
+    suites: [workspace]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: false
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: search_contacts_by_name
+    suites: [dailylife, workspace]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: search_emails
+    suites: [dailylife, github, shopping, workspace]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: search_files
+    suites: [workspace]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: search_files_by_filename
+    suites: [workspace]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: search_product
+    suites: [shopping]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "read/search despite mutation-signature: builds a result dict, no persistent change"
+  - tool: send_channel_message
+    suites: [slack]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: true
+    reviewed_action: true
+    rationale: "messaging: sends or posts a message visible to others"
+  - tool: send_direct_message
+    suites: [slack]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: true
+    reviewed_action: true
+    rationale: "messaging: sends or posts a message visible to others"
+  - tool: send_email
+    suites: [dailylife, github, shopping, travel, workspace]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: true
+    reviewed_action: true
+    rationale: "messaging: sends or posts a message visible to others"
+  - tool: send_money
+    suites: [banking, dailylife, github, shopping]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: true
+    reviewed_action: true
+    rationale: "money: moves/schedules money or completes a financial transaction"
+  - tool: share_file
+    suites: [workspace]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: true
+    reviewed_action: true
+    rationale: "creds/perms: changes credentials, permissions, or ownership"
+  - tool: update_github_account_password
+    suites: [github]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: false
+    reviewed_action: true
+    rationale: "creds/perms: changes credentials, permissions, or ownership"
+  - tool: update_password
+    suites: [banking]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: true
+    reviewed_action: true
+    rationale: "creds/perms: changes credentials, permissions, or ownership"
+  - tool: update_scheduled_transaction
+    suites: [banking]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: true
+    reviewed_action: true
+    rationale: "money: moves/schedules money or completes a financial transaction"
+  - tool: update_shopping_account_password
+    suites: [shopping]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: true
+    reviewed_action: true
+    rationale: "creds/perms: changes credentials, permissions, or ownership"
+  - tool: update_shopping_account_user_info
+    suites: [shopping]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: false
+    reviewed_action: true
+    rationale: "creds/perms: changes credentials, permissions, or ownership"
+  - tool: update_user_info
+    suites: [banking]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: true
+    reviewed_action: true
+    rationale: "creds/perms: changes credentials, permissions, or ownership"
+  - tool: verify_github_account
+    suites: [github]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "auth/session: account verification, precondition not a consequential effect"
+  - tool: verify_shopping_account
+    suites: [shopping]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "auth/session: account verification, precondition not a consequential effect"
+  - tool: verify_transaction
+    suites: [dailylife]
+    candidate_mutation_signature: true
+    candidate_in_ground_truth: true
+    reviewed_action: true
+    rationale: "money: moves/schedules money or completes a financial transaction"
+  - tool: view_available_discounts
+    suites: [shopping]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: view_cart
+    suites: [shopping]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
+  - tool: view_order_history
+    suites: [shopping]
+    candidate_mutation_signature: false
+    candidate_in_ground_truth: true
+    reviewed_action: false
+    rationale: "read/lookup: returns data, no persistent state change"
