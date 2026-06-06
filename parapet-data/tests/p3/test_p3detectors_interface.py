@@ -1,5 +1,5 @@
 """Tests for the detector result schema and helpers."""
-from p3detectors.interface import (
+from parapet_data.p3.detectors.interface import (
     FAMILY_GENERATIVE_MLX,
     DetectorResult,
     EventContext,
@@ -14,6 +14,7 @@ def test_detector_result_to_dict_shape():
     assert d == {
         "score": 0.5, "family": "generative-mlx", "model_id": "m",
         "detector_id": "d", "rationale": "x", "error": None,
+        "engine_sha": None, "binary_path": None,
     }
 
 

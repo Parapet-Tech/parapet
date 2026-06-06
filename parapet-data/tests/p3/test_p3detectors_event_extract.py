@@ -1,7 +1,7 @@
 """Tests for tool-call argument extraction from staged carriers."""
 import json
 
-from p3detectors.event_extract import (
+from parapet_data.p3.detectors.event_extract import (
     ExtractedEvent,
     SkippedEvent,
     events_from_staged,

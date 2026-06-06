@@ -1,5 +1,5 @@
 """Tests for liveness labeling and run normalization."""
-from p3carriers.normalize import normalize_run, tool_call_sequence
+from parapet_data.p3.carriers.normalize import normalize_run, tool_call_sequence
 
 ACTIONS = {"send_money", "create_file"}
 
