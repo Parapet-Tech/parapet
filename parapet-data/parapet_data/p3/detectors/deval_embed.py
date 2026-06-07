@@ -70,9 +70,15 @@ def _identity_chunk(text: str) -> list:
     return [text]
 
 
-def calibrate(max_cos: float) -> float:
-    """Max cosine similarity in [-1,1] -> [0,1] via the in-tree sigmoid (constants above)."""
-    return clamp_unit(1.0 / (1.0 + math.exp(-EMBED_SIGMOID_A * (max_cos - EMBED_SIGMOID_B))))
+def calibrate(max_cos: float, a: float = EMBED_SIGMOID_A, b: float = EMBED_SIGMOID_B) -> float:
+    """Max cosine similarity in [-1,1] -> [0,1] via the sigmoid P = 1/(1+exp(-a*(cos-b))).
+
+    a/b default to the provisional module constants but are overridable: the tau_event
+    calibration sweep FITS them from the per-class raw-cosine distribution (the provisional
+    defaults saturate for high-baseline encoders like bge-small and destroy member
+    comparability, so a fit is required before any tau LOCK; detector_ensemble_spec.md s3).
+    """
+    return clamp_unit(1.0 / (1.0 + math.exp(-a * (max_cos - b))))
 
 
 def _l2_normalize(vec: Sequence[float]) -> Optional[list]:
@@ -100,6 +106,8 @@ class DEvalEmbed:
         reference_texts: Sequence[str],
         model_id: str = DEFAULT_MODEL_ID,
         chunk_fn: Optional[ChunkFn] = None,
+        sigmoid_a: float = EMBED_SIGMOID_A,
+        sigmoid_b: float = EMBED_SIGMOID_B,
     ):
         if embed_fn is None:
             raise ValueError("embed_fn is required")
@@ -109,6 +117,8 @@ class DEvalEmbed:
         self.embed_fn = embed_fn
         self.chunk_fn = chunk_fn if chunk_fn is not None else _identity_chunk
         self.model_id = model_id
+        self.sigmoid_a = sigmoid_a
+        self.sigmoid_b = sigmoid_b
         # Chunk each reference the same way events are chunked, so a long reference
         # payload is not silently truncated either; each chunk becomes an independent
         # reference vector. A broken chunk_fn here is a misconfiguration: let it raise.
@@ -223,7 +233,9 @@ class DEvalEmbed:
             rationale = f"max cosine {best:.4f} over {len(self._ref)} refs"
             if len(positions) > 1:
                 rationale += f" ({len(positions)} chunks)"
-            results[i] = self._result(calibrate(best), None, rationale=rationale)
+            results[i] = self._result(
+                calibrate(best, self.sigmoid_a, self.sigmoid_b), None, rationale=rationale,
+            )
         return results
 
     def _fill(self, results: list, idxs: list, error: str) -> list:
