@@ -19,6 +19,9 @@ from typing import Optional, Protocol, runtime_checkable
 FAMILY_GENERATIVE_MLX = "generative-mlx"
 FAMILY_LINEAR = "linear"
 FAMILY_EMBEDDING = "embedding"
+# The D_eval ensemble's own tag (it aggregates members; not a member family itself).
+# The cross-family invariant is checked on the MEMBER families vs D_gen, not this tag.
+FAMILY_ENSEMBLE = "ensemble"
 
 
 @dataclass
