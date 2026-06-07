@@ -78,6 +78,32 @@ def l2_normalize_rows(mat: np.ndarray) -> np.ndarray:
     return mat / norms
 
 
+def split_windows(ids: Sequence[int], window: int, step: int) -> list:
+    """Split a token-id list into overlapping windows of <= `window` ids, advancing by
+    `step` each time (so the overlap between adjacent windows is `window - step`).
+
+    Returns ``[list(ids)]`` unchanged when the input already fits in one window. The
+    final window always reaches the end of `ids`, so tail tokens are never dropped (the
+    truncation failure mode this exists to fix). Pure (no tokenizer / mlx): this is the
+    chunking math, unit-tested directly.
+    """
+    if window <= 0:
+        raise ValueError("window must be positive")
+    if step <= 0:
+        raise ValueError("step must be positive")
+    ids = list(ids)
+    if len(ids) <= window:
+        return [ids]
+    out: list = []
+    start = 0
+    while start < len(ids):
+        out.append(ids[start:start + window])
+        if start + window >= len(ids):
+            break
+        start += step
+    return out
+
+
 class MLXEncoder:
     """A small BERT-convention encoder run in MLX. Loads config + safetensors weights."""
 
@@ -268,3 +294,44 @@ def make_mlx_embed_fn(
         return out
 
     return embed_fn
+
+
+def make_mlx_chunk_fn(
+    model_path: str,
+    *,
+    max_length: int = 512,
+    overlap: int = 64,
+    allow_download: bool = False,
+) -> Callable[[str], list]:
+    """Build a chunk_fn(text) -> list[str] for DEvalEmbed using the encoder's tokenizer.
+
+    Long event spans are split into overlapping token windows so the embedding member
+    can take a max over chunks instead of letting the encoder silently truncate at
+    max_length (detector_ensemble_spec.md section 3: chunk-and-max-risk, parity with
+    L1). A span that already fits the window is handed back as the single original
+    string (no detokenization round-trip). Two special-token slots ([CLS]/[SEP]) are
+    reserved, since embed() re-adds them when it encodes each returned chunk.
+
+    model_path: a LOCAL tokenizer dir, or a repo id only when allow_download=True;
+    nothing is fetched otherwise. Tokenizer-only (no encoder weights loaded here).
+    """
+    if overlap < 0:
+        raise ValueError("overlap must be non-negative")
+    window = max(1, max_length - 2)  # reserve [CLS]/[SEP] re-added by embed()
+    if overlap >= window:
+        raise ValueError(f"overlap {overlap} must be < content window {window}")
+    step = window - overlap
+
+    from transformers import AutoTokenizer  # lazy: module imports without transformers
+    tok = AutoTokenizer.from_pretrained(
+        model_path, local_files_only=not allow_download
+    )
+
+    def chunk_fn(text: str) -> list:
+        ids = tok(text, add_special_tokens=False, truncation=False)["input_ids"]
+        windows = split_windows(ids, window, step)
+        if len(windows) == 1:
+            return [text]  # fits in one window: keep the original string untouched
+        return [tok.decode(w, skip_special_tokens=True) for w in windows]
+
+    return chunk_fn
