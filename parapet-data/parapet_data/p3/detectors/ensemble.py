@@ -81,6 +81,15 @@ class DEvalEnsemble:
             detector_id=self.detector_id, rationale=rationale, error=error,
         )
 
+    def _member_error(self, member, error: str) -> DetectorResult:
+        return DetectorResult(
+            score=None,
+            family=member.family,
+            model_id=getattr(member, "model_id", member.detector_id),
+            detector_id=member.detector_id,
+            error=error,
+        )
+
     def score(self, event_text: str, context: Optional[EventContext] = None) -> DetectorResult:
         return self.score_batch([event_text], [context])[0]
 
@@ -91,10 +100,30 @@ class DEvalEnsemble:
         subprocess for the whole batch). For the tau_event sweep and per-member
         diagnostics (detector_ensemble_spec.md section 6, per-class histograms).
         """
+        n = len(texts)
         ctxs = contexts if contexts is not None else [None] * len(texts)
-        return {m.detector_id: m.score_batch(list(texts), ctxs) for m in self.members}
+        if len(ctxs) != n:
+            raise ValueError(f"contexts length {len(ctxs)} does not match texts length {n}")
+        out = {}
+        for m in self.members:
+            try:
+                member_results = list(m.score_batch(list(texts), ctxs))
+            except Exception as exc:  # member boundary: fail closed for every event
+                member_results = [
+                    self._member_error(m, f"member_exception: {type(exc).__name__}") for _ in range(n)
+                ]
+            if len(member_results) != n:
+                member_results = [
+                    self._member_error(
+                        m, f"member_count_mismatch: got {len(member_results)} for {n}"
+                    )
+                    for _ in range(n)
+                ]
+            out[m.detector_id] = member_results
+        return out
 
-    def score_batch(self, texts: list, contexts=None) -> list:
+    def score_batch_with_members(self, texts: list, contexts=None) -> tuple:
+        """Return (aggregate_results, per_member_results) from one member batch pass."""
         n = len(texts)
         per_member = self.score_members(texts, contexts)  # detector_id -> list (len n)
         member_ids = [m.detector_id for m in self.members]
@@ -116,4 +145,8 @@ class DEvalEnsemble:
                 best.score, None,
                 rationale=f"max {best.score:.4f} from {best_id}; members: {breakdown}",
             )
+        return results, per_member
+
+    def score_batch(self, texts: list, contexts=None) -> list:
+        results, _ = self.score_batch_with_members(texts, contexts)
         return results

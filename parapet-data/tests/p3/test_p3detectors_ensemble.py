@@ -52,6 +52,19 @@ class FakeDetector:
         )
 
 
+class BadBatchDetector(FakeDetector):
+    def __init__(self, family, detector_id, *, mode):
+        super().__init__(family, detector_id)
+        self.mode = mode
+
+    def score_batch(self, texts, contexts=None):
+        if self.mode == "raise":
+            raise RuntimeError("backend exploded")
+        if self.mode == "short":
+            return [self._r(0.2)]
+        raise AssertionError(self.mode)
+
+
 def _l1(scores=None, error=None):
     return FakeDetector(FAMILY_LINEAR, "deval_l1_generalist", scores=scores, error=error)
 
@@ -156,3 +169,33 @@ def test_score_members_returns_aligned_raw_results():
     assert set(raw) == {"deval_l1_generalist", "deval_embed_cos"}
     assert [r.score for r in raw["deval_l1_generalist"]] == [0.2, 0.3]
     assert [r.score for r in raw["deval_embed_cos"]] == [0.8, 0.1]
+
+
+def test_score_batch_with_members_reuses_one_member_pass():
+    ens = DEvalEnsemble([_l1({"a": 0.2}), _embed({"a": 0.8})])
+    aggregate, raw = ens.score_batch_with_members(["a"])
+    assert aggregate[0].score == 0.8
+    assert raw["deval_l1_generalist"][0].score == 0.2
+    assert raw["deval_embed_cos"][0].score == 0.8
+
+
+def test_context_length_mismatch_is_explicit():
+    ens = DEvalEnsemble([_l1(), _embed()])
+    with pytest.raises(ValueError, match="contexts length"):
+        ens.score_batch(["a", "b"], contexts=[None])
+
+
+def test_member_exception_fails_all_rows_closed():
+    bad = BadBatchDetector(FAMILY_EMBEDDING, "bad_embed", mode="raise")
+    ens = DEvalEnsemble([_l1({"a": 0.1}), bad])
+    res = ens.score_batch(["a", "b"])
+    assert [r.score for r in res] == [None, None]
+    assert all("bad_embed=member_exception: RuntimeError" in r.error for r in res)
+
+
+def test_member_count_mismatch_fails_all_rows_closed():
+    bad = BadBatchDetector(FAMILY_EMBEDDING, "bad_embed", mode="short")
+    ens = DEvalEnsemble([_l1({"a": 0.1}), bad])
+    res = ens.score_batch(["a", "b"])
+    assert [r.score for r in res] == [None, None]
+    assert all("bad_embed=member_count_mismatch: got 1 for 2" in r.error for r in res)
