@@ -44,6 +44,38 @@ def test_l2_normalize_rows_unit_norm_and_zero_safe():
     assert np.allclose(out[1], [0.0, 0.0])                 # zero row stays zero, no nan
 
 
+# ---- token-window chunking math (split_windows: pure, needs numpy only for import) ----
+
+def test_split_windows_no_split_when_fits():
+    pytest.importorskip("numpy")
+    from parapet_data.p3.detectors.mlx_embed_backend import split_windows
+    assert split_windows([1, 2, 3], window=5, step=2) == [[1, 2, 3]]
+    assert split_windows([1, 2, 3, 4, 5], window=5, step=2) == [[1, 2, 3, 4, 5]]  # exact fit
+
+
+def test_split_windows_overlapping():
+    pytest.importorskip("numpy")
+    from parapet_data.p3.detectors.mlx_embed_backend import split_windows
+    # 7 ids, window 4, step 3 (overlap 1): [0:4], [3:7]
+    assert split_windows([0, 1, 2, 3, 4, 5, 6], window=4, step=3) == [[0, 1, 2, 3], [3, 4, 5, 6]]
+
+
+def test_split_windows_covers_tail():
+    pytest.importorskip("numpy")
+    from parapet_data.p3.detectors.mlx_embed_backend import split_windows
+    # 6 ids, window 4, step 4 (no overlap): [0:4], [4:6] -- the tail is covered, not dropped
+    assert split_windows([0, 1, 2, 3, 4, 5], window=4, step=4) == [[0, 1, 2, 3], [4, 5]]
+
+
+def test_split_windows_validates():
+    pytest.importorskip("numpy")
+    from parapet_data.p3.detectors.mlx_embed_backend import split_windows
+    with pytest.raises(ValueError):
+        split_windows([1, 2], window=0, step=1)
+    with pytest.raises(ValueError):
+        split_windows([1, 2], window=2, step=0)
+
+
 # ---- model-path gate (needs numpy for module import, not mlx) ----
 
 def test_requires_local_dir_or_download():

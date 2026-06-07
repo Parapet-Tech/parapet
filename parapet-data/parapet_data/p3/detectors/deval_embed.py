@@ -12,6 +12,15 @@ Backend-agnostic: the embedding model is INJECTED as embed_fn(texts) -> list[vec
 with a deterministic fake embedder and lets the concrete MLX-native backend be chosen
 separately.
 
+Chunk-and-max-risk (detector_ensemble_spec.md section 3): the encoder has a hard token
+window (bge-small: 512), so an event span longer than the window is split into
+overlapping chunks via an injected chunk_fn and scored as the MAX cosine over its
+chunks, NOT silently truncated (truncation drops end-of-span signal, exactly where a
+slow-burn control-plane move can sit in a long tool output). The default chunk_fn is
+identity (one chunk == whole text); the token-aware splitter lives in the backend
+(mlx_embed_backend.make_mlx_chunk_fn) where the tokenizer is. References are chunked
+the same way, so a long reference payload is not truncated either.
+
 Scouting note (2026-06-06): there is no clean lightweight MLX-native embedding package.
 mlx_lm has no embeddings; mlx-embeddings is torch-free but pulls mlx-vlm (+ datasets,
 opencv, audio, fastapi), which AGENTS.md says to defer; sentence-transformers pulls
@@ -50,6 +59,16 @@ DEFAULT_MODEL_ID = "mlx-embed-unset"
 # embed_fn maps a sequence of texts to a same-length sequence of equal-length vectors.
 EmbedFn = Callable[[Sequence[str]], Sequence[Sequence[float]]]
 
+# chunk_fn maps one text to its overlapping sub-spans. The default is identity (one
+# chunk == the whole text); a token-aware chunk_fn (mlx_embed_backend.make_mlx_chunk_fn)
+# splits spans longer than the encoder window so signal at the end of a long span is not
+# truncated away (detector_ensemble_spec.md section 3, chunk-and-max-risk).
+ChunkFn = Callable[[str], Sequence[str]]
+
+
+def _identity_chunk(text: str) -> list:
+    return [text]
+
 
 def calibrate(max_cos: float) -> float:
     """Max cosine similarity in [-1,1] -> [0,1] via the in-tree sigmoid (constants above)."""
@@ -80,6 +99,7 @@ class DEvalEmbed:
         embed_fn: EmbedFn,
         reference_texts: Sequence[str],
         model_id: str = DEFAULT_MODEL_ID,
+        chunk_fn: Optional[ChunkFn] = None,
     ):
         if embed_fn is None:
             raise ValueError("embed_fn is required")
@@ -87,13 +107,22 @@ class DEvalEmbed:
         if not refs:
             raise ValueError("reference_texts must be non-empty (control-plane payload set)")
         self.embed_fn = embed_fn
+        self.chunk_fn = chunk_fn if chunk_fn is not None else _identity_chunk
         self.model_id = model_id
+        # Chunk each reference the same way events are chunked, so a long reference
+        # payload is not silently truncated either; each chunk becomes an independent
+        # reference vector. A broken chunk_fn here is a misconfiguration: let it raise.
+        ref_chunks: list = []
+        for t in refs:
+            ref_chunks.extend(self._chunks_of(t))
+        if not ref_chunks:
+            raise ValueError("reference_texts produced no non-empty chunks")
         # Embed + normalize the reference set ONCE at construction. A backend failure
         # here is a misconfiguration, not a per-event error: fail loud.
-        ref_vecs = list(embed_fn(refs))
-        if len(ref_vecs) != len(refs):
+        ref_vecs = list(embed_fn(ref_chunks))
+        if len(ref_vecs) != len(ref_chunks):
             raise ValueError(
-                f"embed_fn returned {len(ref_vecs)} vectors for {len(refs)} reference texts"
+                f"embed_fn returned {len(ref_vecs)} vectors for {len(ref_chunks)} reference chunks"
             )
         normed = []
         for v in ref_vecs:
@@ -105,6 +134,11 @@ class DEvalEmbed:
         self._dim = len(normed[0])
         if any(len(v) != self._dim for v in normed):
             raise ValueError("reference embeddings have inconsistent dimensions")
+
+    def _chunks_of(self, text: str) -> list:
+        """Apply chunk_fn and drop empty/blank chunks. May raise if chunk_fn raises;
+        callers decide whether that is a construction error or a per-event fail-close."""
+        return [c for c in self.chunk_fn(text) if c and str(c).strip()]
 
     def _result(self, score, error, rationale=None) -> DetectorResult:
         return DetectorResult(
@@ -129,41 +163,67 @@ class DEvalEmbed:
     def score_batch(self, texts: list, contexts=None) -> list:
         n = len(texts)
         results: list = [None] * n
-        # Empty texts never reach the backend; mirror the L1/judge empty handling.
-        send_idx = []
+        # Chunk each non-empty event; embed ALL chunks in one backend call, then take
+        # the max cosine over each event's chunks. Empty texts never reach the backend.
+        chunk_texts: list = []
+        owner: list = []  # event index for each chunk in chunk_texts
         for i, t in enumerate(texts):
             if not t or not str(t).strip():
                 results[i] = self._result(None, "empty_event_text")
-            else:
-                send_idx.append(i)
-        if not send_idx:
+                continue
+            try:
+                chunks = self._chunks_of(t)
+            except Exception as exc:  # chunk_fn is arbitrary; fail this event closed
+                results[i] = self._result(None, f"chunk_failed: {type(exc).__name__}")
+                continue
+            if not chunks:
+                results[i] = self._result(None, "empty_event_text")
+                continue
+            for c in chunks:
+                chunk_texts.append(c)
+                owner.append(i)
+        if not chunk_texts:
             return results
 
         try:
-            vecs = list(self.embed_fn([texts[i] for i in send_idx]))
+            vecs = list(self.embed_fn(chunk_texts))
         except Exception as exc:  # backend is arbitrary; fail closed, do not crash the run
-            return self._fill(results, send_idx, f"embed_failed: {type(exc).__name__}")
+            return self._fill(results, sorted(set(owner)), f"embed_failed: {type(exc).__name__}")
 
-        if len(vecs) != len(send_idx):
+        if len(vecs) != len(chunk_texts):
             return self._fill(
-                results, send_idx,
-                f"embed_count_mismatch: got {len(vecs)} for {len(send_idx)}",
+                results, sorted(set(owner)),
+                f"embed_count_mismatch: got {len(vecs)} for {len(chunk_texts)}",
             )
 
-        for pos, i in enumerate(send_idx):
-            qn = _l2_normalize(vecs[pos])
-            if qn is None:
-                results[i] = self._result(None, "embed_zero_vector")
-            elif len(qn) != self._dim:
-                results[i] = self._result(
-                    None, f"embed_dim_mismatch: {len(qn)} != ref {self._dim}",
-                )
-            else:
-                max_cos = self._max_cos(qn)
-                results[i] = self._result(
-                    calibrate(max_cos), None,
-                    rationale=f"max cosine {max_cos:.4f} over {len(self._ref)} refs",
-                )
+        # Group chunk positions by event, then aggregate by MAX cosine. A single bad
+        # chunk (zero / dim-mismatched vector) fails the whole event closed, never a
+        # silent drop that could discard the chunk carrying the signal.
+        by_event: dict = {}
+        for pos, i in enumerate(owner):
+            by_event.setdefault(i, []).append(pos)
+
+        for i, positions in by_event.items():
+            best = -1.0
+            err = None
+            for pos in positions:
+                qn = _l2_normalize(vecs[pos])
+                if qn is None:
+                    err = "embed_zero_vector"
+                    break
+                if len(qn) != self._dim:
+                    err = f"embed_dim_mismatch: {len(qn)} != ref {self._dim}"
+                    break
+                c = self._max_cos(qn)
+                if c > best:
+                    best = c
+            if err:
+                results[i] = self._result(None, err)
+                continue
+            rationale = f"max cosine {best:.4f} over {len(self._ref)} refs"
+            if len(positions) > 1:
+                rationale += f" ({len(positions)} chunks)"
+            results[i] = self._result(calibrate(best), None, rationale=rationale)
         return results
 
     def _fill(self, results: list, idxs: list, error: str) -> list:
