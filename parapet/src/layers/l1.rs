@@ -5,7 +5,7 @@
 //
 // A compiled-in linear classifier that scores messages using character n-gram
 // weights trained from TF-IDF + LinearSVC. Sub-microsecond inference: slide
-// byte windows over lowercased text, look up weights in a compile-time phf
+// code-point windows over lowercased text, look up weights in a compile-time phf
 // map, sum, compare to threshold.
 //
 // Not robust alone — catches the long tail of unsophisticated attacks at
@@ -166,17 +166,21 @@ fn extract_char_wb_ngrams(text: &str, ngram_range: (usize, usize)) -> Vec<String
 
     for word in lower.split_whitespace() {
         let padded = format!(" {word} ");
-        let bytes = padded.as_bytes();
+        let chars: Vec<char> = padded.chars().collect();
         for n in ngram_range.0..=ngram_range.1 {
-            if bytes.len() < n {
+            if chars.len() < n {
+                // sklearn char_wb emits the whole padded word once when it is
+                // shorter than n; binary dedup collapses repeats across larger n.
+                let s: String = chars.iter().collect();
+                if seen.insert(s.clone()) {
+                    ngrams.push(s);
+                }
                 continue;
             }
-            for window in bytes.windows(n) {
-                if let Ok(ngram) = std::str::from_utf8(window) {
-                    let s = ngram.to_string();
-                    if seen.insert(s.clone()) {
-                        ngrams.push(s);
-                    }
+            for window in chars.windows(n) {
+                let s: String = window.iter().collect();
+                if seen.insert(s.clone()) {
+                    ngrams.push(s);
                 }
             }
         }
@@ -401,8 +405,7 @@ type SpecialistEntry = (
 /// Registry of all compiled-in specialist weight tables.
 /// Add new entries here as specialists are trained.
 fn compiled_specialists() -> Vec<SpecialistEntry> {
-    // Current: all trained with char_wb except meta_probe (4,6).
-    // Registry entries updated to new analyzer/range as each specialist is retrained.
+    // Keep each entry pinned to the analyzer/range used for that specialist's training run.
     vec![
         (
             "generalist",
@@ -1431,6 +1434,48 @@ mod tests {
         let ngrams = super::extract_ngrams("hello hello");
         let unique: std::collections::HashSet<_> = ngrams.iter().collect();
         assert_eq!(ngrams.len(), unique.len(), "n-grams should be deduplicated");
+    }
+
+    #[test]
+    fn extract_char_wb_ngrams_ascii_matches_byte_windows() {
+        let ngrams = super::extract_char_wb_ngrams("ab", (1, 2));
+        assert_eq!(ngrams, vec![" ", "a", "b", " a", "ab", "b "]);
+    }
+
+    #[test]
+    fn extract_char_wb_ngrams_current_range_dedupes_short_word_clamp() {
+        let ngrams = super::extract_char_wb_ngrams("你", (3, 5));
+        assert_eq!(ngrams, vec![" 你 "]);
+    }
+
+    #[test]
+    fn extract_char_wb_ngrams_clamps_short_words_for_future_ranges() {
+        let ngrams = super::extract_char_wb_ngrams("你", (4, 5));
+        assert_eq!(ngrams, vec![" 你 "]);
+    }
+
+    #[test]
+    fn extract_char_wb_ngrams_uses_unicode_scalar_windows() {
+        let ngrams = super::extract_char_wb_ngrams("你好", (1, 2));
+        assert_eq!(ngrams, vec![" ", "你", "好", " 你", "你好", "好 "]);
+    }
+
+    #[test]
+    fn extract_char_wb_ngrams_mixed_ascii_cjk_windows() {
+        let ngrams = super::extract_char_wb_ngrams("a你", (2, 2));
+        assert_eq!(ngrams, vec![" a", "a你", "你 "]);
+    }
+
+    #[test]
+    fn extract_char_wb_ngrams_deduplicates_repeated_words() {
+        let ngrams = super::extract_char_wb_ngrams("你 你", (1, 2));
+        assert_eq!(ngrams, vec![" ", "你", " 你", "你 "]);
+    }
+
+    #[test]
+    fn extract_char_wb_ngrams_lowercases_before_windowing() {
+        let ngrams = super::extract_char_wb_ngrams("A你", (1, 1));
+        assert_eq!(ngrams, vec![" ", "a", "你"]);
     }
 
     #[test]
