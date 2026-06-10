@@ -46,6 +46,7 @@ REASON_NO_DIRECTIVE = "no_directive_content"      # presence false (judge < band
 REASON_PRESENT_UNBOUND = "present_but_unbound"     # present but no slot binds to a downstream executed edge
 REASON_EXTRACTOR_NO_SLOTS = "extractor_no_slots"   # judge says present but the extractor found no slot to bind
 REASON_DIRECTIVE_LOST = "directive_lost_in_refinement"  # worker-loop drop reason (floor went false during refine)
+REASON_JUDGE_ERROR = "floor_judge_error"           # judge raised / returned an unparseable score (fail-closed)
 
 # --------------------------------------------------------------------------- lexicons
 # Tunable recall layer. NOT a perfect NLP extractor: fast deterministic worker feedback +
@@ -212,6 +213,7 @@ class FloorResult:
     judge_band_code: Optional[str]       # below | ge_signal | ge_clear (payload-free)
     bound_edge: Optional[dict]
     reasons: list = field(default_factory=list)
+    judge_error: Optional[str] = None    # exception type name if the judge failed (fail-closed)
     _extraction: Optional[Extraction] = None   # gate-side debug only; NOT for broad audit
 
     def audit_record(self) -> dict:
@@ -376,18 +378,29 @@ def evaluate_floor(
 
     judge_score = None
     band = None
+    judge_error = None
     if judge_fn is not None:
-        score, _reason = judge_fn(text, {"function": function, "span_type": span_type,
-                                         "position": graft_position})
-        judge_score = int(score)
-        band = _band_code(judge_score)
-        directive_present = judge_score >= presence_band
+        # FAIL-CLOSED: a judge/API failure or an unparseable score must produce a controlled
+        # floor-unmet result (the gate rejects it loudly), never crash the gate.
+        try:
+            score, _reason = judge_fn(text, {"function": function, "span_type": span_type,
+                                             "position": graft_position})
+            judge_score = int(score)
+        except Exception as exc:  # noqa: BLE001 - judge_fn is arbitrary; fail closed
+            judge_error = type(exc).__name__
+        if judge_error is None:
+            band = _band_code(judge_score)
+            directive_present = judge_score >= presence_band
+        else:
+            directive_present = False
     else:
         directive_present = extraction.has_directive
 
     reasons: list = []
     floor_met = False
-    if not directive_present:
+    if judge_error is not None:
+        reasons.append(f"{REASON_JUDGE_ERROR}:{judge_error}")
+    elif not directive_present:
         reasons.append(REASON_NO_DIRECTIVE)
     elif not extraction.has_directive:
         reasons.append(REASON_EXTRACTOR_NO_SLOTS)
@@ -411,5 +424,6 @@ def evaluate_floor(
         judge_band_code=band,
         bound_edge=binding.bound_edge,
         reasons=reasons,
+        judge_error=judge_error,
         _extraction=extraction,
     )

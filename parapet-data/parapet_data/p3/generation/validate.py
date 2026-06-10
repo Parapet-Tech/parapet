@@ -177,10 +177,14 @@ def validate_trajectory(
     res["origin"] = ORIGIN_COMPOSED
     res["grafted_eligible"] = True  # carrier geometry real + liveness mechanical (checkpoint ok)
 
-    # 4b. directive floor (slow_burn_attack only; judge-gated). Each grafted live event must
-    # carry a control-plane directive that BINDS to a real downstream executed action edge.
-    # A content-absent trajectory (the attempt-004 failure) rejects as directive_floor_unmet
-    # BEFORE check-8; floor-unmet is NOT a relabel (relabel is for too-loud VALID attacks).
+    # 4b. directive floor (slow_burn_attack only; judge-gated). EVERY grafted live event must
+    # carry a control-plane directive that BINDS to a real downstream executed action edge
+    # (per-graft, author 2026-06-10): a grafted-live attack event that loses presence/binding
+    # rejects the trajectory -- a quiet bridge event must be emitted grafted=false, not a
+    # floor-exempt graft. A content-absent trajectory (the attempt-004 failure) rejects as
+    # directive_floor_unmet BEFORE check-8; floor-unmet is NOT a relabel (relabel is for
+    # too-loud VALID attacks). A judge failure rejects LOUD as floor_judge_error (fail-closed),
+    # distinct from a content verdict.
     floor_enforced = cls == "slow_burn_attack" and floor_judge_fn is not None
     if floor_enforced:
         action_edges = directive_floor.action_edges_from_sequence(seq)
@@ -198,7 +202,15 @@ def validate_trajectory(
             )
             ev_details[idx]["floor"] = fr.audit_record()  # payload-free
             graft_floor.append(fr)
-        if not any(fr.floor_met for fr in graft_floor):
+        # fail-closed: a judge error is an infrastructure failure, not a content verdict.
+        judge_errs = sorted({fr.judge_error for fr in graft_floor if fr.judge_error})
+        if judge_errs:
+            res["disposition"] = "reject"
+            res["final_label"] = None
+            res["reasons"] = [f"floor_judge_error:{judge_errs[0]}"]
+            return _finalize(res)
+        # per-graft: NO grafted-live attack event may miss the floor (and there must be >=1).
+        if not graft_floor or not all(fr.floor_met for fr in graft_floor):
             res["disposition"] = "reject"
             res["final_label"] = None
             res["reasons"] = ["directive_floor_unmet"]
