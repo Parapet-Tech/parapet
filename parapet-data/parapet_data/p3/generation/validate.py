@@ -34,6 +34,7 @@ import sys
 from typing import Callable, Optional
 
 from parapet_data.p3.detectors.interface import EventContext
+from parapet_data.p3.generation import directive_floor
 from parapet_data.p3.generation import schema as gen_schema
 
 # Origin ladder (spec section 4): "grafted" is the author's corpus-level call (needs scar
@@ -56,10 +57,21 @@ def validate_trajectory(
     max_iter: int,
     tau_traj: Optional[float] = None,
     drift: Optional[float] = None,
+    floor_judge_fn=None,
+    presence_band: int = 36,
 ) -> dict:
     """Validate one record. Returns a result dict with a `disposition` of
     'promote' | 'relabel_concentrated' | 'reject'. Never raises on bad worker data;
-    a carrier_loader failure is caught and turned into a reject reason."""
+    a carrier_loader failure is caught and turned into a reject reason.
+
+    floor_judge_fn (the held-out control-plane CONTENT judge, e.g. the gpt-5-codex member)
+    gates the DIRECTIVE FLOOR for slow_burn_attack: when injected, each grafted live event
+    is checked for a control-plane directive that BINDS to a real downstream executed action
+    edge, BEFORE check-8; a trajectory whose grafts are content-absent (the attempt-004
+    failure) is REJECTED as directive_floor_unmet (NOT relabeled). floor_judge_fn=None leaves
+    the floor un-enforced (recorded as floor_enforced=False at the batch level); the live
+    gate MUST inject the judge. The judge is injected exactly like deval/dgen, so the gate is
+    synthetic-testable with a fake and no server."""
     drift = tau_event if drift is None else drift
     res = {
         "batch_id": record.get("batch_id") if isinstance(record, dict) else None,
@@ -165,6 +177,33 @@ def validate_trajectory(
     res["origin"] = ORIGIN_COMPOSED
     res["grafted_eligible"] = True  # carrier geometry real + liveness mechanical (checkpoint ok)
 
+    # 4b. directive floor (slow_burn_attack only; judge-gated). Each grafted live event must
+    # carry a control-plane directive that BINDS to a real downstream executed action edge.
+    # A content-absent trajectory (the attempt-004 failure) rejects as directive_floor_unmet
+    # BEFORE check-8; floor-unmet is NOT a relabel (relabel is for too-loud VALID attacks).
+    floor_enforced = cls == "slow_burn_attack" and floor_judge_fn is not None
+    if floor_enforced:
+        action_edges = directive_floor.action_edges_from_sequence(seq)
+        graft_floor = []
+        for idx, (ev, sentry) in enumerate(bound):
+            if not (ev.get("grafted") and bool(sentry.get("live"))):
+                continue
+            fr = directive_floor.evaluate_floor(
+                ev["event_text"],
+                function=sentry.get("function"),
+                action_edges=action_edges,
+                graft_position=sentry.get("position"),
+                judge_fn=floor_judge_fn,
+                presence_band=presence_band,
+            )
+            ev_details[idx]["floor"] = fr.audit_record()  # payload-free
+            graft_floor.append(fr)
+        if not any(fr.floor_met for fr in graft_floor):
+            res["disposition"] = "reject"
+            res["final_label"] = None
+            res["reasons"] = ["directive_floor_unmet"]
+            return _finalize(res)
+
     # 5. check-8 disposition
     any_live = any(d["live"] for d in ev_details)
     traj_score = max(acc["peak"], acc["persistence"])
@@ -258,10 +297,15 @@ def validate_batch(
     out_dir: str,
     tau_traj: Optional[float] = None,
     drift: Optional[float] = None,
+    floor_judge_fn=None,
+    presence_band: int = 36,
 ) -> dict:
     """Validate one DONE batch dir end to end. Writes filtered/quarantine/audit under
     out_dir. Returns a summary (counts + the audit path). FAIL-CLOSED: a batch whose
-    STATUS is not DONE, or whose detectors are not cross-family, is not processed."""
+    STATUS is not DONE, or whose detectors are not cross-family, is not processed.
+
+    floor_judge_fn gates the directive floor (see validate_trajectory). The summary records
+    floor_enforced so a run WITHOUT the judge cannot silently look like a floor-enforced one."""
     batch_id = os.path.basename(batch_dir.rstrip("/"))
     status = _read_status(batch_dir)
     if status != "DONE":
@@ -293,6 +337,8 @@ def validate_batch(
             max_iter=max_iter,
             tau_traj=tau_traj,
             drift=drift,
+            floor_judge_fn=floor_judge_fn,
+            presence_band=presence_band,
         )
         counts[result["disposition"]] += 1
         _tally(reason_tally, result.get("reasons", []))
@@ -318,6 +364,8 @@ def validate_batch(
         "max_iter": max_iter,
         "tau_traj": tau_traj,
         "drift": tau_event if drift is None else drift,
+        "floor_enforced": floor_judge_fn is not None,
+        "presence_band": presence_band,
         "counts": counts,
         "reason_tally": dict(sorted(reason_tally.items())),
         "processed": sum(counts.values()),
