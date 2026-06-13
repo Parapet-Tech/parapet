@@ -37,6 +37,7 @@ Usage:
 import argparse
 import hashlib
 import re
+import subprocess
 import sys
 import unicodedata
 import time
@@ -856,6 +857,23 @@ def extract_weights(vectorizer, model, prune_threshold):
     return bias, weights
 
 
+def git_head_sha():
+    """Resolve the repo HEAD SHA for provenance stamping ('-dirty' if tracked files are modified)."""
+    repo_root = Path(__file__).resolve().parent.parent
+    try:
+        sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_root, capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain", "-uno"],
+            cwd=repo_root, capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        return f"{sha}-dirty" if dirty else sha
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+
+
 def codegen_phf(bias, weights, out_path, specialist, provenance):
     """Generate l1_weights_{specialist}.rs with a phf_map! macro."""
     print(f"\nWriting {out_path}...", file=sys.stderr)
@@ -877,6 +895,7 @@ def codegen_phf(bias, weights, out_path, specialist, provenance):
         f"// Holdout: {provenance['n_holdout']} samples "
         f"({provenance['holdout_pct']*100:.0f}%, seed={provenance['seed']})",
         f"// Trained: {provenance['timestamp']}",
+        f"// Engine SHA: {provenance['engine_sha']}",
         f"// Train text transform: {provenance['train_transform']}",
         f"// Sources ({len(provenance['files'])} files):",
     ]
@@ -1286,6 +1305,7 @@ def main():
         "holdout_pct": args.holdout_pct,
         "seed": args.seed,
         "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        "engine_sha": git_head_sha(),
         "files": file_stats,
         "vectorizer": vec_desc,
         "train_transform": train_transform,
