@@ -1,9 +1,11 @@
-"""D_eval ensemble: conservative max over cross-family per-event members.
+"""D_eval ensemble: ensemble-max over cross-family per-event members.
 
 The evaluated detector for the viability gate (detector_ensemble_spec.md sections
 1, 4, 5). It combines the D_eval members (L1 linear + embedding retrieval; an external
 judge is the deferred third, section 8) into one per-event surface_signal by taking the
-MAX over the members' calibrated [0,1] scores. "Conservative" because an event counts
+MAX over the members' calibrated [0,1] scores (ensemble-max). Note this is the most
+trigger-happy combination, NOT a conservative one (avoid "conservative-max": in detector
+language conservative means fewer alarms, the opposite of a max). An event counts
 as low-signal (slow-burn) only if NO member flags it: s_i = max_m s_{i,m} < tau_event.
 The check-8 disposition and the headline 2x2 cells read this aggregate.
 
@@ -58,7 +60,7 @@ def assert_cross_family(dgen, deval_members) -> None:
 
 
 class DEvalEnsemble:
-    """Per-event D_eval: conservative max over distinct-family member detectors."""
+    """Per-event D_eval: ensemble-max over distinct-family member detectors."""
 
     family = FAMILY_ENSEMBLE
     detector_id = DETECTOR_ID
