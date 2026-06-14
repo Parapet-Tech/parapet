@@ -27,10 +27,8 @@ See local-llm/.local/multiturn/generation_worker_output_contract.md.
 """
 from __future__ import annotations
 
-import argparse
 import json
 import os
-import sys
 from typing import Callable, Optional
 
 from parapet_data.p3.detectors.interface import EventContext
@@ -422,91 +420,3 @@ def _write_audit_md(path: str, summary: dict) -> None:
     lines.append("")
     with open(path, "w") as fh:
         fh.write("\n".join(lines))
-
-
-# ---------------------------------------------------------------------------
-# CLI (I/O + real detector construction; the tested core above is injection-pure)
-# ---------------------------------------------------------------------------
-
-def load_lock(path: str) -> dict:
-    with open(path) as fh:
-        lock = json.load(fh)
-    for k in ("tau_event", "epsilon", "max_iter"):
-        if k not in lock:
-            raise ValueError(f"tau_event_lock missing {k}")
-    return lock
-
-
-def main(argv: Optional[list] = None, *, deval=None, dgen=None) -> int:
-    ap = argparse.ArgumentParser(description="Validate a P3 generation batch against the carrier backbone + detectors.")
-    ap.add_argument("--batch-dir", required=True, help="runs/p3_pilot/gen/<batch_id>/")
-    ap.add_argument("--out-dir", required=True, help="staging root for filtered/quarantine/audit (e.g. runs/p3_pilot)")
-    ap.add_argument("--lock", required=True, help="path to tau_event_lock.json")
-    ap.add_argument("--carrier-staged-root", required=True, help="root that carrier.staged_path is relative to")
-    ap.add_argument("--repos-root", required=True, help="carrier source clones root (for the round-trip checkpoint)")
-    ap.add_argument("--allowlist", default=None, help="action allowlist yaml (default: package config)")
-    ap.add_argument("--tau-traj", type=float, default=None)
-    ap.add_argument("--drift", type=float, default=None)
-    args = ap.parse_args(argv)
-
-    if deval is None or dgen is None:
-        print(
-            "main() requires injected detectors in this build (deval + dgen). The live "
-            "ensemble wiring is exercised at the gate run, not in unit tests; pass detectors "
-            "in, or extend build_detectors() once the reference-set/embed paths are fixed.",
-            file=sys.stderr,
-        )
-        return 2
-
-    lock = load_lock(args.lock)
-    carrier_loader = _make_carrier_loader(args.carrier_staged_root)
-    checkpoint_fn = _make_checkpoint_fn(args.repos_root, args.allowlist)
-    from parapet_data.p3.detectors.accumulator import accumulate
-    from parapet_data.p3.detectors.ensemble import cross_family_ok
-
-    summary = validate_batch(
-        args.batch_dir,
-        carrier_loader=carrier_loader,
-        checkpoint_fn=checkpoint_fn,
-        cross_family_fn=cross_family_ok,
-        deval=deval,
-        dgen=dgen,
-        accumulate_fn=accumulate,
-        tau_event=float(lock["tau_event"]),
-        epsilon=float(lock["epsilon"]),
-        max_iter=int(lock["max_iter"]),
-        out_dir=args.out_dir,
-        tau_traj=args.tau_traj,
-        drift=args.drift,
-    )
-    if summary.get("error"):
-        print(f"batch not processed: {summary['error']}", file=sys.stderr)
-        return 1
-    print(json.dumps(summary["counts"]) + f"  audit: {summary['audit_json']}")
-    return 0
-
-
-def _make_carrier_loader(staged_root: str) -> Callable[[str], dict]:
-    def _load(staged_path: str) -> dict:
-        path = staged_path if os.path.isabs(staged_path) else os.path.join(staged_root, staged_path)
-        with open(path) as fh:
-            return json.load(fh)
-    return _load
-
-
-def _make_checkpoint_fn(repos_root: str, allowlist: Optional[str]) -> Callable[[dict], object]:
-    from parapet_data.p3.carriers.action_allowlist import default_allowlist_path, load_action_set
-    from parapet_data.p3.carriers.checkpoint import check_artifact
-
-    allowlist_path = allowlist or default_allowlist_path()
-    action_set, action_sha = load_action_set(allowlist_path)
-
-    def _check(carrier: dict):
-        return check_artifact(
-            carrier,
-            repos_root=repos_root,
-            action_set=action_set,
-            action_sha=action_sha,
-            allowlist_path=allowlist_path,
-        )
-    return _check
