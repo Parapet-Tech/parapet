@@ -13,7 +13,7 @@ Per trajectory (every step can only REJECT, never silently pass):
   3. liveness - read mechanical live/is_action from the round-tripped carrier sequence
                 (the checkpoint already proved it equals a fresh re-derivation); enforce
                 class-vs-liveness (attack grafts on live nodes, mention on dead nodes).
-  4. re-score - D_eval ensemble (conservative max over members) drives check-8; D_gen is
+  4. re-score - D_eval ensemble (ensemble-max over members) drives check-8; D_gen is
                 a best-effort diagnostic re-score (compared to the worker's s_hat).
   5. check-8  - explicit disposition (promote / relabel-to-concentrated / drop).
   6. route    - survivors -> filtered (full data); rejects -> quarantine (reason codes,
