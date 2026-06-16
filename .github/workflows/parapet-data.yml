@@ -1,0 +1,28 @@
+name: Parapet Data
+
+on:
+  push:
+    branches: [main]
+    paths: ["parapet-data/**", ".github/workflows/parapet-data.yml"]
+  pull_request:
+    paths: ["parapet-data/**", ".github/workflows/parapet-data.yml"]
+
+defaults:
+  run:
+    working-directory: parapet-data
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: parapet-data/pyproject.toml
+      - run: pip install -e ".[dev]"
+      - run: pytest tests/ -q
