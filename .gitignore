@@ -88,6 +88,11 @@ tests/.tmp_outputs/
 # Codex
 .codex/
 
+# Local agent-comms / tool artifacts
+.agent-comms/
+data/
+parapet-runner/uv.lock
+
 # Editor backup files
 *.py.current
 /runs/
