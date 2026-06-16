@@ -88,6 +88,11 @@ tests/.tmp_outputs/
 # Codex
 .codex/
 
+# Local local-tools / tool artifacts
+.local-tools/
+data/
+parapet-runner/uv.lock
+
 # Editor backup files
 *.py.current
 /runs/
