@@ -62,16 +62,19 @@
       "not": {
         "anyOf": [
           {
-            "pattern": "^/"
+            "pattern": "^[\\\\/]"
           },
           {
-            "pattern": "(^|/)\\.\\.(?:/|$)"
+            "pattern": "^[A-Za-z]:[\\\\/]"
           },
           {
-            "pattern": "^(?:data|runs|models|adjudication|parapet-runner/runs|TheWall|curated|schema/eval/(?:staging|benign|malicious|training|challenges|heuristic_staged)|parapet-data/curated)(?:/|$)"
+            "pattern": "(^|[\\\\/])\\.\\.(?:[\\\\/]|$)"
           },
           {
-            "pattern": "^parapet-data/curated_"
+            "pattern": "^(?:data|runs|models|adjudication|TheWall|curated|parapet-runner[\\\\/]runs|schema[\\\\/]eval[\\\\/](?:staging|benign|malicious|training|challenges|heuristic_staged)|parapet-data[\\\\/]curated)(?:[\\\\/]|$)"
+          },
+          {
+            "pattern": "^parapet-data[\\\\/]curated_"
           }
         ]
       }
