@@ -122,8 +122,10 @@ class TestCmdCurateVerifiedPreflight:
         manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
         assert manifest["verified_sync"]["files_processed"] == 1
         assert manifest["verified_sync"]["total_input"] == 1
-        assert manifest["verified_sync"]["staging_dir"].endswith("schema\\eval\\staging")
-        assert manifest["verified_sync"]["verified_dir"].endswith("schema\\eval\\verified")
+        staging_dir = Path(manifest["verified_sync"]["staging_dir"])
+        verified_dir = Path(manifest["verified_sync"]["verified_dir"])
+        assert staging_dir.parts[-3:] == ("schema", "eval", "staging")
+        assert verified_dir.parts[-3:] == ("schema", "eval", "verified")
         assert (tmp_dir / "schema" / "eval" / "verified" / "staged.jsonl").exists()
         assert (tmp_dir / "schema" / "eval" / "verified" / "sync_stats.json").exists()
 
