@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parapet.dev/repro/schemas/primitive-guard.v0.schema.json",
+  "title": "Parapet Primitive Guard v0",
+  "description": "Reusable differential or integrity guard for a repro primitive.",
+  "type": "object",
+  "required": ["schema_version", "guard_id", "owner", "target", "command", "content_safety"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": "parapet-primitive-guard/v0"
+    },
+    "guard_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._/-]*[a-z0-9]$"
+    },
+    "owner": {
+      "type": "string",
+      "enum": ["routing", "sensor", "l1-cross-family", "operator"]
+    },
+    "target": {
+      "type": "string",
+      "minLength": 1
+    },
+    "command": {
+      "type": "object",
+      "required": ["working_directory", "argv"],
+      "additionalProperties": false,
+      "properties": {
+        "working_directory": {
+          "type": "string",
+          "minLength": 1,
+          "not": {
+            "anyOf": [
+              {
+                "pattern": "^/"
+              },
+              {
+                "pattern": "(^|/)\\.\\.(?:/|$)"
+              }
+            ]
+          }
+        },
+        "argv": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "content_safety": {
+      "type": "object",
+      "required": ["fixture_type", "forbidden_inputs"],
+      "additionalProperties": false,
+      "properties": {
+        "fixture_type": {
+          "type": "string",
+          "enum": ["synthetic", "public_fixture", "public_receipt"]
+        },
+        "forbidden_inputs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["receipts", "corpora", "models", "network", "private_paths"]
+          },
+          "uniqueItems": true
+        }
+      }
+    }
+  }
+}

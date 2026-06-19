@@ -1,0 +1,323 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parapet.dev/repro/schemas/inventory.v0.schema.json",
+  "title": "Parapet Repro Inventory v0",
+  "description": "Public registry of reproducible or explicitly non-runnable result artifacts.",
+  "type": "object",
+  "required": ["schema_version", "inventory_id", "owners", "artifacts"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": "parapet-repro-index/v0"
+    },
+    "inventory_id": {
+      "$ref": "#/$defs/slug"
+    },
+    "owners": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {
+        "$ref": "#/$defs/ownerId"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/owner"
+      }
+    },
+    "defaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "metric_definition_root": {
+          "$ref": "#/$defs/repoPath"
+        },
+        "receipt_schema": {
+          "$ref": "#/$defs/repoPath"
+        }
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/artifact"
+      },
+      "uniqueItems": true
+    }
+  },
+  "$defs": {
+    "slug": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._/-]*[a-z0-9]$"
+    },
+    "ownerId": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]*[a-z0-9]$"
+    },
+    "artifactId": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_]*(\\.[a-z0-9][a-z0-9_]*)+$"
+    },
+    "repoPath": {
+      "type": "string",
+      "minLength": 1,
+      "not": {
+        "anyOf": [
+          {
+            "pattern": "^/"
+          },
+          {
+            "pattern": "(^|/)\\.\\.(?:/|$)"
+          },
+          {
+            "pattern": "^(?:data|runs|models|adjudication|parapet-runner/runs|parapet-data/curated)"
+          }
+        ]
+      }
+    },
+    "owner": {
+      "type": "object",
+      "required": ["kind", "maintainer"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["lane", "paper", "operator"]
+        },
+        "maintainer": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "required": [
+        "artifact_id",
+        "title",
+        "artifact_type",
+        "owner",
+        "release_boundary",
+        "chain",
+        "inputs",
+        "expected_outputs",
+        "required_guards",
+        "upstream_artifacts",
+        "declared_claims"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "artifact_id": {
+          "$ref": "#/$defs/artifactId"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1
+        },
+        "artifact_type": {
+          "type": "string",
+          "enum": [
+            "paper_table_row",
+            "paper_figure",
+            "metrics_page_cell",
+            "model_card_claim",
+            "release_claim"
+          ]
+        },
+        "owner": {
+          "$ref": "#/$defs/ownerId"
+        },
+        "paper_owner": {
+          "$ref": "#/$defs/ownerId"
+        },
+        "release_boundary": {
+          "$ref": "#/$defs/releaseBoundary"
+        },
+        "chain": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/chainStep"
+          }
+        },
+        "inputs": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/repoPath"
+          }
+        },
+        "expected_outputs": {
+          "type": "object",
+          "propertyNames": {
+            "pattern": "^[a-z][a-z0-9_]*\\.[a-z][a-z0-9_]*$"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/repoPath"
+          }
+        },
+        "required_guards": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/guardRef"
+          }
+        },
+        "upstream_artifacts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/artifactId"
+          }
+        },
+        "declared_claims": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/claim"
+          }
+        }
+      }
+    },
+    "releaseBoundary": {
+      "type": "object",
+      "required": ["profile"],
+      "additionalProperties": false,
+      "properties": {
+        "profile": {
+          "type": "string",
+          "enum": [
+            "public",
+            "delayed_public",
+            "withheld",
+            "non_runnable_public_claim"
+          ]
+        },
+        "operator_justification": {
+          "type": "string",
+          "minLength": 1
+        },
+        "planned_public_condition": {
+          "type": "string",
+          "minLength": 1
+        },
+        "withheld_boundary_ref": {
+          "$ref": "#/$defs/repoPath"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "profile": {
+                "enum": ["delayed_public", "withheld", "non_runnable_public_claim"]
+              }
+            },
+            "required": ["profile"]
+          },
+          "then": {
+            "required": ["operator_justification"]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "profile": {
+                "const": "delayed_public"
+              }
+            },
+            "required": ["profile"]
+          },
+          "then": {
+            "required": ["planned_public_condition"]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "profile": {
+                "const": "withheld"
+              }
+            },
+            "required": ["profile"]
+          },
+          "then": {
+            "required": ["withheld_boundary_ref"]
+          }
+        }
+      ]
+    },
+    "primitiveRef": {
+      "type": "string",
+      "enum": [
+        "fetch.parapet-data/v0",
+        "run.command/v0",
+        "emit.metrics/v0",
+        "gate.presence/v0"
+      ]
+    },
+    "alias": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*$"
+    },
+    "chainStep": {
+      "type": "object",
+      "required": ["primitive", "as"],
+      "additionalProperties": false,
+      "properties": {
+        "primitive": {
+          "$ref": "#/$defs/primitiveRef"
+        },
+        "as": {
+          "$ref": "#/$defs/alias"
+        }
+      }
+    },
+    "guardRef": {
+      "type": "object",
+      "required": ["guard_id", "guard_ref", "required_receipt"],
+      "additionalProperties": false,
+      "properties": {
+        "guard_id": {
+          "$ref": "#/$defs/slug"
+        },
+        "guard_ref": {
+          "$ref": "#/$defs/repoPath"
+        },
+        "required_receipt": {
+          "$ref": "#/$defs/slug"
+        }
+      }
+    },
+    "claim": {
+      "type": "object",
+      "required": ["claim_id", "claim_type", "requires_ci"],
+      "additionalProperties": false,
+      "properties": {
+        "claim_id": {
+          "$ref": "#/$defs/slug"
+        },
+        "claim_type": {
+          "type": "string",
+          "enum": ["descriptive", "comparative", "superiority", "noninferiority"]
+        },
+        "requires_ci": {
+          "type": "boolean"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "claim_type": {
+                "enum": ["comparative", "superiority", "noninferiority"]
+              }
+            },
+            "required": ["claim_type"]
+          },
+          "then": {
+            "properties": {
+              "requires_ci": {
+                "const": true
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}
