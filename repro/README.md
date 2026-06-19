@@ -43,13 +43,16 @@ structural invariants the runner design owns before any chain resolves:
 - release-boundary profiles carry their conditionally-required justification
   fields;
 - comparative / superiority / noninferiority claims set `requires_ci: true`.
+- inventory paths reject absolute paths, traversal segments, and blocked local
+  data/run roots even when no JSON Schema validator is installed.
 
 The release-boundary and comparative-CI invariants are also encoded in
-`schemas/inventory.v0.schema.json`; they are re-checked in stdlib so the runner
-fails closed even without a JSON Schema validator. When `jsonschema` is
-installed the script additionally runs full schema validation as a bonus check.
-Synthetic fixtures (no private data, no receipts) exercise each invariant since
-the live inventory currently has zero artifacts.
+`schemas/inventory.v0.schema.json`, and path safety is encoded in the schema's
+`repoPath` definition; they are re-checked in stdlib so the runner fails closed
+even without a JSON Schema validator. When `jsonschema` is installed the script
+additionally runs full schema validation as a bonus check. Synthetic fixtures
+(no private data, no receipts) exercise each invariant since the live inventory
+currently has zero artifacts.
 
 Run it:
 
