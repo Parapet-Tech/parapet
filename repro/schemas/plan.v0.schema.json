@@ -1,0 +1,154 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parapet.dev/repro/schemas/plan.v0.schema.json",
+  "title": "Parapet Repro Resolved Plan v0",
+  "description": "Immutable execution plan resolved from a repro inventory artifact entry.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "plan_id",
+    "artifact_id",
+    "inventory_sha256",
+    "release_boundary",
+    "chain",
+    "slots"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": "parapet-repro-plan/v0"
+    },
+    "plan_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_.-]+@[a-f0-9]{12,64}$"
+    },
+    "artifact_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_]*(\\.[a-z0-9][a-z0-9_]*)+$"
+    },
+    "inventory_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "release_boundary": {
+      "type": "object",
+      "required": ["profile"],
+      "additionalProperties": false,
+      "properties": {
+        "profile": {
+          "type": "string",
+          "enum": ["public", "delayed_public", "withheld", "non_runnable_public_claim"]
+        },
+        "operator_justification": {
+          "type": "string",
+          "minLength": 1
+        },
+        "planned_public_condition": {
+          "type": "string",
+          "minLength": 1
+        },
+        "withheld_boundary_ref": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "profile": {
+                "enum": ["delayed_public", "withheld", "non_runnable_public_claim"]
+              }
+            },
+            "required": ["profile"]
+          },
+          "then": {
+            "required": ["operator_justification"]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "profile": {
+                "const": "delayed_public"
+              }
+            },
+            "required": ["profile"]
+          },
+          "then": {
+            "required": ["planned_public_condition"]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "profile": {
+                "const": "withheld"
+              }
+            },
+            "required": ["profile"]
+          },
+          "then": {
+            "required": ["withheld_boundary_ref"]
+          }
+        }
+      ]
+    },
+    "chain": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["primitive", "as"],
+        "additionalProperties": false,
+        "properties": {
+          "primitive": {
+            "type": "string",
+            "enum": [
+              "fetch.parapet-data/v0",
+              "run.command/v0",
+              "emit.metrics/v0",
+              "gate.presence/v0"
+            ]
+          },
+          "as": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]*$"
+          }
+        }
+      }
+    },
+    "slots": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9_]*\\.[a-z][a-z0-9_]*$"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/slotRequirement"
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "slotRequirement": {
+      "type": "object",
+      "required": ["required"],
+      "additionalProperties": false,
+      "properties": {
+        "required": {
+          "type": "boolean"
+        },
+        "media_type": {
+          "type": "string",
+          "enum": ["application/json", "application/jsonl", "text/markdown", "text/plain"]
+        },
+        "expected_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    }
+  }
+}

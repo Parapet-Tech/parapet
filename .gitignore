@@ -96,6 +96,7 @@ parapet-runner/uv.lock
 # Editor backup files
 *.py.current
 /runs/
+repro/out/
 
 adjudication
 models
