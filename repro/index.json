@@ -1,0 +1,23 @@
+{
+  "schema_version": "parapet-repro-index/v0",
+  "inventory_id": "parapet-public-results",
+  "owners": {
+    "routing": {
+      "kind": "lane",
+      "maintainer": "routing-architect"
+    },
+    "sensor": {
+      "kind": "lane",
+      "maintainer": "sensor-architect"
+    },
+    "l1-cross-family": {
+      "kind": "lane",
+      "maintainer": "l1-cross-family-architect"
+    },
+    "operator": {
+      "kind": "operator",
+      "maintainer": "operator"
+    }
+  },
+  "artifacts": []
+}
