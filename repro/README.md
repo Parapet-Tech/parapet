@@ -38,21 +38,24 @@ structural invariants the runner design owns before any chain resolves:
   `schema_version` const;
 - artifact `owner` and `paper_owner` exist in `owners` (referential, not
   expressible in JSON Schema);
+- every `artifact_id` is unique, because `resolve` uses it as the primary key;
 - each `expected_outputs` key is `<alias>.<slot>` and `<alias>` is a declared
   `chain[].as` alias;
 - release-boundary profiles carry their conditionally-required justification
   fields;
-- comparative / superiority / noninferiority claims set `requires_ci: true`.
+- comparative / superiority / noninferiority claims set `requires_ci: true`;
 - inventory paths reject absolute paths, traversal segments, and blocked local
-  data/run roots even when no JSON Schema validator is installed.
+  data/run roots aligned with `scripts/check_no_data_commit.py`, even when no
+  JSON Schema validator is installed.
 
 The release-boundary and comparative-CI invariants are also encoded in
 `schemas/inventory.v0.schema.json`, and path safety is encoded in the schema's
 `repoPath` definition; they are re-checked in stdlib so the runner fails closed
 even without a JSON Schema validator. When `jsonschema` is installed the script
-additionally runs full schema validation as a bonus check. Synthetic fixtures
-(no private data, no receipts) exercise each invariant since the live inventory
-currently has zero artifacts.
+additionally validates the schema files themselves and validates `index.json`
+against the inventory schema as bonus checks. Synthetic fixtures (no private
+data, no receipts) exercise each invariant since the live inventory currently
+has zero artifacts.
 
 Run it:
 
