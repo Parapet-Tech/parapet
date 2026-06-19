@@ -23,12 +23,15 @@ resolved:
                         present for delayed/withheld/non-runnable profiles.
   * comparative CI    - comparative / superiority / noninferiority claims set
                         ``requires_ci: true``.
+  * path safety       - inventory paths do not point at absolute paths,
+                        traversal segments, or blocked local data/run roots.
 
 Release-boundary and comparative-CI invariants are also encoded in
-``schemas/inventory.v0.schema.json`` via ``if/then``. They are re-checked here
-in pure stdlib on purpose: the runner must fail closed even in an environment
-that has no JSON Schema validator installed. When ``jsonschema`` is importable
-this script additionally runs the full schema validation as a bonus check.
+``schemas/inventory.v0.schema.json`` via ``if/then``; path safety is encoded in
+the schema's ``repoPath`` definition. They are re-checked here in pure stdlib on
+purpose: the runner must fail closed even in an environment that has no JSON
+Schema validator installed. When ``jsonschema`` is importable this script
+additionally runs the full schema validation as a bonus check.
 
 Deliberately deferred (return as findings, not enforced here):
 
@@ -77,6 +80,14 @@ PROFILE_REQUIRED_FIELDS = {
 CI_REQUIRED_CLAIM_TYPES = {"comparative", "superiority", "noninferiority"}
 
 OUTPUT_SLOT_RE = re.compile(r"^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$")
+BLOCKED_PATH_PREFIXES = (
+    "data",
+    "runs",
+    "models",
+    "adjudication",
+    "parapet-runner/runs",
+    "parapet-data/curated",
+)
 
 
 # --------------------------------------------------------------------------
@@ -153,11 +164,65 @@ def check_comparative_claims_ci(inventory: dict) -> list[str]:
     return errors
 
 
+def _path_safety_errors(label: str, path: object) -> list[str]:
+    if path is None:
+        return []
+    if not isinstance(path, str):
+        return [f"{label}: path value must be a string"]
+
+    errors: list[str] = []
+    normalized = path.replace("\\", "/")
+    parts = [part for part in normalized.split("/") if part]
+    if normalized.startswith("/"):
+        errors.append(f"{label}: absolute path '{path}' is not public-safe")
+    if ".." in parts:
+        errors.append(f"{label}: traversal path '{path}' is not public-safe")
+    for prefix in BLOCKED_PATH_PREFIXES:
+        if normalized == prefix or normalized.startswith(f"{prefix}/"):
+            errors.append(f"{label}: blocked private/output path '{path}'")
+            break
+    return errors
+
+
+def check_repo_paths(inventory: dict) -> list[str]:
+    errors: list[str] = []
+
+    for key, path in inventory.get("defaults", {}).items():
+        errors.extend(_path_safety_errors(f"defaults.{key}", path))
+
+    for artifact in inventory.get("artifacts", []):
+        aid = artifact.get("artifact_id", "<missing artifact_id>")
+        for key, path in artifact.get("inputs", {}).items():
+            errors.extend(_path_safety_errors(f"{aid}: inputs.{key}", path))
+        for key, path in artifact.get("expected_outputs", {}).items():
+            errors.extend(
+                _path_safety_errors(f"{aid}: expected_outputs.{key}", path)
+            )
+        boundary = artifact.get("release_boundary", {})
+        if "withheld_boundary_ref" in boundary:
+            errors.extend(
+                _path_safety_errors(
+                    f"{aid}: release_boundary.withheld_boundary_ref",
+                    boundary.get("withheld_boundary_ref"),
+                )
+            )
+        for guard in artifact.get("required_guards", []):
+            guard_id = guard.get("guard_id", "<missing guard_id>")
+            errors.extend(
+                _path_safety_errors(
+                    f"{aid}: required_guards.{guard_id}.guard_ref",
+                    guard.get("guard_ref"),
+                )
+            )
+    return errors
+
+
 INVARIANTS = (
     ("owner_refs", check_owner_refs),
     ("output_slot_aliases", check_output_slot_aliases),
     ("release_boundary", check_release_boundary),
     ("comparative_claims_ci", check_comparative_claims_ci),
+    ("repo_paths", check_repo_paths),
 )
 
 
@@ -364,6 +429,92 @@ def _fixture_cases():
                 )
             ),
             "comparative_claims_ci",
+        )
+    )
+    cases.append(
+        (
+            "absolute input path",
+            mutate(lambda a, _inv: a.__setitem__("inputs", {"config": "/etc/passwd"})),
+            "repo_paths",
+        )
+    )
+    cases.append(
+        (
+            "traversal input path",
+            mutate(
+                lambda a, _inv: a.__setitem__(
+                    "inputs", {"config": "../../private/keys.json"}
+                )
+            ),
+            "repo_paths",
+        )
+    )
+    cases.append(
+        (
+            "blocked private input path",
+            mutate(
+                lambda a, _inv: a.__setitem__(
+                    "inputs", {"data_spec": "data/thewall/raw.jsonl"}
+                )
+            ),
+            "repo_paths",
+        )
+    )
+    cases.append(
+        (
+            "blocked expected output path",
+            mutate(
+                lambda a, _inv: a.__setitem__(
+                    "expected_outputs",
+                    {"emit_metric.result_receipt": "parapet-runner/runs/leak.json"},
+                )
+            ),
+            "repo_paths",
+        )
+    )
+    cases.append(
+        (
+            "blocked defaults path",
+            mutate(
+                lambda _a, inv: inv.__setitem__(
+                    "defaults", {"receipt_schema": "models/private/schema.json"}
+                )
+            ),
+            "repo_paths",
+        )
+    )
+    cases.append(
+        (
+            "blocked withheld boundary ref",
+            mutate(
+                lambda a, _inv: a.__setitem__(
+                    "release_boundary",
+                    {
+                        "profile": "withheld",
+                        "operator_justification": "ops note",
+                        "withheld_boundary_ref": "adjudication/private.md",
+                    },
+                )
+            ),
+            "repo_paths",
+        )
+    )
+    cases.append(
+        (
+            "blocked guard ref",
+            mutate(
+                lambda a, _inv: a.__setitem__(
+                    "required_guards",
+                    [
+                        {
+                            "guard_id": "synthetic.guard",
+                            "guard_ref": "runs/private_guard.json",
+                            "required_receipt": "primitive_guard.synthetic.guard",
+                        }
+                    ],
+                )
+            ),
+            "repo_paths",
         )
     )
     return cases
