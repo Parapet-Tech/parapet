@@ -19,6 +19,8 @@ resolved:
                         ``owners``.
   * output slot shape - every ``expected_outputs`` key is ``<alias>.<slot>`` and
                         ``<alias>`` is a declared ``chain[].as`` alias.
+  * artifact ids      - every artifact id is unique, because ``resolve`` uses it
+                        as the primary key.
   * release boundary  - the conditionally-required justification fields are
                         present for delayed/withheld/non-runnable profiles.
   * comparative CI    - comparative / superiority / noninferiority claims set
@@ -85,9 +87,18 @@ BLOCKED_PATH_PREFIXES = (
     "runs",
     "models",
     "adjudication",
+    "TheWall",
+    "curated",
+    "schema/eval/staging",
+    "schema/eval/benign",
+    "schema/eval/malicious",
+    "schema/eval/training",
+    "schema/eval/challenges",
+    "schema/eval/heuristic_staged",
     "parapet-runner/runs",
     "parapet-data/curated",
 )
+BLOCKED_PATH_STARTS = ("parapet-data/curated_",)
 
 
 # --------------------------------------------------------------------------
@@ -129,6 +140,17 @@ def check_output_slot_aliases(inventory: dict) -> list[str]:
                     f"{aid}: output slot '{slot_key}' references alias '{alias}' "
                     f"absent from chain aliases {sorted(a for a in aliases if a)}"
                 )
+    return errors
+
+
+def check_artifact_id_uniqueness(inventory: dict) -> list[str]:
+    errors: list[str] = []
+    seen: set[str] = set()
+    for artifact in inventory.get("artifacts", []):
+        aid = artifact.get("artifact_id", "<missing artifact_id>")
+        if aid in seen:
+            errors.append(f"{aid}: duplicate artifact_id")
+        seen.add(aid)
     return errors
 
 
@@ -181,6 +203,11 @@ def _path_safety_errors(label: str, path: object) -> list[str]:
         if normalized == prefix or normalized.startswith(f"{prefix}/"):
             errors.append(f"{label}: blocked private/output path '{path}'")
             break
+    else:
+        for prefix in BLOCKED_PATH_STARTS:
+            if normalized.startswith(prefix):
+                errors.append(f"{label}: blocked private/output path '{path}'")
+                break
     return errors
 
 
@@ -220,6 +247,7 @@ def check_repo_paths(inventory: dict) -> list[str]:
 INVARIANTS = (
     ("owner_refs", check_owner_refs),
     ("output_slot_aliases", check_output_slot_aliases),
+    ("artifact_id_uniqueness", check_artifact_id_uniqueness),
     ("release_boundary", check_release_boundary),
     ("comparative_claims_ci", check_comparative_claims_ci),
     ("repo_paths", check_repo_paths),
@@ -288,7 +316,11 @@ def check_live_tree() -> list[str]:
     else:
         try:
             schema = load_json(SCHEMA_DIR / "inventory.v0.schema.json")
+            for schema_path in sorted(SCHEMA_DIR.glob("*.json")):
+                jsonschema.Draft202012Validator.check_schema(load_json(schema_path))
             jsonschema.validate(instance=inventory, schema=schema)
+        except jsonschema.SchemaError as exc:  # type: ignore[attr-defined]
+            errors.append(f"schema validation failed: {exc.message}")
         except jsonschema.ValidationError as exc:  # type: ignore[attr-defined]
             errors.append(f"index.json: jsonschema validation failed: {exc.message}")
         except Exception as exc:  # noqa: BLE001 - schema authoring error surfaces here
@@ -387,6 +419,13 @@ def _fixture_cases():
     )
     cases.append(
         (
+            "duplicate artifact_id",
+            mutate(lambda a, inv: inv["artifacts"].append(dict(a))),
+            "artifact_id_uniqueness",
+        )
+    )
+    cases.append(
+        (
             "delayed_public missing planned_public_condition",
             mutate(
                 lambda a, _inv: a.__setitem__(
@@ -455,6 +494,39 @@ def _fixture_cases():
             mutate(
                 lambda a, _inv: a.__setitem__(
                     "inputs", {"data_spec": "data/thewall/raw.jsonl"}
+                )
+            ),
+            "repo_paths",
+        )
+    )
+    cases.append(
+        (
+            "blocked TheWall input path",
+            mutate(
+                lambda a, _inv: a.__setitem__(
+                    "inputs", {"data_spec": "TheWall/raw.jsonl"}
+                )
+            ),
+            "repo_paths",
+        )
+    )
+    cases.append(
+        (
+            "blocked schema eval corpus path",
+            mutate(
+                lambda a, _inv: a.__setitem__(
+                    "inputs", {"data_spec": "schema/eval/malicious/x.jsonl"}
+                )
+            ),
+            "repo_paths",
+        )
+    )
+    cases.append(
+        (
+            "blocked parapet-data curated underscore path",
+            mutate(
+                lambda a, _inv: a.__setitem__(
+                    "inputs", {"data_spec": "parapet-data/curated_v2/x.jsonl"}
                 )
             ),
             "repo_paths",

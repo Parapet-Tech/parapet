@@ -1,0 +1,26 @@
+name: Repro Contract
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "repro/**"
+      - "scripts/check_no_data_commit.py"
+      - ".github/workflows/repro-contract.yml"
+  pull_request:
+    paths:
+      - "repro/**"
+      - "scripts/check_no_data_commit.py"
+      - ".github/workflows/repro-contract.yml"
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python3 -m pip install jsonschema
+      - run: python3 repro/validate_contract.py
+      - run: python3 scripts/check_no_data_commit.py --all
