@@ -200,8 +200,8 @@ def _path_safety_errors(label: str, path: object) -> list[str]:
         errors.append(f"{label}: absolute path '{path}' is not public-safe")
     if WINDOWS_DRIVE_ABSOLUTE_RE.match(normalized):
         errors.append(f"{label}: absolute path '{path}' is not public-safe")
-    if ".." in parts:
-        errors.append(f"{label}: traversal path '{path}' is not public-safe")
+    if "." in parts or ".." in parts:
+        errors.append(f"{label}: dot-segment path '{path}' is not public-safe")
     for prefix in BLOCKED_PATH_PREFIXES:
         if normalized == prefix or normalized.startswith(f"{prefix}/"):
             errors.append(f"{label}: blocked private/output path '{path}'")
@@ -701,6 +701,10 @@ def test_repo_path_normalizes_backslash_separators():
         "data\\raw.jsonl",
         "C:/Users/example/TheWall/raw.jsonl",
         "C:\\Users\\example\\TheWall\\raw.jsonl",
+        "./data/raw.jsonl",
+        ".\\data\\raw.jsonl",
+        "././TheWall/secret.jsonl",
+        "./parapet-data/curated_v2/source.jsonl",
         "schema\\eval\\malicious\\source.jsonl",
         "parapet-runner\\runs\\latest.json",
         "parapet-data\\curated_v2\\source.jsonl",
@@ -718,6 +722,10 @@ def test_schema_repo_path_matches_stdlib_path_safety_when_jsonschema_available()
         "data\\raw.jsonl": False,
         "C:/Users/example/TheWall/raw.jsonl": False,
         "C:\\Users\\example\\TheWall\\raw.jsonl": False,
+        "./data/raw.jsonl": False,
+        ".\\data\\raw.jsonl": False,
+        "././TheWall/secret.jsonl": False,
+        "./parapet-data/curated_v2/source.jsonl": False,
         "..\\private\\keys.json": False,
         "schema/eval/malicious": False,
         "schema\\eval\\malicious\\source.jsonl": False,
