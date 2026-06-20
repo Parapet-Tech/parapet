@@ -215,15 +215,14 @@ fn is_invisible(c: char) -> bool {
         | '\u{202C}' // Pop directional formatting
         | '\u{202D}' // Left-to-right override
         | '\u{202E}' // Right-to-left override
-        | '\u{2060}' // Word joiner
-        | '\u{2061}' // Function application
-        | '\u{2062}' // Invisible times
-        | '\u{2063}' // Invisible separator
-        | '\u{2064}' // Invisible plus
+        | '\u{061C}' // Arabic letter mark
+        | '\u{2060}'..='\u{206F}' // Word joiner, invisible operators, isolates, deprecated controls
         | '\u{FE00}'..='\u{FE0F}' // Variation selectors 1-16
         | '\u{E0100}'..='\u{E01EF}' // Variation selectors 17-256
         | '\u{E0000}'..='\u{E007F}' // Tags block
+        | '\u{180B}'..='\u{180D}' // Mongolian free variation selectors
         | '\u{180E}' // Mongolian vowel separator
+        | '\u{180F}' // Mongolian free variation selector 4
     )
 }
 
@@ -757,6 +756,15 @@ mod tests {
         assert_eq!(n.normalize("ig\u{E0001}nore\u{E007F}"), "ignore");
     }
 
+    #[test]
+    fn residual_bmp_invisible_controls_removed() {
+        let n = normalizer();
+        assert_eq!(n.normalize("ig\u{061C}nore"), "ignore");
+        assert_eq!(n.normalize("ig\u{2065}n\u{206A}o\u{206F}re"), "ignore");
+        assert_eq!(n.normalize("ig\u{2066}n\u{2068}o\u{2069}re"), "ignore");
+        assert_eq!(n.normalize("ig\u{180B}n\u{180D}o\u{180F}re"), "ignore");
+    }
+
     // -------------------------------------------------------------------
     // 5. Combining characters handled correctly (NFKC)
     // -------------------------------------------------------------------
@@ -804,6 +812,16 @@ mod tests {
     fn idempotent_after_supplementary_invisible_removal() {
         let n = normalizer();
         let input = "ig\u{E0100}nore\u{E007F}";
+        let once = n.normalize(input);
+        let twice = n.normalize(&once);
+        assert_eq!(once, twice);
+        assert_eq!(once, "ignore");
+    }
+
+    #[test]
+    fn idempotent_after_bmp_invisible_control_removal() {
+        let n = normalizer();
+        let input = "ig\u{061C}n\u{2066}o\u{180F}re";
         let once = n.normalize(input);
         let twice = n.normalize(&once);
         assert_eq!(once, twice);
@@ -1224,6 +1242,12 @@ mod tests {
     #[test]
     fn normalize_for_comparison_removes_invisible_carriers() {
         let result = normalize_for_comparison("ig\u{E0100}nore\u{E007F}");
+        assert_eq!(result, "ignore");
+    }
+
+    #[test]
+    fn normalize_for_comparison_removes_bmp_invisible_controls() {
+        let result = normalize_for_comparison("ig\u{061C}n\u{2067}o\u{180B}re");
         assert_eq!(result, "ignore");
     }
 
