@@ -82,6 +82,7 @@ PROFILE_REQUIRED_FIELDS = {
 CI_REQUIRED_CLAIM_TYPES = {"comparative", "superiority", "noninferiority"}
 
 OUTPUT_SLOT_RE = re.compile(r"^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$")
+WINDOWS_DRIVE_ABSOLUTE_RE = re.compile(r"^[A-Za-z]:/")
 BLOCKED_PATH_PREFIXES = (
     "data",
     "runs",
@@ -197,8 +198,10 @@ def _path_safety_errors(label: str, path: object) -> list[str]:
     parts = [part for part in normalized.split("/") if part]
     if normalized.startswith("/"):
         errors.append(f"{label}: absolute path '{path}' is not public-safe")
-    if ".." in parts:
-        errors.append(f"{label}: traversal path '{path}' is not public-safe")
+    if WINDOWS_DRIVE_ABSOLUTE_RE.match(normalized):
+        errors.append(f"{label}: absolute path '{path}' is not public-safe")
+    if "." in parts or ".." in parts:
+        errors.append(f"{label}: dot-segment path '{path}' is not public-safe")
     for prefix in BLOCKED_PATH_PREFIXES:
         if normalized == prefix or normalized.startswith(f"{prefix}/"):
             errors.append(f"{label}: blocked private/output path '{path}'")
@@ -592,6 +595,26 @@ def _fixture_cases():
     return cases
 
 
+def _inventory_with_input_path(path: str) -> dict:
+    inv = _valid_inventory()
+    inv["artifacts"][0]["inputs"] = {"candidate": path}
+    return inv
+
+
+def _schema_accepts_inventory(inventory: dict) -> bool | None:
+    try:
+        import jsonschema  # type: ignore
+    except ImportError:
+        return None
+
+    schema = load_json(SCHEMA_DIR / "inventory.v0.schema.json")
+    try:
+        jsonschema.validate(instance=inventory, schema=schema)
+    except jsonschema.ValidationError:  # type: ignore[attr-defined]
+        return False
+    return True
+
+
 # --------------------------------------------------------------------------
 # Test functions (pytest-collectable AND runnable under plain python3).
 # --------------------------------------------------------------------------
@@ -610,6 +633,117 @@ def test_each_invalid_fixture_is_caught():
         check = invariant_map[expected_invariant]
         assert check(inventory), (
             f"'{label}' should be caught by '{expected_invariant}'"
+        )
+
+
+def test_repo_path_blocks_exact_roots_and_children():
+    blocked_paths = [
+        "data",
+        "data/raw.jsonl",
+        "runs",
+        "runs/latest.json",
+        "models",
+        "models/private.bin",
+        "adjudication",
+        "adjudication/private.md",
+        "TheWall",
+        "TheWall/raw.jsonl",
+        "curated",
+        "curated/local.jsonl",
+        "schema/eval/staging",
+        "schema/eval/staging/source.jsonl",
+        "schema/eval/benign",
+        "schema/eval/benign/source.jsonl",
+        "schema/eval/malicious",
+        "schema/eval/malicious/source.jsonl",
+        "schema/eval/training",
+        "schema/eval/training/source.jsonl",
+        "schema/eval/challenges",
+        "schema/eval/challenges/source.jsonl",
+        "schema/eval/heuristic_staged",
+        "schema/eval/heuristic_staged/source.jsonl",
+        "parapet-runner/runs",
+        "parapet-runner/runs/latest.json",
+        "parapet-data/curated",
+        "parapet-data/curated/source.jsonl",
+        "parapet-data/curated_v2/source.jsonl",
+    ]
+
+    for path in blocked_paths:
+        errors = check_repo_paths(_inventory_with_input_path(path))
+        assert errors, f"expected blocked repo path: {path}"
+
+
+def test_repo_path_allows_sibling_prefixes():
+    allowed_paths = [
+        "database.json",
+        "runstats.json",
+        "model_card.json",
+        "adjudication_notes.md",
+        "TheWallaby/fixture.json",
+        "curated-notes/summary.md",
+        "schema/eval/maliciousness.json",
+        "schema/eval/staging_notes.json",
+        "parapet-runner/runstats.json",
+        "parapet-data/curated.json",
+        "parapet-data/curated-notes/summary.md",
+    ]
+
+    for path in allowed_paths:
+        errors = check_repo_paths(_inventory_with_input_path(path))
+        assert errors == [], f"expected allowed repo path {path}, got {errors}"
+
+
+def test_repo_path_normalizes_backslash_separators():
+    blocked_paths = [
+        "\\absolute\\path.json",
+        "..\\private\\keys.json",
+        "data\\raw.jsonl",
+        "C:/Users/example/TheWall/raw.jsonl",
+        "C:\\Users\\example\\TheWall\\raw.jsonl",
+        "./data/raw.jsonl",
+        ".\\data\\raw.jsonl",
+        "././TheWall/secret.jsonl",
+        "./parapet-data/curated_v2/source.jsonl",
+        "schema\\eval\\malicious\\source.jsonl",
+        "parapet-runner\\runs\\latest.json",
+        "parapet-data\\curated_v2\\source.jsonl",
+    ]
+
+    for path in blocked_paths:
+        errors = check_repo_paths(_inventory_with_input_path(path))
+        assert errors, f"expected blocked backslash repo path: {path}"
+
+
+def test_schema_repo_path_matches_stdlib_path_safety_when_jsonschema_available():
+    checks = {
+        "data": False,
+        "data/raw.jsonl": False,
+        "data\\raw.jsonl": False,
+        "C:/Users/example/TheWall/raw.jsonl": False,
+        "C:\\Users\\example\\TheWall\\raw.jsonl": False,
+        "./data/raw.jsonl": False,
+        ".\\data\\raw.jsonl": False,
+        "././TheWall/secret.jsonl": False,
+        "./parapet-data/curated_v2/source.jsonl": False,
+        "..\\private\\keys.json": False,
+        "schema/eval/malicious": False,
+        "schema\\eval\\malicious\\source.jsonl": False,
+        "parapet-data/curated_v2/source.jsonl": False,
+        "parapet-data\\curated_v2\\source.jsonl": False,
+        "database.json": True,
+        "runstats.json": True,
+        "model_card.json": True,
+        "schema/eval/maliciousness.json": True,
+        "parapet-data/curated.json": True,
+    }
+
+    for path, expected in checks.items():
+        accepted = _schema_accepts_inventory(_inventory_with_input_path(path))
+        if accepted is None:
+            continue
+        assert accepted is expected, (
+            f"schema acceptance for {path!r} should be {expected}, got {accepted}"
         )
 
 
