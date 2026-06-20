@@ -197,6 +197,9 @@ fn skip_tag(chars: &[char], start: usize, len: usize) -> usize {
 
 /// Returns true if the character is a zero-width or invisible character
 /// that should be stripped during normalization.
+///
+/// This intentionally collapses some valid presentation forms, including
+/// subdivision flag tag sequences and CJK ideographic variation sequences.
 fn is_invisible(c: char) -> bool {
     matches!(
         c,
@@ -218,6 +221,8 @@ fn is_invisible(c: char) -> bool {
         | '\u{2063}' // Invisible separator
         | '\u{2064}' // Invisible plus
         | '\u{FE00}'..='\u{FE0F}' // Variation selectors 1-16
+        | '\u{E0100}'..='\u{E01EF}' // Variation selectors 17-256
+        | '\u{E0000}'..='\u{E007F}' // Tags block
         | '\u{180E}' // Mongolian vowel separator
     )
 }
@@ -739,6 +744,19 @@ mod tests {
         assert_eq!(n.normalize("ig\u{00AD}nore"), "ignore");
     }
 
+    #[test]
+    fn variation_selector_supplement_removed() {
+        let n = normalizer();
+        assert_eq!(n.normalize("ig\u{E0100}nore\u{E01EF}"), "ignore");
+    }
+
+    #[test]
+    fn unicode_tags_removed() {
+        let n = normalizer();
+        assert_eq!(n.normalize("ig\u{E006E}\u{E006F}nore"), "ignore");
+        assert_eq!(n.normalize("ig\u{E0001}nore\u{E007F}"), "ignore");
+    }
+
     // -------------------------------------------------------------------
     // 5. Combining characters handled correctly (NFKC)
     // -------------------------------------------------------------------
@@ -780,6 +798,16 @@ mod tests {
         let twice = n.normalize(&once);
         assert_eq!(once, twice);
         assert_eq!(once, "hello");
+    }
+
+    #[test]
+    fn idempotent_after_supplementary_invisible_removal() {
+        let n = normalizer();
+        let input = "ig\u{E0100}nore\u{E007F}";
+        let once = n.normalize(input);
+        let twice = n.normalize(&once);
+        assert_eq!(once, twice);
+        assert_eq!(once, "ignore");
     }
 
     // -------------------------------------------------------------------
@@ -1190,6 +1218,12 @@ mod tests {
     fn normalize_for_comparison_catches_confusables() {
         // Verify the constraint-DSL path also replaces confusables
         let result = normalize_for_comparison("ign\u{043E}re");
+        assert_eq!(result, "ignore");
+    }
+
+    #[test]
+    fn normalize_for_comparison_removes_invisible_carriers() {
+        let result = normalize_for_comparison("ig\u{E0100}nore\u{E007F}");
         assert_eq!(result, "ignore");
     }
 
