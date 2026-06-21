@@ -11,17 +11,15 @@ The v0 shape is intentionally thin:
 - `schemas/plan.v0.schema.json` validates a resolved immutable run plan.
 - `schemas/primitive-guard.v0.schema.json` validates reusable guard specs under
   `guards/`.
-
-Result-receipt envelope validation is intentionally deferred until the
-sensor/l1-owned receipt schema is relocated into the public `repro/` tree. The
-inventory and runner should reference that schema; routing-owned glue must not
-hand-copy the verification-rung field set.
+- `schemas/receipt.v0.schema.json` validates the public-safe result /
+  verification receipt envelope, including the DoD-6 verification-rung presence
+  fields from the research standards charter.
 
 The v0 runner still owns referential checks that JSON Schema cannot express
 portably: artifact owners must exist in `owners`, `paper_owner` must exist when
 present, input keys must match the selected primitive specs, output slots must
 match the resolved primitive aliases, and receipt gates must enforce
-`resample_unit == independence_unit` through the sensor/l1-owned receipt schema.
+`resample_unit == independence_unit`.
 
 Generated run output belongs under ignored local paths such as `repro/out/`.
 Only public-safe frozen receipts should be committed under `repro/receipts/`
@@ -44,9 +42,14 @@ structural invariants the runner design owns before any chain resolves:
 - release-boundary profiles carry their conditionally-required justification
   fields;
 - comparative / superiority / noninferiority claims set `requires_ci: true`;
-- inventory paths reject absolute paths, traversal segments, and blocked local
-  data/run roots aligned with `scripts/check_no_data_commit.py`, even when no
-  JSON Schema validator is installed.
+- inventory and receipt paths reject absolute paths, traversal segments, and
+  blocked local data/run roots aligned with `scripts/check_no_data_commit.py`,
+  even when no JSON Schema validator is installed;
+- any committed frozen receipt under `repro/receipts/**/*.json` carries the
+  verification-rung fields required by the charter: independence rung, named
+  residual, independence unit, independent-unit count, criterion provenance, CI
+  presence for materially exceeds claims, and a rung-2 disambiguation audit when
+  the receipt claims algorithmic independence.
 
 The release-boundary and comparative-CI invariants are also encoded in
 `schemas/inventory.v0.schema.json`, and path safety is encoded in the schema's
@@ -67,6 +70,6 @@ python3 repro/validate_contract.py --live        # committed tree only
 
 It exits 0 on success and nonzero on any failure, so CI can invoke it directly.
 The test functions are also pytest-collectable once pytest is wired in
-(`pytest repro/validate_contract.py`). Receipt / verification-rung validation
-and `resample_unit == independence_unit` stay deferred until the
-sensor/l1-owned receipt schema is relocated into `repro/`.
+(`pytest repro/validate_contract.py`). Input-key-vs-primitive-spec checks and
+guard-file existence stay deferred until `repro/primitives/*` and
+`repro/guards/*` are committed.

@@ -1,0 +1,398 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parapet.dev/repro/schemas/receipt.v0.schema.json",
+  "title": "Parapet Repro Receipt v0",
+  "description": "Public-safe receipt envelope for result reproduction and verification-rung gates.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "receipt_id",
+    "artifact_id",
+    "receipt_type",
+    "producer",
+    "provenance",
+    "per_unit_outputs",
+    "verification"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": "parapet-repro-receipt/v0"
+    },
+    "receipt_id": {
+      "$ref": "#/$defs/slug"
+    },
+    "artifact_id": {
+      "$ref": "#/$defs/artifactId"
+    },
+    "receipt_type": {
+      "type": "string",
+      "enum": ["result", "verification"]
+    },
+    "producer": {
+      "type": "object",
+      "required": ["owner", "generated_at"],
+      "additionalProperties": false,
+      "properties": {
+        "owner": {
+          "$ref": "#/$defs/ownerId"
+        },
+        "generated_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "tool": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "required": [
+        "code_ref",
+        "detector_of_record",
+        "model",
+        "input_artifact_shas",
+        "operating_point_lock"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "code_ref": {
+          "type": "object",
+          "required": ["git_sha"],
+          "additionalProperties": false,
+          "properties": {
+            "git_sha": {
+              "type": "string",
+              "pattern": "^[a-f0-9]{7,64}$"
+            },
+            "repo_path": {
+              "$ref": "#/$defs/repoPath"
+            }
+          }
+        },
+        "detector_of_record": {
+          "type": "string",
+          "minLength": 1
+        },
+        "model": {
+          "$ref": "#/$defs/modelReceipt"
+        },
+        "provider": {
+          "$ref": "#/$defs/providerReceipt"
+        },
+        "input_artifact_shas": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "$ref": "#/$defs/sha256"
+          }
+        },
+        "operating_point_lock": {
+          "type": "object",
+          "minProperties": 1
+        },
+        "pre_registration": {
+          "type": "object",
+          "required": ["timestamp", "sha256"],
+          "additionalProperties": false,
+          "properties": {
+            "timestamp": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "sha256": {
+              "$ref": "#/$defs/sha256"
+            },
+            "ref": {
+              "$ref": "#/$defs/repoPath"
+            }
+          }
+        }
+      }
+    },
+    "per_unit_outputs": {
+      "type": "object",
+      "required": ["path", "sha256", "media_type"],
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/repoPath"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "media_type": {
+          "type": "string",
+          "enum": ["application/jsonl", "application/json"]
+        },
+        "row_count": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "verification": {
+      "$ref": "#/$defs/verificationRung"
+    },
+    "metrics": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/metricValue"
+      }
+    },
+    "claims": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/claimEvidence"
+      }
+    }
+  },
+  "$defs": {
+    "slug": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._/-]*[a-z0-9]$"
+    },
+    "ownerId": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]*[a-z0-9]$"
+    },
+    "artifactId": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_]*(\\.[a-z0-9][a-z0-9_]*)+$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "repoPath": {
+      "type": "string",
+      "minLength": 1,
+      "not": {
+        "anyOf": [
+          {
+            "pattern": "^[\\\\/]"
+          },
+          {
+            "pattern": "^[A-Za-z]:[\\\\/]"
+          },
+          {
+            "pattern": "(^|[\\\\/])\\.(?:[\\\\/]|$)"
+          },
+          {
+            "pattern": "(^|[\\\\/])\\.\\.(?:[\\\\/]|$)"
+          },
+          {
+            "pattern": "^(?:data|runs|models|adjudication|TheWall|curated|parapet-runner[\\\\/]runs|schema[\\\\/]eval[\\\\/](?:staging|benign|malicious|training|challenges|heuristic_staged)|parapet-data[\\\\/]curated)(?:[\\\\/]|$)"
+          },
+          {
+            "pattern": "^parapet-data[\\\\/]curated_"
+          }
+        ]
+      }
+    },
+    "modelReceipt": {
+      "type": "object",
+      "required": ["model_id"],
+      "additionalProperties": false,
+      "properties": {
+        "model_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "receipt_ref": {
+          "$ref": "#/$defs/repoPath"
+        }
+      }
+    },
+    "providerReceipt": {
+      "type": "object",
+      "required": ["provider_id"],
+      "additionalProperties": false,
+      "properties": {
+        "provider_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "receipt_ref": {
+          "$ref": "#/$defs/repoPath"
+        }
+      }
+    },
+    "criterionProvenance": {
+      "type": "object",
+      "required": ["kind", "evidence"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["predating_timestamp", "post_hoc_exploratory"]
+        },
+        "evidence": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "disambiguationAudit": {
+      "type": "object",
+      "required": ["ambiguity", "status"],
+      "additionalProperties": false,
+      "properties": {
+        "ambiguity": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "exercised_by_data",
+            "exercised_by_fixture",
+            "not_yet_validated"
+          ]
+        },
+        "fixture_ref": {
+          "$ref": "#/$defs/repoPath"
+        },
+        "notes": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "verificationRung": {
+      "type": "object",
+      "required": [
+        "independence_rung",
+        "residual_named",
+        "independence_unit",
+        "n_independent_units",
+        "resample_unit",
+        "criterion_provenance",
+        "ci_present_where_materially_exceeds"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "independence_rung": {
+          "type": "string",
+          "enum": ["rung1_data_path", "rung2_algorithmic"]
+        },
+        "residual_named": {
+          "type": "string",
+          "minLength": 1
+        },
+        "independence_unit": {
+          "type": "string",
+          "minLength": 1
+        },
+        "n_independent_units": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "resample_unit": {
+          "type": "string",
+          "minLength": 1
+        },
+        "criterion_provenance": {
+          "$ref": "#/$defs/criterionProvenance"
+        },
+        "ci_present_where_materially_exceeds": {
+          "const": true
+        },
+        "disambiguation_audit": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/disambiguationAudit"
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "independence_rung": {
+                "const": "rung2_algorithmic"
+              }
+            },
+            "required": ["independence_rung"]
+          },
+          "then": {
+            "required": ["disambiguation_audit"]
+          }
+        }
+      ]
+    },
+    "metricValue": {
+      "type": "object",
+      "required": ["metric_id", "value"],
+      "additionalProperties": false,
+      "properties": {
+        "metric_id": {
+          "$ref": "#/$defs/slug"
+        },
+        "value": {
+          "type": "number"
+        },
+        "ci": {
+          "type": "object",
+          "required": ["low", "high", "level"],
+          "additionalProperties": false,
+          "properties": {
+            "low": {
+              "type": "number"
+            },
+            "high": {
+              "type": "number"
+            },
+            "level": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "exclusiveMaximum": 1
+            }
+          }
+        }
+      }
+    },
+    "claimEvidence": {
+      "type": "object",
+      "required": ["claim_id", "claim_type", "ci_present"],
+      "additionalProperties": false,
+      "properties": {
+        "claim_id": {
+          "$ref": "#/$defs/slug"
+        },
+        "claim_type": {
+          "type": "string",
+          "enum": ["descriptive", "comparative", "superiority", "noninferiority"]
+        },
+        "ci_present": {
+          "type": "boolean"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "claim_type": {
+                "enum": ["comparative", "superiority", "noninferiority"]
+              }
+            },
+            "required": ["claim_type"]
+          },
+          "then": {
+            "properties": {
+              "ci_present": {
+                "const": true
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

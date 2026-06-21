@@ -19,5 +19,8 @@
       "maintainer": "operator"
     }
   },
+  "defaults": {
+    "receipt_schema": "repro/schemas/receipt.v0.schema.json"
+  },
   "artifacts": []
 }
