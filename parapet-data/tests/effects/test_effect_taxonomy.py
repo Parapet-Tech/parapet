@@ -6,8 +6,11 @@ Fixtures are the worked examples from the two converged design docs:
   * effect_severity_rubric.md v1.1 (g worked examples per severity bucket)
 
 NO benchmark data here. Hand-authored synthetic calls only -> content-safe to
-promote behind the executable content-safety guard. Stdlib only; runs as a
-script (exit 0 = pass) and is pytest-discoverable.
+promote behind the executable content-safety guard. Stdlib only; pytest-
+discoverable, and runs as a script (exit 0 = pass) when parapet_data is
+importable, e.g. from parapet-data/:
+    PYTHONPATH=. python3 tests/effects/test_effect_taxonomy.py
+(or with parapet-data installed editable).
 """
 import sys
 
