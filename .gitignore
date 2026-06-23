@@ -25,6 +25,7 @@ schema/eval/out_of_scope/
 docs/publications/*/*.aux
 docs/publications/*/*.log
 docs/publications/*/*.out
+docs/publications/*/*.pdf
 docs/publications/*/*.synctex.gz
 docs/publications/*/local_author.tex
 
