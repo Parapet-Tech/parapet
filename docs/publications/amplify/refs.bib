@@ -1,0 +1,228 @@
+% refs.bib for "Amplify, Don't Create"
+% biblatex/natbib-compatible. Built from the in-text citations + Sources list.
+%
+% Verified 2026-06-17: all 13 arXiv entries (titles/first author/author count
+% via arXiv API) and Page/Lorden/Pollak/Lai/Hurlbert/Lazic/Roberts (vol/issue/pages).
+% Remaining unchecked: Shewhart 1931, Poor & Hadjiliadis 2009.
+
+% ---------- Prompt injection / agent security (arXiv) ----------
+
+@inproceedings{perez2022promptinject,
+  author    = {Perez, F{\'a}bio and Ribeiro, Ian},
+  title     = {Ignore Previous Prompt: Attack Techniques for Language Models},
+  booktitle = {NeurIPS ML Safety Workshop},
+  year      = {2022},
+  eprint    = {2211.09527},
+  archiveprefix = {arXiv},
+  primaryclass = {cs.CL}
+}
+
+@inproceedings{greshake2023indirect,
+  author    = {Greshake, Kai and Abdelnabi, Sahar and Mishra, Shailesh and Endres, Christoph and Holz, Thorsten and Fritz, Mario},
+  title     = {Not What You've Signed Up For: Compromising Real-World {LLM}-Integrated Applications with Indirect Prompt Injection},
+  booktitle = {ACM Workshop on Artificial Intelligence and Security (AISec)},
+  year      = {2023},
+  eprint    = {2302.12173},
+  archiveprefix = {arXiv},
+  primaryclass = {cs.CR}
+}
+
+@inproceedings{liu2024formalizing,
+  author    = {Liu, Yupei and Jia, Yuqi and Geng, Runpeng and Jia, Jinyuan and Gong, Neil Zhenqiang},
+  title     = {Formalizing and Benchmarking Prompt Injection Attacks and Defenses},
+  booktitle = {USENIX Security Symposium},
+  year      = {2024},
+  eprint    = {2310.12815},
+  archiveprefix = {arXiv},
+  primaryclass = {cs.CR}
+}
+
+@article{li2024mhj,
+  author    = {Li, Nathaniel and Han, Ziwen and Steneker, Ian and Primack, Willow and Goodside, Riley and Zhang, Hugh and Wang, Zifan and Menghini, Cristina and Yue, Summer},
+  title     = {{LLM} Defenses Are Not Robust to Multi-Turn Human Jailbreaks Yet},
+  journal   = {arXiv preprint},
+  year      = {2024},
+  eprint    = {2408.15221},
+  archiveprefix = {arXiv},
+  primaryclass = {cs.LG}
+}
+
+@inproceedings{debenedetti2024agentdojo,
+  author    = {Debenedetti, Edoardo and Zhang, Jie and Balunovi{\'c}, Mislav and Beurer-Kellner, Luca and Fischer, Marc and Tram{\`e}r, Florian},
+  title     = {{AgentDojo}: A Dynamic Environment to Evaluate Prompt Injection Attacks and Defenses for {LLM} Agents},
+  booktitle = {NeurIPS Datasets and Benchmarks Track},
+  year      = {2024},
+  eprint    = {2406.13352},
+  archiveprefix = {arXiv},
+  primaryclass = {cs.CR}
+}
+
+@inproceedings{zhan2024injecagent,
+  author    = {Zhan, Qiusi and Liang, Zhixiang and Ying, Zifan and Kang, Daniel},
+  title     = {{InjecAgent}: Benchmarking Indirect Prompt Injections in Tool-Integrated Large Language Model Agents},
+  booktitle = {Findings of ACL},
+  year      = {2024},
+  eprint    = {2403.02691},
+  archiveprefix = {arXiv},
+  primaryclass = {cs.CR}
+}
+
+@misc{agentdyn2026,
+  author    = {Li, Hao and Wen, Ruoyao and Shi, Shanghao and Zhang, Ning and Vorobeychik, Yevgeniy and Xiao, Chaowei},
+  title     = {{AgentDyn}: Are Your Agent Security Defenses Deployable in Real-World Dynamic Environments?},
+  year      = {2026},
+  eprint    = {2602.03117},
+  archiveprefix = {arXiv},
+  primaryclass = {cs.CR}
+}
+
+@article{hines2024spotlighting,
+  author    = {Hines, Keegan and Lopez, Gary and Hall, Matthew and Zarfati, Federico and Zunger, Yonatan and Kiciman, Emre},
+  title     = {Defending Against Indirect Prompt Injection Attacks With Spotlighting},
+  journal   = {arXiv preprint},
+  year      = {2024},
+  eprint    = {2403.14720},
+  archiveprefix = {arXiv},
+  primaryclass = {cs.CR}
+}
+
+% ---------- Adversarial robustness / non-circular evaluation (arXiv) ----------
+
+@inproceedings{athalye2018obfuscated,
+  author    = {Athalye, Anish and Carlini, Nicholas and Wagner, David},
+  title     = {Obfuscated Gradients Give a False Sense of Security: Circumventing Defenses to Adversarial Examples},
+  booktitle = {International Conference on Machine Learning (ICML)},
+  year      = {2018},
+  eprint    = {1802.00420},
+  archiveprefix = {arXiv},
+  primaryclass = {cs.LG}
+}
+
+@inproceedings{tramer2020adaptive,
+  author    = {Tram{\`e}r, Florian and Carlini, Nicholas and Brendel, Wieland and Madry, Aleksander},
+  title     = {On Adaptive Attacks to Adversarial Example Defenses},
+  booktitle = {Advances in Neural Information Processing Systems (NeurIPS)},
+  year      = {2020},
+  eprint    = {2002.08347},
+  archiveprefix = {arXiv},
+  primaryclass = {cs.LG}
+}
+
+@misc{carlini2019evaluating,
+  author    = {Carlini, Nicholas and Athalye, Anish and Papernot, Nicolas and Brendel, Wieland and Rauber, Jonas and Tsipras, Dimitris and Goodfellow, Ian and Madry, Aleksander and Kurakin, Alexey},
+  title     = {On Evaluating Adversarial Robustness},
+  year      = {2019},
+  eprint    = {1902.06705},
+  archiveprefix = {arXiv},
+  primaryclass = {cs.LG}
+}
+
+@inproceedings{papernot2017blackbox,
+  author    = {Papernot, Nicolas and McDaniel, Patrick and Goodfellow, Ian and Jha, Somesh and Celik, Z. Berkay and Swami, Ananthram},
+  title     = {Practical Black-Box Attacks Against Machine Learning},
+  booktitle = {ACM Asia Conference on Computer and Communications Security (ASIA CCS)},
+  year      = {2016},
+  eprint    = {1602.02697},
+  archiveprefix = {arXiv},
+  primaryclass = {cs.CR}
+}
+
+@inproceedings{demontis2019transfer,
+  author    = {Demontis, Ambra and Melis, Marco and Pintor, Maura and Jagielski, Matthew and Biggio, Battista and Oprea, Alina and Nita-Rotaru, Cristina and Roli, Fabio},
+  title     = {Why Do Adversarial Attacks Transfer? Explaining Transferability of Evasion and Poisoning Attacks},
+  booktitle = {USENIX Security Symposium},
+  year      = {2019},
+  eprint    = {1809.02861},
+  archiveprefix = {arXiv},
+  primaryclass = {cs.LG}
+}
+
+% ---------- Sequential change detection (classical, non-arXiv) ----------
+% Page, Lorden, Pollak, Lai: confirmed (vol/issue/pages/year).
+% Shewhart 1931, Roberts 1959, Poor & Hadjiliadis 2009: standard refs, NOT
+% independently re-checked this pass; spot-check before camera-ready.
+
+@article{page1954cusum,
+  author  = {Page, E. S.},
+  title   = {Continuous Inspection Schemes},
+  journal = {Biometrika},
+  volume  = {41},
+  number  = {1/2},
+  pages   = {100--115},
+  year    = {1954}
+}
+
+@book{shewhart1931economic,
+  author    = {Shewhart, Walter A.},
+  title     = {Economic Control of Quality of Manufactured Product},
+  publisher = {D. Van Nostrand Company},
+  year      = {1931}
+}
+
+@article{roberts1959ewma,
+  author  = {Roberts, S. W.},
+  title   = {Control Chart Tests Based on Geometric Moving Averages},
+  journal = {Technometrics},
+  volume  = {1},
+  number  = {3},
+  pages   = {239--250},
+  year    = {1959}
+}
+
+@article{lorden1971procedures,
+  author  = {Lorden, Gary},
+  title   = {Procedures for Reacting to a Change in Distribution},
+  journal = {The Annals of Mathematical Statistics},
+  volume  = {42},
+  number  = {6},
+  pages   = {1897--1908},
+  year    = {1971}
+}
+
+@article{pollak1985optimal,
+  author  = {Pollak, Moshe},
+  title   = {Optimal Detection of a Change in Distribution},
+  journal = {The Annals of Statistics},
+  volume  = {13},
+  number  = {1},
+  pages   = {206--227},
+  year    = {1985}
+}
+
+@article{lai1998information,
+  author  = {Lai, Tze Leung},
+  title   = {Information Bounds and Quick Detection of Parameter Changes in Stochastic Systems},
+  journal = {IEEE Transactions on Information Theory},
+  volume  = {44},
+  number  = {7},
+  pages   = {2917--2929},
+  year    = {1998}
+}
+
+@book{poor2009quickest,
+  author    = {Poor, H. Vincent and Hadjiliadis, Olympia},
+  title     = {Quickest Detection},
+  publisher = {Cambridge University Press},
+  year      = {2009}
+}
+
+% ---------- Pseudoreplication (statistical ecology, non-arXiv) ----------
+
+@article{hurlbert1984pseudoreplication,
+  author  = {Hurlbert, Stuart H.},
+  title   = {Pseudoreplication and the Design of Ecological Field Experiments},
+  journal = {Ecological Monographs},
+  volume  = {54},
+  number  = {2},
+  pages   = {187--211},
+  year    = {1984}
+}
+
+@article{lazic2010pseudoreplication,
+  author  = {Lazic, Stanley E.},
+  title   = {The Problem of Pseudoreplication in Neuroscientific Studies: Is It Affecting Your Analysis?},
+  journal = {BMC Neuroscience},
+  volume  = {11},
+  pages   = {5},
+  year    = {2010}
+}
