@@ -380,9 +380,11 @@ def check_receipt_envelope(receipt: dict) -> list[str]:
         if not isinstance(operating_point, dict) or not operating_point:
             errors.append(f"{rid}: provenance.operating_point_lock is required")
         model = provenance.get("model")
-        if not isinstance(model, dict):
-            errors.append(f"{rid}: provenance.model is required")
-        elif not (isinstance(model.get("model_id"), str) and model["model_id"]):
+        if model is not None and not isinstance(model, dict):
+            errors.append(f"{rid}: provenance.model must be an object when present")
+        elif isinstance(model, dict) and not (
+            isinstance(model.get("model_id"), str) and model["model_id"]
+        ):
             errors.append(f"{rid}: provenance.model.model_id is required")
         code_ref = provenance.get("code_ref")
         if not isinstance(code_ref, dict) or not re.match(
@@ -908,8 +910,8 @@ def _receipt_cases():
     )
     cases.append(
         (
-            "missing model provenance",
-            mutate(lambda r: r["provenance"].pop("model")),
+            "bad model provenance",
+            mutate(lambda r: r["provenance"].__setitem__("model", "not-a-model")),
         )
     )
     cases.append(
@@ -1008,6 +1010,12 @@ def test_valid_fixture_passes():
 
 def test_valid_receipt_fixture_passes():
     assert check_receipt_envelope(_valid_receipt()) == []
+
+
+def test_model_provenance_is_optional_for_non_model_detectors():
+    receipt = _valid_receipt()
+    receipt["provenance"].pop("model")
+    assert check_receipt_envelope(receipt) == []
 
 
 def test_each_invalid_fixture_is_caught():

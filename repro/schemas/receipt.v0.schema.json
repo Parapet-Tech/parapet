@@ -52,7 +52,6 @@
       "required": [
         "code_ref",
         "detector_of_record",
-        "model",
         "input_artifact_shas",
         "operating_point_lock"
       ],
