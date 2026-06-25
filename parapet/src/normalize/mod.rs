@@ -199,7 +199,8 @@ fn skip_tag(chars: &[char], start: usize, len: usize) -> usize {
 /// that should be stripped during normalization.
 ///
 /// This intentionally collapses some valid presentation forms, including
-/// subdivision flag tag sequences and CJK ideographic variation sequences.
+/// subdivision flag tag sequences, CJK ideographic variation sequences, and
+/// reserved default-ignorable carrier ranges.
 fn is_invisible(c: char) -> bool {
     matches!(
         c,
@@ -220,15 +221,36 @@ fn is_invisible(c: char) -> bool {
         | '\u{FE00}'..='\u{FE0F}' // Variation selectors 1-16
         | '\u{E0100}'..='\u{E01EF}' // Variation selectors 17-256
         | '\u{E0000}'..='\u{E007F}' // Tags block
+        | '\u{FFF0}'..='\u{FFF8}' // Reserved default-ignorable code points
+        | '\u{E0080}'..='\u{E00FF}' // Reserved tag-block default-ignorables
+        | '\u{E01F0}'..='\u{E0FFF}' // Reserved variation-selector-supplement default-ignorables
         | '\u{180B}'..='\u{180D}' // Mongolian free variation selectors
         | '\u{180E}' // Mongolian vowel separator
         | '\u{180F}' // Mongolian free variation selector 4
+        | '\u{1BCA0}'..='\u{1BCA3}' // Duployan shorthand format controls
+        | '\u{1D173}'..='\u{1D17A}' // Musical notation format controls
     )
 }
 
 /// Remove all invisible / zero-width characters from a string.
 fn remove_invisible_chars(input: &str) -> String {
     input.chars().filter(|c| !is_invisible(*c)).collect()
+}
+
+fn is_comparison_only_invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{034F}' // Combining grapheme joiner
+        | '\u{17B4}' // Khmer vowel inherent Aq
+        | '\u{17B5}' // Khmer vowel inherent Aa
+    )
+}
+
+fn remove_comparison_only_invisible_chars(input: &str) -> String {
+    input
+        .chars()
+        .filter(|c| !is_comparison_only_invisible(*c))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -366,10 +388,15 @@ fn replace_mixed_script_confusables(input: &str) -> String {
 /// Apply NFKC normalization, strip invisible characters, and replace
 /// mixed-script confusables. Used for security-critical string comparisons
 /// (e.g., constraint predicates) where Unicode tricks could bypass checks.
+///
+/// This comparison path strips a small extra default-ignorable subset
+/// (CGJ and deprecated Khmer inherent vowels) that display normalization keeps
+/// to avoid over-collapsing legitimate text.
 pub fn normalize_for_comparison(input: &str) -> String {
     let nfkc: String = input.nfkc().collect();
     let clean = remove_invisible_chars(&nfkc);
-    replace_mixed_script_confusables(&clean)
+    let comparison_clean = remove_comparison_only_invisible_chars(&clean);
+    replace_mixed_script_confusables(&comparison_clean)
 }
 
 // ---------------------------------------------------------------------------
@@ -765,6 +792,33 @@ mod tests {
         assert_eq!(n.normalize("ig\u{180B}n\u{180D}o\u{180F}re"), "ignore");
     }
 
+    #[test]
+    fn residual_default_ignorable_tail_removed() {
+        let n = normalizer();
+        assert_eq!(n.normalize("ig\u{FFF0}nore"), "ignore");
+        assert_eq!(n.normalize("ig\u{E0080}nore"), "ignore");
+        assert_eq!(n.normalize("ig\u{E01F0}nore"), "ignore");
+        assert_eq!(n.normalize("ig\u{1BCA0}nore"), "ignore");
+        assert_eq!(n.normalize("ig\u{1D173}nore"), "ignore");
+    }
+
+    #[test]
+    fn tier_c_default_ignorables_preserved_in_display_path() {
+        let n = normalizer();
+        assert_eq!(n.normalize("a\u{034F}b"), "a\u{034F}b");
+        assert_eq!(n.normalize("a\u{17B4}b"), "a\u{17B4}b");
+        assert_eq!(n.normalize("a\u{17B5}b"), "a\u{17B5}b");
+        assert_eq!(n.normalize("a\u{115F}b"), "a\u{115F}b");
+        assert_eq!(n.normalize("a\u{1160}b"), "a\u{1160}b");
+    }
+
+    #[test]
+    fn hangul_fillers_are_not_deleted_by_l0() {
+        let n = normalizer();
+        assert_eq!(n.normalize("a\u{3164}b"), "a\u{1160}b");
+        assert_eq!(n.normalize("a\u{FFA0}b"), "a\u{1160}b");
+    }
+
     // -------------------------------------------------------------------
     // 5. Combining characters handled correctly (NFKC)
     // -------------------------------------------------------------------
@@ -822,6 +876,16 @@ mod tests {
     fn idempotent_after_bmp_invisible_control_removal() {
         let n = normalizer();
         let input = "ig\u{061C}n\u{2066}o\u{180F}re";
+        let once = n.normalize(input);
+        let twice = n.normalize(&once);
+        assert_eq!(once, twice);
+        assert_eq!(once, "ignore");
+    }
+
+    #[test]
+    fn idempotent_after_default_ignorable_tail_removal() {
+        let n = normalizer();
+        let input = "ig\u{E0080}n\u{E01F0}o\u{1D173}re";
         let once = n.normalize(input);
         let twice = n.normalize(&once);
         assert_eq!(once, twice);
@@ -978,6 +1042,18 @@ mod tests {
         let normalized = n.normalize(original);
         assert_eq!(normalized, "hello");
         // "llo" in "hello" is at bytes 2..5
+        assert_eq!(spans[0].start, 2);
+        assert_eq!(spans[0].end, 5);
+    }
+
+    #[test]
+    fn remap_spans_astral_default_ignorable_removed() {
+        let n = normalizer();
+        let original = "he\u{E0080}llo";
+        assert_eq!(original.len(), 9);
+        let mut spans = vec![crate::trust::TrustSpan::untrusted(6, 9, "test")];
+        remap_trust_spans(&n, original, &mut spans);
+        assert_eq!(n.normalize(original), "hello");
         assert_eq!(spans[0].start, 2);
         assert_eq!(spans[0].end, 5);
     }
@@ -1249,6 +1325,27 @@ mod tests {
     fn normalize_for_comparison_removes_bmp_invisible_controls() {
         let result = normalize_for_comparison("ig\u{061C}n\u{2067}o\u{180B}re");
         assert_eq!(result, "ignore");
+    }
+
+    #[test]
+    fn normalize_for_comparison_removes_default_ignorable_tail() {
+        let result = normalize_for_comparison("ig\u{FFF0}n\u{E0080}o\u{1BCA0}re");
+        assert_eq!(result, "ignore");
+    }
+
+    #[test]
+    fn normalize_for_comparison_removes_comparison_only_ignorables() {
+        assert_eq!(normalize_for_comparison("a\u{034F}b"), "ab");
+        assert_eq!(normalize_for_comparison("a\u{17B4}b"), "ab");
+        assert_eq!(normalize_for_comparison("a\u{17B5}b"), "ab");
+    }
+
+    #[test]
+    fn normalize_for_comparison_idempotent_after_comparison_only_removal() {
+        let once = normalize_for_comparison("a\u{034F}b");
+        let twice = normalize_for_comparison(&once);
+        assert_eq!(once, twice);
+        assert_eq!(once, "ab");
     }
 
     // -------------------------------------------------------------------
