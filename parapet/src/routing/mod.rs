@@ -155,10 +155,11 @@ impl<'a> RoutingEvidenceContext<'a> {
 ///
 /// Fixed numeric and boolean telemetry only: no message content, no byte
 /// ranges, no character offsets, no matched tokens, no policy vocabulary.
-/// Counts are bounded per message and intended to be derived deterministically
-/// from the L0 sanitize pass. Engine population is not wired yet; the field
-/// is reserved on `RoutingEvidenceContext` for future routing-evidence
-/// consumers and must not gate enforcement decisions in its first wire-up.
+/// Counts are bounded per message and derived deterministically from the L0
+/// sanitize pass. Engine population is wired: when L0 runs in `sanitize` mode,
+/// `engine::process_request` collects one `L0Evidence` per message and passes
+/// `Some(&[L0Evidence])` into `RoutingEvidenceContext`. This evidence is for
+/// routing consumers only and must not gate enforcement decisions.
 #[derive(Debug, Clone, PartialEq)]
 pub struct L0Evidence {
     pub message_index: usize,
