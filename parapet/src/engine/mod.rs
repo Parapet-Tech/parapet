@@ -29,10 +29,10 @@ use crate::config::L4Mode;
 use crate::layers::l4::{DefaultMultiTurnScanner, L4Verdict, MultiTurnScanner};
 use crate::layers::l5a::{L5aScanner, OutputScanner};
 use crate::message::ToolCall;
-use crate::normalize::{neutralize_role_markers, normalize_messages_with_spans, L0Normalizer, Normalizer};
+use crate::normalize::{neutralize_role_markers, normalize_messages_with_spans_and_evidence, L0Normalizer, Normalizer};
 use crate::provider::{adapter_for, ProviderAdapter, ProviderType};
 use crate::proxy::{ProxyError, ProxyRequest, ProxyResponse, Provider, UpstreamClient};
-use crate::routing::{NoopOrthogonalSensorRouter, OrthogonalSensorRouter, RoutingEvidenceContext};
+use crate::routing::{L0Evidence, NoopOrthogonalSensorRouter, OrthogonalSensorRouter, RoutingEvidenceContext};
 use crate::stream::{
     AnthropicChunkClassifier, OpenAiChunkClassifier, StreamProcessor, ToolCallBlockMode,
     ToolCallValidator, ValidationResult,
@@ -272,9 +272,18 @@ impl UpstreamClient for EngineUpstreamClient {
             .assign_trust(&mut messages, &self.deps.config);
 
         // 3) L0 normalization (if enabled)
+        //
+        // When sanitize mode runs, collect content-free L0 evidence (one entry
+        // per message) so it can be surfaced to the routing context below. This
+        // does not change enforcement: content mutation and span remapping still
+        // go through the injected normalizer exactly as before.
+        let mut l0_evidence: Option<Vec<L0Evidence>> = None;
         if let Some(layer) = &self.deps.config.policy.layers.l0 {
             if layer.mode == "sanitize" {
-                normalize_messages_with_spans(self.deps.normalizer.as_ref(), &mut messages);
+                let msg_evidence = normalize_messages_with_spans_and_evidence(
+                    self.deps.normalizer.as_ref(),
+                    &mut messages,
+                );
                 // Role marker neutralization: replace chat template tokens in untrusted content.
                 // Runs after normalization so span offsets are already remapped.
                 let replacements = neutralize_role_markers(&mut messages);
@@ -287,6 +296,34 @@ impl UpstreamClient for EngineUpstreamClient {
                         "role markers neutralized in untrusted content"
                     );
                 }
+
+                // Merge role-marker neutralization counts in by message index.
+                let mut role_counts = vec![0usize; messages.len()];
+                for r in &replacements {
+                    if let Some(slot) = role_counts.get_mut(r.message_index) {
+                        *slot += 1;
+                    }
+                }
+
+                l0_evidence = Some(
+                    msg_evidence
+                        .into_iter()
+                        .map(|m| L0Evidence {
+                            message_index: m.message_index,
+                            pre_char_len: m.evidence.pre_char_len,
+                            post_char_len: m.evidence.post_char_len,
+                            pre_byte_len: m.evidence.pre_byte_len,
+                            post_byte_len: m.evidence.post_byte_len,
+                            removed_invisible_count: m.evidence.removed_invisible_count,
+                            confusable_replacement_count: m.evidence.confusable_replacement_count,
+                            html_stripped: m.evidence.html_stripped,
+                            role_marker_neutralized_count: role_counts
+                                .get(m.message_index)
+                                .copied()
+                                .unwrap_or(0),
+                        })
+                        .collect(),
+                );
             }
         }
 
@@ -696,7 +733,7 @@ impl UpstreamClient for EngineUpstreamClient {
         // enforcement behavior.
         let routing_context = RoutingEvidenceContext::new(
             &messages,
-            None,
+            l0_evidence.as_deref(),
             l1_signals_opt.as_deref(),
             l1_result_opt.as_ref(),
             &l2a_signals,
