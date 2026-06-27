@@ -50,20 +50,115 @@ impl Default for L0Normalizer {
 
 impl Normalizer for L0Normalizer {
     fn normalize(&self, input: &str) -> String {
-        // Step 1: NFKC normalization (handles fullwidth chars + combining chars)
-        let nfkc: String = input.nfkc().collect();
-
-        // Step 2: Strip HTML tags (including script/style content)
-        let stripped = strip_html(&nfkc);
-
-        // Step 3: Remove zero-width / invisible characters
-        let clean = remove_invisible_chars(&stripped);
-
-        // Step 4: Replace confusable characters in mixed-script words.
-        // Must be LAST because steps 2-3 may bring characters together
-        // (e.g., "ig<b>n</b>оre" or "ig\u{200B}nоre" → "ignоre" → "ignore").
-        replace_mixed_script_confusables(&clean)
+        normalize_core(input)
     }
+}
+
+/// Private L0 stage order shared by `L0Normalizer::normalize` and
+/// `normalize_with_evidence`. Keeping this separate ensures the hot-path
+/// `normalize` (including the per-prefix calls made by `remap_trust_spans`)
+/// never pays for evidence allocation or counting.
+fn normalize_core(input: &str) -> String {
+    // Step 1: NFKC normalization (handles fullwidth chars + combining chars)
+    let nfkc: String = input.nfkc().collect();
+
+    // Step 2: Strip HTML tags (including script/style content)
+    let stripped = strip_html(&nfkc);
+
+    // Step 3: Remove zero-width / invisible characters
+    let clean = remove_invisible_chars(&stripped);
+
+    // Step 4: Replace confusable characters in mixed-script words.
+    // Must be LAST because steps 2-3 may bring characters together
+    // (e.g., "ig<b>n</b>оre" or "ig\u{200B}nоre" → "ignоre" → "ignore").
+    replace_mixed_script_confusables(&clean)
+}
+
+// ---------------------------------------------------------------------------
+// L0 normalization evidence (metrics-producing path)
+// ---------------------------------------------------------------------------
+
+/// Content-free metrics describing a single L0 normalization. Numeric and
+/// boolean fields only: no offsets, tokens, ranges, or policy labels.
+///
+/// Counting semantics (see `normalize_with_evidence`):
+/// - `pre_*` measure the L0 input before NFKC.
+/// - `post_*` measure the final L0 output after confusable replacement,
+///   before role-marker neutralization.
+/// - `removed_invisible_count` counts characters removed by the display-path
+///   invisible strip, after NFKC and HTML stripping. Invisibles swallowed by
+///   the earlier HTML-strip stage are not counted here.
+/// - `confusable_replacement_count` counts exact character positions changed by
+///   the mixed-script confusable replacement stage.
+/// - `html_stripped` is true when the HTML-strip stage mutates the NFKC string.
+#[derive(Debug, Clone, PartialEq)]
+pub struct L0NormalizationEvidence {
+    pub pre_char_len: usize,
+    pub post_char_len: usize,
+    pub pre_byte_len: usize,
+    pub post_byte_len: usize,
+    pub removed_invisible_count: usize,
+    pub confusable_replacement_count: usize,
+    pub html_stripped: bool,
+}
+
+/// Normalize `input` with the same L0 stage order as `L0Normalizer::normalize`,
+/// while collecting content-free metrics about what each stage changed.
+///
+/// This reuses the existing private stage functions and the same `is_invisible`
+/// predicate used by `remove_invisible_chars`; it does not introduce a second
+/// invisible-character table.
+pub fn normalize_with_evidence(input: &str) -> (String, L0NormalizationEvidence) {
+    let pre_char_len = input.chars().count();
+    let pre_byte_len = input.len();
+
+    // Step 1: NFKC.
+    let nfkc: String = input.nfkc().collect();
+
+    // Step 2: HTML strip. `html_stripped` reflects whether the stage mutated the
+    // NFKC string (it does not prove well-formed HTML; the stripper also mutates
+    // stray angle-bracket spans).
+    let stripped = strip_html(&nfkc);
+    let html_stripped = stripped != nfkc;
+
+    // Step 3: invisible strip. Count by testing the post-HTML string with the
+    // same predicate the strip uses, so invisibles already removed by the HTML
+    // stage are not counted here.
+    let removed_invisible_count = stripped.chars().filter(|c| is_invisible(*c)).count();
+    let clean = remove_invisible_chars(&stripped);
+
+    // Step 4: mixed-script confusable replacement. The stage emits one output
+    // char per input char, so compare pre/post position-wise by `char`.
+    let replaced = replace_mixed_script_confusables(&clean);
+    let confusable_replacement_count = clean
+        .chars()
+        .zip(replaced.chars())
+        .filter(|(a, b)| a != b)
+        .count();
+
+    let post_char_len = replaced.chars().count();
+    let post_byte_len = replaced.len();
+
+    let evidence = L0NormalizationEvidence {
+        pre_char_len,
+        post_char_len,
+        pre_byte_len,
+        post_byte_len,
+        removed_invisible_count,
+        confusable_replacement_count,
+        html_stripped,
+    };
+    (replaced, evidence)
+}
+
+/// Per-message L0 evidence: the per-string `L0NormalizationEvidence` plus the
+/// originating `message_index`. This is the normalize-local evidence type;
+/// engine maps it into `routing::L0Evidence` to avoid a `normalize -> routing`
+/// dependency.
+#[derive(Debug, Clone, PartialEq)]
+pub struct L0MessageEvidence {
+    pub message_index: usize,
+    pub evidence: L0NormalizationEvidence,
 }
 
 // ---------------------------------------------------------------------------
@@ -498,6 +593,49 @@ pub fn normalize_messages_with_spans(normalizer: &dyn Normalizer, messages: &mut
             msg.content = normalizer.normalize(&msg.content);
         }
     }
+}
+
+/// Evidence-producing counterpart to `normalize_messages_with_spans`.
+///
+/// Keeps the exact same per-message sequence (normalize the full content, and
+/// call `remap_trust_spans` against the provided normalizer) so span offsets
+/// remain valid for `neutralize_role_markers` and downstream span-aware logic.
+/// Additionally derives content-free `L0NormalizationEvidence` for each message
+/// from the original content via `normalize_with_evidence`.
+///
+/// The normalized content and evidence counts come from the concrete L0 stage
+/// core. A debug assertion checks that the injected normalizer agrees, keeping
+/// future normalizer divergence visible while avoiding a second full
+/// normalization pass on the request hot path.
+pub fn normalize_messages_with_spans_and_evidence(
+    normalizer: &dyn Normalizer,
+    messages: &mut [Message],
+) -> Vec<L0MessageEvidence> {
+    let mut evidence = Vec::with_capacity(messages.len());
+    for (message_index, msg) in messages.iter_mut().enumerate() {
+        let original = msg.content.clone();
+        // Derive evidence and normalized content from the pre-normalization
+        // content in one pass. `remap_trust_spans` below still uses
+        // `normalizer.normalize` for its per-prefix calls.
+        let (normalized, ev) = normalize_with_evidence(&original);
+        debug_assert_eq!(
+            normalized,
+            normalizer.normalize(&original),
+            "L0 evidence helper must agree with the injected normalizer"
+        );
+        evidence.push(L0MessageEvidence {
+            message_index,
+            evidence: ev,
+        });
+
+        if !msg.trust_spans.is_empty() {
+            msg.content = normalized;
+            remap_trust_spans(normalizer, &original, &mut msg.trust_spans);
+        } else {
+            msg.content = normalized;
+        }
+    }
+    evidence
 }
 
 // ---------------------------------------------------------------------------
@@ -1346,6 +1484,91 @@ mod tests {
         let twice = normalize_for_comparison(&once);
         assert_eq!(once, twice);
         assert_eq!(once, "ab");
+    }
+
+    // -------------------------------------------------------------------
+    // 10b. L0 normalization evidence
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn normalize_with_evidence_matches_normalize_output() {
+        let n = normalizer();
+        let input = "<b>ig\u{200B}n\u{043E}re</b>";
+        let (out, _ev) = normalize_with_evidence(input);
+        assert_eq!(out, n.normalize(input));
+    }
+
+    #[test]
+    fn normalize_with_evidence_counts_invisible_removed() {
+        // One legacy invisible (ZWS) and one CHANGE 1 code point (U+E0080).
+        let (out, ev) = normalize_with_evidence("ig\u{200B}n\u{E0080}ore");
+        assert_eq!(out, "ignore");
+        assert_eq!(ev.removed_invisible_count, 2);
+        assert!(!ev.html_stripped);
+        assert_eq!(ev.confusable_replacement_count, 0);
+    }
+
+    #[test]
+    fn normalize_with_evidence_does_not_count_comparison_only() {
+        // U+034F (CGJ) survives display normalization and is not counted.
+        let (out, ev) = normalize_with_evidence("a\u{034F}b");
+        assert_eq!(out, "a\u{034F}b");
+        assert_eq!(ev.removed_invisible_count, 0);
+    }
+
+    #[test]
+    fn normalize_with_evidence_reports_html_and_confusable() {
+        // HTML stage mutates, and a mixed Cyrillic/Latin word is repaired.
+        let (out, ev) = normalize_with_evidence("<b>ign\u{043E}re</b>");
+        assert_eq!(out, "ignore");
+        assert!(ev.html_stripped);
+        // Only the Cyrillic 'о' position changes.
+        assert_eq!(ev.confusable_replacement_count, 1);
+        assert_eq!(ev.removed_invisible_count, 0);
+    }
+
+    #[test]
+    fn normalize_with_evidence_html_stage_mutation_semantics() {
+        // Stray angle-bracket span containing an invisible: the invisible is
+        // swallowed by the HTML strip, so it is NOT counted as removed_invisible.
+        let (out, ev) = normalize_with_evidence("a<\u{200B}x>c");
+        assert_eq!(out, "ac");
+        assert!(ev.html_stripped);
+        assert_eq!(ev.removed_invisible_count, 0);
+    }
+
+    #[test]
+    fn normalize_with_evidence_lengths() {
+        // Fullwidth A,B (3 bytes each) -> ASCII (1 byte each).
+        let (out, ev) = normalize_with_evidence("\u{FF21}\u{FF22}");
+        assert_eq!(out, "AB");
+        assert_eq!(ev.pre_char_len, 2);
+        assert_eq!(ev.post_char_len, 2);
+        assert_eq!(ev.pre_byte_len, 6);
+        assert_eq!(ev.post_byte_len, 2);
+    }
+
+    #[test]
+    fn normalize_messages_with_spans_and_evidence_remaps_and_reports() {
+        let n = normalizer();
+        // Trusted message with an untrusted span containing an invisible char.
+        let mut msg = Message::new(Role::User, "he\u{200B}llo data");
+        // "llo data" starts after "he"(2) + ZWS(3) = byte 5.
+        msg.trust_spans
+            .push(crate::trust::TrustSpan::untrusted(5, msg.content.len(), "rag"));
+
+        let mut messages = vec![msg];
+        let evidence = normalize_messages_with_spans_and_evidence(&n, &mut messages);
+
+        // Content normalized and spans remapped against the same normalizer.
+        assert_eq!(messages[0].content, "hello data");
+        assert_eq!(messages[0].trust_spans[0].start, 2);
+        assert_eq!(messages[0].trust_spans[0].end, "hello data".len());
+
+        // Evidence produced for the message.
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].message_index, 0);
+        assert_eq!(evidence[0].evidence.removed_invisible_count, 1);
     }
 
     // -------------------------------------------------------------------
