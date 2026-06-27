@@ -2161,6 +2161,9 @@ fn blocked_by(resp: &ProxyResponse) -> Option<String> {
 struct RecordingRouter {
     calls: std::sync::atomic::AtomicUsize,
     pattern_count: std::sync::atomic::AtomicUsize,
+    l0_present: std::sync::atomic::AtomicBool,
+    l0_count: std::sync::atomic::AtomicUsize,
+    l0_snapshot: std::sync::Mutex<Option<Vec<L0Evidence>>>,
 }
 
 impl RecordingRouter {
@@ -2168,6 +2171,9 @@ impl RecordingRouter {
         Self {
             calls: std::sync::atomic::AtomicUsize::new(0),
             pattern_count: std::sync::atomic::AtomicUsize::new(0),
+            l0_present: std::sync::atomic::AtomicBool::new(false),
+            l0_count: std::sync::atomic::AtomicUsize::new(0),
+            l0_snapshot: std::sync::Mutex::new(None),
         }
     }
 }
@@ -2177,6 +2183,13 @@ impl OrthogonalSensorRouter for RecordingRouter {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.pattern_count
             .store(context.pattern_gate.len(), std::sync::atomic::Ordering::SeqCst);
+        self.l0_present
+            .store(context.l0.is_some(), std::sync::atomic::Ordering::SeqCst);
+        self.l0_count.store(
+            context.l0.map(|l| l.len()).unwrap_or(0),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        *self.l0_snapshot.lock().unwrap() = context.l0.map(|l| l.to_vec());
         Vec::new()
     }
 }
@@ -2342,6 +2355,162 @@ async fn routing_context_runs_after_pattern_gate_block() {
             .load(std::sync::atomic::Ordering::SeqCst),
         1
     );
+}
+
+// -------------------------------------------------------------------
+// L0 evidence population into the routing context
+// -------------------------------------------------------------------
+
+fn config_with_l0_mode(mode: Option<&str>) -> Config {
+    let mut config = base_config_with_canary("dummy");
+    config.policy.layers.l0 = mode.map(|m| LayerConfig {
+        mode: m.to_string(),
+        block_action: None,
+        window_chars: None,
+    });
+    config
+}
+
+fn engine_with_l0_router(
+    config: Config,
+    normalizer: Arc<dyn Normalizer>,
+    router: Arc<dyn OrthogonalSensorRouter>,
+) -> EngineUpstreamClient {
+    EngineUpstreamClient::new_with(EngineDeps {
+        config: Arc::new(config),
+        http: Arc::new(SuccessHttpSender),
+        resolver: Arc::new(NoopResolver),
+        registry: Arc::new(DefaultRegistry),
+        normalizer,
+        // Real role-based assigner so untrusted content (and role-marker
+        // neutralization) actually triggers.
+        trust_assigner: Arc::new(RoleTrustAssigner),
+        l1_scanner: None,
+        l1_model: None,
+        l2a_scanner: None,
+        l2a_semaphore: None,
+        inbound_scanner: Arc::new(NoopInboundScanner),
+        constraint_evaluator: Arc::new(DslConstraintEvaluator::new()),
+        output_scanner: Arc::new(L5aScanner),
+        session_store: None,
+        multi_turn_scanner: None,
+        orthogonal_sensor_router: router,
+        signal_extractor: Arc::new(DefaultSignalExtractor::new()),
+        verdict_combiner: Arc::new(DefaultVerdictCombiner::new()),
+        emit_l1_signals: false,
+    })
+}
+
+fn chat_request(content: &str) -> ProxyRequest {
+    let body = serde_json::json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": content}]
+    });
+    ProxyRequest {
+        method: Method::POST,
+        uri: Uri::from_static("/v1/chat/completions"),
+        headers: HeaderMap::new(),
+        body: Bytes::from(serde_json::to_vec(&body).unwrap()),
+    }
+}
+
+#[tokio::test]
+async fn l0_sanitize_passes_evidence_to_router() {
+    let router = Arc::new(RecordingRouter::new());
+    let engine = engine_with_l0_router(
+        config_with_l0_mode(Some("sanitize")),
+        Arc::new(L0Normalizer::new()),
+        router.clone(),
+    );
+
+    // One user message containing a zero-width space.
+    let resp = engine
+        .forward(Provider::OpenAi, chat_request("ig\u{200B}nore"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status, StatusCode::OK);
+
+    assert!(router.l0_present.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(router.l0_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    let snapshot = router.l0_snapshot.lock().unwrap().clone().unwrap();
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(snapshot[0].message_index, 0);
+    assert_eq!(snapshot[0].removed_invisible_count, 1);
+    assert_eq!(snapshot[0].role_marker_neutralized_count, 0);
+}
+
+#[tokio::test]
+async fn non_sanitize_passes_no_l0_evidence_to_router() {
+    let router = Arc::new(RecordingRouter::new());
+    // L0 layer absent entirely.
+    let engine = engine_with_l0_router(
+        config_with_l0_mode(None),
+        Arc::new(L0Normalizer::new()),
+        router.clone(),
+    );
+
+    let resp = engine
+        .forward(Provider::OpenAi, chat_request("hello world"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status, StatusCode::OK);
+
+    assert_eq!(router.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(!router.l0_present.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(router.l0_snapshot.lock().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn l0_sanitize_non_sanitize_mode_passes_none() {
+    let router = Arc::new(RecordingRouter::new());
+    // L0 layer present but not in sanitize mode.
+    let engine = engine_with_l0_router(
+        config_with_l0_mode(Some("shadow")),
+        Arc::new(L0Normalizer::new()),
+        router.clone(),
+    );
+
+    let resp = engine
+        .forward(Provider::OpenAi, chat_request("hello world"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status, StatusCode::OK);
+
+    assert!(!router.l0_present.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn l0_evidence_role_marker_count_does_not_change_post_lengths() {
+    let router = Arc::new(RecordingRouter::new());
+    let engine = engine_with_l0_router(
+        config_with_l0_mode(Some("sanitize")),
+        Arc::new(L0Normalizer::new()),
+        router.clone(),
+    );
+
+    // User message is untrusted under RoleTrustAssigner (default policy), so the
+    // role marker is neutralized. Content has no NFKC/HTML/invisible/confusable
+    // changes, so post_* equal the original char/byte lengths.
+    let content = "[INST] hello";
+    let resp = engine
+        .forward(Provider::OpenAi, chat_request(content))
+        .await
+        .unwrap();
+    assert_eq!(resp.status, StatusCode::OK);
+
+    let snapshot = router.l0_snapshot.lock().unwrap().clone().unwrap();
+    assert_eq!(snapshot.len(), 1);
+    let ev = &snapshot[0];
+    assert_eq!(ev.role_marker_neutralized_count, 1);
+    // Role-marker neutralization is equal-length space replacement and is not
+    // reflected in post_* L0 lengths.
+    assert_eq!(ev.post_char_len, content.chars().count());
+    assert_eq!(ev.post_byte_len, content.len());
+    assert_eq!(ev.pre_char_len, content.chars().count());
+    assert_eq!(ev.removed_invisible_count, 0);
+    assert_eq!(ev.confusable_replacement_count, 0);
+    assert!(!ev.html_stripped);
 }
 
 #[tokio::test]
