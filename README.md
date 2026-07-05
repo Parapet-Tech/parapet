@@ -189,9 +189,11 @@ LiteLLM chaining is documented separately in [use/litellm.md](use/litellm.md).
 Parapet includes ongoing work on multi-turn attack detection, lexical
 classifiers, and deterministic orthogonal sensors.
 
-Current paper:
+Current public papers:
 
-- [publications/mirror/paper.pdf](publications/mirror/paper.pdf)
+- [Amplify, Don't Create: Temporal Accumulation for Slow-Burn Prompt Injection](docs/publications/amplify/paper.pdf)
+- [Peak + Accumulation: A Proxy-Level Scoring Formula for Multi-Turn LLM Attack Detection](docs/publications/multiturn/paper.pdf)
+- [The Mirror Design Pattern: Strict Data Geometry over Model Scale for Prompt Injection Detection](docs/publications/mirror/paper.pdf)
 
 The broader research and layer notes live under [strategy/](strategy).
 
