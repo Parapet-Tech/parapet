@@ -61,6 +61,23 @@ All boxes above are **Protocol interfaces**. The runner owns orchestration; adap
 - **parse_eval_result_json()**: Flexible JSON parser with recursive key lookup for eval output.
 - Subprocess boundary fully injectable for testing.
 
+### temporal_adapter.py -- Claim-bearing event adapter
+
+- **TemporalEventAssembler**: Protocol for the routing-owned join between
+  lab-produced raw-envelope events and frozen detector/CDF observations.
+- **RawEnvelopeEvent**: exact scored payload plus raw envelope role, original
+  source order, construction labels, and source receipt reference.
+- **DetectorObservation**: payload-hash-bound D_eval score, surprise,
+  score-context, fallback level, and detector provenance.
+- **P3TemporalAdapterPins**: explicit index, D_eval, reference-CDF, source-code,
+  and contract pins. The frozen P3 `alpha=1`, `n_c>=50`, and fallback order are
+  validated fail-closed.
+- Output is payload-free `TemporalEvent` JSONL plus a deterministic construction
+  receipt. The adapter preserves honest missingness and does not parse source-
+  specific traces, run D_eval, select a cohort, or make a performance claim.
+- **temporal_adapter_io.py** owns deterministic JSONL loading/writing, sanitized
+  validation diagnostics, input/output hashes, and the payload-free receipt.
+
 ### runner.py -- Experiment orchestration
 
 **8 Protocol interfaces:**
@@ -107,7 +124,11 @@ cd parapet/parapet-runner
 python -m pytest -q
 ```
 
-23 passed.
+Run the targeted temporal tests with:
+
+```bash
+python -m pytest tests/test_temporal_adapter.py tests/test_temporal.py -q
+```
 
 ## Checkpointed ablations
 
@@ -153,3 +174,22 @@ python -m parapet_runner.runner run \
 | `--random-mode on` | no | Enable random-sample baseline. Off by default. |
 
 See `parapet-data/README.md` for the full end-to-end workflow (spec generation, curation, then runner).
+
+### Temporal event adapter
+
+After owning teams have produced exact raw-envelope event JSONL, frozen D_eval/CDF
+observation JSONL, and an explicit pins file, assemble scorer input with:
+
+```bash
+python -m parapet_runner.runner temporal-adapt \
+  --raw-events-jsonl runs/<run>/raw-envelope-events.jsonl \
+  --detector-observations-jsonl runs/<run>/detector-observations.jsonl \
+  --pins-json runs/<run>/temporal-adapter-pins.json \
+  --output-events-jsonl runs/<run>/temporal-events.jsonl \
+  --output-receipt runs/<run>/temporal-adapter-receipt.json
+```
+
+The command fails closed on unsafe trajectory paths, non-contiguous trajectory
+blocks, source-order drift, payload-hash mismatch, missing/extra detector rows,
+label or cell drift, unknown CDF fallback levels, and frozen-pin drift. Event
+payload text is never written to the output or receipt.

@@ -39,6 +39,7 @@ from .temporal import (
     load_temporal_events_jsonl,
     write_temporal_receipt,
 )
+from .temporal_adapter_io import adapt_temporal_events_jsonl
 
 
 class ResolvedSplits(BaseModel):
@@ -1542,6 +1543,19 @@ def _build_parser() -> argparse.ArgumentParser:
     temporal.add_argument("--h-c-broad", type=float, default=0.0)
     temporal.add_argument("--min-productive-band-fraction", type=float, default=0.20)
     temporal.add_argument("--min-cells-positive-b-mass", type=int, default=15)
+
+    temporal_adapt = subparsers.add_parser(
+        "temporal-adapt",
+        help=(
+            "Join exact raw-envelope payloads to frozen detector/CDF observations "
+            "and emit payload-free TemporalEvent JSONL plus a construction receipt"
+        ),
+    )
+    temporal_adapt.add_argument("--raw-events-jsonl", type=Path, required=True)
+    temporal_adapt.add_argument("--detector-observations-jsonl", type=Path, required=True)
+    temporal_adapt.add_argument("--pins-json", type=Path, required=True)
+    temporal_adapt.add_argument("--output-events-jsonl", type=Path, required=True)
+    temporal_adapt.add_argument("--output-receipt", type=Path, required=True)
     return parser
 
 
@@ -1658,6 +1672,19 @@ def _cli_temporal_score(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cli_temporal_adapt(args: argparse.Namespace) -> int:
+    receipt = adapt_temporal_events_jsonl(
+        raw_events_path=Path(args.raw_events_jsonl),
+        detector_observations_path=Path(args.detector_observations_jsonl),
+        pins_path=Path(args.pins_json),
+        output_events_path=Path(args.output_events_jsonl),
+        output_receipt_path=Path(args.output_receipt),
+    )
+    print(receipt.output.path)
+    print(Path(args.output_receipt).resolve())
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
@@ -1669,6 +1696,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _cli_semantic_hash(args.content_hashes_file, args.cell_counts_json)
     if args.command == "temporal-score":
         return _cli_temporal_score(args)
+    if args.command == "temporal-adapt":
+        return _cli_temporal_adapt(args)
     parser.print_help()
     return 1
 
