@@ -76,6 +76,12 @@ def _raw(
         task_epoch_provenance=task_epoch_provenance,
         population=population,
         labels=labels or _labels("attack", event_attack=True),
+        trajectory_strata={
+            "generator": "fixture-generator",
+            "mechanism": "fixture-mechanism",
+            "surface": "filesystem",
+            "surface_relation": "within_surface",
+        },
         source_receipt_ref="raw-envelope-receipt.json",
         provenance=RawEnvelopeProvenance(
             source_artifact_ref="raw-trace.json",
@@ -162,6 +168,8 @@ def test_assemble_preserves_order_roles_and_honest_missingness() -> None:
     assert events[1].continuity_keys["instruction_channel"] == "assistant"
     assert events[0].labels.event_attack_label is True
     assert events[1].labels.event_attack_label is False
+    assert events[0].trajectory_strata is not None
+    assert events[0].trajectory_strata.surface_relation == "within_surface"
     assert events[2].continuity_keys == {"instruction_channel": "tool"}
     assert events[0].provenance["envelope"]["source_event_ordinal"] == 4
     assert events[0].provenance["envelope"]["event_text_sha256"] == _sha("one")
@@ -275,6 +283,21 @@ def test_source_order_and_trajectory_drift_fail_closed() -> None:
     with pytest.raises(TemporalAdapterContractError, match="cell_id drift"):
         assemble_temporal_events(
             [earlier, drift], [_observation(earlier), _observation(drift)], _pins()
+        )
+
+    strata_drift = _raw(source_event_ordinal=10, event_text="strata-drift")
+    strata_drift = strata_drift.model_copy(
+        update={
+            "trajectory_strata": strata_drift.trajectory_strata.model_copy(
+                update={"surface_relation": "cross_surface"}
+            )
+        }
+    )
+    with pytest.raises(TemporalAdapterContractError, match="trajectory_strata drift"):
+        assemble_temporal_events(
+            [earlier, strata_drift],
+            [_observation(earlier), _observation(strata_drift)],
+            _pins(),
         )
 
 

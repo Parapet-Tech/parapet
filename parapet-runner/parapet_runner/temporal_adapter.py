@@ -17,6 +17,7 @@ from typing import Any, Literal, Protocol
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .temporal import TemporalEvent, TemporalLabels
+from .temporal_claim import TemporalTrajectoryStrata
 
 
 EVENT_ID_SCHEMA = "temporal-event-id/1"
@@ -118,6 +119,7 @@ class RawEnvelopeEvent(StrictContractModel):
     ) = None
     population: Literal["attack_eval", "benign_eval"]
     labels: FrozenEventLabels
+    trajectory_strata: TemporalTrajectoryStrata
     source_receipt_ref: str
     provenance: RawEnvelopeProvenance
 
@@ -429,6 +431,7 @@ def assemble_temporal_events(
                 "cell_id": raw.cell_id,
                 "population": raw.population,
                 "labels": _trajectory_label_contract(raw.labels),
+                "trajectory_strata": raw.trajectory_strata.model_dump(mode="json"),
                 "source_receipt_ref": raw.source_receipt_ref,
             }
         else:
@@ -437,6 +440,8 @@ def assemble_temporal_events(
                 actual: Any
                 if field_name == "labels":
                     actual = _trajectory_label_contract(raw.labels)
+                elif field_name == "trajectory_strata":
+                    actual = raw.trajectory_strata.model_dump(mode="json")
                 else:
                     actual = getattr(raw, field_name)
                 if actual != expected:
@@ -509,6 +514,7 @@ def assemble_temporal_events(
             hard_trigger=observation.hard_trigger,
             hard_trigger_source_ref=observation.hard_trigger_source_ref,
             source_receipt_ref=raw.source_receipt_ref,
+            trajectory_strata=raw.trajectory_strata,
         )
         output.append(event)
         trajectory_index += 1

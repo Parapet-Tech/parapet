@@ -66,7 +66,8 @@ All boxes above are **Protocol interfaces**. The runner owns orchestration; adap
 - **TemporalEventAssembler**: Protocol for the routing-owned join between
   lab-produced raw-envelope events and frozen detector/CDF observations.
 - **RawEnvelopeEvent**: exact scored payload plus raw envelope role, original
-  source order, construction labels, and source receipt reference.
+  source order, construction labels, frozen generator/mechanism/surface strata,
+  and source receipt reference.
 - **DetectorObservation**: payload-hash-bound D_eval score, surprise,
   score-context, fallback level, and detector provenance.
 - **P3TemporalAdapterPins**: explicit index, D_eval, reference-CDF, source-code,
@@ -174,6 +175,36 @@ python -m parapet_runner.runner run \
 | `--random-mode on` | no | Enable random-sample baseline. Off by default. |
 
 See `parapet-data/README.md` for the full end-to-end workflow (spec generation, curation, then runner).
+
+### Temporal scorer
+
+`temporal-score` emits a generic diagnostic receipt by default. Supply
+`--metadata-json` with a validated `TemporalReceiptMetadata` envelope to emit
+the mechanically distinct `p3_temporal_validation` receipt:
+
+```bash
+python -m parapet_runner.runner temporal-score \
+  --events-jsonl runs/<run>/temporal-events.jsonl \
+  --metadata-json runs/<run>/temporal-receipt-metadata.json \
+  --output-receipt runs/<run>/temporal-receipt.json \
+  --k-u-b <frozen-value> \
+  --k-u-c-strict <frozen-value> \
+  --k-u-c-broad <frozen-value> \
+  --peak-alert-level <frozen-value>
+```
+
+The P3 envelope fails closed unless calibration/evaluation/registration
+references, CI and float-policy hashes, trajectory strata, and scorer
+thresholds agree. Delta intervals use deterministic paired cell-level bootstrap
+resampling. Supplying the envelope does not authorize an empirical run; the
+frozen cohort and owning-team artifacts must already exist.
+
+Validate a written receipt and rerun its mechanical P3 recomputation gates with:
+
+```bash
+python -m parapet_runner.runner temporal-validate \
+  --receipt-json runs/<run>/temporal-receipt.json
+```
 
 ### Temporal event adapter
 

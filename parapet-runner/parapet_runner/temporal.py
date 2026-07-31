@@ -7,16 +7,38 @@ import json
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
+from statistics import median
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from .temporal_claim import (
+    P3CalibrationBlock,
+    P3ClaimInputs,
+    P3CIConfig,
+    P3CriterionProvenance,
+    P3EvaluationRefs,
+    P3FloatPolicy,
+    P3RegistrationRefs,
+    P3ValidationContract,
+    TemporalConfidenceInterval,
+    TemporalTrajectoryStrata,
+    claim_contract_sha256,
+    compute_paired_delta_intervals,
+)
 
 
 DEFAULT_STRICT_KEYS = ("tool_target", "source_document_id", "instruction_channel", "task_epoch")
 DEFAULT_BROAD_KEYS = ("tool_target", "instruction_channel", "task_epoch")
 
 
-class TemporalLabels(BaseModel):
+class TemporalContractModel(BaseModel):
+    """Fail closed on unknown fields at temporal scorer/receipt boundaries."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class TemporalLabels(TemporalContractModel):
     """Frozen evaluation labels carried in receipts, never used for scoring."""
 
     event_attack_label: bool = False
@@ -37,7 +59,7 @@ class TemporalLabels(BaseModel):
         return self
 
 
-class TemporalEvent(BaseModel):
+class TemporalEvent(TemporalContractModel):
     """One ordered detector event entering temporal accumulation."""
 
     event_id: str
@@ -57,6 +79,7 @@ class TemporalEvent(BaseModel):
     hard_trigger: bool = False
     hard_trigger_source_ref: str | None = None
     source_receipt_ref: str
+    trajectory_strata: TemporalTrajectoryStrata | None = None
 
     @model_validator(mode="after")
     def population_matches_labels(self) -> "TemporalEvent":
@@ -70,7 +93,7 @@ class TemporalEvent(BaseModel):
         return self
 
 
-class TemporalAccumulatorConfig(BaseModel):
+class TemporalAccumulatorConfig(TemporalContractModel):
     """Frozen accumulator parameters for A/B/C scoring."""
 
     k_u_b: float = Field(ge=0.0)
@@ -92,7 +115,7 @@ class TemporalAccumulatorConfig(BaseModel):
         return self
 
 
-class TemporalEventScore(BaseModel):
+class TemporalEventScore(TemporalContractModel):
     """Per-event temporal outputs and reset/missingness sidecars."""
 
     event_id: str
@@ -116,11 +139,12 @@ class TemporalEventScore(BaseModel):
     hard_trigger: bool = False
 
 
-class TemporalTrajectoryResult(BaseModel):
+class TemporalTrajectoryResult(TemporalContractModel):
     """Per-trajectory maxima and shape diagnostics."""
 
     trajectory_id: str
     cell_id: str
+    population: Literal["attack_eval", "benign_eval"]
     trajectory_label: Literal["attack", "benign"]
     cell_label: Literal["attack", "benign"]
     layer_id: str
@@ -137,10 +161,29 @@ class TemporalTrajectoryResult(BaseModel):
     broad_missing_key_count: int
     hard_trigger_seen: bool
     peak_event_id: str
+    peak_event_index: int
     peak_event_layer: str
+    strict_churn_rate: float
+    broad_churn_rate: float
+    strict_longest_valid_segment: int
+    broad_longest_valid_segment: int
+    missing_key_counts: dict[str, int]
+    fallback_level_counts: dict[str, int]
+    productive_band_event_count: int
+    productive_band_fraction: float
+    n_positive_b_mass_events: int
+    majority_cdf_fallback: bool
+    generator: str | None = None
+    mechanism: str | None = None
+    surface: str | None = None
+    surface_relation: Literal[
+        "within_surface",
+        "cross_surface",
+        "mixed_or_unknown",
+    ] | None = None
 
 
-class SubstrateGateResult(BaseModel):
+class SubstrateGateResult(TemporalContractModel):
     """Report-only substrate premise values plus pass/fail under frozen thresholds."""
 
     productive_band_fraction: float
@@ -153,7 +196,7 @@ class SubstrateGateResult(BaseModel):
     passed: bool
 
 
-class TemporalReceiptEvent(BaseModel):
+class TemporalReceiptEvent(TemporalContractModel):
     """Sanitized event inputs sufficient for receipt recomputation."""
 
     event_id: str
@@ -181,7 +224,7 @@ class TemporalReceiptEvent(BaseModel):
     source_receipt_ref: str
 
 
-class TemporalReceiptMetadata(BaseModel):
+class TemporalReceiptMetadata(TemporalContractModel):
     """Claim and provenance envelope supplied before a claim-bearing run."""
 
     receipt_kind: Literal["generic_temporal_scorer", "p3_temporal_validation"] = (
@@ -197,18 +240,48 @@ class TemporalReceiptMetadata(BaseModel):
     break_schema_ref: str | None = None
     validation_contract: dict[str, Any] = Field(default_factory=dict)
     registration_refs: dict[str, Any] = Field(default_factory=dict)
+    p3_claim: P3ClaimInputs | None = None
 
     @model_validator(mode="after")
     def require_claim_metadata(self) -> "TemporalReceiptMetadata":
         if self.receipt_kind == "p3_temporal_validation":
+            if not self.created_at or not self.created_at.strip():
+                raise ValueError("p3_temporal_validation requires created_at")
+            for field_name in (
+                "detector_of_record",
+                "input_artifact_shas",
+                "code_refs",
+                "calibration_refs",
+            ):
+                if not getattr(self, field_name):
+                    raise ValueError(f"p3_temporal_validation requires {field_name}")
+            if not self.break_schema_ref or not self.break_schema_ref.strip():
+                raise ValueError("p3_temporal_validation requires break_schema_ref")
+            if self.p3_claim is None:
+                raise ValueError("p3_temporal_validation requires p3_claim")
+
+            P3CalibrationBlock.model_validate(self.calibration_block)
+            evaluation_refs = P3EvaluationRefs.model_validate(self.evaluation_refs)
+            P3ValidationContract.model_validate(self.validation_contract)
+            P3RegistrationRefs.model_validate(self.registration_refs)
+            if evaluation_refs.ci_config_sha != claim_contract_sha256(
+                self.p3_claim.ci_config.model_dump(mode="json")
+            ):
+                raise ValueError("evaluation_refs.ci_config_sha does not match p3_claim")
+            if evaluation_refs.float_policy_sha != claim_contract_sha256(
+                self.p3_claim.float_policy.model_dump(mode="json")
+            ):
+                raise ValueError(
+                    "evaluation_refs.float_policy_sha does not match p3_claim"
+                )
+        elif self.p3_claim is not None:
             raise ValueError(
-                "p3_temporal_validation is not supported until the full P3 receipt "
-                "schema and gate fields are implemented"
+                "generic_temporal_scorer receipts cannot carry a p3_claim envelope"
             )
         return self
 
 
-class TemporalHeadlineResults(BaseModel):
+class TemporalHeadlineResults(TemporalContractModel):
     """Receipt-level results available in the executable V1 slice."""
 
     independence_unit: Literal["cell_id"] = "cell_id"
@@ -225,9 +298,28 @@ class TemporalHeadlineResults(BaseModel):
     delta_c_broad_minus_b: float
     substrate_gate_result: SubstrateGateResult
     criterion_provenance: dict[str, Any]
+    independence_rung: str | None = None
+    residual_named: str | None = None
+    productive_band_fraction: float
+    n_cells_positive_b_mass: int
+    n_events_distribution_by_population: dict[str, list[int]]
+    calib_vs_benign_eval_length_delta: float | None = None
+    benign_eval_vs_attack_eval_length_delta: float | None = None
+    length_comparison_method: str | None = None
+    fallback_majority_cell_count: int
+    ci_method: str | None = None
+    ci_resample_count: int | None = None
+    ci_seed: int | None = None
+    ci_interval_type: str | None = None
+    ci_pairing: str | None = None
+    ci_stratification: str | None = None
+    delta_b_minus_peak_ci: TemporalConfidenceInterval | None = None
+    delta_c_strict_minus_b_ci: TemporalConfidenceInterval | None = None
+    delta_c_broad_minus_b_ci: TemporalConfidenceInterval | None = None
+    float_policy: dict[str, Any] | None = None
 
 
-class TemporalReceipt(BaseModel):
+class TemporalReceipt(TemporalContractModel):
     """Executable temporal scoring receipt for one detector/layer event stream."""
 
     receipt_version: Literal["temporal_accumulation/1"] = "temporal_accumulation/1"
@@ -251,6 +343,287 @@ class TemporalReceipt(BaseModel):
     aucs: dict[str, float]
     substrate_gate_result: SubstrateGateResult
     headline_results: TemporalHeadlineResults
+
+    @model_validator(mode="after")
+    def validate_claim_receipt(self) -> "TemporalReceipt":
+        if self.receipt_kind != "p3_temporal_validation":
+            return self
+
+        if not self.created_at or not self.break_schema_ref:
+            raise ValueError("P3 receipts require created_at and break_schema_ref")
+        for field_name in (
+            "detector_of_record",
+            "input_artifact_shas",
+            "code_refs",
+            "calibration_refs",
+        ):
+            if not getattr(self, field_name):
+                raise ValueError(f"P3 receipt requires {field_name}")
+        calibration = P3CalibrationBlock.model_validate(self.calibration_block)
+        evaluation = P3EvaluationRefs.model_validate(self.evaluation_refs)
+        validation = P3ValidationContract.model_validate(self.validation_contract)
+        P3RegistrationRefs.model_validate(self.registration_refs)
+        criterion = P3CriterionProvenance.model_validate(
+            self.headline_results.criterion_provenance
+        )
+        if self.config.strict_keys != DEFAULT_STRICT_KEYS:
+            raise ValueError("P3 receipt strict continuity keys drifted from V1")
+        if self.config.broad_keys != DEFAULT_BROAD_KEYS:
+            raise ValueError("P3 receipt broad continuity keys drifted from V1")
+        for field_name, expected in (
+            ("k_u_b", self.config.k_u_b),
+            ("k_u_c_strict", self.config.k_u_c_strict),
+            ("k_u_c_broad", self.config.k_u_c_broad),
+            ("h_b", self.config.h_b_persistence),
+            ("h_c_strict", self.config.h_c_strict),
+            ("h_c_broad", self.config.h_c_broad),
+            ("peak_alert_level", self.config.peak_alert_level),
+        ):
+            if getattr(calibration, field_name) != expected:
+                raise ValueError(
+                    f"calibration_block.{field_name} does not match scorer config"
+                )
+        if (
+            criterion.min_productive_band_fraction
+            != self.substrate_gate_result.min_productive_band_fraction
+        ):
+            raise ValueError("criterion productive-band threshold drift")
+        if (
+            criterion.min_cells_positive_b_mass
+            != self.substrate_gate_result.min_cells_positive_b_mass
+        ):
+            raise ValueError("criterion positive-B-mass threshold drift")
+        if self.headline_results.independence_rung != validation.independence_rung:
+            raise ValueError("headline independence_rung drifted from validation contract")
+        if self.headline_results.residual_named != validation.residual_named:
+            raise ValueError("headline residual_named drifted from validation contract")
+        if self.headline_results.n_independent_units != len(
+            {result.cell_id for result in self.per_trajectory_results}
+        ):
+            raise ValueError("n_independent_units does not match distinct cell_id count")
+        if self.headline_results.resample_unit != self.headline_results.independence_unit:
+            raise ValueError("resample_unit must equal independence_unit")
+        for field_name in (
+            "ci_method",
+            "ci_resample_count",
+            "ci_seed",
+            "ci_interval_type",
+            "ci_pairing",
+            "ci_stratification",
+            "delta_b_minus_peak_ci",
+            "delta_c_strict_minus_b_ci",
+            "delta_c_broad_minus_b_ci",
+            "float_policy",
+            "length_comparison_method",
+            "calib_vs_benign_eval_length_delta",
+            "benign_eval_vs_attack_eval_length_delta",
+        ):
+            if getattr(self.headline_results, field_name) is None:
+                raise ValueError(f"P3 receipt headline requires {field_name}")
+        intervals = (
+            self.headline_results.delta_b_minus_peak_ci,
+            self.headline_results.delta_c_strict_minus_b_ci,
+            self.headline_results.delta_c_broad_minus_b_ci,
+        )
+        confidence_levels = {
+            interval.confidence_level
+            for interval in intervals
+            if interval is not None
+        }
+        if len(confidence_levels) != 1:
+            raise ValueError("P3 delta confidence levels must match")
+        ci_config = P3CIConfig(
+            method=self.headline_results.ci_method,
+            resample_count=self.headline_results.ci_resample_count,
+            seed=self.headline_results.ci_seed,
+            interval_type=self.headline_results.ci_interval_type,
+            confidence_level=next(iter(confidence_levels)),
+            pairing=self.headline_results.ci_pairing,
+            stratification=self.headline_results.ci_stratification,
+        )
+        if evaluation.ci_config_sha != claim_contract_sha256(
+            ci_config.model_dump(mode="json")
+        ):
+            raise ValueError("receipt CI config does not match evaluation_refs")
+        float_policy = P3FloatPolicy.model_validate(
+            self.headline_results.float_policy
+        )
+        if evaluation.float_policy_sha != claim_contract_sha256(
+            float_policy.model_dump(mode="json")
+        ):
+            raise ValueError("receipt float policy does not match evaluation_refs")
+
+        def require_equal(name: str, actual: float, expected: float) -> None:
+            if float_policy.mode == "exact":
+                equal = actual == expected
+            else:
+                assert float_policy.absolute_tolerance is not None
+                equal = abs(actual - expected) <= float_policy.absolute_tolerance
+            if not equal:
+                raise ValueError(f"{name} does not recompute under float policy")
+
+        event_ids = [event.event_id for event in self.events]
+        if len(event_ids) != len(set(event_ids)):
+            raise ValueError("P3 receipt event_id values must be unique")
+        if set(event_ids) != {score.event_id for score in self.scored_events}:
+            raise ValueError("P3 receipt scored event IDs do not match events")
+        layer_ids = {event.layer_id for event in self.events}
+        if len(layer_ids) != 1:
+            raise ValueError("P3 V1 receipt requires one layer_id")
+        trajectory_by_cell: dict[str, str] = {}
+        indexes_by_trajectory: dict[str, set[int]] = defaultdict(set)
+        for event in self.events:
+            indexes = indexes_by_trajectory[event.trajectory_id]
+            if event.event_index in indexes:
+                raise ValueError("P3 receipt event ordering is not total")
+            indexes.add(event.event_index)
+            prior = trajectory_by_cell.setdefault(
+                event.cell_id,
+                event.trajectory_id,
+            )
+            if prior != event.trajectory_id:
+                raise ValueError("P3 V1 cell_id maps to multiple trajectories")
+
+        for result in self.per_trajectory_results:
+            for field_name in (
+                "generator",
+                "mechanism",
+                "surface",
+                "surface_relation",
+            ):
+                if not getattr(result, field_name):
+                    raise ValueError(
+                        f"P3 trajectory {result.trajectory_id} requires {field_name}"
+                    )
+        recomputed_aucs = compute_aucs(self.per_trajectory_results)
+        for key, recomputed in recomputed_aucs.items():
+            if key not in self.aucs:
+                raise ValueError(f"P3 receipt missing AUC {key}")
+            require_equal(f"aucs.{key}", self.aucs[key], recomputed)
+        headline_auc_fields = {
+            "auc_peak": recomputed_aucs["a_peak"],
+            "auc_b": recomputed_aucs["b_persistence"],
+            "auc_c_strict": recomputed_aucs["c_strict"],
+            "auc_c_broad": recomputed_aucs["c_broad"],
+            "delta_b_minus_peak": (
+                recomputed_aucs["b_persistence"] - recomputed_aucs["a_peak"]
+            ),
+            "delta_c_strict_minus_b": (
+                recomputed_aucs["c_strict"] - recomputed_aucs["b_persistence"]
+            ),
+            "delta_c_broad_minus_b": (
+                recomputed_aucs["c_broad"] - recomputed_aucs["b_persistence"]
+            ),
+        }
+        for field_name, recomputed in headline_auc_fields.items():
+            require_equal(
+                f"headline_results.{field_name}",
+                getattr(self.headline_results, field_name),
+                recomputed,
+            )
+
+        recomputed_intervals = compute_paired_delta_intervals(
+            self.per_trajectory_results,
+            ci_config,
+            auc_estimator=mann_whitney_auc,
+        )
+        for field_name in (
+            "delta_b_minus_peak",
+            "delta_c_strict_minus_b",
+            "delta_c_broad_minus_b",
+        ):
+            actual_interval = getattr(
+                self.headline_results,
+                f"{field_name}_ci",
+            )
+            expected_interval = getattr(recomputed_intervals, field_name)
+            assert actual_interval is not None
+            require_equal(
+                f"headline_results.{field_name}_ci.lower",
+                actual_interval.lower,
+                expected_interval.lower,
+            )
+            require_equal(
+                f"headline_results.{field_name}_ci.upper",
+                actual_interval.upper,
+                expected_interval.upper,
+            )
+
+        event_by_id = {event.event_id: event for event in self.events}
+        attack_events = [
+            event for event in self.events if event.event_attack_label
+        ]
+        productive_events = [
+            event
+            for event in attack_events
+            if self.config.k_u_b
+            < event.surprise
+            < self.config.peak_alert_level
+        ]
+        productive_fraction = (
+            len(productive_events) / len(attack_events)
+            if attack_events
+            else 0.0
+        )
+        positive_cells = {
+            score.cell_id
+            for score in self.scored_events
+            if event_by_id[score.event_id].cell_label == "attack"
+            and score.b_persistence > 0.0
+        }
+        require_equal(
+            "substrate_gate_result.productive_band_fraction",
+            self.substrate_gate_result.productive_band_fraction,
+            productive_fraction,
+        )
+        if self.substrate_gate_result.n_cells_positive_b_mass != len(
+            positive_cells
+        ):
+            raise ValueError("substrate positive-B-mass cell count does not recompute")
+        expected_gate_passed = (
+            productive_fraction
+            >= self.substrate_gate_result.min_productive_band_fraction
+            and len(positive_cells)
+            >= self.substrate_gate_result.min_cells_positive_b_mass
+        )
+        if self.substrate_gate_result.passed != expected_gate_passed:
+            raise ValueError("substrate gate pass/fail does not recompute")
+
+        distributions = self.headline_results.n_events_distribution_by_population
+        expected_attack_lengths = sorted(
+            result.n_events
+            for result in self.per_trajectory_results
+            if result.population == "attack_eval"
+        )
+        expected_benign_lengths = sorted(
+            result.n_events
+            for result in self.per_trajectory_results
+            if result.population == "benign_eval"
+        )
+        if distributions.get("attack_eval") != expected_attack_lengths:
+            raise ValueError("attack_eval length distribution does not recompute")
+        if distributions.get("benign_eval") != expected_benign_lengths:
+            raise ValueError("benign_eval length distribution does not recompute")
+        calibration_lengths = distributions.get("benign_calibration", [])
+        if not calibration_lengths or any(length <= 0 for length in calibration_lengths):
+            raise ValueError("P3 receipt requires benign calibration lengths")
+        require_equal(
+            "calib_vs_benign_eval_length_delta",
+            self.headline_results.calib_vs_benign_eval_length_delta,
+            float(median(expected_benign_lengths) - median(calibration_lengths)),
+        )
+        require_equal(
+            "benign_eval_vs_attack_eval_length_delta",
+            self.headline_results.benign_eval_vs_attack_eval_length_delta,
+            float(median(expected_attack_lengths) - median(expected_benign_lengths)),
+        )
+        if self.headline_results.fallback_majority_cell_count != sum(
+            1
+            for result in self.per_trajectory_results
+            if result.majority_cdf_fallback
+        ):
+            raise ValueError("fallback-majority cell count does not recompute")
+        return self
 
 
 def canonical_json_sha256(value: Any) -> str:
@@ -305,7 +678,7 @@ def _sort_events(events: Iterable[TemporalEvent]) -> list[TemporalEvent]:
     materialized = list(events)
     by_trajectory: dict[str, set[int]] = defaultdict(set)
     event_ids: set[str] = set()
-    trajectory_contract: dict[str, tuple[str, str, str]] = {}
+    trajectory_contract: dict[str, tuple[Any, ...]] = {}
     trajectory_by_cell: dict[str, str] = {}
     for event in materialized:
         if event.event_id in event_ids:
@@ -319,8 +692,14 @@ def _sort_events(events: Iterable[TemporalEvent]) -> list[TemporalEvent]:
         seen.add(event.event_index)
         contract = (
             event.cell_id,
+            event.population,
             event.labels.trajectory_label,
             event.labels.cell_label,
+            (
+                event.trajectory_strata.model_dump(mode="json")
+                if event.trajectory_strata is not None
+                else None
+            ),
         )
         prior_contract = trajectory_contract.setdefault(event.trajectory_id, contract)
         if prior_contract != contract:
@@ -428,7 +807,9 @@ def score_temporal_events(
 
 
 def summarize_trajectories(
-    events: Iterable[TemporalEvent], scored_events: Sequence[TemporalEventScore]
+    events: Iterable[TemporalEvent],
+    scored_events: Sequence[TemporalEventScore],
+    config: TemporalAccumulatorConfig | None = None,
 ) -> list[TemporalTrajectoryResult]:
     """Summarize event scores into one result per trajectory/cell."""
 
@@ -441,15 +822,49 @@ def summarize_trajectories(
     for trajectory_id in sorted(grouped):
         scores = sorted(grouped[trajectory_id], key=lambda score: score.event_index)
         first_event = events_by_id[scores[0].event_id]
+        trajectory_events = [events_by_id[score.event_id] for score in scores]
         peak_score = max(scores, key=lambda score: (score.a_peak, -score.event_index))
         a_peak = max(score.a_peak for score in scores)
         b_peak = max(score.b_persistence for score in scores)
         c_strict_peak = max(score.c_strict for score in scores)
         c_broad_peak = max(score.c_broad for score in scores)
+        strict_reset_count = sum(1 for score in scores if score.c_strict_break)
+        broad_reset_count = sum(1 for score in scores if score.c_broad_break)
+        fallback_level_counts: dict[str, int] = defaultdict(int)
+        for event in trajectory_events:
+            fallback_level_counts[event.cdf_fallback_level] += 1
+        event_attack_scores = [
+            score
+            for score in scores
+            if events_by_id[score.event_id].labels.event_attack_label
+        ]
+        productive_band_scores = (
+            [
+                score
+                for score in event_attack_scores
+                if config.k_u_b < score.surprise < config.peak_alert_level
+            ]
+            if config is not None
+            else []
+        )
+        strata = first_event.trajectory_strata
+
+        def longest_segment(break_field: str) -> int:
+            longest = 0
+            current = 0
+            for score in scores:
+                if getattr(score, break_field):
+                    current = 1
+                else:
+                    current += 1
+                longest = max(longest, current)
+            return longest
+
         results.append(
             TemporalTrajectoryResult(
                 trajectory_id=trajectory_id,
                 cell_id=first_event.cell_id,
+                population=first_event.population,
                 trajectory_label=first_event.labels.trajectory_label,
                 cell_label=first_event.labels.cell_label,
                 layer_id=first_event.layer_id,
@@ -460,13 +875,54 @@ def summarize_trajectories(
                 c_broad_peak=c_broad_peak,
                 b_minus_c_strict=b_peak - c_strict_peak,
                 b_minus_c_broad=b_peak - c_broad_peak,
-                strict_reset_count=sum(1 for score in scores if score.c_strict_break),
-                broad_reset_count=sum(1 for score in scores if score.c_broad_break),
+                strict_reset_count=strict_reset_count,
+                broad_reset_count=broad_reset_count,
                 strict_missing_key_count=sum(1 for score in scores if score.c_strict_missing),
                 broad_missing_key_count=sum(1 for score in scores if score.c_broad_missing),
                 hard_trigger_seen=any(score.hard_trigger for score in scores),
                 peak_event_id=peak_score.event_id,
+                peak_event_index=peak_score.event_index,
                 peak_event_layer=peak_score.layer_id,
+                strict_churn_rate=strict_reset_count / max(len(scores) - 1, 1),
+                broad_churn_rate=broad_reset_count / max(len(scores) - 1, 1),
+                strict_longest_valid_segment=longest_segment(
+                    "c_strict_accumulation_break"
+                ),
+                broad_longest_valid_segment=longest_segment(
+                    "c_broad_accumulation_break"
+                ),
+                missing_key_counts={
+                    "strict": sum(
+                        1 for score in scores if score.c_strict_missing
+                    ),
+                    "broad": sum(
+                        1 for score in scores if score.c_broad_missing
+                    ),
+                },
+                fallback_level_counts=dict(sorted(fallback_level_counts.items())),
+                productive_band_event_count=len(productive_band_scores),
+                productive_band_fraction=(
+                    len(productive_band_scores) / len(event_attack_scores)
+                    if event_attack_scores
+                    else 0.0
+                ),
+                n_positive_b_mass_events=sum(
+                    1 for score in scores if score.b_persistence > 0.0
+                ),
+                majority_cdf_fallback=(
+                    sum(
+                        count
+                        for level, count in fallback_level_counts.items()
+                        if level != "exact"
+                    )
+                    > len(scores) / 2
+                ),
+                generator=strata.generator if strata is not None else None,
+                mechanism=strata.mechanism if strata is not None else None,
+                surface=strata.surface if strata is not None else None,
+                surface_relation=(
+                    strata.surface_relation if strata is not None else None
+                ),
             )
         )
     return results
@@ -598,6 +1054,100 @@ def _receipt_events(
     return receipt_events
 
 
+def _validate_p3_build_inputs(
+    *,
+    metadata: TemporalReceiptMetadata,
+    config: TemporalAccumulatorConfig,
+    events: Sequence[TemporalEvent],
+    min_productive_band_fraction: float,
+    min_cells_positive_b_mass: int,
+) -> tuple[
+    P3CalibrationBlock,
+    P3ValidationContract,
+    P3ClaimInputs,
+]:
+    """Validate the frozen claim envelope against the executable scorer inputs."""
+
+    assert metadata.p3_claim is not None
+    calibration = P3CalibrationBlock.model_validate(metadata.calibration_block)
+    validation = P3ValidationContract.model_validate(metadata.validation_contract)
+    claim = P3ClaimInputs.model_validate(
+        metadata.p3_claim.model_dump(mode="json")
+    )
+
+    expected_config_values = {
+        "k_u_b": config.k_u_b,
+        "k_u_c_strict": config.k_u_c_strict,
+        "k_u_c_broad": config.k_u_c_broad,
+        "h_b": config.h_b_persistence,
+        "h_c_strict": config.h_c_strict,
+        "h_c_broad": config.h_c_broad,
+        "peak_alert_level": config.peak_alert_level,
+    }
+    for field_name, expected in expected_config_values.items():
+        if getattr(calibration, field_name) != expected:
+            raise ValueError(
+                f"calibration_block.{field_name} does not match scorer config"
+            )
+    if config.strict_keys != DEFAULT_STRICT_KEYS:
+        raise ValueError("P3 receipt strict continuity keys drifted from V1")
+    if config.broad_keys != DEFAULT_BROAD_KEYS:
+        raise ValueError("P3 receipt broad continuity keys drifted from V1")
+
+    criterion = claim.criterion_provenance
+    if criterion.min_productive_band_fraction != min_productive_band_fraction:
+        raise ValueError(
+            "P3 criterion min_productive_band_fraction does not match scorer"
+        )
+    if criterion.min_cells_positive_b_mass != min_cells_positive_b_mass:
+        raise ValueError(
+            "P3 criterion min_cells_positive_b_mass does not match scorer"
+        )
+
+    for name, digest in metadata.input_artifact_shas.items():
+        if (
+            not name.strip()
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ValueError(f"invalid P3 input artifact SHA for {name!r}")
+    for mapping_name in ("code_refs", "calibration_refs"):
+        mapping = getattr(metadata, mapping_name)
+        if any(not key.strip() or not value.strip() for key, value in mapping.items()):
+            raise ValueError(f"{mapping_name} names and values must be non-empty")
+
+    for event in events:
+        if event.labels.trajectory_label != event.labels.cell_label:
+            raise ValueError("P3 trajectory_label and cell_label must match")
+        if event.trajectory_strata is None:
+            raise ValueError(
+                f"P3 event {event.event_id} requires frozen trajectory_strata"
+            )
+    return calibration, validation, claim
+
+
+def _n_events_distributions(
+    results: Sequence[TemporalTrajectoryResult],
+    *,
+    calibration_n_events: Sequence[int] | None = None,
+) -> dict[str, list[int]]:
+    distributions = {
+        "attack_eval": sorted(
+            result.n_events
+            for result in results
+            if result.population == "attack_eval"
+        ),
+        "benign_eval": sorted(
+            result.n_events
+            for result in results
+            if result.population == "benign_eval"
+        ),
+    }
+    if calibration_n_events is not None:
+        distributions["benign_calibration"] = sorted(calibration_n_events)
+    return distributions
+
+
 def build_temporal_receipt(
     events: Sequence[TemporalEvent],
     config: TemporalAccumulatorConfig,
@@ -610,7 +1160,7 @@ def build_temporal_receipt(
 
     sorted_events = _sort_events(events)
     scored = score_temporal_events(sorted_events, config)
-    trajectory_results = summarize_trajectories(sorted_events, scored)
+    trajectory_results = summarize_trajectories(sorted_events, scored, config)
     aucs = compute_aucs(trajectory_results)
     gate = evaluate_substrate_gate(
         sorted_events,
@@ -620,10 +1170,50 @@ def build_temporal_receipt(
         min_cells_positive_b_mass=min_cells_positive_b_mass,
     )
     metadata = metadata or TemporalReceiptMetadata()
+    p3_validation: P3ValidationContract | None = None
+    p3_claim: P3ClaimInputs | None = None
+    p3_intervals = None
+    length_distributions = _n_events_distributions(trajectory_results)
+    calib_vs_benign_delta: float | None = None
+    benign_vs_attack_delta: float | None = None
+    if metadata.receipt_kind == "p3_temporal_validation":
+        _, p3_validation, p3_claim = _validate_p3_build_inputs(
+            metadata=metadata,
+            config=config,
+            events=sorted_events,
+            min_productive_band_fraction=min_productive_band_fraction,
+            min_cells_positive_b_mass=min_cells_positive_b_mass,
+        )
+        p3_intervals = compute_paired_delta_intervals(
+            trajectory_results,
+            p3_claim.ci_config,
+            auc_estimator=mann_whitney_auc,
+        )
+        length_distributions = _n_events_distributions(
+            trajectory_results,
+            calibration_n_events=p3_claim.calibration_n_events,
+        )
+        calib_vs_benign_delta = float(
+            median(length_distributions["benign_eval"])
+            - median(length_distributions["benign_calibration"])
+        )
+        benign_vs_attack_delta = float(
+            median(length_distributions["attack_eval"])
+            - median(length_distributions["benign_eval"])
+        )
     events_sha256 = canonical_json_sha256(
         [event.model_dump(mode="json") for event in sorted_events]
     )
     receipt_events = _receipt_events(sorted_events, scored, config)
+    criterion_provenance = (
+        p3_claim.criterion_provenance.model_dump(mode="json")
+        if p3_claim is not None
+        else {
+            "productive_band": "k_u_b < surprise < peak_alert_level",
+            "positive_b_mass_cell": gate.positive_b_mass_cell_definition,
+            "threshold_source": "caller_supplied_or_v1_default",
+        }
+    )
     headline = TemporalHeadlineResults(
         n_independent_units=len({event.cell_id for event in sorted_events}),
         auc_peak=aucs["a_peak"],
@@ -634,11 +1224,58 @@ def build_temporal_receipt(
         delta_c_strict_minus_b=aucs["c_strict"] - aucs["b_persistence"],
         delta_c_broad_minus_b=aucs["c_broad"] - aucs["b_persistence"],
         substrate_gate_result=gate,
-        criterion_provenance={
-            "productive_band": "k_u_b < surprise < peak_alert_level",
-            "positive_b_mass_cell": gate.positive_b_mass_cell_definition,
-            "threshold_source": "caller_supplied_or_v1_default",
-        },
+        criterion_provenance=criterion_provenance,
+        independence_rung=(
+            p3_validation.independence_rung
+            if p3_validation is not None
+            else None
+        ),
+        residual_named=(
+            p3_validation.residual_named if p3_validation is not None else None
+        ),
+        productive_band_fraction=gate.productive_band_fraction,
+        n_cells_positive_b_mass=gate.n_cells_positive_b_mass,
+        n_events_distribution_by_population=length_distributions,
+        calib_vs_benign_eval_length_delta=calib_vs_benign_delta,
+        benign_eval_vs_attack_eval_length_delta=benign_vs_attack_delta,
+        length_comparison_method=(
+            p3_claim.length_comparison_method if p3_claim is not None else None
+        ),
+        fallback_majority_cell_count=sum(
+            1 for result in trajectory_results if result.majority_cdf_fallback
+        ),
+        ci_method=p3_claim.ci_config.method if p3_claim is not None else None,
+        ci_resample_count=(
+            p3_claim.ci_config.resample_count if p3_claim is not None else None
+        ),
+        ci_seed=p3_claim.ci_config.seed if p3_claim is not None else None,
+        ci_interval_type=(
+            p3_claim.ci_config.interval_type if p3_claim is not None else None
+        ),
+        ci_pairing=p3_claim.ci_config.pairing if p3_claim is not None else None,
+        ci_stratification=(
+            p3_claim.ci_config.stratification if p3_claim is not None else None
+        ),
+        delta_b_minus_peak_ci=(
+            p3_intervals.delta_b_minus_peak
+            if p3_intervals is not None
+            else None
+        ),
+        delta_c_strict_minus_b_ci=(
+            p3_intervals.delta_c_strict_minus_b
+            if p3_intervals is not None
+            else None
+        ),
+        delta_c_broad_minus_b_ci=(
+            p3_intervals.delta_c_broad_minus_b
+            if p3_intervals is not None
+            else None
+        ),
+        float_policy=(
+            p3_claim.float_policy.model_dump(mode="json")
+            if p3_claim is not None
+            else None
+        ),
     )
     artifact_id = "temporal:" + canonical_json_sha256(
         {
@@ -655,6 +1292,19 @@ def build_temporal_receipt(
             "break_schema_ref": metadata.break_schema_ref,
             "validation_contract": metadata.validation_contract,
             "registration_refs": metadata.registration_refs,
+            "p3_claim": (
+                {
+                    **metadata.p3_claim.model_dump(
+                        mode="json",
+                        exclude={"calibration_n_events"},
+                    ),
+                    "calibration_n_events": sorted(
+                        metadata.p3_claim.calibration_n_events
+                    ),
+                }
+                if metadata.p3_claim is not None
+                else None
+            ),
             "min_productive_band_fraction": min_productive_band_fraction,
             "min_cells_positive_b_mass": min_cells_positive_b_mass,
         }
@@ -697,6 +1347,26 @@ def load_temporal_events_jsonl(path: Path) -> list[TemporalEvent]:
             raise ValueError(f"Invalid temporal event JSONL at {path}:{line_no}: {exc}") from exc
         events.append(TemporalEvent.model_validate(payload))
     return events
+
+
+def load_temporal_receipt_metadata_json(path: Path) -> TemporalReceiptMetadata:
+    """Load and validate the explicit generic or P3 receipt envelope."""
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid temporal receipt metadata JSON at {path}: {exc}") from exc
+    return TemporalReceiptMetadata.model_validate(payload)
+
+
+def load_temporal_receipt_json(path: Path) -> TemporalReceipt:
+    """Load a receipt and execute its generic or P3 mechanical model gates."""
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid temporal receipt JSON at {path}: {exc}") from exc
+    return TemporalReceipt.model_validate(payload)
 
 
 def write_temporal_receipt(path: Path, receipt: TemporalReceipt) -> None:
