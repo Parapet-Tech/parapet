@@ -33,6 +33,15 @@ from .protectai import (
     ProtectAIRecipeSource,
     materialize_protectai_recipe,
 )
+from .temporal import (
+    TemporalAccumulatorConfig,
+    build_temporal_receipt,
+    load_temporal_events_jsonl,
+    load_temporal_receipt_json,
+    load_temporal_receipt_metadata_json,
+    write_temporal_receipt,
+)
+from .temporal_adapter_io import adapt_temporal_events_jsonl
 
 
 class ResolvedSplits(BaseModel):
@@ -1516,6 +1525,53 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     semantic_hash.add_argument("--content-hashes-file", type=Path, required=True)
     semantic_hash.add_argument("--cell-counts-json", type=Path, required=True)
+
+    temporal = subparsers.add_parser(
+        "temporal-score",
+        help=(
+            "Score TemporalEvent JSONL and emit a generic diagnostic receipt or "
+            "a metadata-bound P3 validation receipt"
+        ),
+    )
+    temporal.add_argument("--events-jsonl", type=Path, required=True)
+    temporal.add_argument("--output-receipt", type=Path, required=True)
+    temporal.add_argument(
+        "--metadata-json",
+        type=Path,
+        help=(
+            "Validated TemporalReceiptMetadata JSON; required to emit "
+            "p3_temporal_validation"
+        ),
+    )
+    temporal.add_argument("--k-u-b", type=float, required=True)
+    temporal.add_argument("--k-u-c-strict", type=float, required=True)
+    temporal.add_argument("--k-u-c-broad", type=float, required=True)
+    temporal.add_argument("--peak-alert-level", type=float, required=True)
+    temporal.add_argument("--h-a-peak", type=float, default=0.0)
+    temporal.add_argument("--h-b-persistence", type=float, default=0.0)
+    temporal.add_argument("--h-c-strict", type=float, default=0.0)
+    temporal.add_argument("--h-c-broad", type=float, default=0.0)
+    temporal.add_argument("--min-productive-band-fraction", type=float, default=0.20)
+    temporal.add_argument("--min-cells-positive-b-mass", type=int, default=15)
+
+    temporal_validate = subparsers.add_parser(
+        "temporal-validate",
+        help="Validate a temporal receipt and execute P3 mechanical recomputation gates",
+    )
+    temporal_validate.add_argument("--receipt-json", type=Path, required=True)
+
+    temporal_adapt = subparsers.add_parser(
+        "temporal-adapt",
+        help=(
+            "Join exact raw-envelope payloads to frozen detector/CDF observations "
+            "and emit payload-free TemporalEvent JSONL plus a construction receipt"
+        ),
+    )
+    temporal_adapt.add_argument("--raw-events-jsonl", type=Path, required=True)
+    temporal_adapt.add_argument("--detector-observations-jsonl", type=Path, required=True)
+    temporal_adapt.add_argument("--pins-json", type=Path, required=True)
+    temporal_adapt.add_argument("--output-events-jsonl", type=Path, required=True)
+    temporal_adapt.add_argument("--output-receipt", type=Path, required=True)
     return parser
 
 
@@ -1608,6 +1664,55 @@ def _cli_eval(args: argparse.Namespace) -> int:
     return 0 if result.returncode in (0, 1) else result.returncode
 
 
+def _cli_temporal_score(args: argparse.Namespace) -> int:
+    config = TemporalAccumulatorConfig(
+        k_u_b=args.k_u_b,
+        k_u_c_strict=args.k_u_c_strict,
+        k_u_c_broad=args.k_u_c_broad,
+        h_a_peak=args.h_a_peak,
+        h_b_persistence=args.h_b_persistence,
+        h_c_strict=args.h_c_strict,
+        h_c_broad=args.h_c_broad,
+        peak_alert_level=args.peak_alert_level,
+    )
+    events = load_temporal_events_jsonl(Path(args.events_jsonl).resolve())
+    metadata = (
+        load_temporal_receipt_metadata_json(Path(args.metadata_json).resolve())
+        if args.metadata_json is not None
+        else None
+    )
+    receipt = build_temporal_receipt(
+        events,
+        config,
+        min_productive_band_fraction=args.min_productive_band_fraction,
+        min_cells_positive_b_mass=args.min_cells_positive_b_mass,
+        metadata=metadata,
+    )
+    output_receipt = Path(args.output_receipt).resolve()
+    write_temporal_receipt(output_receipt, receipt)
+    print(output_receipt)
+    return 0
+
+
+def _cli_temporal_adapt(args: argparse.Namespace) -> int:
+    receipt = adapt_temporal_events_jsonl(
+        raw_events_path=Path(args.raw_events_jsonl),
+        detector_observations_path=Path(args.detector_observations_jsonl),
+        pins_path=Path(args.pins_json),
+        output_events_path=Path(args.output_events_jsonl),
+        output_receipt_path=Path(args.output_receipt),
+    )
+    print(receipt.output.path)
+    print(Path(args.output_receipt).resolve())
+    return 0
+
+
+def _cli_temporal_validate(args: argparse.Namespace) -> int:
+    receipt = load_temporal_receipt_json(Path(args.receipt_json).resolve())
+    print(receipt.artifact_id)
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
@@ -1617,6 +1722,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _cli_eval(args)
     if args.command == "semantic-hash":
         return _cli_semantic_hash(args.content_hashes_file, args.cell_counts_json)
+    if args.command == "temporal-score":
+        return _cli_temporal_score(args)
+    if args.command == "temporal-validate":
+        return _cli_temporal_validate(args)
+    if args.command == "temporal-adapt":
+        return _cli_temporal_adapt(args)
     parser.print_help()
     return 1
 
