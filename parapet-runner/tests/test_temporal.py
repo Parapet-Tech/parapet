@@ -12,6 +12,7 @@ from parapet_runner.temporal import (
     TemporalLabels,
     TemporalReceipt,
     TemporalReceiptMetadata,
+    TemporalTrajectoryResult,
     build_temporal_receipt,
     canonical_json_sha256,
     compute_aucs,
@@ -26,6 +27,7 @@ from parapet_runner.temporal_claim import (
     P3FloatPolicy,
     TemporalTrajectoryStrata,
     claim_contract_sha256,
+    compute_paired_delta_intervals,
 )
 
 
@@ -136,6 +138,7 @@ def _p3_metadata(
             "k_u_b": 1.0,
             "k_u_c_strict": 1.0,
             "k_u_c_broad": 1.0,
+            "h_a_peak": 0.0,
             "h_b": 0.0,
             "h_c_strict": 0.0,
             "h_c_broad": 0.0,
@@ -537,6 +540,7 @@ def test_p3_receipt_emits_strata_ci_and_length_diagnostics() -> None:
         "benign_calibration": [1, 2, 3],
     }
     assert receipt.headline_results.calib_vs_benign_eval_length_delta == -1.0
+    assert receipt.events[0].trajectory_strata == _strata()
     assert receipt.per_trajectory_results[0].generator == "fixture-generator"
     assert {
         result.surface_relation for result in receipt.per_trajectory_results
@@ -565,6 +569,37 @@ def test_p3_receipt_rejects_calibration_config_drift() -> None:
     drifted = _config().model_copy(update={"k_u_b": 1.1})
 
     with pytest.raises(ValueError, match="k_u_b does not match scorer config"):
+        build_temporal_receipt(
+            events,
+            drifted,
+            min_productive_band_fraction=0.0,
+            min_cells_positive_b_mass=1,
+            metadata=_p3_metadata(),
+        )
+
+
+def test_p3_receipt_rejects_h_a_peak_calibration_drift() -> None:
+    events = [
+        _event(
+            "a1",
+            trajectory_id="attack-a",
+            event_index=0,
+            surprise=1.4,
+            attack=True,
+            trajectory_strata=_strata(),
+        ),
+        _event(
+            "b1",
+            trajectory_id="benign-a",
+            event_index=0,
+            surprise=0.8,
+            attack=False,
+            trajectory_strata=_strata(),
+        ),
+    ]
+    drifted = _config().model_copy(update={"h_a_peak": 0.25})
+
+    with pytest.raises(ValueError, match="h_a_peak does not match scorer config"):
         build_temporal_receipt(
             events,
             drifted,
@@ -615,6 +650,247 @@ def test_p3_receipt_model_rejects_tampered_claim_fields() -> None:
     payload["substrate_gate_result"]["n_cells_positive_b_mass"] += 1
     with pytest.raises(ValueError, match="positive-B-mass cell count"):
         TemporalReceipt.model_validate(payload)
+
+
+def test_p3_receipt_rejects_claims_recomputed_from_tampered_results() -> None:
+    events = [
+        _event(
+            "a1",
+            trajectory_id="attack-a",
+            event_index=0,
+            surprise=1.4,
+            attack=True,
+            trajectory_strata=_strata(),
+        ),
+        _event(
+            "b1",
+            trajectory_id="benign-a",
+            event_index=0,
+            surprise=0.8,
+            attack=False,
+            trajectory_strata=_strata(),
+        ),
+    ]
+    metadata = _p3_metadata()
+    receipt = build_temporal_receipt(
+        events,
+        _config(),
+        min_productive_band_fraction=0.0,
+        min_cells_positive_b_mass=1,
+        metadata=metadata,
+    )
+    payload = receipt.model_dump(mode="json")
+    payload["per_trajectory_results"][0]["a_peak"] = 0.1
+    payload["per_trajectory_results"][1]["a_peak"] = 9.9
+    tampered_results = [
+        TemporalTrajectoryResult.model_validate(result)
+        for result in payload["per_trajectory_results"]
+    ]
+    tampered_aucs = compute_aucs(tampered_results)
+    payload["aucs"] = tampered_aucs
+    headline = payload["headline_results"]
+    headline["auc_peak"] = tampered_aucs["a_peak"]
+    headline["auc_b"] = tampered_aucs["b_persistence"]
+    headline["auc_c_strict"] = tampered_aucs["c_strict"]
+    headline["auc_c_broad"] = tampered_aucs["c_broad"]
+    headline["delta_b_minus_peak"] = (
+        tampered_aucs["b_persistence"] - tampered_aucs["a_peak"]
+    )
+    headline["delta_c_strict_minus_b"] = (
+        tampered_aucs["c_strict"] - tampered_aucs["b_persistence"]
+    )
+    headline["delta_c_broad_minus_b"] = (
+        tampered_aucs["c_broad"] - tampered_aucs["b_persistence"]
+    )
+    assert metadata.p3_claim is not None
+    tampered_intervals = compute_paired_delta_intervals(
+        tampered_results,
+        metadata.p3_claim.ci_config,
+        auc_estimator=mann_whitney_auc,
+    )
+    for field_name in (
+        "delta_b_minus_peak",
+        "delta_c_strict_minus_b",
+        "delta_c_broad_minus_b",
+    ):
+        headline[f"{field_name}_ci"] = getattr(
+            tampered_intervals,
+            field_name,
+        ).model_dump(mode="json")
+
+    with pytest.raises(
+        ValueError,
+        match="per_trajectory_results do not recompute from receipt events",
+    ):
+        TemporalReceipt.model_validate(payload)
+
+
+def test_p3_receipt_rejects_scored_event_tampering() -> None:
+    events = [
+        _event(
+            "a1",
+            trajectory_id="attack-a",
+            event_index=0,
+            surprise=1.4,
+            attack=True,
+            trajectory_strata=_strata(),
+        ),
+        _event(
+            "b1",
+            trajectory_id="benign-a",
+            event_index=0,
+            surprise=0.8,
+            attack=False,
+            trajectory_strata=_strata(),
+        ),
+    ]
+    receipt = build_temporal_receipt(
+        events,
+        _config(),
+        min_productive_band_fraction=0.0,
+        min_cells_positive_b_mass=1,
+        metadata=_p3_metadata(),
+    )
+    payload = receipt.model_dump(mode="json")
+    payload["scored_events"][0]["a_peak"] = 0.1
+
+    with pytest.raises(
+        ValueError,
+        match="scored_events do not recompute from receipt events",
+    ):
+        TemporalReceipt.model_validate(payload)
+
+
+def test_p3_receipt_recomputes_continuity_from_event_hash_witnesses() -> None:
+    events = [
+        _event(
+            "a1",
+            trajectory_id="attack-a",
+            event_index=0,
+            surprise=1.4,
+            attack=True,
+            trajectory_strata=_strata(),
+        ),
+        _event(
+            "a2",
+            trajectory_id="attack-a",
+            event_index=1,
+            surprise=1.4,
+            attack=True,
+            trajectory_strata=_strata(),
+        ),
+        _event(
+            "b1",
+            trajectory_id="benign-a",
+            event_index=0,
+            surprise=0.8,
+            attack=False,
+            trajectory_strata=_strata(),
+        ),
+    ]
+    receipt = build_temporal_receipt(
+        events,
+        _config(),
+        min_productive_band_fraction=0.0,
+        min_cells_positive_b_mass=1,
+        metadata=_p3_metadata(),
+    )
+    payload = receipt.model_dump(mode="json")
+    event_by_id = {event["event_id"]: event for event in payload["events"]}
+    event_by_id["a2"]["continuity_key_values_hash_strict"] = "f" * 64
+
+    with pytest.raises(
+        ValueError,
+        match="scored_events do not recompute from receipt events",
+    ):
+        TemporalReceipt.model_validate(payload)
+
+
+def test_p3_receipt_rejects_strata_tampering_at_event_layer() -> None:
+    events = [
+        _event(
+            "a1",
+            trajectory_id="attack-a",
+            event_index=0,
+            surprise=1.4,
+            attack=True,
+            trajectory_strata=_strata(),
+        ),
+        _event(
+            "b1",
+            trajectory_id="benign-a",
+            event_index=0,
+            surprise=0.8,
+            attack=False,
+            trajectory_strata=_strata(),
+        ),
+    ]
+    receipt = build_temporal_receipt(
+        events,
+        _config(),
+        min_productive_band_fraction=0.0,
+        min_cells_positive_b_mass=1,
+        metadata=_p3_metadata(),
+    )
+    payload = receipt.model_dump(mode="json")
+    payload["events"][0]["trajectory_strata"]["generator"] = "tampered-generator"
+
+    with pytest.raises(
+        ValueError,
+        match="per_trajectory_results do not recompute from receipt events",
+    ):
+        TemporalReceipt.model_validate(payload)
+
+
+def test_p3_receipt_validation_is_trajectory_result_order_invariant() -> None:
+    attack_scores = (0.8, 1.2, 1.8)
+    benign_scores = (0.9, 1.4, 1.6)
+    events = [
+        *[
+            _event(
+                f"a{index}",
+                trajectory_id=f"attack-{index}",
+                event_index=0,
+                surprise=surprise,
+                attack=True,
+                trajectory_strata=_strata(),
+            )
+            for index, surprise in enumerate(attack_scores)
+        ],
+        *[
+            _event(
+                f"b{index}",
+                trajectory_id=f"benign-{index}",
+                event_index=0,
+                surprise=surprise,
+                attack=False,
+                trajectory_strata=_strata(),
+            )
+            for index, surprise in enumerate(benign_scores)
+        ],
+    ]
+    receipt = build_temporal_receipt(
+        events,
+        _config(),
+        min_productive_band_fraction=0.0,
+        min_cells_positive_b_mass=1,
+        metadata=_p3_metadata(),
+    )
+    payload = receipt.model_dump(mode="json")
+    payload["per_trajectory_results"].reverse()
+
+    validated = TemporalReceipt.model_validate(payload)
+
+    assert [
+        result.trajectory_id for result in validated.per_trajectory_results
+    ] == [
+        "benign-2",
+        "benign-1",
+        "benign-0",
+        "attack-2",
+        "attack-1",
+        "attack-0",
+    ]
 
 
 def test_temporal_v1_rejects_nonzero_c_lambda() -> None:

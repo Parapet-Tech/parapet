@@ -8,7 +8,7 @@ from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from statistics import median
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -91,6 +91,18 @@ class TemporalEvent(TemporalContractModel):
         if self.hard_trigger and not self.hard_trigger_source_ref:
             raise ValueError("hard triggers require hard_trigger_source_ref")
         return self
+
+    def continuity_hashes(
+        self,
+        strict_keys: Sequence[str],
+        broad_keys: Sequence[str],
+    ) -> tuple[str | None, str | None]:
+        """Derive canonical continuity hashes from raw event keys."""
+
+        return (
+            _canonical_key_hash(strict_keys, self.continuity_keys),
+            _canonical_key_hash(broad_keys, self.continuity_keys),
+        )
 
 
 class TemporalAccumulatorConfig(TemporalContractModel):
@@ -222,6 +234,95 @@ class TemporalReceiptEvent(TemporalContractModel):
     hard_trigger_present: bool
     hard_trigger_source_ref: str | None
     source_receipt_ref: str
+    trajectory_strata: TemporalTrajectoryStrata | None = None
+
+    @property
+    def labels(self) -> TemporalLabels:
+        """Expose the sanitized label fields through the scoring interface."""
+
+        return TemporalLabels(
+            event_attack_label=self.event_attack_label,
+            trajectory_label=self.trajectory_label,
+            cell_label=self.cell_label,
+            label_source_ref=self.label_source_ref,
+            label_provenance=self.label_provenance,
+            label_audit_ref=self.label_audit_ref,
+        )
+
+    @property
+    def hard_trigger(self) -> bool:
+        """Expose the sanitized hard-trigger witness through the scoring interface."""
+
+        return self.hard_trigger_present
+
+    def continuity_hashes(
+        self,
+        strict_keys: Sequence[str],
+        broad_keys: Sequence[str],
+    ) -> tuple[str | None, str | None]:
+        """Validate and return receipt-carried continuity witnesses."""
+
+        expected_keys = set(strict_keys) | set(broad_keys)
+        if set(self.continuity_keys_present) != expected_keys:
+            raise ValueError("receipt continuity presence keys do not match scorer config")
+
+        def validate_hash(
+            keys: Sequence[str],
+            value: str | None,
+            name: str,
+        ) -> str | None:
+            missing = any(not self.continuity_keys_present[key] for key in keys)
+            if missing:
+                if value is not None:
+                    raise ValueError(f"{name} must be absent when continuity keys are missing")
+                return None
+            if value is None:
+                raise ValueError(f"{name} is required when continuity keys are present")
+            if len(value) != 64 or any(
+                character not in "0123456789abcdef" for character in value
+            ):
+                raise ValueError(f"{name} must be a lowercase SHA-256 digest")
+            return value
+
+        return (
+            validate_hash(
+                strict_keys,
+                self.continuity_key_values_hash_strict,
+                "strict continuity hash",
+            ),
+            validate_hash(
+                broad_keys,
+                self.continuity_key_values_hash_broad,
+                "broad continuity hash",
+            ),
+        )
+
+
+class TemporalScoringInput(Protocol):
+    """Interface consumed by the shared A/B/C event scorer."""
+
+    event_id: str
+    trajectory_id: str
+    cell_id: str
+    event_index: int
+    layer_id: str
+    surprise: float
+    hard_trigger: bool
+
+    def continuity_hashes(
+        self,
+        strict_keys: Sequence[str],
+        broad_keys: Sequence[str],
+    ) -> tuple[str | None, str | None]: ...
+
+
+class TemporalSummaryInput(TemporalScoringInput, Protocol):
+    """Event interface consumed by trajectory summarization."""
+
+    population: Literal["attack_eval", "benign_eval"]
+    cdf_fallback_level: str
+    labels: TemporalLabels
+    trajectory_strata: TemporalTrajectoryStrata | None
 
 
 class TemporalReceiptMetadata(TemporalContractModel):
@@ -374,6 +475,7 @@ class TemporalReceipt(TemporalContractModel):
             ("k_u_b", self.config.k_u_b),
             ("k_u_c_strict", self.config.k_u_c_strict),
             ("k_u_c_broad", self.config.k_u_c_broad),
+            ("h_a_peak", self.config.h_a_peak),
             ("h_b", self.config.h_b_persistence),
             ("h_c_strict", self.config.h_c_strict),
             ("h_c_broad", self.config.h_c_broad),
@@ -398,7 +500,7 @@ class TemporalReceipt(TemporalContractModel):
         if self.headline_results.residual_named != validation.residual_named:
             raise ValueError("headline residual_named drifted from validation contract")
         if self.headline_results.n_independent_units != len(
-            {result.cell_id for result in self.per_trajectory_results}
+            {event.cell_id for event in self.events}
         ):
             raise ValueError("n_independent_units does not match distinct cell_id count")
         if self.headline_results.resample_unit != self.headline_results.independence_unit:
@@ -462,27 +564,46 @@ class TemporalReceipt(TemporalContractModel):
             if not equal:
                 raise ValueError(f"{name} does not recompute under float policy")
 
-        event_ids = [event.event_id for event in self.events]
-        if len(event_ids) != len(set(event_ids)):
-            raise ValueError("P3 receipt event_id values must be unique")
-        if set(event_ids) != {score.event_id for score in self.scored_events}:
-            raise ValueError("P3 receipt scored event IDs do not match events")
-        layer_ids = {event.layer_id for event in self.events}
+        sorted_receipt_events = _sort_receipt_events(self.events)
+        event_ids = {event.event_id for event in sorted_receipt_events}
+        layer_ids = {event.layer_id for event in sorted_receipt_events}
         if len(layer_ids) != 1:
             raise ValueError("P3 V1 receipt requires one layer_id")
-        trajectory_by_cell: dict[str, str] = {}
-        indexes_by_trajectory: dict[str, set[int]] = defaultdict(set)
-        for event in self.events:
-            indexes = indexes_by_trajectory[event.trajectory_id]
-            if event.event_index in indexes:
-                raise ValueError("P3 receipt event ordering is not total")
-            indexes.add(event.event_index)
-            prior = trajectory_by_cell.setdefault(
-                event.cell_id,
-                event.trajectory_id,
-            )
-            if prior != event.trajectory_id:
-                raise ValueError("P3 V1 cell_id maps to multiple trajectories")
+        for event in sorted_receipt_events:
+            if event.trajectory_strata is None:
+                raise ValueError(
+                    f"P3 event {event.event_id} requires frozen trajectory_strata"
+                )
+
+        recomputed_scored_events = _score_temporal_receipt_events(
+            sorted_receipt_events,
+            self.config,
+        )
+        scored_by_id = {score.event_id: score for score in self.scored_events}
+        if len(scored_by_id) != len(self.scored_events) or set(scored_by_id) != event_ids:
+            raise ValueError("P3 receipt scored event IDs do not match events")
+        for expected_score in recomputed_scored_events:
+            if scored_by_id[expected_score.event_id].model_dump(mode="json") != (
+                expected_score.model_dump(mode="json")
+            ):
+                raise ValueError("scored_events do not recompute from receipt events")
+
+        recomputed_results = summarize_trajectories(
+            sorted_receipt_events,
+            recomputed_scored_events,
+            self.config,
+        )
+        results_by_id = {
+            result.trajectory_id: result for result in self.per_trajectory_results
+        }
+        expected_result_ids = {
+            result.trajectory_id for result in recomputed_results
+        }
+        if (
+            len(results_by_id) != len(self.per_trajectory_results)
+            or set(results_by_id) != expected_result_ids
+        ):
+            raise ValueError("P3 receipt trajectory result IDs do not match events")
 
         for result in self.per_trajectory_results:
             for field_name in (
@@ -495,7 +616,15 @@ class TemporalReceipt(TemporalContractModel):
                     raise ValueError(
                         f"P3 trajectory {result.trajectory_id} requires {field_name}"
                     )
-        recomputed_aucs = compute_aucs(self.per_trajectory_results)
+        for expected_result in recomputed_results:
+            if results_by_id[expected_result.trajectory_id].model_dump(mode="json") != (
+                expected_result.model_dump(mode="json")
+            ):
+                raise ValueError(
+                    "per_trajectory_results do not recompute from receipt events"
+                )
+
+        recomputed_aucs = compute_aucs(recomputed_results)
         for key, recomputed in recomputed_aucs.items():
             if key not in self.aucs:
                 raise ValueError(f"P3 receipt missing AUC {key}")
@@ -523,7 +652,7 @@ class TemporalReceipt(TemporalContractModel):
             )
 
         recomputed_intervals = compute_paired_delta_intervals(
-            self.per_trajectory_results,
+            recomputed_results,
             ci_config,
             auc_estimator=mann_whitney_auc,
         )
@@ -549,9 +678,9 @@ class TemporalReceipt(TemporalContractModel):
                 expected_interval.upper,
             )
 
-        event_by_id = {event.event_id: event for event in self.events}
+        event_by_id = {event.event_id: event for event in sorted_receipt_events}
         attack_events = [
-            event for event in self.events if event.event_attack_label
+            event for event in sorted_receipt_events if event.event_attack_label
         ]
         productive_events = [
             event
@@ -567,7 +696,7 @@ class TemporalReceipt(TemporalContractModel):
         )
         positive_cells = {
             score.cell_id
-            for score in self.scored_events
+            for score in recomputed_scored_events
             if event_by_id[score.event_id].cell_label == "attack"
             and score.b_persistence > 0.0
         }
@@ -588,16 +717,25 @@ class TemporalReceipt(TemporalContractModel):
         )
         if self.substrate_gate_result.passed != expected_gate_passed:
             raise ValueError("substrate gate pass/fail does not recompute")
+        if self.headline_results.substrate_gate_result != self.substrate_gate_result:
+            raise ValueError("headline substrate gate result drifted from receipt gate")
+        require_equal(
+            "headline_results.productive_band_fraction",
+            self.headline_results.productive_band_fraction,
+            productive_fraction,
+        )
+        if self.headline_results.n_cells_positive_b_mass != len(positive_cells):
+            raise ValueError("headline positive-B-mass cell count does not recompute")
 
         distributions = self.headline_results.n_events_distribution_by_population
         expected_attack_lengths = sorted(
             result.n_events
-            for result in self.per_trajectory_results
+            for result in recomputed_results
             if result.population == "attack_eval"
         )
         expected_benign_lengths = sorted(
             result.n_events
-            for result in self.per_trajectory_results
+            for result in recomputed_results
             if result.population == "benign_eval"
         )
         if distributions.get("attack_eval") != expected_attack_lengths:
@@ -619,7 +757,7 @@ class TemporalReceipt(TemporalContractModel):
         )
         if self.headline_results.fallback_majority_cell_count != sum(
             1
-            for result in self.per_trajectory_results
+            for result in recomputed_results
             if result.majority_cdf_fallback
         ):
             raise ValueError("fallback-majority cell count does not recompute")
@@ -715,12 +853,53 @@ def _sort_events(events: Iterable[TemporalEvent]) -> list[TemporalEvent]:
     return sorted(materialized, key=lambda event: (event.trajectory_id, event.event_index))
 
 
-def score_temporal_events(
-    events: Iterable[TemporalEvent], config: TemporalAccumulatorConfig
-) -> list[TemporalEventScore]:
-    """Compute A/B/C temporal scores with V1 missing-key and break semantics."""
+def _sort_receipt_events(
+    events: Iterable[TemporalReceiptEvent],
+) -> list[TemporalReceiptEvent]:
+    """Validate trajectory invariants and canonicalize sanitized receipt events."""
 
-    sorted_events = _sort_events(events)
+    materialized = list(events)
+    by_trajectory: dict[str, set[int]] = defaultdict(set)
+    event_ids: set[str] = set()
+    trajectory_contract: dict[str, tuple[Any, ...]] = {}
+    trajectory_by_cell: dict[str, str] = {}
+    for event in materialized:
+        if event.event_id in event_ids:
+            raise ValueError("P3 receipt event_id values must be unique")
+        event_ids.add(event.event_id)
+        seen = by_trajectory[event.trajectory_id]
+        if event.event_index in seen:
+            raise ValueError("P3 receipt event ordering is not total")
+        seen.add(event.event_index)
+        contract = (
+            event.cell_id,
+            event.population,
+            event.trajectory_label,
+            event.cell_label,
+            (
+                event.trajectory_strata.model_dump(mode="json")
+                if event.trajectory_strata is not None
+                else None
+            ),
+        )
+        prior_contract = trajectory_contract.setdefault(event.trajectory_id, contract)
+        if prior_contract != contract:
+            raise ValueError("P3 receipt trajectory event contract is inconsistent")
+        prior_trajectory = trajectory_by_cell.setdefault(event.cell_id, event.trajectory_id)
+        if prior_trajectory != event.trajectory_id:
+            raise ValueError("P3 V1 cell_id maps to multiple trajectories")
+    return sorted(
+        materialized,
+        key=lambda event: (event.trajectory_id, event.event_index),
+    )
+
+
+def _score_temporal_inputs(
+    sorted_events: Sequence[TemporalScoringInput],
+    config: TemporalAccumulatorConfig,
+) -> list[TemporalEventScore]:
+    """Compute A/B/C scores from a canonicalized raw or receipt event stream."""
+
     if not sorted_events:
         return []
 
@@ -743,8 +922,10 @@ def score_temporal_events(
         b_value = max(0.0, b_by_trajectory[event.trajectory_id] + event.surprise - config.k_u_b)
         b_by_trajectory[event.trajectory_id] = b_value
 
-        strict_hash = _canonical_key_hash(config.strict_keys, event.continuity_keys)
-        broad_hash = _canonical_key_hash(config.broad_keys, event.continuity_keys)
+        strict_hash, broad_hash = event.continuity_hashes(
+            config.strict_keys,
+            config.broad_keys,
+        )
         strict_value, strict_accumulation_break, strict_missing, strict_state = _advance_c_state(
             state=strict_state_by_trajectory[event.trajectory_id],
             key_hash=strict_hash,
@@ -806,8 +987,25 @@ def score_temporal_events(
     return scored
 
 
+def score_temporal_events(
+    events: Iterable[TemporalEvent], config: TemporalAccumulatorConfig
+) -> list[TemporalEventScore]:
+    """Compute A/B/C temporal scores with V1 missing-key and break semantics."""
+
+    return _score_temporal_inputs(_sort_events(events), config)
+
+
+def _score_temporal_receipt_events(
+    events: Iterable[TemporalReceiptEvent],
+    config: TemporalAccumulatorConfig,
+) -> list[TemporalEventScore]:
+    """Recompute A/B/C scores from sanitized receipt event witnesses."""
+
+    return _score_temporal_inputs(_sort_receipt_events(events), config)
+
+
 def summarize_trajectories(
-    events: Iterable[TemporalEvent],
+    events: Iterable[TemporalSummaryInput],
     scored_events: Sequence[TemporalEventScore],
     config: TemporalAccumulatorConfig | None = None,
 ) -> list[TemporalTrajectoryResult]:
@@ -1049,6 +1247,7 @@ def _receipt_events(
                 hard_trigger_present=event.hard_trigger,
                 hard_trigger_source_ref=event.hard_trigger_source_ref,
                 source_receipt_ref=event.source_receipt_ref,
+                trajectory_strata=event.trajectory_strata,
             )
         )
     return receipt_events
@@ -1079,6 +1278,7 @@ def _validate_p3_build_inputs(
         "k_u_b": config.k_u_b,
         "k_u_c_strict": config.k_u_c_strict,
         "k_u_c_broad": config.k_u_c_broad,
+        "h_a_peak": config.h_a_peak,
         "h_b": config.h_b_persistence,
         "h_c_strict": config.h_c_strict,
         "h_c_broad": config.h_c_broad,

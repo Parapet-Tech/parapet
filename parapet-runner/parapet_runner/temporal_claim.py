@@ -72,6 +72,7 @@ class P3CalibrationBlock(ClaimContractModel):
     k_u_b: float = Field(ge=0.0, allow_inf_nan=False)
     k_u_c_strict: float = Field(ge=0.0, allow_inf_nan=False)
     k_u_c_broad: float = Field(ge=0.0, allow_inf_nan=False)
+    h_a_peak: float = Field(ge=0.0, allow_inf_nan=False)
     h_b: float = Field(ge=0.0, allow_inf_nan=False)
     h_c_strict: float = Field(ge=0.0, allow_inf_nan=False)
     h_c_broad: float = Field(ge=0.0, allow_inf_nan=False)
@@ -319,8 +320,14 @@ def compute_paired_delta_intervals(
 ) -> P3DeltaIntervals:
     """Bootstrap attack/benign cells independently and pair metrics per draw."""
 
-    attack = [result for result in results if result.cell_label == "attack"]
-    benign = [result for result in results if result.cell_label == "benign"]
+    attack = sorted(
+        (result for result in results if result.cell_label == "attack"),
+        key=lambda result: result.trajectory_id,
+    )
+    benign = sorted(
+        (result for result in results if result.cell_label == "benign"),
+        key=lambda result: result.trajectory_id,
+    )
     if not attack or not benign:
         raise ValueError("paired delta CIs require attack and benign cells")
 
