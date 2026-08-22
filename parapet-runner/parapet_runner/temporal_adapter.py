@@ -156,6 +156,9 @@ class RawEnvelopeEvent(StrictContractModel):
         )
         if self.population != expected_population:
             raise ValueError("population must match trajectory_label")
+        self.trajectory_strata.validate_for_trajectory_label(
+            self.labels.trajectory_label
+        )
         if not self.source_receipt_ref.strip():
             raise ValueError("source_receipt_ref must be non-empty")
         return self

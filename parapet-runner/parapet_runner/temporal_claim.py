@@ -8,7 +8,7 @@ import random
 from collections.abc import Sequence
 from typing import Any, Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
 
 
 SHA256_PATTERN = r"^[0-9a-f]{64}$"
@@ -260,21 +260,52 @@ class P3ClaimInputs(ClaimContractModel):
 
 
 class TemporalTrajectoryStrata(ClaimContractModel):
-    """Frozen trajectory-grain P3 strata required for C-shape reporting."""
+    """Class-symmetric cohort identity plus attack-only construction strata.
 
-    generator: str
-    mechanism: str
-    surface: str
-    surface_relation: Literal[
-        "within_surface",
-        "cross_surface",
-        "mixed_or_unknown",
-    ]
+    P3 V1 has one governed cohort surface, ``swe_coding``. ``generator``,
+    ``mechanism``, and ``surface`` exist only for the attack-side 5B census and
+    no-single-carrier checks; they are not cross-class matching fields.
+
+    ``surface_relation`` is deliberately absent from V1. A future multi-surface
+    study may reintroduce it only from preregistered per-event surface IDs, with
+    a class-blind derivation that is recomputable from receipt events.
+    """
+
+    cohort_surface: Literal["swe_coding"]
+    generator: str | None = None
+    mechanism: str | None = None
+    surface: str | None = None
 
     @model_validator(mode="after")
     def require_named_strata(self) -> "TemporalTrajectoryStrata":
-        _require_nonempty_strings(self, ("generator", "mechanism", "surface"))
+        for field_name in ("generator", "mechanism", "surface"):
+            value = getattr(self, field_name)
+            if value is not None and not value.strip():
+                raise ValueError(f"{field_name} must be non-empty when present")
         return self
+
+    def validate_for_trajectory_label(
+        self,
+        trajectory_label: Literal["attack", "benign"],
+    ) -> None:
+        """Enforce attack-required and benign-absent construction metadata."""
+
+        attack_only_fields = ("generator", "mechanism", "surface")
+        if trajectory_label == "attack":
+            for field_name in attack_only_fields:
+                if getattr(self, field_name) is None:
+                    raise ValueError(f"attack trajectory requires {field_name}")
+            return
+
+        for field_name in attack_only_fields:
+            if field_name in self.model_fields_set:
+                raise ValueError(f"benign trajectory must not include {field_name}")
+
+    @model_serializer(mode="wrap")
+    def omit_absent_attack_only_fields(self, handler: Any) -> dict[str, Any]:
+        """Serialize benign strata without invented null construction fields."""
+
+        return {key: value for key, value in handler(self).items() if value is not None}
 
 
 class TemporalConfidenceInterval(ClaimContractModel):

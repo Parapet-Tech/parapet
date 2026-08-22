@@ -101,16 +101,15 @@ def _config() -> TemporalAccumulatorConfig:
     )
 
 
-def _strata(
-    *,
-    relation: str = "within_surface",
-) -> TemporalTrajectoryStrata:
-    return TemporalTrajectoryStrata(
-        generator="fixture-generator",
-        mechanism="fixture-mechanism",
-        surface="filesystem",
-        surface_relation=relation,
-    )
+def _strata(*, attack: bool = True) -> TemporalTrajectoryStrata:
+    values: dict[str, str] = {"cohort_surface": "swe_coding"}
+    if attack:
+        values.update(
+            generator="fixture-generator",
+            mechanism="fixture-mechanism",
+            surface="filesystem",
+        )
+    return TemporalTrajectoryStrata.model_validate(values)
 
 
 def _p3_metadata(
@@ -489,7 +488,7 @@ def test_p3_receipt_emits_strata_ci_and_length_diagnostics() -> None:
             event_index=0,
             surprise=2.2,
             attack=True,
-            trajectory_strata=_strata(relation="cross_surface"),
+            trajectory_strata=_strata(),
         ),
         _event(
             "b1",
@@ -497,7 +496,7 @@ def test_p3_receipt_emits_strata_ci_and_length_diagnostics() -> None:
             event_index=0,
             surprise=0.8,
             attack=False,
-            trajectory_strata=_strata(),
+            trajectory_strata=_strata(attack=False),
         ),
         _event(
             "b2",
@@ -505,7 +504,7 @@ def test_p3_receipt_emits_strata_ci_and_length_diagnostics() -> None:
             event_index=0,
             surprise=0.7,
             attack=False,
-            trajectory_strata=_strata(relation="mixed_or_unknown"),
+            trajectory_strata=_strata(attack=False),
         ),
     ]
 
@@ -543,8 +542,17 @@ def test_p3_receipt_emits_strata_ci_and_length_diagnostics() -> None:
     assert receipt.events[0].trajectory_strata == _strata()
     assert receipt.per_trajectory_results[0].generator == "fixture-generator"
     assert {
-        result.surface_relation for result in receipt.per_trajectory_results
-    } == {"within_surface", "cross_surface", "mixed_or_unknown"}
+        result.cohort_surface for result in receipt.per_trajectory_results
+    } == {"swe_coding"}
+    benign_result_payloads = [
+        result.model_dump(mode="json")
+        for result in receipt.per_trajectory_results
+        if result.trajectory_label == "benign"
+    ]
+    assert all(
+        not {"generator", "mechanism", "surface"} & payload.keys()
+        for payload in benign_result_payloads
+    )
 
 
 def test_p3_receipt_rejects_calibration_config_drift() -> None:
@@ -563,7 +571,7 @@ def test_p3_receipt_rejects_calibration_config_drift() -> None:
             event_index=0,
             surprise=0.8,
             attack=False,
-            trajectory_strata=_strata(),
+            trajectory_strata=_strata(attack=False),
         ),
     ]
     drifted = _config().model_copy(update={"k_u_b": 1.1})
@@ -594,7 +602,7 @@ def test_p3_receipt_rejects_h_a_peak_calibration_drift() -> None:
             event_index=0,
             surprise=0.8,
             attack=False,
-            trajectory_strata=_strata(),
+            trajectory_strata=_strata(attack=False),
         ),
     ]
     drifted = _config().model_copy(update={"h_a_peak": 0.25})
@@ -625,7 +633,7 @@ def test_p3_receipt_model_rejects_tampered_claim_fields() -> None:
             event_index=0,
             surprise=0.8,
             attack=False,
-            trajectory_strata=_strata(),
+            trajectory_strata=_strata(attack=False),
         ),
     ]
     receipt = build_temporal_receipt(
@@ -668,7 +676,7 @@ def test_p3_receipt_rejects_claims_recomputed_from_tampered_results() -> None:
             event_index=0,
             surprise=0.8,
             attack=False,
-            trajectory_strata=_strata(),
+            trajectory_strata=_strata(attack=False),
         ),
     ]
     metadata = _p3_metadata()
@@ -741,7 +749,7 @@ def test_p3_receipt_rejects_scored_event_tampering() -> None:
             event_index=0,
             surprise=0.8,
             attack=False,
-            trajectory_strata=_strata(),
+            trajectory_strata=_strata(attack=False),
         ),
     ]
     receipt = build_temporal_receipt(
@@ -785,7 +793,7 @@ def test_p3_receipt_recomputes_continuity_from_event_hash_witnesses() -> None:
             event_index=0,
             surprise=0.8,
             attack=False,
-            trajectory_strata=_strata(),
+            trajectory_strata=_strata(attack=False),
         ),
     ]
     receipt = build_temporal_receipt(
@@ -822,7 +830,7 @@ def test_p3_receipt_rejects_strata_tampering_at_event_layer() -> None:
             event_index=0,
             surprise=0.8,
             attack=False,
-            trajectory_strata=_strata(),
+            trajectory_strata=_strata(attack=False),
         ),
     ]
     receipt = build_temporal_receipt(
@@ -864,7 +872,7 @@ def test_p3_receipt_validation_is_trajectory_result_order_invariant() -> None:
                 event_index=0,
                 surprise=surprise,
                 attack=False,
-                trajectory_strata=_strata(),
+                trajectory_strata=_strata(attack=False),
             )
             for index, surprise in enumerate(benign_scores)
         ],
@@ -1145,7 +1153,7 @@ def test_temporal_score_cli_writes_metadata_bound_p3_receipt(capsys) -> None:
             event_index=0,
             surprise=0.8,
             attack=False,
-            trajectory_strata=_strata(),
+            trajectory_strata=_strata(attack=False),
         ),
     ]
     events_path = tmp_path / "events.jsonl"

@@ -10,7 +10,7 @@ from pathlib import Path
 from statistics import median
 from typing import Any, Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
 
 from .temporal_claim import (
     P3CalibrationBlock,
@@ -90,6 +90,10 @@ class TemporalEvent(TemporalContractModel):
             raise ValueError("task_epoch requires task_epoch_provenance")
         if self.hard_trigger and not self.hard_trigger_source_ref:
             raise ValueError("hard triggers require hard_trigger_source_ref")
+        if self.trajectory_strata is not None:
+            self.trajectory_strata.validate_for_trajectory_label(
+                self.labels.trajectory_label
+            )
         return self
 
     def continuity_hashes(
@@ -185,14 +189,16 @@ class TemporalTrajectoryResult(TemporalContractModel):
     productive_band_fraction: float
     n_positive_b_mass_events: int
     majority_cdf_fallback: bool
+    cohort_surface: Literal["swe_coding"] | None = None
     generator: str | None = None
     mechanism: str | None = None
     surface: str | None = None
-    surface_relation: Literal[
-        "within_surface",
-        "cross_surface",
-        "mixed_or_unknown",
-    ] | None = None
+
+    @model_serializer(mode="wrap")
+    def omit_absent_attack_only_fields(self, handler: Any) -> dict[str, Any]:
+        """Keep benign P3 results free of null attack-only fields."""
+
+        return {key: value for key, value in handler(self).items() if value is not None}
 
 
 class SubstrateGateResult(TemporalContractModel):
@@ -235,6 +241,14 @@ class TemporalReceiptEvent(TemporalContractModel):
     hard_trigger_source_ref: str | None
     source_receipt_ref: str
     trajectory_strata: TemporalTrajectoryStrata | None = None
+
+    @model_validator(mode="after")
+    def validate_trajectory_strata_label(self) -> "TemporalReceiptEvent":
+        if self.trajectory_strata is not None:
+            self.trajectory_strata.validate_for_trajectory_label(
+                self.trajectory_label
+            )
+        return self
 
     @property
     def labels(self) -> TemporalLabels:
@@ -606,16 +620,18 @@ class TemporalReceipt(TemporalContractModel):
             raise ValueError("P3 receipt trajectory result IDs do not match events")
 
         for result in self.per_trajectory_results:
-            for field_name in (
-                "generator",
-                "mechanism",
-                "surface",
-                "surface_relation",
-            ):
-                if not getattr(result, field_name):
-                    raise ValueError(
-                        f"P3 trajectory {result.trajectory_id} requires {field_name}"
-                    )
+            if result.cohort_surface is None:
+                raise ValueError(
+                    f"P3 trajectory {result.trajectory_id} requires cohort_surface"
+                )
+            result_strata_payload = {"cohort_surface": result.cohort_surface}
+            for field_name in ("generator", "mechanism", "surface"):
+                if field_name in result.model_fields_set:
+                    result_strata_payload[field_name] = getattr(result, field_name)
+            result_strata = TemporalTrajectoryStrata.model_validate(
+                result_strata_payload
+            )
+            result_strata.validate_for_trajectory_label(result.trajectory_label)
         for expected_result in recomputed_results:
             if results_by_id[expected_result.trajectory_id].model_dump(mode="json") != (
                 expected_result.model_dump(mode="json")
@@ -1046,6 +1062,15 @@ def summarize_trajectories(
             else []
         )
         strata = first_event.trajectory_strata
+        result_strata: dict[str, Any] = {}
+        if strata is not None:
+            result_strata["cohort_surface"] = strata.cohort_surface
+            if first_event.labels.trajectory_label == "attack":
+                result_strata.update(
+                    generator=strata.generator,
+                    mechanism=strata.mechanism,
+                    surface=strata.surface,
+                )
 
         def longest_segment(break_field: str) -> int:
             longest = 0
@@ -1115,12 +1140,7 @@ def summarize_trajectories(
                     )
                     > len(scores) / 2
                 ),
-                generator=strata.generator if strata is not None else None,
-                mechanism=strata.mechanism if strata is not None else None,
-                surface=strata.surface if strata is not None else None,
-                surface_relation=(
-                    strata.surface_relation if strata is not None else None
-                ),
+                **result_strata,
             )
         )
     return results

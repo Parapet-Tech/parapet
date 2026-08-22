@@ -56,6 +56,14 @@ def _raw(
     task_epoch: int | str | None = None,
     task_epoch_provenance: str | None = None,
 ) -> RawEnvelopeEvent:
+    effective_labels = labels or _labels("attack", event_attack=True)
+    trajectory_strata = {"cohort_surface": "swe_coding"}
+    if effective_labels.trajectory_label == "attack":
+        trajectory_strata.update(
+            generator="fixture-generator",
+            mechanism="fixture-mechanism",
+            surface="filesystem",
+        )
     return RawEnvelopeEvent(
         trajectory_id=trajectory_id,
         cell_id=cell_id,
@@ -75,13 +83,8 @@ def _raw(
         task_epoch=task_epoch,
         task_epoch_provenance=task_epoch_provenance,
         population=population,
-        labels=labels or _labels("attack", event_attack=True),
-        trajectory_strata={
-            "generator": "fixture-generator",
-            "mechanism": "fixture-mechanism",
-            "surface": "filesystem",
-            "surface_relation": "within_surface",
-        },
+        labels=effective_labels,
+        trajectory_strata=trajectory_strata,
         source_receipt_ref="raw-envelope-receipt.json",
         provenance=RawEnvelopeProvenance(
             source_artifact_ref="raw-trace.json",
@@ -169,7 +172,14 @@ def test_assemble_preserves_order_roles_and_honest_missingness() -> None:
     assert events[0].labels.event_attack_label is True
     assert events[1].labels.event_attack_label is False
     assert events[0].trajectory_strata is not None
-    assert events[0].trajectory_strata.surface_relation == "within_surface"
+    assert events[0].trajectory_strata.cohort_surface == "swe_coding"
+    assert events[0].trajectory_strata.surface == "filesystem"
+    assert events[2].trajectory_strata is not None
+    assert events[2].trajectory_strata.cohort_surface == "swe_coding"
+    assert events[2].trajectory_strata.generator is None
+    assert events[2].trajectory_strata.model_dump(mode="json") == {
+        "cohort_surface": "swe_coding"
+    }
     assert events[2].continuity_keys == {"instruction_channel": "tool"}
     assert events[0].provenance["envelope"]["source_event_ordinal"] == 4
     assert events[0].provenance["envelope"]["event_text_sha256"] == _sha("one")
@@ -215,6 +225,44 @@ def test_benign_events_and_hard_trigger_refs_are_consistent() -> None:
                 update={"hard_trigger_source_ref": "receipt.json#trigger/0"}
             ).model_dump()
         )
+
+
+@pytest.mark.parametrize("field_name", ["generator", "mechanism", "surface"])
+def test_attack_trajectory_requires_each_attack_only_stratum(
+    field_name: str,
+) -> None:
+    payload = _raw().model_dump(mode="json")
+    del payload["trajectory_strata"][field_name]
+
+    with pytest.raises(ValidationError, match=field_name):
+        RawEnvelopeEvent.model_validate(payload)
+
+
+@pytest.mark.parametrize("field_value", [None, "fabricated-stratum"])
+@pytest.mark.parametrize("field_name", ["generator", "mechanism", "surface"])
+def test_benign_trajectory_requires_attack_only_strata_to_be_absent(
+    field_name: str,
+    field_value: str | None,
+) -> None:
+    benign = _raw(
+        trajectory_id="trajectory/benign/run.json",
+        population="benign_eval",
+        labels=_labels("benign"),
+    )
+    payload = benign.model_dump(mode="json")
+    assert payload["trajectory_strata"] == {"cohort_surface": "swe_coding"}
+
+    payload["trajectory_strata"][field_name] = field_value
+    with pytest.raises(ValidationError, match=field_name):
+        RawEnvelopeEvent.model_validate(payload)
+
+
+def test_surface_relation_is_not_a_live_p3_v1_field() -> None:
+    payload = _raw().model_dump(mode="json")
+    payload["trajectory_strata"]["surface_relation"] = "within_surface"
+
+    with pytest.raises(ValidationError, match="surface_relation"):
+        RawEnvelopeEvent.model_validate(payload)
 
 
 def test_contract_models_reject_unknown_fields() -> None:
@@ -289,7 +337,7 @@ def test_source_order_and_trajectory_drift_fail_closed() -> None:
     strata_drift = strata_drift.model_copy(
         update={
             "trajectory_strata": strata_drift.trajectory_strata.model_copy(
-                update={"surface_relation": "cross_surface"}
+                update={"mechanism": "other-mechanism"}
             )
         }
     )
