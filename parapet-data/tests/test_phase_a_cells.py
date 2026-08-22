@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import importlib.util
+import os
+import re
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -21,12 +24,47 @@ from parapet_data.phase_a_cells import (
 )
 from parapet_data.sweep import CellResult, CellSpec, FileSystemResultStore, canonical_digest
 
-RQ_PATH = Path("/_redacted_/dev/DefenseSector/parapet-l1-coverage-ru-paraphrase/implement/zh_specialist_bootstrap/production_corpus/source_qualification/run_qualification.py")
-spec = importlib.util.spec_from_file_location("phase_a_real_rq", RQ_PATH)
-assert spec and spec.loader
-rq = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(rq)
-normalized_5grams = rq.normalized_5grams
+RQ_PATH_ENV = "PARAPET_RQ_PATH"
+
+_SPACE = re.compile(r"\s+")
+
+
+def _fixture_normalized_5grams(text: str) -> set[str]:
+    t = _SPACE.sub(" ", text.lower()).strip()
+    if len(t) < 5:
+        return set()
+    return {t[i : i + 5] for i in range(len(t) - 4)}
+
+
+def _load_normalized_5grams() -> tuple[Callable[[str], set[str]], bool]:
+    # When PARAPET_RQ_PATH points at the qualification pipeline's
+    # run_qualification.py, every test in this module runs against the real
+    # normalizer and the parity test below binds the fixture stand-in to it.
+    # Without it (CI, clean checkouts) the stand-in carries the suite; the
+    # executor takes the normalizer by injection, so the wire-domain and merge
+    # behavior under test is independent of which implementation supplies it.
+    rq_path = os.environ.get(RQ_PATH_ENV)
+    if not rq_path:
+        return _fixture_normalized_5grams, False
+    spec = importlib.util.spec_from_file_location("phase_a_real_rq", rq_path)
+    assert spec and spec.loader
+    rq = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(rq)
+    return rq.normalized_5grams, True
+
+
+normalized_5grams, USING_REAL_RQ = _load_normalized_5grams()
+
+
+def test_fixture_normalizer_parity_with_real_rq() -> None:
+    if not USING_REAL_RQ:
+        pytest.skip(f"set {RQ_PATH_ENV} to run_qualification.py to bind the parity check")
+    texts = [
+        "abcdefghijklmn", "mnopqrstuvwx", "abcdefgQRSTUVW",
+        "A  b\tC\nd e f g h", "shrt", "", "  padded  text\twith\nspaces  ",
+    ]
+    for text in texts:
+        assert normalized_5grams(text) == _fixture_normalized_5grams(text), text
 
 
 def ref(row_id: str, text: str, file: str | None = "same.jsonl", **extra: object) -> dict[str, object]:
