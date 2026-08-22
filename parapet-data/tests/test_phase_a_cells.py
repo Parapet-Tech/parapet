@@ -284,6 +284,110 @@ def test_wire_rejects_duplicate_and_unsorted_arrays() -> None:
         CellPayload.model_validate({**payload, "bestj_partial": {"R1": [bestj[0], bestj[0]]}})
 
 
+@pytest.mark.parametrize("change,match", [
+    ({"containment_num": 11}, "containment_num"),
+    ({"jaccard_num": 11}, "jaccard_num"),
+    ({"jaccard_num": 4}, "must equal"),
+    ({"containment_den": 11, "jaccard_den": 10}, "containment_den"),
+    ({"containment_num": 2, "jaccard_num": 2}, "admission gate"),
+    ({"containment_num": GRAM_SET_BOUND, "jaccard_num": GRAM_SET_BOUND,
+      "containment_den": GRAM_SET_BOUND + 1, "jaccard_den": GRAM_SET_BOUND + 1}, "exceeds B"),
+    ({"jaccard_den": 2 * GRAM_SET_BOUND}, "exceeds 2B-1"),
+])
+def test_c1_wire_domain_rejects_impossible_statistics(change: dict[str, int], match: str) -> None:
+    reference = ref("forged", "abcdefghijklmn")
+    row = {"candidate_id": "c0", "reference_file": "same.jsonl", "locator": "forged",
+           "containment_num": 3, "containment_den": 10,
+           "jaccard_num": 3, "jaccard_den": 10, "reference": reference}
+    with pytest.raises(ValidationError, match=match):
+        CellPayload.model_validate({"c1_partial": [{**row, **change}], "bestj_partial": {}})
+
+
+@pytest.mark.parametrize("change,match", [
+    ({"jaccard_num": 11}, "jaccard_num"),
+    ({"jaccard_den": 2 * GRAM_SET_BOUND}, "exceeds 2B-1"),
+])
+def test_bestj_wire_domain_rejects_impossible_statistics(change: dict[str, int], match: str) -> None:
+    row = {"candidate_index": 0, "candidate_id": "c0", "jaccard_num": 3,
+           "jaccard_den": 10, "reference": ref("forged", "abcdefghijklmn")}
+    with pytest.raises(ValidationError, match=match):
+        CellPayload.model_validate({"c1_partial": [], "bestj_partial": {"R1": [{**row, **change}]}})
+
+
+@pytest.mark.parametrize("intersection,minimum,union,match", [
+    (0, 1, 1, "intersection must be at least 1"),
+    (1, 2, 2, "at least twice containment_den"),
+    (GRAM_SET_BOUND, GRAM_SET_BOUND, 2 * GRAM_SET_BOUND - 1, "larger gram set exceeds B"),
+])
+def test_c1_wire_rejects_unreachable_set_topologies(
+    intersection: int, minimum: int, union: int, match: str,
+) -> None:
+    reference = ref("unreachable", "abcdefghijklmn")
+    row = {"candidate_id": "c0", "reference_file": "same.jsonl", "locator": "unreachable",
+           "containment_num": intersection, "containment_den": minimum,
+           "jaccard_num": intersection, "jaccard_den": union, "reference": reference}
+    with pytest.raises(ValidationError, match=match):
+        CellPayload.model_validate({"c1_partial": [row], "bestj_partial": {}})
+
+
+@pytest.mark.parametrize("intersection,union,match", [
+    (GRAM_SET_BOUND, 2 * GRAM_SET_BOUND - 1, "exceeds 2B"),
+    (0, 1, "intersection must be at least 1"),
+])
+def test_bestj_wire_rejects_unreachable_set_topologies(
+    intersection: int, union: int, match: str,
+) -> None:
+    row = {"candidate_index": 0, "candidate_id": "c0", "jaccard_num": intersection,
+           "jaccard_den": union, "reference": ref("unreachable", "abcdefghijklmn")}
+    with pytest.raises(ValidationError, match=match):
+        CellPayload.model_validate({"c1_partial": [], "bestj_partial": {"R1": [row]}})
+
+
+@pytest.mark.parametrize("intersection,minimum,union", [
+    (1, 1, 1),
+    (1, 1, GRAM_SET_BOUND),
+])
+def test_c1_wire_accepts_reachability_boundaries(
+    intersection: int, minimum: int, union: int,
+) -> None:
+    reference = ref("boundary", "abcdefghijklmn")
+    row = {"candidate_id": "c0", "reference_file": "same.jsonl", "locator": "boundary",
+           "containment_num": intersection, "containment_den": minimum,
+           "jaccard_num": intersection, "jaccard_den": union, "reference": reference}
+    assert CellPayload.model_validate({"c1_partial": [row], "bestj_partial": {}}).c1_partial
+
+
+def test_bestj_wire_accepts_reachability_boundary() -> None:
+    row = {"candidate_index": 0, "candidate_id": "c0", "jaccard_num": 1,
+           "jaccard_den": 2 * GRAM_SET_BOUND - 1,
+           "reference": ref("boundary", "abcdefghijklmn")}
+    assert CellPayload.model_validate(
+        {"c1_partial": [], "bestj_partial": {"R1": [row]}},
+    ).bestj_partial["R1"]
+
+
+def test_wire_rejects_below_gate_architect_reproducer() -> None:
+    row = {"candidate_id": "c0", "reference_file": "same.jsonl", "locator": "below-gate",
+           "containment_num": 2, "containment_den": 10,
+           "jaccard_num": 2, "jaccard_den": 10,
+           "reference": ref("below-gate", "abcdefghijklmn")}
+    with pytest.raises(ValidationError, match="admission gate"):
+        CellPayload.model_validate({"c1_partial": [row], "bestj_partial": {}})
+
+
+def test_wire_rejects_forged_15_over_10_so_honest_winner_stands() -> None:
+    honest_ref, forged_ref = ref("honest", "abcdefghijklmn"), ref("forged", "abcdefghijklmn")
+    honest = {"candidate_id": "c0", "reference_file": "same.jsonl", "locator": "honest",
+              "containment_num": 10, "containment_den": 10,
+              "jaccard_num": 10, "jaccard_den": 10, "reference": honest_ref}
+    forged = {**honest, "locator": "forged", "containment_num": 15,
+              "jaccard_num": 15, "reference": forged_ref}
+    validated = CellPayload.model_validate({"c1_partial": [honest], "bestj_partial": {}})
+    assert validated.c1_partial[0].locator == "honest"
+    with pytest.raises(ValidationError, match="containment_num"):
+        CellPayload.model_validate({"c1_partial": [forged], "bestj_partial": {}})
+
+
 def test_adversarial_valid_payloads_merge_permutation_equally() -> None:
     rows = {"a": [ref("a", "abcdefghijklmn")], "b": [ref("b", "abcdefghijklmn")]}
     specs = [cell(name, records) for name, records in rows.items()]
@@ -304,10 +408,10 @@ def test_executor_detects_namespace_duplicates_even_when_not_competing() -> None
 def test_merger_detects_cross_cell_duplicate_emitted_references() -> None:
     left_ref, right_ref = ref("same", "abcdefghijklmn"), ref("same", "mnopqrstuvwx")
     left = {"c1_partial": [{"candidate_id": "c0", "reference_file": "same.jsonl", "locator": "same",
-                            "containment_num": 1, "containment_den": 2, "jaccard_num": 1, "jaccard_den": 2,
+                            "containment_num": 1, "containment_den": 2, "jaccard_num": 1, "jaccard_den": 3,
                             "reference": left_ref}], "bestj_partial": {}}
     right = {"c1_partial": [{"candidate_id": "c1", "reference_file": "same.jsonl", "locator": "same",
-                             "containment_num": 1, "containment_den": 2, "jaccard_num": 1, "jaccard_den": 2,
+                             "containment_num": 1, "containment_den": 2, "jaccard_num": 1, "jaccard_den": 3,
                              "reference": right_ref}], "bestj_partial": {}}
     cells = [cell("left", [left_ref]), cell("right", [right_ref])]
     with pytest.raises(DuplicateProjectedIdentity, match="duplicate projected c1"):
@@ -403,7 +507,7 @@ def test_merger_rejects_unknown_c1_candidate_id() -> None:
     payload = {"c1_partial": [{
         "candidate_id": "WRONG-ID", "reference_file": "same.jsonl", "locator": "r",
         "containment_num": 1, "containment_den": 2,
-        "jaccard_num": 1, "jaccard_den": 2, "reference": r,
+        "jaccard_num": 1, "jaccard_den": 3, "reference": r,
     }], "bestj_partial": {}}
     with pytest.raises(ValueError, match="not present in the pinned candidate universe"):
         merger().merge([result(c, payload)])
@@ -415,7 +519,7 @@ def test_malformed_embedded_reference_is_rejected(namespace: str, missing: str) 
     del reference[missing]
     if namespace == "c1":
         payload = {"c1_partial": [{"candidate_id": "c0", "reference_file": "same.jsonl", "locator": "r",
-                   "containment_num": 1, "containment_den": 2, "jaccard_num": 1, "jaccard_den": 2,
+                       "containment_num": 1, "containment_den": 2, "jaccard_num": 1, "jaccard_den": 3,
                    "reference": reference}], "bestj_partial": {}}
     else:
         payload = {"c1_partial": [], "bestj_partial": {"R1": [{"candidate_index": 0, "candidate_id": "c0",

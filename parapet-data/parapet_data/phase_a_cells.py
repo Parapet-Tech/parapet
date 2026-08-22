@@ -20,7 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .sweep import CellResult, CellSpec, canonical_digest, normalize_json
 
-GRAM_SET_BOUND = 2**26
+GRAM_SET_BOUND = 2**25
 FLOAT_PROBES = (
     "4503599627370497/9007199254740993==0.5",
     "3/10==0.3",
@@ -123,6 +123,30 @@ class C1Partial(_StrictModel):
     reference: dict[str, Any]
 
     @model_validator(mode="after")
+    def validate_wire_domain(self) -> "C1Partial":
+        if self.containment_num > self.containment_den:
+            raise ValueError("containment_num must not exceed containment_den")
+        if self.jaccard_num > self.jaccard_den:
+            raise ValueError("jaccard_num must not exceed jaccard_den")
+        if self.containment_num != self.jaccard_num:
+            raise ValueError("c1 containment_num must equal jaccard_num")
+        if self.containment_den > self.jaccard_den:
+            raise ValueError("c1 containment_den must not exceed jaccard_den")
+        if self.containment_num < 1:
+            raise ValueError("c1 intersection must be at least 1")
+        if self.containment_num / self.containment_den < .3:
+            raise ValueError("c1 containment score must satisfy the .3 admission gate")
+        if self.containment_den > GRAM_SET_BOUND:
+            raise ValueError(f"containment_den exceeds B={GRAM_SET_BOUND}")
+        if self.jaccard_den > 2 * GRAM_SET_BOUND - 1:
+            raise ValueError(f"jaccard_den exceeds 2B-1={2 * GRAM_SET_BOUND - 1}")
+        if self.jaccard_den + self.containment_num < 2 * self.containment_den:
+            raise ValueError("c1 union plus intersection must be at least twice containment_den")
+        if self.jaccard_den + self.containment_num - self.containment_den > GRAM_SET_BOUND:
+            raise ValueError(f"c1 larger gram set exceeds B={GRAM_SET_BOUND}")
+        return self
+
+    @model_validator(mode="after")
     def validate_reference_keys(self) -> "C1Partial":
         if "file" not in self.reference or "row_id" not in self.reference:
             raise ValueError("c1 reference requires file and row_id")
@@ -139,6 +163,18 @@ class BestJPartial(_StrictModel):
     jaccard_num: int = Field(ge=0)
     jaccard_den: int = Field(gt=0)
     reference: dict[str, Any]
+
+    @model_validator(mode="after")
+    def validate_wire_domain(self) -> "BestJPartial":
+        if self.jaccard_num > self.jaccard_den:
+            raise ValueError("jaccard_num must not exceed jaccard_den")
+        if self.jaccard_num < 1:
+            raise ValueError("bestj intersection must be at least 1")
+        if self.jaccard_den > 2 * GRAM_SET_BOUND - 1:
+            raise ValueError(f"jaccard_den exceeds 2B-1={2 * GRAM_SET_BOUND - 1}")
+        if self.jaccard_den + self.jaccard_num > 2 * GRAM_SET_BOUND:
+            raise ValueError(f"bestj union plus intersection exceeds 2B={2 * GRAM_SET_BOUND}")
+        return self
 
     @model_validator(mode="after")
     def validate_reference_keys(self) -> "BestJPartial":
@@ -239,7 +275,7 @@ def _bounded(grams: set[str], *, where: str) -> set[str]:
 
 
 def enforce_gram_bound(cardinality: int, *, where: str) -> None:
-    """Set-level bound seam used by the infeasible 2**26 fixture check."""
+    """Set-level bound seam used by the infeasible 2**25 fixture check."""
     if cardinality > GRAM_SET_BOUND:
         raise ValueError(f"{where} gram-set cardinality {cardinality} exceeds B={GRAM_SET_BOUND}")
 
