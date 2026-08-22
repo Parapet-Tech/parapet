@@ -1,6 +1,7 @@
 """CLI tests with an injected fake judge (no live model, no endpoint)."""
 import json
 
+from parapet_data.p3.detectors import score_cli
 from parapet_data.p3.detectors.interface import FAMILY_GENERATIVE_MLX, DetectorResult
 from parapet_data.p3.detectors.score_cli import main
 
@@ -92,3 +93,33 @@ def test_cli_limit_caps_scoring(tmp_path):
                "--out", str(out), "--limit", "1"], judge=judge)
     assert rc == 0 and judge.calls == 1
     assert len(out.read_text().splitlines()) == 1
+
+
+def test_cli_threads_expected_revision_flag(tmp_path, monkeypatch):
+    staged, repos = _fixture(tmp_path)
+    seen = {}
+
+    def fake_judge(**kwargs):
+        seen.update(kwargs)
+        return FakeJudge()
+
+    monkeypatch.setattr(score_cli, "MLXJudge", fake_judge)
+    rc = main(["--staged", staged, "--repos-root", repos,
+               "--out", str(tmp_path / "scores.jsonl"),
+               "--expected-revision", "flag-sha"])
+    assert rc == 0 and seen["expected_revision"] == "flag-sha"
+
+
+def test_cli_expected_revision_environment_fallback(tmp_path, monkeypatch):
+    staged, repos = _fixture(tmp_path)
+    seen = {}
+
+    def fake_judge(**kwargs):
+        seen.update(kwargs)
+        return FakeJudge()
+
+    monkeypatch.setenv("PARAPET_DGEN_EXPECTED_REVISION", "env-sha")
+    monkeypatch.setattr(score_cli, "MLXJudge", fake_judge)
+    rc = main(["--staged", staged, "--repos-root", repos,
+               "--out", str(tmp_path / "scores.jsonl")])
+    assert rc == 0 and seen["expected_revision"] == "env-sha"

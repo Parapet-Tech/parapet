@@ -1,11 +1,14 @@
 """Tests for the MLX judge: parsing, scoring, preflight check. No live model."""
+import json
+
+from parapet_data.p3.detectors import mlx_judge
 from parapet_data.p3.detectors.interface import EventContext
 from parapet_data.p3.detectors.mlx_judge import (
     DEFAULT_MODEL_ID,
     MLXJudge,
     build_user_prompt,
     parse_judge_output,
-    served_model_ok,
+    model_cached_ok,
 )
 
 REPO = "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit"
@@ -88,11 +91,58 @@ def test_score_passes_messages_with_system_and_user():
 
 # --- preflight ---
 
-def test_served_model_ok():
-    ok, _ = served_model_ok({"data": [{"id": REPO}]}, REPO)
+def test_model_cached_ok_positive_and_negative():
+    ok, _ = model_cached_ok({"data": [{"id": REPO}]}, REPO)
     assert ok
-    bad, msg = served_model_ok({"data": [{"id": "other"}]}, REPO)
-    assert not bad and "mismatch" in msg
+    bad, msg = model_cached_ok({"data": [{"id": "other"}]}, REPO)
+    assert not bad and msg.startswith("model not cached:")
+
+
+class _ModelsResponse:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return None
+
+    def read(self):
+        return json.dumps({"data": [{"id": REPO}]}).encode()
+
+
+def test_preflight_fails_when_served_revision_absent_despite_cached_model(monkeypatch):
+    monkeypatch.setattr(mlx_judge, "urlopen", lambda *args, **kwargs: _ModelsResponse())
+    judge = MLXJudge(expected_revision="expected-sha", served_revision_fn=lambda: None)
+    ok, msg = judge.preflight()
+    assert not ok and msg.startswith("dgen_revision_unavailable:")
+
+
+def test_preflight_fails_when_served_revision_mismatches_despite_cached_model(monkeypatch):
+    monkeypatch.setattr(mlx_judge, "urlopen", lambda *args, **kwargs: _ModelsResponse())
+    judge = MLXJudge(expected_revision="expected-sha", served_revision_fn=lambda: "other-sha")
+    ok, msg = judge.preflight()
+    assert not ok and msg == "dgen_revision_mismatch:expected=expected-sha:served=other-sha"
+
+
+def test_preflight_fails_when_expected_revision_unset(monkeypatch):
+    monkeypatch.setattr(mlx_judge, "urlopen", lambda *args, **kwargs: _ModelsResponse())
+    ok, msg = MLXJudge(served_revision_fn=lambda: "served-sha").preflight()
+    assert not ok and msg.startswith("dgen_expected_revision_unset:")
+
+
+def test_preflight_happy_path_returns_revision(monkeypatch):
+    monkeypatch.setattr(mlx_judge, "urlopen", lambda *args, **kwargs: _ModelsResponse())
+    ok, msg = MLXJudge(
+        expected_revision="same-sha", served_revision_fn=lambda: "same-sha"
+    ).preflight()
+    assert ok and msg == "same-sha"
+
+
+def test_served_revision_environment_is_read_at_preflight_time(monkeypatch):
+    monkeypatch.setattr(mlx_judge, "urlopen", lambda *args, **kwargs: _ModelsResponse())
+    monkeypatch.delenv(mlx_judge.DGEN_SERVED_REVISION_ENV, raising=False)
+    judge = MLXJudge(expected_revision="late-sha")
+    monkeypatch.setenv(mlx_judge.DGEN_SERVED_REVISION_ENV, "late-sha")
+    assert judge.preflight() == (True, "late-sha")
 
 
 def test_build_prompt_function_is_context_not_scored():
