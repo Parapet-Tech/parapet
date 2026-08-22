@@ -45,15 +45,22 @@ Pass 3:
 
 ## Modes
 
-1. `block`: return `403` on first blocking verdict.
+1. `block`: record the first blocking verdict, continue running later configured
+   inbound layers for signal collection, then return `403` before the upstream
+   model call. The first blocker wins.
 2. `shadow`: log would-block events, do not block.
 
-## Eval snapshot (L3-only baseline)
+## Historical eval snapshot (L3-only baseline)
 
-From `implement/v3/baseline_evals.md`:
+These figures were introduced with the original strategy overview on
+2026-02-17. The cited supporting file is not present in the current public
+tree, so they are preserved only as an undated historical snapshot, not as a
+current implementation contract or reproducible evaluation claim:
 
 1. Precision: `99.2%`
 2. Recall: `14.1%`
 3. FP rate: `0.11%`
 
-This is expected behavior for a high-precision regex layer. `L1`, optional `L2a`, and `L4` provide additional coverage.
+They describe the intended high-precision, lower-recall role of the regex
+layer. Current performance claims require a dated, reproducible evaluation
+artifact.

@@ -2,7 +2,7 @@
 
 Date: 2026-06-27
 Owner: routing
-Status: accepted and implemented
+Status: closed (accepted and implemented)
 
 ## Goal
 
@@ -11,19 +11,26 @@ changing enforcement behavior. The first slice should make
 `removed_invisible_count` observable to routing consumers while preserving the
 current L0 sanitize semantics, including trust-span remapping.
 
-## Current State
+## Implemented State
 
 - `routing::L0Evidence` already exists and is deliberately content-free:
   numeric and boolean fields only, no offsets, tokens, ranges, or policy labels.
-- `RoutingEvidenceContext::new` accepts `l0: Option<&[L0Evidence]>`, but
-  `engine::process_request` currently passes `None`.
+- `engine::process_request` collects per-message evidence during L0 sanitize,
+  merges role-marker neutralization counts, and passes `Some(&l0_evidence)` to
+  `RoutingEvidenceContext::new`. Non-sanitize and absent-L0 paths pass `None`.
 - `L0Normalizer::normalize` already performs:
   `NFKC -> strip_html -> remove_invisible_chars -> replace_mixed_script_confusables`.
+- `normalize_with_evidence` and the span-preserving message helper reuse that
+  stage order while keeping the ordinary normalization path free of evidence
+  work.
 - The recent Default_Ignorable work extended `is_invisible`; those display-path
   removals must count the same way as the older invisible set.
 - `normalize_for_comparison` has an additional comparison-only strip for
   `U+034F`, `U+17B4`, and `U+17B5`; it emits no evidence and is not part of this
   slice.
+
+The sections below preserve the accepted implementation contract and review
+record. They are historical specification text, not an open work plan.
 
 ## Contract
 

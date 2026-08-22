@@ -32,4 +32,7 @@ Each match is redacted and logged with pattern and position metadata.
 ## Notes
 
 1. `mode: redact` enables redaction; other mode values effectively disable L5a behavior.
-2. Streaming responses with compressed chunk encodings can reduce boundary visibility for cross-chunk matches.
+2. Streaming L5a redaction is skipped entirely when the upstream SSE response
+   uses gzip or deflate content encoding. The engine requests identity encoding
+   and records a warning and skip counter when an upstream still returns a
+   compressed stream.

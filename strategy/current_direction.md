@@ -13,7 +13,9 @@ importing local experiment artifacts into canonical docs.
   n-gram SVM still implemented under legacy `L1` names.
 - `L3` is the orthogonal sensor/router layer. It is sensor-first, deterministic,
   and returns only `allow` or `block`.
-- There is no specialist/escalation branch in the current target architecture.
+- There is no separate specialist/escalation layer in the current target
+  architecture. L1-internal specialist weight tables remain an implementation
+  option inside the lexical-classifier layer.
 - Legacy `L2a` / Prompt Guard style payload analysis is not the strategic path.
 
 ## What Recent Research Established
