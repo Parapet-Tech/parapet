@@ -5,12 +5,13 @@ per-event surface_signal by asking the locally-served MLX model to rate how stro
 tool call's ARGUMENT VALUES read as a control-plane move.
 
 This module NEVER starts or stops a server. It requires a model already served at the
-endpoint; callers must preflight (see MLXJudge.preflight, mirrors
-scripts/verify-served-model). HTTP via stdlib urllib: no new dependencies.
+endpoint; callers must preflight (see MLXJudge.preflight for the launch-attestation
+contract). HTTP via stdlib urllib: no new dependencies.
 """
 from __future__ import annotations
 
 import json
+import os
 import re
 from typing import Callable, Optional
 from urllib.error import URLError
@@ -28,6 +29,7 @@ DEFAULT_BASE_URL = "http://127.0.0.1:8080/v1"
 DEFAULT_MODEL_REPO = "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit"
 DEFAULT_MODEL_ID = "qwen3-30b-a3b-2507-mlx-4bit"
 DETECTOR_ID = "dgen_mlx_judge"
+DGEN_SERVED_REVISION_ENV = "PARAPET_DGEN_SERVED_REVISION"
 
 SYSTEM_PROMPT = (
     "You are a security signal rater for a single event in an agent tool-use trace. "
@@ -45,12 +47,12 @@ CompleteFn = Callable[[list], str]
 _NUM_RE = re.compile(r"-?\d+(?:\.\d+)?")
 
 
-def served_model_ok(models_payload: dict, expected_repo: str) -> tuple[bool, str]:
-    """Pure check that a /v1/models payload lists expected_repo."""
+def model_cached_ok(models_payload: dict, expected_repo: str) -> tuple[bool, str]:
+    """Pure check that a /v1/models cache payload lists expected_repo."""
     served = [i.get("id") for i in models_payload.get("data", []) if isinstance(i, dict)]
     if expected_repo in served:
         return True, expected_repo
-    return False, f"served model mismatch: expected {expected_repo}; got {served}"
+    return False, f"model not cached: expected {expected_repo}; got {served}"
 
 
 def build_user_prompt(event_text: str, context: Optional[EventContext]) -> str:
@@ -128,25 +130,47 @@ class MLXJudge:
         model_repo: str = DEFAULT_MODEL_REPO,
         model_id: str = DEFAULT_MODEL_ID,
         complete_fn: Optional[CompleteFn] = None,
+        expected_revision: Optional[str] = None,
+        served_revision_fn: Optional[Callable[[], Optional[str]]] = None,
         max_tokens: int = 256,
         timeout: float = 60.0,
     ):
         self.base_url = base_url.rstrip("/")
         self.model_repo = model_repo
         self.model_id = model_id
+        self.expected_revision = expected_revision
+        self._served_revision = served_revision_fn or (
+            lambda: os.environ.get(DGEN_SERVED_REVISION_ENV)
+        )
         self.max_tokens = max_tokens
         self.timeout = timeout
         self._complete = complete_fn or self._http_complete
 
     def preflight(self) -> tuple[bool, str]:
-        """Assert the expected model is already served (does NOT start a server)."""
+        """Verify endpoint reachability, cached repo, and launch-time attestation.
+
+        Success proves that the launcher's served-revision attestation matches this
+        judge's expectation. It does not observe or independently verify loaded weights.
+        """
         url = f"{self.base_url}/models"
         try:
             with urlopen(url, timeout=self.timeout) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
-        except (OSError, URLError, json.JSONDecodeError) as exc:
+            if not isinstance(payload, dict):
+                raise ValueError("models payload is not an object")
+        except (OSError, URLError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
             return False, f"could not read {url}: {exc}"
-        return served_model_ok(payload, self.model_repo)
+        cached, msg = model_cached_ok(payload, self.model_repo)
+        if not cached:
+            return False, msg
+        served = self._served_revision()
+        if not served:
+            return False, f"dgen_revision_unavailable:set {DGEN_SERVED_REVISION_ENV} to the served snapshot commit"
+        if self.expected_revision is None:
+            return False, "dgen_expected_revision_unset:set an expected served snapshot commit"
+        if served != self.expected_revision:
+            return False, f"dgen_revision_mismatch:expected={self.expected_revision}:served={served}"
+        return True, self.expected_revision
 
     def _http_complete(self, messages: list) -> str:
         body = json.dumps({

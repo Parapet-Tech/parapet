@@ -83,6 +83,7 @@ def main(argv: Optional[list] = None, judge: Optional[Detector] = None) -> int:
     ap.add_argument("--base-url", default=DEFAULT_BASE_URL)
     ap.add_argument("--model-repo", default=DEFAULT_MODEL_REPO)
     ap.add_argument("--model-id", default=DEFAULT_MODEL_ID)
+    ap.add_argument("--expected-revision", default=os.environ.get("PARAPET_DGEN_EXPECTED_REVISION"))
     args = ap.parse_args(argv)
 
     staged = args.staged or carrier_schemas.default_staged_out()
@@ -98,12 +99,13 @@ def main(argv: Optional[list] = None, judge: Optional[Detector] = None) -> int:
 
     judge = judge or MLXJudge(
         base_url=args.base_url, model_repo=args.model_repo, model_id=args.model_id,
+        expected_revision=args.expected_revision,
     )
 
     ok, msg = judge.preflight()
     if not ok:
         print(f"preflight failed: {msg}", file=sys.stderr)
-        print("serve the model first (in the local-llm repo): "
+        print("serve the model with served-revision attestation first (in the local-llm repo): "
               "scripts/serve-model qwen3-30b-a3b-2507-mlx-4bit && "
               "scripts/verify-served-model qwen3-30b-a3b-2507-mlx-4bit", file=sys.stderr)
         return 2
