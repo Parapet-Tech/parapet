@@ -103,3 +103,5 @@ adjudication
 models
 # L2 parity test fixtures (regenerable via scripts/prep_l2_assets.py)
 tests/fixtures/
+# Local hygiene blocklist (real identifying strings; never commit)
+.hygiene-blocklist.local

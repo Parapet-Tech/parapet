@@ -402,3 +402,26 @@ Before writing ANY fix, ask:
 1. Why does this problem exist?
 2. Is there code that should be deleted instead of code to add?
 3. Am I fixing a symptom or the root cause?
+
+## Public Identity Policy (mechanical, enforced)
+
+- Every commit and tag is authored, committed, and tagged as exactly
+  `some one <someone@example.com>`. No other identity, ever. The repo-local
+  git config pins this; do not override it.
+- Commit messages carry no tool trailers, no session URLs, and no
+  Co-Authored-By lines.
+- Merges happen only via `scripts/merge_pr_local.sh` from the publisher
+  clone. The GitHub web-UI merge button and `gh pr merge` are forbidden:
+  server-side merges are committed by GitHub's noreply identity. External
+  PRs are squash-landed under the anonymous identity; external contributor
+  identities are intentionally not preserved.
+- `scripts/check_public_hygiene.py` enforces identity, message, path, and
+  content hygiene at commit granularity, including binary blobs.
+  `.githooks/pre-push` runs it on every push (activate once per clone:
+  `git config core.hooksPath .githooks`). The Identity Guard workflow is
+  the CI tripwire behind the hook, set as a required status check.
+- Real identifying strings live only in a gitignored
+  `.hygiene-blocklist.local` and must never appear in tracked content or
+  in the checker source.
+- Absolute home-directory paths in any OS form never enter tracked
+  content; use fixture forms such as `C:/Users/example/` or `/home/user/`.

@@ -1,0 +1,31 @@
+name: Identity Guard
+
+permissions:
+  contents: read
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  hygiene:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 0
+          # On pull_request the default checkout is the SYNTHETIC merge
+          # commit refs/pull/<n>/merge, committed by GitHub noreply; checking
+          # that would fail every clean PR. Check out the PR HEAD instead.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Check commit identity and message hygiene
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch -q origin "${{ github.base_ref }}"
+            RANGE="origin/${{ github.base_ref }}..${{ github.event.pull_request.head.sha }}"
+          elif [ "${{ github.event.before }}" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "${{ github.event.before }}" 2>/dev/null; then
+            RANGE="--all"
+          else
+            RANGE="${{ github.event.before }}..${{ github.sha }}"
+          fi
+          python3 scripts/check_public_hygiene.py $RANGE
