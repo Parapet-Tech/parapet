@@ -10,7 +10,11 @@ status must be explicit.
 |-------|---------|-------------|
 | `real-corpus` | The sensor fires on tracked or reviewable corpus rows and has measured positives and negatives. | Eligible for precision/recall claims on that corpus. |
 | `synthetic-regression` | The sensor is covered only by hand-built fixtures or simulations. | Eligible for deterministic behavior checks, but not corpus precision/recall claims. |
-| `runtime-hypothesis` | The sensor targets traffic shapes expected at runtime but absent from current public corpora. | May ship if cheap and precision-first, but reports must say corpus validation is unmeasured. |
+| `runtime-hypothesis` | The sensor targets traffic shapes expected at runtime but absent from current public corpora. | May be emitted by offline scope-audit tooling if cheap and precision-first, but reports must say corpus validation is unmeasured. |
+
+Here, shipping an observation sensor means including it in offline
+`parapet-data scope-audit` output. No observation sensor currently affects a
+runtime verdict.
 
 ## Reporting Rules
 
@@ -18,13 +22,16 @@ status must be explicit.
   contain the detector's target pattern.
 - Synthetic fixtures prove implementation mechanics only. They do not establish
   prevalence, precision, or recall in real data.
-- If a detector ships with `synthetic-regression` or `runtime-hypothesis`
+- If a detector is emitted with `synthetic-regression` or `runtime-hypothesis`
   coverage, the audit summary must say so directly.
 - Promotion from `runtime-hypothesis` to `real-corpus` requires at least one
   reviewable positive pattern source and one reviewable benign hard-negative
   source.
 
 ## Current Application
+
+The following corpus and runtime checks were re-measured at Parapet commit
+`88fd3e8`.
 
 The mechanical blob `escape_sequence_blob` rule targets dense literal escape
 text such as `\uXXXX` and `\xNN`. A scan of the tracked public schema and
