@@ -195,6 +195,14 @@ def test_eligibility_fails_closed_on_bad_inputs():
         pick_carrier([_carrier("x", n_tool_calls="40")], h_c=6)
     with pytest.raises(TypeError):
         pick_carrier([_carrier("x", n_live_positions=True)], h_c=6)
+    # A shallow row with a bad live count still raises, even beside a valid carrier.
+    shallow_no_live = {"out_path": "s", "n_tool_calls": 17}
+    with pytest.raises(KeyError):
+        pick_carrier([shallow_no_live, _carrier("ok")], h_c=6)
+    with pytest.raises(TypeError):
+        pick_carrier([_carrier("s", n_tool_calls=17, n_live_positions=None), _carrier("ok")], h_c=6)
+    with pytest.raises(TypeError):
+        eligible_carriers([_carrier("s", n_tool_calls=17, n_live_positions="30")], h_c=6)
     with pytest.raises(ValueError, match="h_min"):
         pick_carrier([_carrier("x")], h_c=5)
     with pytest.raises(TypeError):

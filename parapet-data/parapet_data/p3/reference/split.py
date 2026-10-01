@@ -152,10 +152,9 @@ def eligible_carriers(
     if h_min < 1 or h_c < h_min:
         raise ValueError(f"need 1 <= h_min <= h_c, got h_min={h_min}, h_c={h_c}")
     floor = NATIVE_EVENTS_PER_HARMFUL * h_min
-    return tuple(
-        r for r in rows
-        if _count(r, NATIVE_EVENTS_FIELD) >= floor and _count(r, LIVE_POSITIONS_FIELD) >= h_c
-    )
+    # Read both counts on every row before judging any: a bad count must raise, not hide behind a failed floor.
+    counts = [(r, _count(r, NATIVE_EVENTS_FIELD), _count(r, LIVE_POSITIONS_FIELD)) for r in rows]
+    return tuple(r for r, native, live in counts if native >= floor and live >= h_c)
 
 
 def pick_carrier(
