@@ -11,6 +11,7 @@ Everything here is key-level: no trajectory text is read.
 from __future__ import annotations
 
 import hashlib
+import unicodedata
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -25,6 +26,12 @@ A5_REGRESSION_KEY = "agentdojo|banking|user_task_1"
 A5_REGRESSION_BUCKET = 854
 
 FLOOR_SAMPLE_SALT = "p3-reference-floor/1"
+
+# Carrier eligibility at event grain: a carrier must have room to bury the harmful budget.
+H_MIN = 6
+NATIVE_EVENTS_PER_HARMFUL = 3
+NATIVE_EVENTS_FIELD = "n_tool_calls"
+LIVE_POSITIONS_FIELD = "n_live_positions"
 SWE_SCAFFOLDS = frozenset({"openhands", "swe-agent"})
 
 
@@ -36,9 +43,14 @@ class SideAssigner(Protocol):
     def is_held_out(self, key: str) -> bool: ...
 
 
+def canonical_key(key: str) -> str:
+    """NFC(casefold(key)): spellings of one repo that differ in case or composition share a side."""
+    return unicodedata.normalize("NFC", key.casefold())
+
+
 @dataclass(frozen=True)
 class SaltedBucketSplit:
-    """HELD-OUT iff int(sha256(salt + '|' + key)[:8 hex], 16) % 1000 < held_out_milli."""
+    """HELD-OUT iff int(sha256(salt + '|' + canonical_key(key))[:8 hex], 16) % 1000 < held_out_milli."""
 
     salt: str
     held_out_milli: int
@@ -52,7 +64,7 @@ class SaltedBucketSplit:
             raise ValueError(f"held_out_milli must be in (0, {BUCKET_MODULUS})")
 
     def bucket(self, key: str) -> int:
-        digest = hashlib.sha256((self.salt + "|" + key).encode()).hexdigest()
+        digest = hashlib.sha256((self.salt + "|" + canonical_key(key)).encode()).hexdigest()
         return int(digest[:8], 16) % BUCKET_MODULUS
 
     def is_held_out(self, key: str) -> bool:
@@ -118,11 +130,46 @@ def salted_path_order_key(out_path: str, salt: str = FLOOR_SAMPLE_SALT) -> str:
     return hashlib.sha256((salt + "|" + out_path.casefold()).encode()).hexdigest()
 
 
-def pick_carrier(rows: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
-    """The carrier that represents a cell: least sha256(out_path), ties broken by the path bytes."""
+def _count(row: Mapping[str, Any], field: str) -> int:
+    value = row[field]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{field} must be an int, got {value!r} for {row.get('out_path')!r}")
+    return value
+
+
+def eligible_carriers(
+    rows: Sequence[Mapping[str, Any]], *, h_c: int, h_min: int = H_MIN,
+) -> tuple[Mapping[str, Any], ...]:
+    """Carriers deep enough for the cell's harmful budget ``h_c``.
+
+    Eligible iff native events >= 3 * h_min and live positions >= h_c. The floor is a
+    fixed threshold, not a preference, so the pick that follows stays depth-blind.
+    An ungrafted cell has no budget of its own and passes ``h_c = h_min``.
+    A row missing either count raises KeyError.
+    """
+    if isinstance(h_c, bool) or not isinstance(h_c, int) or isinstance(h_min, bool) or not isinstance(h_min, int):
+        raise TypeError("h_c and h_min must be ints")
+    if h_min < 1 or h_c < h_min:
+        raise ValueError(f"need 1 <= h_min <= h_c, got h_min={h_min}, h_c={h_c}")
+    floor = NATIVE_EVENTS_PER_HARMFUL * h_min
+    return tuple(
+        r for r in rows
+        if _count(r, NATIVE_EVENTS_FIELD) >= floor and _count(r, LIVE_POSITIONS_FIELD) >= h_c
+    )
+
+
+def pick_carrier(
+    rows: Sequence[Mapping[str, Any]], *, h_c: int, h_min: int = H_MIN,
+) -> Mapping[str, Any]:
+    """The carrier that represents a cell: least sha256(out_path) among the ELIGIBLE
+    carriers, ties broken by the path bytes. No eligible carrier is an error, never a fallback."""
     if not rows:
         raise ValueError("no carrier to pick from")
     paths = [r["out_path"] for r in rows]
     if len(paths) != len(set(paths)):
         raise ValueError("duplicate out_path among cell carriers")
-    return min(rows, key=lambda r: (hashlib.sha256(r["out_path"].encode()).digest(), r["out_path"].encode()))
+    eligible = eligible_carriers(rows, h_c=h_c, h_min=h_min)
+    if not eligible:
+        raise ValueError(f"no eligible carrier among {len(rows)}: need {NATIVE_EVENTS_FIELD} >= "
+                         f"{NATIVE_EVENTS_PER_HARMFUL * h_min} and {LIVE_POSITIONS_FIELD} >= {h_c}")
+    return min(eligible, key=lambda r: (hashlib.sha256(r["out_path"].encode()).digest(), r["out_path"].encode()))
