@@ -22,7 +22,7 @@ use std::io::Read as _;
 use crate::config::{Config, FailureMode, L2aMode, PatternAction};
 use crate::constraint::{ConstraintEvaluator, DslConstraintEvaluator, ToolCallVerdict};
 use crate::layers::l1::{EnsembleL1Scanner, L1Scanner, L1Verdict, L1Block, SvmModel};
-use crate::layers::l1_harness::{L1Harness, L1Model, L1Signal, MENTION_RAW_DELTA_THRESHOLD};
+use crate::layers::l1_harness::{L1Harness, L1Model, L1Signal, threshold_outcome, OutcomeView};
 use crate::layers::l2a::L2aScanner;
 use crate::layers::l3_inbound::{DefaultInboundScanner, InboundScanner, InboundVerdict};
 use crate::config::L4Mode;
@@ -367,10 +367,10 @@ impl UpstreamClient for EngineUpstreamClient {
                     // on the holdout set).
                     let verdict = signals.iter()
                         .find_map(|s| {
-                            let eff = effective_raw(s);
-                            if eff >= l1_config.threshold {
-                                let mention = s.quote_detected
-                                    && s.raw_score_delta > MENTION_RAW_DELTA_THRESHOLD;
+                            let outcome = threshold_outcome(s, l1_config.threshold);
+                            let eff = outcome.effective_raw;
+                            if outcome.threshold_breached {
+                                let mention = outcome.outcome_view == OutcomeView::Unquoted;
                                 let score_label = if mention { "unquoted_score" } else { "score" };
                                 Some(L1Verdict::Block(L1Block {
                                     reason: format!(
@@ -1678,14 +1678,6 @@ fn attach_l1_signal_headers(headers: &mut HeaderMap, signals: &Option<Vec<L1Sign
             headers.insert("x-parapet-l1-signals", v);
         }
     }
-}
-
-/// Compute the effective raw score for an L1Signal, matching verdict derivation logic.
-/// Mention-dampened signals use raw_unquoted_score; all others use raw_score.
-fn effective_raw(s: &L1Signal) -> f64 {
-    let mention = s.quote_detected
-        && s.raw_score_delta > MENTION_RAW_DELTA_THRESHOLD;
-    if mention { s.raw_unquoted_score } else { s.raw_score }
 }
 
 /// Emits both the fused score (what the threshold applies to) and the raw

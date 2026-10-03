@@ -5,6 +5,7 @@
 
 pub mod l1;
 pub mod l1_harness;
+pub mod l1_detection;
 pub mod l2a;
 pub mod l2a_model;
 pub mod l2_semantic;
