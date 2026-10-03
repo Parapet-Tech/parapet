@@ -15,7 +15,7 @@
 // l1_weights.rs (phf_map). Updates ship as new binary releases.
 
 #[path = "l1_weights.rs"]
-mod l1_weights;
+pub(crate) mod l1_weights;
 
 #[path = "l1_weights_roleplay_jailbreak.rs"]
 mod l1_weights_roleplay_jailbreak;
@@ -271,6 +271,43 @@ pub fn score_text(text: &str) -> f64 {
 pub struct SvmModel;
 
 impl L1Model for SvmModel {
+    fn score_attributed(&self, text: &str) -> crate::layers::l1_harness::Attributed {
+        use crate::layers::l1_harness::{Attributed, AttributedFeature};
+        let lower: Vec<char> = text.to_lowercase().chars().collect();
+        let mut matches: HashMap<String, AttributedFeature> = HashMap::new();
+        let mut start = 0;
+        while start < lower.len() {
+            if lower[start].is_whitespace() { start += 1; continue; }
+            let mut end = start;
+            while end < lower.len() && !lower[end].is_whitespace() { end += 1; }
+            let mut padded = vec![' '];
+            padded.extend_from_slice(&lower[start..end]);
+            padded.push(' ');
+            for n in 3..=5 {
+                let width = n.min(padded.len());
+                for offset in 0..=padded.len()-width {
+                    let feature: String = padded[offset..offset+width].iter().collect();
+                    if let Some(&weight) = l1_weights::WEIGHTS.get(feature.as_str()) {
+                        let span = [start + offset.saturating_sub(1),
+                            start + (offset + width - 1).min(end - start)];
+                        let entry = matches.entry(feature.clone()).or_insert_with(|| AttributedFeature {
+                            feature, weight, contribution: weight, occurrences: 0, spans: Vec::new(),
+                        });
+                        if !entry.spans.contains(&span) { entry.spans.push(span); }
+                    }
+                }
+            }
+            start = end;
+        }
+        let mut features: Vec<_> = matches.into_values().collect();
+        for feature in &mut features {
+            feature.spans.sort_unstable();
+            feature.occurrences = feature.spans.len();
+        }
+        crate::layers::l1_detection::order_features(&mut features);
+        Attributed { margin: self.score(text), features: Some(features) }
+    }
+
     fn score(&self, text: &str) -> f64 {
         score_text(text)
     }

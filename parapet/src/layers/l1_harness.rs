@@ -41,8 +41,55 @@ pub trait L1Model: Send + Sync {
     /// Score a text fragment. Returns raw, unbounded margin.
     fn score(&self, text: &str) -> f64;
 
+    /// Optional attribution surface; absence differs from an empty match set.
+    fn score_attributed(&self, text: &str) -> Attributed {
+        Attributed { margin: self.score(text), features: None }
+    }
+
     /// Calibration parameters for this model's score distribution.
     fn calibration(&self) -> CalibrationParams;
+}
+
+/// A model margin and, when supported, all distinct matched features.
+#[derive(Debug, Clone)]
+pub struct Attributed {
+    pub margin: f64,
+    pub features: Option<Vec<AttributedFeature>>,
+}
+
+/// One binary feature, with distinct lowercased-view scalar spans.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AttributedFeature {
+    pub feature: String,
+    pub weight: f64,
+    pub contribution: f64,
+    pub occurrences: usize,
+    pub spans: Vec<[usize; 2]>,
+}
+
+/// View selected by the shared raw-margin threshold rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutcomeView { Raw, Unquoted, Squashed }
+
+/// Evidence from threshold comparison, independent of policy or action.
+#[derive(Debug, Clone, Copy)]
+pub struct ThresholdOutcome {
+    pub outcome_view: OutcomeView,
+    pub effective_raw: f64,
+    pub threshold_breached: bool,
+}
+
+/// The engine and detection-record entry point share this exact rule.
+pub fn threshold_outcome(signal: &L1Signal, threshold: f64) -> ThresholdOutcome {
+    let mention = signal.quote_detected
+        && signal.raw_score_delta > MENTION_RAW_DELTA_THRESHOLD;
+    let effective_raw = if mention { signal.raw_unquoted_score } else { signal.raw_score };
+    ThresholdOutcome {
+        outcome_view: if mention { OutcomeView::Unquoted } else { OutcomeView::Raw },
+        effective_raw,
+        threshold_breached: effective_raw >= threshold,
+    }
 }
 
 // ---------------------------------------------------------------------------
