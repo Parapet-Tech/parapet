@@ -17,6 +17,7 @@ from parapet_data.p3.reference.backstop import (
     merge_nearest,
     name_component,
     name_twin_exclusion,
+    nearest_jaccard,
     nearest_rank_quantile,
     nearest_scan,
     null_sample,
@@ -163,9 +164,19 @@ def test_scan_fires_on_a_trajectory_shift():
     assert best[0].out_path == "b/pos" and best[0].jaccard >= THRESHOLD
 
 
-def test_scan_does_not_find_an_argument_shift():
+def test_zero_overlap_query_has_no_nearest_carrier_and_scores_zero():
+    # Every eligible carrier is at Jaccard 0.0, so none is nearer than another and none is
+    # named; the statistic itself is 0.0 (representation note 2026-10-03).
     best, _ = _scan([("b/shift", "b")])
     assert 0 not in best
+    assert nearest_jaccard(best, 0) == 0.0
+    assert fires(nearest_jaccard(best, 0)) == {"0.30": False, "0.50": False, "0.70": False}
+
+
+def test_nearest_jaccard_reads_a_found_carrier():
+    best, _ = _scan([("b/pos", "b")])
+    assert nearest_jaccard(best, 0) == best[0].jaccard == 17 / 19
+    assert nearest_jaccard({}, 5) == 0.0
 
 
 def test_scan_skips_candidates_in_the_query_repo():
@@ -201,7 +212,9 @@ def test_chunked_scan_merges_to_the_single_pass_result():
         merge_nearest(merged, part)
         merged_hits |= hits
     assert merged == whole and merged_hits == whole_hits
-    assert 1 not in whole
+    # The zero-overlap query is absent from both, and reads as 0.0 from both.
+    assert 1 not in whole and 1 not in merged
+    assert nearest_jaccard(whole, 1) == nearest_jaccard(merged, 1) == 0.0
 
 
 def test_scan_fails_closed_when_the_loader_cannot_read_a_carrier():

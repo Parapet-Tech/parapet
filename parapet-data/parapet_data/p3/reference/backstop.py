@@ -165,8 +165,10 @@ def scan_chunk(
 
     Returns the nearest build carrier per query id, and which of ``exact_events`` occur
     verbatim in the chunk. A carrier in the query's own repo is never a candidate. A query
-    that shares no shingle with any candidate has no entry. Chunks can be scanned in any
-    order or in parallel and folded with ``merge_nearest``.
+    that shares no shingle with any candidate has no entry: its Jaccard against every
+    candidate is 0.0 and no carrier is nearer than any other, so none is named (read it
+    with ``nearest_jaccard``). Chunks can be scanned in any order or in parallel and
+    folded with ``merge_nearest``.
     """
     best: dict[int, Nearest] = {}
     hits: set[bytes] = set()
@@ -210,6 +212,18 @@ def nearest_scan(
 ) -> tuple[dict[int, Nearest], set[bytes]]:
     """Single-process scan of the whole build set. Same result as chunked scans merged."""
     return scan_chunk(index, build, load_event_hashes, exact_events)
+
+
+def nearest_jaccard(best: Mapping[int, Nearest], query_id: int) -> float:
+    """A query's nearest-carrier Jaccard after a scan: 0.0 when it has no entry.
+
+    No entry means no eligible carrier shared a shingle, so the statistic is 0.0 and the
+    nearest path, repo and event count are null in the reported row. A query with no
+    shingles of its own also has no entry; that case is undefined, not 0.0, and the
+    caller tells the two apart from the query's own shingle set before asking here.
+    """
+    nearest = best.get(query_id)
+    return nearest.jaccard if nearest is not None else 0.0
 
 
 # ---------------------------------------------------------------- verdicts and null
