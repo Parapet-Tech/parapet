@@ -990,3 +990,405 @@ fn receipt_decision_enum_vocabulary() {
         assert_eq!(serde_json::from_str::<DecisionReason>(literal).unwrap(), variant);
     }
 }
+
+// Pure function fixture expectations are supplied independently of production code.
+fn a2_cases() -> Value {
+    serde_json::from_slice(include_bytes!("fixtures/receipt_v0/a2_function_cases.json")).unwrap()
+}
+
+fn a2_method_case(case: &Value) {
+    let proposal: Proposal = serde_json::from_value(case["proposal"].clone()).unwrap();
+    let attempt: Attempt = serde_json::from_value(case["attempt"].clone()).unwrap();
+    let observation: Observation = serde_json::from_value(case["observation"].clone()).unwrap();
+    let result = verify_expected_effect(&proposal, &attempt, &observation);
+    if case["expected"].is_null() {
+        assert_eq!(result, None, "{}", case["id"]);
+    } else {
+        let expected = &case["expected"];
+        let result = result.unwrap();
+        assert_eq!(
+            serde_json::to_value(result.outcome).unwrap(),
+            expected["outcome"],
+            "{}",
+            case["id"]
+        );
+        assert_eq!(
+            serde_json::to_value(result.reason_code).unwrap(),
+            expected["reason_code"],
+            "{}",
+            case["id"]
+        );
+        assert_eq!(
+            serde_json::to_value(result.comparison).unwrap(),
+            expected["comparison"],
+            "{}",
+            case["id"]
+        );
+    }
+}
+
+macro_rules! a2_method_line_test {
+    ($name:ident, $line:literal) => {
+        #[test]
+        fn $name() {
+            let cases = a2_cases();
+            for case in cases["methods"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|c| c["line"] == $line)
+            {
+                a2_method_case(case);
+            }
+        }
+    };
+}
+a2_method_line_test!(receipt_method_line_1, 1);
+a2_method_line_test!(receipt_method_line_2, 2);
+a2_method_line_test!(receipt_method_line_3, 3);
+a2_method_line_test!(receipt_method_line_4, 4);
+a2_method_line_test!(receipt_method_line_5, 5);
+a2_method_line_test!(receipt_method_line_6, 6);
+a2_method_line_test!(receipt_method_line_7, 7);
+a2_method_line_test!(receipt_method_line_8, 8);
+a2_method_line_test!(receipt_method_line_9, 9);
+a2_method_line_test!(receipt_method_line_10, 10);
+
+macro_rules! a2_domain_test {
+    ($name:ident, $index:literal) => {
+        #[test]
+        fn $name() {
+            a2_method_case(&a2_cases()["out_of_domain"][$index]);
+        }
+    };
+}
+a2_domain_test!(receipt_method_out_of_domain_absent, 0);
+a2_domain_test!(receipt_method_out_of_domain_errored, 1);
+a2_domain_test!(receipt_method_out_of_domain_rejected, 2);
+
+#[test]
+fn receipt_delta_all_pairs_and_missing_measurements() {
+    for c in a2_cases()["deltas"].as_array().unwrap() {
+        let before = serde_json::from_value(c["before"].clone()).unwrap();
+        let observed = serde_json::from_value(c["observed"].clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(receipt_delta(&before, &observed)).unwrap(),
+            c["expected"],
+            "{}",
+            c["id"]
+        );
+    }
+}
+
+macro_rules! a2_summary_line_test {
+    ($name:ident, $line:literal) => {
+        #[test]
+        fn $name() {
+            for c in a2_cases()["summaries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|c| c["line"] == $line)
+            {
+                let row: Row = serde_json::from_value(c["row"].clone()).unwrap();
+                assert_eq!(
+                    serde_json::to_value(receipt_summary(&row)).unwrap(),
+                    c["expected"],
+                    "{}",
+                    c["id"]
+                );
+            }
+        }
+    };
+}
+a2_summary_line_test!(receipt_summary_line_1, 1);
+a2_summary_line_test!(receipt_summary_line_2, 2);
+a2_summary_line_test!(receipt_summary_line_3, 3);
+a2_summary_line_test!(receipt_summary_line_4, 4);
+a2_summary_line_test!(receipt_summary_sink_all_three_codes, 5);
+a2_summary_line_test!(receipt_summary_line_6, 6);
+a2_summary_line_test!(receipt_summary_line_7, 7);
+a2_summary_line_test!(receipt_summary_line_8, 8);
+a2_summary_line_test!(receipt_summary_line_9, 9);
+a2_summary_line_test!(receipt_summary_line_10, 10);
+
+#[test]
+fn receipt_summary_f54_wrong_labels_and_f8() {
+    for c in a2_cases()["wrong_summaries"].as_array().unwrap() {
+        let row: Row = serde_json::from_value(c["row"].clone()).unwrap();
+        let result = receipt_summary(&row);
+        assert_eq!(
+            serde_json::to_value(result).unwrap(),
+            c["expected"],
+            "{}",
+            c["id"]
+        );
+        assert_ne!(result, row.summary, "{}", c["id"]);
+    }
+}
+
+#[test]
+fn receipt_summary_precedence_and_total_invalid_slots() {
+    let mut row: Row =
+        serde_json::from_slice(include_bytes!("fixtures/receipt_v0/base_row.json")).unwrap();
+    row.stages.proposal.record.effect_kind = EffectKind::Unsupported;
+    row.stages.decision.record.enforcement = Enforcement::Shadow;
+    row.stages.attempt = Slot::AbsentByContract(AttemptAbsentReason::NoExecutor);
+    assert_eq!(receipt_summary(&row), Summary::NotAttemptedUnsupported);
+    row.stages.proposal.record.effect_kind = EffectKind::WriteFile;
+    assert_eq!(receipt_summary(&row), Summary::NotAttemptedNotEnforced);
+    row.stages.decision.record.enforcement = Enforcement::Enforced;
+    assert_eq!(receipt_summary(&row), Summary::NotAttemptedNoExecutor);
+    // Slot-table invalid but representable: classification remains deterministic.
+    row.stages.attempt = Slot::AbsentByContract(AttemptAbsentReason::Blocked);
+    assert_eq!(receipt_summary(&row), Summary::AllowedEffectVerified);
+}
+
+fn a2_projection_cases(prefix: &str) {
+    for c in a2_cases()["projections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["id"].as_str().unwrap().starts_with(prefix))
+    {
+        let row: Row = serde_json::from_value(c["row"].clone()).unwrap();
+        let p = receipt_projection(&row);
+        assert_eq!(
+            serde_json::to_value(&p).unwrap(),
+            c["expected"],
+            "{}",
+            c["id"]
+        );
+        assert_eq!(
+            projection_bytes(&p),
+            c["expected_bytes"].as_str().unwrap().as_bytes(),
+            "{}",
+            c["id"]
+        );
+        let bytes = record_bytes(ReceiptRecord::Row(&row)).unwrap();
+        // Independent digest oracle, deliberately does not call record_digest.
+        let mut h = Sha256::new();
+        h.update(b"parapet-effect-receipt-digest/v0\n");
+        h.update(&bytes);
+        assert_eq!(p.projection_of, format!("{:x}", h.finalize()));
+    }
+}
+
+#[test]
+fn receipt_projection_all_thirteen_keys_and_nested_values() {
+    a2_projection_cases("");
+}
+#[test]
+fn receipt_projection_f69_order_and_distinct_missingness() {
+    a2_projection_cases("F69");
+}
+#[test]
+fn receipt_projection_f70_byte_limits_utf8_and_resolved_source() {
+    a2_projection_cases("F70");
+}
+#[test]
+fn receipt_projection_f71_json_escapes_control_bytes() {
+    a2_projection_cases("F71");
+    for c in a2_cases()["projections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["id"].as_str().unwrap().starts_with("F71"))
+    {
+        let bytes = c["expected_bytes"].as_str().unwrap();
+        assert!(bytes.contains("\\u001b"));
+        assert!(!bytes.contains('\x1b'));
+    }
+}
+#[test]
+fn receipt_projection_f72_all_ten_lines() {
+    a2_projection_cases("F72");
+}
+#[test]
+fn receipt_projection_f12_detection_display() {
+    a2_projection_cases("F12");
+    assert_eq!(
+        detection_display_text(DetectionAvailability::AbsentByContract),
+        Some("not produced by this deployment")
+    );
+    assert_eq!(
+        detection_display_text(DetectionAvailability::Unavailable),
+        Some("could not be produced")
+    );
+    assert_eq!(detection_display_text(DetectionAvailability::Present), None);
+}
+
+#[test]
+fn receipt_projection_instruments_pass_fail_and_exemptions() {
+    for c in a2_cases()["instruments"].as_array().unwrap() {
+        let row: Row = serde_json::from_value(c["row"].clone()).unwrap();
+        let forbidden: Vec<_> = c["forbidden"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s.as_str().unwrap().as_bytes())
+            .collect();
+        let p = &c["presented"];
+        assert_eq!(
+            serde_json::to_value(projection_field_not_allowed(p)).unwrap(),
+            c["expected_keys"],
+            "{}",
+            c["id"]
+        );
+        assert_eq!(
+            serde_json::to_value(redaction_failure(&row, p, &forbidden)).unwrap(),
+            c["expected_redaction"],
+            "{}",
+            c["id"]
+        );
+        assert_eq!(
+            serde_json::to_value(projection_mismatch(&row, p)).unwrap(),
+            c["expected_mismatch"],
+            "{}",
+            c["id"]
+        );
+    }
+}
+
+#[test]
+fn receipt_projection_f52_reasons_do_not_carry_paths() {
+    for c in a2_cases()["projections"].as_array().unwrap() {
+        for entry in c["expected"]["not_present"].as_array().unwrap() {
+            if let Some(code) = entry["reason_code"].as_str() {
+                assert!(!code.contains('/'));
+            }
+        }
+    }
+}
+
+#[test]
+fn receipt_projection_determinism_fixture_output() {
+    let cases = a2_cases();
+    // One output stream can be compared across fresh processes with one test thread.
+    for group in ["summaries", "wrong_summaries", "projections"] {
+        for c in cases[group].as_array().unwrap() {
+            let row: Row = serde_json::from_value(c["row"].clone()).unwrap();
+            let p = receipt_projection(&row);
+            println!(
+                "A2_PROJECTION {} {} {}",
+                group,
+                c["id"],
+                String::from_utf8(projection_bytes(&p)).unwrap()
+            );
+            let presented = serde_json::to_value(&p).unwrap();
+            println!(
+                "A2_INSTRUMENT {} {} {:?} {:?} {:?}",
+                group,
+                c["id"],
+                projection_field_not_allowed(&presented),
+                redaction_failure(&row, &presented, &[]),
+                projection_mismatch(&row, &presented)
+            );
+        }
+    }
+    for c in cases["instruments"].as_array().unwrap() {
+        let row: Row = serde_json::from_value(c["row"].clone()).unwrap();
+        let forbidden: Vec<_> = c["forbidden"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s.as_str().unwrap().as_bytes())
+            .collect();
+        let p = &c["presented"];
+        println!(
+            "A2_PROJECTION instruments {} {}",
+            c["id"],
+            String::from_utf8(projection_bytes(&receipt_projection(&row))).unwrap()
+        );
+        println!(
+            "A2_INSTRUMENT {} {:?} {:?} {:?}",
+            c["id"],
+            projection_field_not_allowed(p),
+            redaction_failure(&row, p, &forbidden),
+            projection_mismatch(&row, p)
+        );
+    }
+    for group in ["methods", "out_of_domain"] {
+        for c in cases[group].as_array().unwrap() {
+            let proposal: Proposal = serde_json::from_value(c["proposal"].clone()).unwrap();
+            let attempt: Attempt = serde_json::from_value(c["attempt"].clone()).unwrap();
+            let observation: Observation =
+                serde_json::from_value(c["observation"].clone()).unwrap();
+            println!(
+                "A2_METHOD {} {:?}",
+                c["id"],
+                verify_expected_effect(&proposal, &attempt, &observation)
+            );
+        }
+    }
+    for c in cases["deltas"].as_array().unwrap() {
+        let before = serde_json::from_value(c["before"].clone()).unwrap();
+        let observed = serde_json::from_value(c["observed"].clone()).unwrap();
+        println!(
+            "A2_DELTA {} {:?}",
+            c["id"],
+            receipt_delta(&before, &observed)
+        );
+    }
+}
+
+// Catch mutation m26: BQ-5 precision 1 excludes keys from redaction matching.
+#[test]
+fn receipt_projection_redaction_excludes_closed_and_extra_keys() {
+    fn assert_marker_absent_from_strings(value: &serde_json::Value, marker: &str) {
+        match value {
+            serde_json::Value::String(text) => assert!(!text.contains(marker)),
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    assert_marker_absent_from_strings(value, marker);
+                }
+            }
+            serde_json::Value::Object(values) => {
+                for value in values.values() {
+                    assert_marker_absent_from_strings(value, marker);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let cases = a2_cases();
+    let row: Row = serde_json::from_value(cases["projections"][0]["row"].clone()).unwrap();
+    let projection = serde_json::to_value(receipt_projection(&row)).unwrap();
+    let closed_key = "projection_of";
+    assert!(projection.as_object().unwrap().contains_key(closed_key));
+    assert_marker_absent_from_strings(&projection, closed_key);
+    assert_eq!(
+        redaction_failure(&row, &projection, &[closed_key.as_bytes()]),
+        ProjectionInstrument::Pass
+    );
+
+    let marker = "KEY_ONLY_FIXTURE_7b91c2";
+    assert_marker_absent_from_strings(&projection, marker);
+    let mut extra_key = projection.clone();
+    extra_key["policy"].as_object_mut().unwrap().insert(
+        format!("extra_{marker}_key"),
+        serde_json::Value::Null,
+    );
+    assert_marker_absent_from_strings(&extra_key, marker);
+    assert_eq!(
+        redaction_failure(&row, &extra_key, &[marker.as_bytes()]),
+        ProjectionInstrument::Pass
+    );
+    assert_eq!(
+        projection_field_not_allowed(&extra_key),
+        ProjectionInstrument::ProjectionFieldNotAllowed
+    );
+
+    let mut positive_twin = projection;
+    assert!(positive_twin["proposal_id"].is_string());
+    positive_twin["proposal_id"] = serde_json::Value::String(marker.to_owned());
+    assert_eq!(
+        projection_field_not_allowed(&positive_twin),
+        ProjectionInstrument::Pass
+    );
+    assert_eq!(
+        redaction_failure(&row, &positive_twin, &[marker.as_bytes()]),
+        ProjectionInstrument::RedactionFailure
+    );
+}
