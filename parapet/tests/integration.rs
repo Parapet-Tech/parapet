@@ -3,7 +3,7 @@
 // End-to-end tests exercising the full Parapet pipeline:
 // request → parse → trust → L0 → L3-inbound → upstream → L3-outbound → L5a → response
 //
-// Uses wiremock as the upstream mock, tower::ServiceExt::oneshot for
+// Uses an in-process upstream double, tower::ServiceExt::oneshot for
 // in-process HTTP, and real engine deps (no mocks except HTTP target).
 
 use axum::body::Body;
@@ -14,7 +14,7 @@ use parapet::config::{self, StringSource};
 use parapet::constraint::DslConstraintEvaluator;
 use parapet::engine::{
     EngineDeps, EngineUpstreamClient, HttpBody, HttpError, HttpRequest, HttpResponse, HttpSender,
-    ReqwestHttpSender, UpstreamResolver,
+    UpstreamResolver,
 };
 use parapet::config::Config;
 use parapet::layers::l3_inbound::{DefaultInboundScanner, InboundResult, InboundScanner};
@@ -26,10 +26,8 @@ use parapet::routing::NoopOrthogonalSensorRouter;
 use parapet::signal::combiner::DefaultVerdictCombiner;
 use parapet::signal::extractor::DefaultSignalExtractor;
 use parapet::trust::RoleTrustAssigner;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
-use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // ---------------------------------------------------------------------------
 // Test config YAML — all layers enabled
@@ -75,19 +73,27 @@ layers:
 // Infrastructure
 // ---------------------------------------------------------------------------
 
-/// Resolver that always returns the wiremock server URL.
-struct WiremockResolver {
+/// Resolver that always returns a fixed non-routable URL.
+struct FixedUrlResolver {
     url: String,
 }
 
-impl UpstreamResolver for WiremockResolver {
+impl UpstreamResolver for FixedUrlResolver {
     fn base_url(&self, _provider: Provider) -> String {
         self.url.clone()
     }
 }
 
-/// Build a real EngineUpstreamClient with all real deps, HTTP pointed at wiremock.
-fn build_test_engine(yaml: &str, mock_url: &str) -> EngineUpstreamClient {
+/// Build a real EngineUpstreamClient with an injected HTTP sender.
+fn build_test_engine(yaml: &str, http: Arc<dyn HttpSender>) -> EngineUpstreamClient {
+    build_test_engine_with_scanner(yaml, http, Arc::new(DefaultInboundScanner::new()))
+}
+
+fn build_test_engine_with_scanner(
+    yaml: &str,
+    http: Arc<dyn HttpSender>,
+    inbound_scanner: Arc<dyn InboundScanner>,
+) -> EngineUpstreamClient {
     let source = StringSource {
         content: yaml.to_string(),
     };
@@ -95,9 +101,9 @@ fn build_test_engine(yaml: &str, mock_url: &str) -> EngineUpstreamClient {
 
     let deps = EngineDeps {
         config,
-        http: Arc::new(ReqwestHttpSender::new(reqwest::Client::new())),
-        resolver: Arc::new(WiremockResolver {
-            url: mock_url.to_string(),
+        http,
+        resolver: Arc::new(FixedUrlResolver {
+            url: "http://upstream.invalid".to_string(),
         }),
         registry: Arc::new(parapet::engine::DefaultProviderRegistry),
         normalizer: Arc::new(L0Normalizer::new()),
@@ -106,7 +112,7 @@ fn build_test_engine(yaml: &str, mock_url: &str) -> EngineUpstreamClient {
         l1_model: None,
         l2a_scanner: None,
         l2a_semaphore: None,
-        inbound_scanner: Arc::new(DefaultInboundScanner::new()),
+        inbound_scanner,
         constraint_evaluator: Arc::new(DslConstraintEvaluator::new()),
         output_scanner: Arc::new(L5aScanner),
         session_store: None,
@@ -118,6 +124,68 @@ fn build_test_engine(yaml: &str, mock_url: &str) -> EngineUpstreamClient {
     };
 
     EngineUpstreamClient::new_with(deps)
+}
+
+/// Canned or refusing upstream, recording the complete requests it receives.
+struct TestHttpSender {
+    response_body: Option<Bytes>,
+    delay: Option<std::time::Duration>,
+    calls: Mutex<Vec<HttpRequest>>,
+}
+
+impl TestHttpSender {
+    fn json(body: serde_json::Value) -> Self {
+        Self {
+            response_body: Some(Bytes::from(serde_json::to_vec(&body).unwrap())),
+            delay: None,
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn refusing() -> Self {
+        Self { response_body: None, delay: None, calls: Mutex::new(Vec::new()) }
+    }
+
+    fn delayed_json(body: serde_json::Value, delay: std::time::Duration) -> Self {
+        Self { delay: Some(delay), ..Self::json(body) }
+    }
+}
+
+#[async_trait::async_trait]
+impl HttpSender for TestHttpSender {
+    async fn send(&self, request: HttpRequest) -> Result<HttpResponse, HttpError> {
+        let timeout_ms = request.timeout_ms;
+        let method_ok = request.method == axum::http::Method::POST;
+        let path_ok = url::Url::parse(&request.url)
+            .map(|url| url.path() == "/v1/chat/completions")
+            .unwrap_or(false);
+        self.calls.lock().unwrap().push(request);
+        if !(method_ok && path_ok) {
+            return Ok(HttpResponse {
+                status: StatusCode::NOT_FOUND,
+                headers: axum::http::HeaderMap::new(),
+                body: HttpBody::Full(Bytes::new()),
+            });
+        }
+        let response = async {
+            if let Some(delay) = self.delay {
+                tokio::time::sleep(delay).await;
+            }
+            let body = self.response_body.clone().ok_or_else(|| {
+                HttpError::Transport("upstream must not be reached".to_string())
+            })?;
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert("content-type", axum::http::HeaderValue::from_static("application/json"));
+            Ok(HttpResponse { status: StatusCode::OK, headers, body: HttpBody::Full(body) })
+        };
+        if let Some(ms) = timeout_ms {
+            tokio::time::timeout(std::time::Duration::from_millis(ms), response)
+                .await
+                .map_err(|error| HttpError::Timeout(error.to_string()))?
+        } else {
+            response.await
+        }
+    }
 }
 
 fn json_request(path_str: &str, body: &str) -> Request<Body> {
@@ -141,8 +209,6 @@ async fn body_bytes(resp: axum::response::Response) -> Bytes {
 
 #[tokio::test]
 async fn blocked_tool_call_returns_refusal_text() {
-    let mock_server = MockServer::start().await;
-
     // Upstream returns a response with exec_command tool call
     let upstream_response = serde_json::json!({
         "choices": [{
@@ -160,13 +226,9 @@ async fn blocked_tool_call_returns_refusal_text() {
         }]
     });
 
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&upstream_response))
-        .mount(&mock_server)
-        .await;
+    let mock_http = Arc::new(TestHttpSender::json(upstream_response));
 
-    let engine = build_test_engine(TEST_YAML, &mock_server.uri());
+    let engine = build_test_engine(TEST_YAML, mock_http.clone());
     let upstream: Arc<dyn proxy::UpstreamClient> = Arc::new(engine);
     let app = proxy::build_router(upstream);
 
@@ -203,8 +265,6 @@ async fn blocked_tool_call_returns_refusal_text() {
 
 #[tokio::test]
 async fn allowed_tool_call_passes_through() {
-    let mock_server = MockServer::start().await;
-
     let upstream_response = serde_json::json!({
         "choices": [{
             "message": {
@@ -221,13 +281,9 @@ async fn allowed_tool_call_passes_through() {
         }]
     });
 
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&upstream_response))
-        .mount(&mock_server)
-        .await;
+    let mock_http = Arc::new(TestHttpSender::json(upstream_response));
 
-    let engine = build_test_engine(TEST_YAML, &mock_server.uri());
+    let engine = build_test_engine(TEST_YAML, mock_http.clone());
     let upstream: Arc<dyn proxy::UpstreamClient> = Arc::new(engine);
     let app = proxy::build_router(upstream);
 
@@ -254,8 +310,6 @@ async fn allowed_tool_call_passes_through() {
 
 #[tokio::test]
 async fn constraint_violation_blocks_tool_call() {
-    let mock_server = MockServer::start().await;
-
     let upstream_response = serde_json::json!({
         "choices": [{
             "message": {
@@ -272,13 +326,9 @@ async fn constraint_violation_blocks_tool_call() {
         }]
     });
 
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&upstream_response))
-        .mount(&mock_server)
-        .await;
+    let mock_http = Arc::new(TestHttpSender::json(upstream_response));
 
-    let engine = build_test_engine(TEST_YAML, &mock_server.uri());
+    let engine = build_test_engine(TEST_YAML, mock_http.clone());
     let upstream: Arc<dyn proxy::UpstreamClient> = Arc::new(engine);
     let app = proxy::build_router(upstream);
 
@@ -317,10 +367,9 @@ async fn constraint_violation_blocks_tool_call() {
 
 #[tokio::test]
 async fn l3_inbound_block_returns_403() {
-    let mock_server = MockServer::start().await;
-
+    let mock_http = Arc::new(TestHttpSender::refusing());
     // No mock needed since the request should be blocked before forwarding
-    let engine = build_test_engine(TEST_YAML, &mock_server.uri());
+    let engine = build_test_engine(TEST_YAML, mock_http.clone());
     let upstream: Arc<dyn proxy::UpstreamClient> = Arc::new(engine);
     let app = proxy::build_router(upstream);
 
@@ -331,6 +380,7 @@ async fn l3_inbound_block_returns_403() {
     let resp = app.oneshot(req).await.unwrap();
 
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert!(mock_http.calls.lock().unwrap().is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -339,8 +389,6 @@ async fn l3_inbound_block_returns_403() {
 
 #[tokio::test]
 async fn l5a_redacts_canary_token_in_response() {
-    let mock_server = MockServer::start().await;
-
     let upstream_response = serde_json::json!({
         "choices": [{
             "message": {
@@ -350,13 +398,9 @@ async fn l5a_redacts_canary_token_in_response() {
         }]
     });
 
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&upstream_response))
-        .mount(&mock_server)
-        .await;
+    let mock_http = Arc::new(TestHttpSender::json(upstream_response));
 
-    let engine = build_test_engine(TEST_YAML, &mock_server.uri());
+    let engine = build_test_engine(TEST_YAML, mock_http.clone());
     let upstream: Arc<dyn proxy::UpstreamClient> = Arc::new(engine);
     let app = proxy::build_router(upstream);
 
@@ -387,20 +431,13 @@ async fn l5a_redacts_canary_token_in_response() {
 
 #[tokio::test]
 async fn timeout_returns_504() {
-    let mock_server = MockServer::start().await;
-
     // Respond with a delay longer than timeout_ms (2000ms in config)
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({"choices": []}))
-                .set_delay(std::time::Duration::from_millis(3000)),
-        )
-        .mount(&mock_server)
-        .await;
+    let mock_http = Arc::new(TestHttpSender::delayed_json(
+        serde_json::json!({"choices": []}),
+        std::time::Duration::from_millis(3000),
+    ));
 
-    let engine = build_test_engine(TEST_YAML, &mock_server.uri());
+    let engine = build_test_engine(TEST_YAML, mock_http.clone());
     let upstream: Arc<dyn proxy::UpstreamClient> = Arc::new(engine);
     let app = proxy::build_router(upstream);
 
@@ -486,10 +523,9 @@ fn json_request_with_trust(
 
 #[tokio::test]
 async fn untrusted_span_exceeds_max_length_returns_403() {
-    let mock_server = MockServer::start().await;
-
+    let mock_http = Arc::new(TestHttpSender::refusing());
     // No mock needed — request should be blocked by L3-inbound before forwarding
-    let engine = build_test_engine(TRUST_YAML, &mock_server.uri());
+    let engine = build_test_engine(TRUST_YAML, mock_http.clone());
     let upstream: Arc<dyn proxy::UpstreamClient> = Arc::new(engine);
     let app = proxy::build_router(upstream);
 
@@ -512,6 +548,7 @@ async fn untrusted_span_exceeds_max_length_returns_403() {
         StatusCode::FORBIDDEN,
         "untrusted span > max_length should be blocked"
     );
+    assert!(mock_http.calls.lock().unwrap().is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -520,8 +557,6 @@ async fn untrusted_span_exceeds_max_length_returns_403() {
 
 #[tokio::test]
 async fn same_content_without_trust_spans_passes() {
-    let mock_server = MockServer::start().await;
-
     let upstream_response = serde_json::json!({
         "choices": [{
             "message": {
@@ -531,13 +566,9 @@ async fn same_content_without_trust_spans_passes() {
         }]
     });
 
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&upstream_response))
-        .mount(&mock_server)
-        .await;
+    let mock_http = Arc::new(TestHttpSender::json(upstream_response));
 
-    let engine = build_test_engine(TRUST_YAML, &mock_server.uri());
+    let engine = build_test_engine(TRUST_YAML, mock_http.clone());
     let upstream: Arc<dyn proxy::UpstreamClient> = Arc::new(engine);
     let app = proxy::build_router(upstream);
 
@@ -563,9 +594,8 @@ async fn same_content_without_trust_spans_passes() {
 
 #[tokio::test]
 async fn untrusted_span_with_block_pattern_returns_403() {
-    let mock_server = MockServer::start().await;
-
-    let engine = build_test_engine(TRUST_YAML, &mock_server.uri());
+    let mock_http = Arc::new(TestHttpSender::refusing());
+    let engine = build_test_engine(TRUST_YAML, mock_http.clone());
     let upstream: Arc<dyn proxy::UpstreamClient> = Arc::new(engine);
     let app = proxy::build_router(upstream);
 
@@ -590,6 +620,7 @@ async fn untrusted_span_with_block_pattern_returns_403() {
         StatusCode::FORBIDDEN,
         "block pattern in untrusted span should be blocked"
     );
+    assert!(mock_http.calls.lock().unwrap().is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -598,8 +629,6 @@ async fn untrusted_span_with_block_pattern_returns_403() {
 
 #[tokio::test]
 async fn no_trust_spans_regression_clean_request_passes() {
-    let mock_server = MockServer::start().await;
-
     let upstream_response = serde_json::json!({
         "choices": [{
             "message": {
@@ -609,13 +638,9 @@ async fn no_trust_spans_regression_clean_request_passes() {
         }]
     });
 
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&upstream_response))
-        .mount(&mock_server)
-        .await;
+    let mock_http = Arc::new(TestHttpSender::json(upstream_response));
 
-    let engine = build_test_engine(TEST_YAML, &mock_server.uri());
+    let engine = build_test_engine(TEST_YAML, mock_http.clone());
     let upstream: Arc<dyn proxy::UpstreamClient> = Arc::new(engine);
     let app = proxy::build_router(upstream);
 
@@ -659,36 +684,7 @@ impl HttpSender for FramingHeaderSender {
 }
 
 fn build_test_engine_with_http(yaml: &str, http: Arc<dyn HttpSender>) -> EngineUpstreamClient {
-    let source = config::StringSource {
-        content: yaml.to_string(),
-    };
-    let config = Arc::new(config::load_config(&source).expect("test config should parse"));
-
-    let deps = EngineDeps {
-        config,
-        http,
-        resolver: Arc::new(WiremockResolver {
-            url: "https://unused.test".to_string(),
-        }),
-        registry: Arc::new(parapet::engine::DefaultProviderRegistry),
-        normalizer: Arc::new(L0Normalizer::new()),
-        trust_assigner: Arc::new(RoleTrustAssigner),
-        l1_scanner: None,
-        l1_model: None,
-        l2a_scanner: None,
-        l2a_semaphore: None,
-        inbound_scanner: Arc::new(DefaultInboundScanner::new()),
-        constraint_evaluator: Arc::new(DslConstraintEvaluator::new()),
-        output_scanner: Arc::new(L5aScanner),
-        session_store: None,
-        multi_turn_scanner: None,
-        orthogonal_sensor_router: Arc::new(NoopOrthogonalSensorRouter::new()),
-        signal_extractor: Arc::new(DefaultSignalExtractor),
-        verdict_combiner: Arc::new(DefaultVerdictCombiner),
-        emit_l1_signals: false,
-    };
-
-    EngineUpstreamClient::new_with(deps)
+    build_test_engine(yaml, http)
 }
 
 #[tokio::test]
@@ -782,53 +778,18 @@ impl InboundScanner for PanickingInboundScanner {
     }
 }
 
-fn build_test_engine_with_panicking_inbound(yaml: &str, mock_url: &str) -> EngineUpstreamClient {
-    let source = StringSource {
-        content: yaml.to_string(),
-    };
-    let config = Arc::new(config::load_config(&source).expect("test config should parse"));
-
-    let deps = EngineDeps {
-        config,
-        http: Arc::new(ReqwestHttpSender::new(reqwest::Client::new())),
-        resolver: Arc::new(WiremockResolver {
-            url: mock_url.to_string(),
-        }),
-        registry: Arc::new(parapet::engine::DefaultProviderRegistry),
-        normalizer: Arc::new(L0Normalizer::new()),
-        trust_assigner: Arc::new(RoleTrustAssigner),
-        l1_scanner: None,
-        l1_model: None,
-        l2a_scanner: None,
-        l2a_semaphore: None,
-        inbound_scanner: Arc::new(PanickingInboundScanner),
-        constraint_evaluator: Arc::new(DslConstraintEvaluator::new()),
-        output_scanner: Arc::new(L5aScanner),
-        session_store: None,
-        multi_turn_scanner: None,
-        orthogonal_sensor_router: Arc::new(NoopOrthogonalSensorRouter::new()),
-        signal_extractor: Arc::new(DefaultSignalExtractor),
-        verdict_combiner: Arc::new(DefaultVerdictCombiner),
-        emit_l1_signals: false,
-    };
-
-    EngineUpstreamClient::new_with(deps)
+fn build_test_engine_with_panicking_inbound(yaml: &str, http: Arc<dyn HttpSender>) -> EngineUpstreamClient {
+    build_test_engine_with_scanner(yaml, http, Arc::new(PanickingInboundScanner))
 }
 
 #[tokio::test]
 async fn on_failure_closed_panicking_scanner_returns_503() {
-    let mock_server = MockServer::start().await;
-
     // Upstream doesn't matter — scanner panics before forwarding.
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "choices": [{"message": {"content": "ok"}}]
-        })))
-        .mount(&mock_server)
-        .await;
+    let mock_http = Arc::new(TestHttpSender::json(serde_json::json!({
+        "choices": [{"message": {"content": "ok"}}]
+    })));
 
-    let engine = build_test_engine_with_panicking_inbound(TEST_YAML, &mock_server.uri());
+    let engine = build_test_engine_with_panicking_inbound(TEST_YAML, mock_http.clone());
     let upstream: Arc<dyn proxy::UpstreamClient> = Arc::new(engine);
     let app = proxy::build_router(upstream);
 

@@ -9,6 +9,8 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use async_trait::async_trait;
+use bytes::Bytes;
 use sha2::{Digest, Sha256};
 
 /// Known model definitions with download URLs and expected checksums.
@@ -123,6 +125,67 @@ pub fn find_model(name: &str) -> Result<&'static ModelManifest, FetchError> {
         .ok_or_else(|| FetchError::UnknownModel(name.to_string()))
 }
 
+/// Sends a file request without reading its response body.
+#[async_trait]
+pub trait FileFetcher: Send + Sync {
+    async fn get(&self, url: &str, bearer_token: Option<&str>) -> Result<Box<dyn FetchedResponse>, FetchError>;
+}
+
+/// Separates status inspection from the fallible response body read.
+#[async_trait]
+pub trait FetchedResponse: Send {
+    fn status(&self) -> u16;
+    async fn bytes(self: Box<Self>) -> Result<Bytes, FetchError>;
+}
+
+pub struct ReqwestFileFetcher {
+    client: reqwest::Client,
+}
+
+impl ReqwestFileFetcher {
+    pub fn new(client: reqwest::Client) -> Self {
+        Self { client }
+    }
+}
+
+impl Default for ReqwestFileFetcher {
+    fn default() -> Self {
+        Self::new(reqwest::Client::new())
+    }
+}
+
+#[async_trait]
+impl FileFetcher for ReqwestFileFetcher {
+    async fn get(&self, url: &str, bearer_token: Option<&str>) -> Result<Box<dyn FetchedResponse>, FetchError> {
+        let mut request = self.client.get(url);
+        if let Some(token) = bearer_token {
+            request = request.header("Authorization", format!("Bearer {token}"));
+        }
+        let response = request.send().await.map_err(|source| FetchError::Download {
+            url: url.to_string(),
+            source,
+        })?;
+        Ok(Box::new(ReqwestFetchedResponse { response, url: url.to_string() }))
+    }
+}
+
+struct ReqwestFetchedResponse {
+    response: reqwest::Response,
+    url: String,
+}
+
+#[async_trait]
+impl FetchedResponse for ReqwestFetchedResponse {
+    fn status(&self) -> u16 {
+        self.response.status().as_u16()
+    }
+
+    async fn bytes(self: Box<Self>) -> Result<Bytes, FetchError> {
+        let Self { response, url } = *self;
+        response.bytes().await.map_err(|source| FetchError::Download { url, source })
+    }
+}
+
 /// Download and verify a single model file.
 ///
 /// When `skip_checksum` is false:
@@ -131,6 +194,15 @@ pub fn find_model(name: &str) -> Result<&'static ModelManifest, FetchError> {
 ///
 /// When `skip_checksum` is true, no verification is performed.
 pub async fn fetch_file(
+    file: &ModelFile,
+    dest_dir: &Path,
+    skip_checksum: bool,
+) -> Result<PathBuf, FetchError> {
+    fetch_file_with(&ReqwestFileFetcher::default(), file, dest_dir, skip_checksum).await
+}
+
+pub async fn fetch_file_with(
+    fetcher: &dyn FileFetcher,
     file: &ModelFile,
     dest_dir: &Path,
     skip_checksum: bool,
@@ -144,38 +216,21 @@ pub async fn fetch_file(
         });
     }
 
-    let client = reqwest::Client::new();
-    let mut request = client.get(file.url);
-    if let Some(token) = std::env::var("HF_TOKEN")
+    let token = std::env::var("HF_TOKEN")
         .or_else(|_| std::env::var("HUGGINGFACE_API_KEY"))
-        .ok()
-    {
-        request = request.header("Authorization", format!("Bearer {token}"));
-    }
-    let response = request
-        .send()
-        .await
-        .map_err(|e| FetchError::Download {
-            url: file.url.to_string(),
-            source: e,
-        })?;
+        .ok();
+    let response = fetcher.get(file.url, token.as_deref()).await?;
 
     // Validate HTTP status before reading body.
     let status = response.status();
-    if !status.is_success() {
+    if !(200..300).contains(&status) {
         return Err(FetchError::HttpStatus {
             url: file.url.to_string(),
-            status: status.as_u16(),
+            status,
         });
     }
 
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| FetchError::Download {
-            url: file.url.to_string(),
-            source: e,
-        })?;
+    let bytes = response.bytes().await?;
 
     // Verify checksum before writing.
     if !skip_checksum {
@@ -247,11 +302,95 @@ pub async fn fetch_model(
     Ok(())
 }
 
+/// Download all files for a model and write a manifest.json alongside them.
+pub async fn fetch_model_with(
+    fetcher: &dyn FileFetcher,
+    manifest: &ModelManifest,
+    dest_dir: &Path,
+    skip_checksum: bool,
+) -> Result<(), FetchError> {
+    let model_dir = dest_dir.join(manifest.name);
+    fs::create_dir_all(&model_dir).map_err(|e| FetchError::CreateDir {
+        path: model_dir.clone(),
+        source: e,
+    })?;
+
+    for file in manifest.files {
+        fetch_file_with(fetcher, file, &model_dir, skip_checksum).await?;
+    }
+
+    // Write manifest.json
+    let manifest_json = serde_json::json!({
+        "model": manifest.name,
+        "files": manifest.files.iter().map(|f| serde_json::json!({
+            "filename": f.filename,
+            "sha256": f.sha256,
+        })).collect::<Vec<_>>(),
+        "fetched_at": chrono::Utc::now().to_rfc3339(),
+    });
+    let manifest_path = model_dir.join("manifest.json");
+    let mut f = fs::File::create(&manifest_path).map_err(|e| FetchError::WriteFile {
+        path: manifest_path.clone(),
+        source: e,
+    })?;
+    f.write_all(
+        serde_json::to_string_pretty(&manifest_json)
+            .unwrap()
+            .as_bytes(),
+    )
+    .map_err(|e| FetchError::WriteFile {
+        path: manifest_path,
+        source: e,
+    })?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct FakeFileFetcher {
+        responses: HashMap<String, (u16, Bytes)>,
+        calls: Mutex<Vec<(String, Option<String>)>>,
+        body_reads: Arc<Mutex<Vec<String>>>,
+        fetched: Option<(String, u16, Bytes)>,
+    }
+
+    impl FakeFileFetcher {
+        fn response(&mut self, path: &str, status: u16, body: &[u8]) {
+            self.responses.insert(format!("http://upstream.invalid{path}"), (status, Bytes::copy_from_slice(body)));
+        }
+    }
+
+    #[async_trait]
+    impl FileFetcher for FakeFileFetcher {
+        async fn get(&self, url: &str, bearer_token: Option<&str>) -> Result<Box<dyn FetchedResponse>, FetchError> {
+            self.calls.lock().unwrap().push((url.to_string(), bearer_token.map(str::to_string)));
+            let (status, body) = self.responses.get(url).expect("unexpected fetch URL");
+            Ok(Box::new(Self {
+                fetched: Some((url.to_string(), *status, body.clone())),
+                body_reads: self.body_reads.clone(),
+                ..Self::default()
+            }))
+        }
+    }
+
+    #[async_trait]
+    impl FetchedResponse for FakeFileFetcher {
+        fn status(&self) -> u16 {
+            self.fetched.as_ref().expect("response mode").1
+        }
+
+        async fn bytes(self: Box<Self>) -> Result<Bytes, FetchError> {
+            let (url, _, body) = self.fetched.expect("response mode");
+            self.body_reads.lock().unwrap().push(url);
+            Ok(body)
+        }
+    }
 
     #[test]
     fn find_model_known() {
@@ -322,7 +461,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // fetch_file tests (wiremock)
+    // fetch_file tests (in-process fetcher)
     // -----------------------------------------------------------------
 
     fn test_file_with_checksum(url: &str, sha256: &str) -> ModelFile {
@@ -344,23 +483,19 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_file_success_with_valid_checksum() {
-        let server = MockServer::start().await;
+        let mut fetcher = FakeFileFetcher::default();
         let body = b"model data here";
         let checksum = sha256_hex(body);
 
-        Mock::given(method("GET"))
-            .and(path("/model.bin"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.as_slice()))
-            .mount(&server)
-            .await;
+        fetcher.response("/model.bin", 200, body.as_slice());
 
         let dir = tempfile::tempdir().unwrap();
         let file = test_file_with_checksum(
-            &format!("{}/model.bin", server.uri()),
+            "http://upstream.invalid/model.bin",
             &checksum,
         );
 
-        let result = fetch_file(&file, dir.path(), false).await;
+        let result = fetch_file_with(&fetcher, &file, dir.path(), false).await;
         assert!(result.is_ok());
         let written = std::fs::read(dir.path().join("test.bin")).unwrap();
         assert_eq!(written, body);
@@ -368,122 +503,107 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_file_checksum_mismatch() {
-        let server = MockServer::start().await;
+        let mut fetcher = FakeFileFetcher::default();
 
-        Mock::given(method("GET"))
-            .and(path("/model.bin"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"actual data"))
-            .mount(&server)
-            .await;
+        fetcher.response("/model.bin", 200, b"actual data");
 
         let dir = tempfile::tempdir().unwrap();
         let file = test_file_with_checksum(
-            &format!("{}/model.bin", server.uri()),
+            "http://upstream.invalid/model.bin",
             "0000000000000000000000000000000000000000000000000000000000000000",
         );
 
-        let err = fetch_file(&file, dir.path(), false).await.unwrap_err();
+        let err = fetch_file_with(&fetcher, &file, dir.path(), false).await.unwrap_err();
         assert!(matches!(err, FetchError::ChecksumMismatch { .. }));
     }
 
     #[tokio::test]
     async fn fetch_file_skip_checksum_bypasses_verification() {
-        let server = MockServer::start().await;
+        let mut fetcher = FakeFileFetcher::default();
 
-        Mock::given(method("GET"))
-            .and(path("/model.bin"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"data"))
-            .mount(&server)
-            .await;
+        fetcher.response("/model.bin", 200, b"data");
 
         let dir = tempfile::tempdir().unwrap();
         let file = test_file_with_checksum(
-            &format!("{}/model.bin", server.uri()),
+            "http://upstream.invalid/model.bin",
             "wrong_checksum",
         );
 
         // With skip_checksum=true, wrong checksum should not cause error.
-        let result = fetch_file(&file, dir.path(), true).await;
+        let result = fetch_file_with(&fetcher, &file, dir.path(), true).await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn fetch_file_no_checksum_without_skip_returns_error() {
+        let mut fetcher = FakeFileFetcher::default();
+        fetcher.response("/unused", 200, b"data");
         let file = ModelFile {
             filename: "test.bin",
-            url: "http://localhost:1/unused",
+            url: "http://upstream.invalid/unused",
             sha256: "",
         };
         let dir = tempfile::tempdir().unwrap();
 
         // Should fail before even making an HTTP request.
-        let err = fetch_file(&file, dir.path(), false).await.unwrap_err();
+        let err = fetch_file_with(&fetcher, &file, dir.path(), false).await.unwrap_err();
         assert!(matches!(err, FetchError::NoChecksum { .. }));
         assert!(err.to_string().contains("--skip-checksum"));
+        assert!(fetcher.calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn fetch_file_no_checksum_with_skip_proceeds() {
-        let server = MockServer::start().await;
+        let mut fetcher = FakeFileFetcher::default();
 
-        Mock::given(method("GET"))
-            .and(path("/model.bin"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"data"))
-            .mount(&server)
-            .await;
+        fetcher.response("/model.bin", 200, b"data");
 
         let dir = tempfile::tempdir().unwrap();
         // Leak for 'static
         let url: &'static str =
-            Box::leak(format!("{}/model.bin", server.uri()).into_boxed_str());
+            Box::leak("http://upstream.invalid/model.bin".to_string().into_boxed_str());
         let file = ModelFile {
             filename: "test.bin",
             url,
             sha256: "",
         };
 
-        let result = fetch_file(&file, dir.path(), true).await;
+        let result = fetch_file_with(&fetcher, &file, dir.path(), true).await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn fetch_file_http_404_returns_error() {
-        let server = MockServer::start().await;
+        let mut fetcher = FakeFileFetcher::default();
 
-        Mock::given(method("GET"))
-            .and(path("/missing.bin"))
-            .respond_with(ResponseTemplate::new(404))
-            .mount(&server)
-            .await;
+        fetcher.response("/missing.bin", 404, b"");
 
         let dir = tempfile::tempdir().unwrap();
         let file = test_file_with_checksum(
-            &format!("{}/missing.bin", server.uri()),
+            "http://upstream.invalid/missing.bin",
             "abc",
         );
 
-        let err = fetch_file(&file, dir.path(), true).await.unwrap_err();
+        let err = fetch_file_with(&fetcher, &file, dir.path(), true).await.unwrap_err();
         assert!(matches!(err, FetchError::HttpStatus { status: 404, .. }));
+        assert!(fetcher.body_reads.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn fetch_file_http_500_returns_error() {
-        let server = MockServer::start().await;
+        let mut fetcher = FakeFileFetcher::default();
 
-        Mock::given(method("GET"))
-            .and(path("/error.bin"))
-            .respond_with(ResponseTemplate::new(500))
-            .mount(&server)
-            .await;
+        fetcher.response("/error.bin", 500, b"");
 
         let dir = tempfile::tempdir().unwrap();
         let file = test_file_with_checksum(
-            &format!("{}/error.bin", server.uri()),
+            "http://upstream.invalid/error.bin",
             "abc",
         );
 
-        let err = fetch_file(&file, dir.path(), true).await.unwrap_err();
+        let err = fetch_file_with(&fetcher, &file, dir.path(), true).await.unwrap_err();
         assert!(matches!(err, FetchError::HttpStatus { status: 500, .. }));
+        assert!(fetcher.body_reads.lock().unwrap().is_empty());
     }
 
     // -----------------------------------------------------------------
@@ -492,27 +612,19 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_model_writes_all_files_and_manifest() {
-        let server = MockServer::start().await;
+        let mut fetcher = FakeFileFetcher::default();
         let body_a = b"file_a_content";
         let body_b = b"file_b_content";
         let hash_a = sha256_hex(body_a);
         let hash_b = sha256_hex(body_b);
 
-        Mock::given(method("GET"))
-            .and(path("/a.bin"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(body_a.as_slice()))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/b.bin"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(body_b.as_slice()))
-            .mount(&server)
-            .await;
+        fetcher.response("/a.bin", 200, body_a.as_slice());
+        fetcher.response("/b.bin", 200, body_b.as_slice());
 
         let url_a: &'static str =
-            Box::leak(format!("{}/a.bin", server.uri()).into_boxed_str());
+            Box::leak("http://upstream.invalid/a.bin".to_string().into_boxed_str());
         let url_b: &'static str =
-            Box::leak(format!("{}/b.bin", server.uri()).into_boxed_str());
+            Box::leak("http://upstream.invalid/b.bin".to_string().into_boxed_str());
         let hash_a: &'static str = Box::leak(hash_a.into_boxed_str());
         let hash_b: &'static str = Box::leak(hash_b.into_boxed_str());
 
@@ -535,7 +647,7 @@ mod tests {
         };
 
         let dir = tempfile::tempdir().unwrap();
-        fetch_model(&manifest, dir.path(), false).await.unwrap();
+        fetch_model_with(&fetcher, &manifest, dir.path(), false).await.unwrap();
 
         // Check files written.
         let model_dir = dir.path().join("test-model");
