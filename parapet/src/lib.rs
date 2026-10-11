@@ -20,3 +20,4 @@ pub mod session;
 pub mod signal;
 pub(crate) mod stream;
 pub mod trust;
+pub mod receipt;
