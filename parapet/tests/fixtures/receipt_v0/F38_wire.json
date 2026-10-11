@@ -1,0 +1,1 @@
+[{"form":"string","wire":"","expected":"{}"},{"form":"null_value","wire":null,"expected":"{}"},{"form":"absent","expected":"{}"},{"form":"string","wire":"{}","expected":"{}"},{"form":"object","wire":{},"expected":"{}"}]
