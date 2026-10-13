@@ -22,3 +22,24 @@ pub use records::*;
 pub use summary::*;
 pub use verification::*;
 pub use projection::*;
+
+/// Contract e7b70be3, section 16.2: ordered byte validation.
+pub mod validator;
+pub use validator::*;
+
+/// Contract e7b70be3, sections 5.4 and 16.2: injected protected-payload lookup.
+pub trait PayloadResolver {
+    /// Contract e7b70be3, sections 7.10 and 7.11: resolve a store and raw digest.
+    fn resolve(&self, store: PayloadStore, digest: &str) -> PayloadResolution;
+}
+
+/// Contract e7b70be3, sections 7.10 and 7.11: protected-payload lookup outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PayloadResolution {
+    /// Contract e7b70be3, section 5.4: carried payload bytes.
+    Found(Vec<u8>),
+    /// Contract e7b70be3, sections 7.10 and 7.11: lookup has no matching bytes.
+    NotFound,
+    /// Contract e7b70be3, sections 7.10 and 7.11: lookup is not configured.
+    NotConfigured,
+}
