@@ -43,3 +43,25 @@ pub enum PayloadResolution {
     /// Contract e7b70be3, sections 7.10 and 7.11: lookup is not configured.
     NotConfigured,
 }
+
+/// Contract e7b70be3, section 9.1: injected receipt decision function.
+pub trait DecisionFunction {
+    /// Contract e7b70be3, sections 9.1 and 17: recompute from verified inputs.
+    fn decide(&self, policy: &ResolvedActionPolicyV0, tool_name: &str,
+              arguments: &serde_json::Value) -> DecisionOutput;
+}
+
+/// Contract e7b70be3, sections 9 and 17: recomputed comparison fields.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecisionOutput {
+    /// Contract e7b70be3, section 9: decision.
+    pub decision: DecisionOutcome,
+    /// Contract e7b70be3, section 9: reason.
+    pub reason_code: DecisionReason,
+    /// Contract e7b70be3, section 9: ordered failures.
+    pub failed_constraints: Vec<FailedConstraint>,
+}
+
+/// Contract e7b70be3, section 17: input binding and replay comparison.
+pub mod replay;
+pub use replay::*;
