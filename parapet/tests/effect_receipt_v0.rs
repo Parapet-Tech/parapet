@@ -5094,3 +5094,338 @@ fn fix1_f17_f62_action_id_collision_valid() {
     s6_repair(&mut text);
     assert_eq!(s2_validate(text.as_bytes()), ValidationResult::Valid);
 }
+
+// Replay controls use only the injected policy value, tool and parsed arguments.
+#[derive(Default)]
+struct ReplayFunctionDouble {
+    calls: std::cell::RefCell<Vec<(String, String, Value)>>,
+}
+impl DecisionFunction for ReplayFunctionDouble {
+    fn decide(&self, policy: &ResolvedActionPolicyV0, tool: &str, arguments: &Value) -> DecisionOutput {
+        self.calls.borrow_mut().push((policy_digest(&canonical_policy_bytes(policy).unwrap()),
+            tool.to_owned(), arguments.clone()));
+        // Fixed convention for an unlisted tool; no default or predicate evaluation.
+        if policy.tools.get(tool).is_none_or(|t| t.allowed) {
+            DecisionOutput { decision: DecisionOutcome::Allow, reason_code: DecisionReason::Allowed,
+                failed_constraints: vec![] }
+        } else {
+            DecisionOutput { decision: DecisionOutcome::Block, reason_code: DecisionReason::ToolNotAllowed,
+                failed_constraints: vec![FailedConstraint { argument: None, constraint: ConstraintName::ToolAllowed }] }
+        }
+    }
+}
+struct ReplayResolverDouble {
+    arguments_digest: Option<String>,
+    detection_digest: Option<String>,
+    arguments: Vec<PayloadResolution>,
+    detection: Vec<PayloadResolution>,
+    calls: std::cell::RefCell<Vec<(PayloadStore, String)>>,
+}
+impl PayloadResolver for ReplayResolverDouble {
+    fn resolve(&self, store: PayloadStore, digest: &str) -> PayloadResolution {
+        assert_eq!(store, PayloadStore::ReceiptEvidence);
+        let mut calls = self.calls.borrow_mut();
+        let index = calls.iter().filter(|(_, d)| d == digest).count();
+        let sequence = if self.arguments_digest.as_deref() == Some(digest) { &self.arguments }
+            else if self.detection_digest.as_deref() == Some(digest) { &self.detection }
+            else { panic!("unexpected payload lookup") };
+        calls.push((store, digest.to_owned()));
+        sequence.get(index).expect("unexpected extra lookup").clone()
+    }
+}
+fn replay_fixture_bytes(name: &str) -> &'static [u8] {
+    match name {
+        "a" => include_bytes!("fixtures/receipt_v0/F45_row_a.json"),
+        "b" => include_bytes!("fixtures/receipt_v0/F45_row_b.json"),
+        "f19" => include_bytes!("fixtures/receipt_v0/F19_row.json"),
+        "f46" => include_bytes!("fixtures/receipt_v0/F46_row.json"),
+        "f58" => include_bytes!("fixtures/receipt_v0/F58_row.json"),
+        "tag" => include_bytes!("fixtures/receipt_v0/F58_tag_mismatch_row.json"),
+        "f74" => include_bytes!("fixtures/receipt_v0/F74_row.json"),
+        "f76" => include_bytes!("fixtures/receipt_v0/F76_replay_row.json"),
+        _ => panic!("unknown replay fixture"),
+    }
+}
+fn replay_fixture(name: &str) -> Row {
+    serde_json::from_slice(replay_fixture_bytes(name)).unwrap()
+}
+fn replay_resolver(row: &Row, arguments: Vec<PayloadResolution>, detection: Vec<PayloadResolution>) -> ReplayResolverDouble {
+    ReplayResolverDouble {
+        arguments_digest: match &row.proposal_context.record.arguments_payload {
+            PresentUnavailable::Present(p) => Some(p.digest.clone()), _ => None },
+        detection_digest: match &row.proposal_context.record.detection_payload {
+            PresentUnavailableAbsent::Present(p) => Some(p.digest.clone()), _ => None },
+        arguments, detection, calls: Default::default(),
+    }
+}
+fn replay_allowed() -> DecisionOutput {
+    DecisionOutput { decision: DecisionOutcome::Allow, reason_code: DecisionReason::Allowed, failed_constraints: vec![] }
+}
+fn replay_blocked() -> DecisionOutput {
+    DecisionOutput { decision: DecisionOutcome::Block, reason_code: DecisionReason::ToolNotAllowed,
+        failed_constraints: vec![FailedConstraint { argument: None, constraint: ConstraintName::ToolAllowed }] }
+}
+fn replay_assert(id: &str, row: &Row, policy: &[u8], resolver: ReplayResolverDouble,
+                 expected: ReplayVerdict, arguments_calls: usize, detection_calls: usize) {
+    let function = ReplayFunctionDouble::default();
+    let actual = DecisionReplayer::new(&function, &resolver).replay(&s5_bytes(row), policy);
+    assert_eq!(actual, expected, "{id}");
+    let calls = function.calls.borrow();
+    if matches!(expected, ReplayVerdict::NotComparable(_)) { assert!(calls.is_empty(), "{id}"); }
+    else {
+        let args: Value = serde_json::from_slice(include_bytes!("fixtures/receipt_v0/arguments.json")).unwrap();
+        assert_eq!(*calls, vec![(policy_digest(policy), "write_file".to_owned(), args)], "{id}");
+    }
+    let lookups = resolver.calls.borrow();
+    assert_eq!(lookups.iter().filter(|(_, d)| Some(d) == resolver.arguments_digest.as_ref()).count(), arguments_calls, "{id}");
+    assert_eq!(lookups.iter().filter(|(_, d)| Some(d) == resolver.detection_digest.as_ref()).count(), detection_calls, "{id}");
+    println!("{id}: {actual:?}; function_calls={}; arguments_calls={arguments_calls}; detection_calls={detection_calls}", calls.len());
+}
+fn replay_partition(id: &str) {
+    use ReplayReason::*;
+    use ReplayVerdict::*;
+    use PayloadResolution::*;
+    let mut row = replay_fixture(match id {
+        "C3"|"C4" => "b", "C5" => "f19", "C6" => "f46", "C9" => "f58", "C10" => "tag",
+        "C11" => "f76", "C12"|"C13" => "f74", _ => "a" });
+    let mut policy = include_bytes!("fixtures/receipt_v0/policy.json").to_vec();
+    if matches!(id, "C2"|"C3") { policy = include_bytes!("fixtures/receipt_v0/policy_flipped.json").to_vec(); }
+    if id == "C14" {
+        row.stages.decision.record.enforcement = Enforcement::NotEvaluated;
+        row.stages.decision.record.evaluated_policy = false;
+        row.stages.decision.record.reason_code = DecisionReason::PolicyLayerOff;
+        row.stages.attempt = Slot::AbsentByContract(AttemptAbsentReason::NotEnforced);
+        s5_rechain(&mut row, "");
+    }
+    if id == "C15" {
+        policy = b"not a policy".to_vec();
+        row.stages.decision.record.policy.policy_digest = policy_digest(&policy);
+        s5_rechain(&mut row, "");
+    }
+    let arguments = if id == "C7" { vec![NotConfigured; 2] }
+        else if id == "C8" { vec![NotFound] } else { vec![s8_args(); 2] };
+    let detection = if id == "C13" { vec![NotConfigured; 2] } else { vec![s8_detection(); 2] };
+    let (expected, ac, dc) = match id {
+        "C1"|"C9" => (Match(replay_allowed()), 2, 0),
+        "C2"|"C4" => (NotComparable(PolicyDigestMismatch), 1, 0),
+        "C3" => (Fail(replay_blocked()), 2, 0),
+        "C5" => (Fail(replay_allowed()), 2, 0),
+        "C6" => (NotComparable(ArgumentsNotPresent), 0, 0),
+        "C7" => (NotComparable(ArgumentsUnresolved), 2, 0),
+        "C8"|"C10" => (NotComparable(RowRejected(RejectionCode::ArgumentsPayloadMismatch)), 1, 0),
+        "C11" => (NotComparable(DetectionNotPresent), 2, 0),
+        "C12" => (Match(replay_allowed()), 2, 2),
+        "C13" => (NotComparable(DetectionUnresolved), 2, 2),
+        "C14" => (NotComparable(PolicyNotEvaluated), 1, 0),
+        "C15" => (NotComparable(PolicyUnparsable), 1, 0),
+        _ => unreachable!(),
+    };
+    let resolver = replay_resolver(&row, arguments, detection);
+    replay_assert(id, &row, &policy, resolver, expected, ac, dc);
+}
+
+#[test]
+fn replay_c01() { replay_partition("C1"); }
+
+#[test]
+fn replay_c02() { replay_partition("C2"); }
+
+#[test]
+fn replay_c03() { replay_partition("C3"); }
+
+#[test]
+fn replay_c04() { replay_partition("C4"); }
+
+#[test]
+fn replay_c05() { replay_partition("C5"); }
+
+#[test]
+fn replay_c06() { replay_partition("C6"); }
+
+#[test]
+fn replay_c07() { replay_partition("C7"); }
+
+#[test]
+fn replay_c08() { replay_partition("C8"); }
+
+#[test]
+fn replay_c09() { replay_partition("C9"); }
+
+#[test]
+fn replay_c10() { replay_partition("C10"); }
+
+#[test]
+fn replay_c11() { replay_partition("C11"); }
+
+#[test]
+fn replay_c12() { replay_partition("C12"); }
+
+#[test]
+fn replay_c13() { replay_partition("C13"); }
+
+#[test]
+fn replay_c14() { replay_partition("C14"); }
+
+#[test]
+fn replay_c15() { replay_partition("C15"); }
+
+fn replay_order(id: &str) {
+    use PayloadResolution::*;
+    use ReplayReason::*;
+    use ReplayVerdict::*;
+    use ReplayCheck::*;
+    let mut row = replay_fixture(match id {
+        "O1"|"A3" => "tag", "O2" => "a", "O3" => "f46", "O4" => "f76",
+        "O5"|"D0"|"D1"|"D2"|"D3" => "f74", _ => "f58" });
+    let policy = if matches!(id, "O1"|"O2"|"O3") {
+        include_bytes!("fixtures/receipt_v0/policy_flipped.json").as_slice()
+    } else { include_bytes!("fixtures/receipt_v0/policy.json").as_slice() };
+    let mut arguments = vec![s8_args(); 2];
+    let mut detection = vec![s8_detection(); 2];
+    match id {
+        "O2" => {
+            row.stages.decision.record.enforcement = Enforcement::NotEvaluated;
+            row.stages.decision.record.evaluated_policy = false;
+            row.stages.decision.record.reason_code = DecisionReason::PolicyLayerOff;
+            row.stages.attempt = Slot::AbsentByContract(AttemptAbsentReason::NotEnforced);
+        }
+        "O4" => row.proposal_context.record.arguments_payload = PresentUnavailable::Unavailable(ArgumentsPayloadError::StoreNotConfigured),
+        "O5" => { arguments = vec![NotConfigured; 2]; detection = vec![NotConfigured; 2]; }
+        "A0" => arguments[1] = NotFound,
+        "A1" => arguments[1] = Found(vec![b'x'; 34]),
+        "A2" => {
+            if let PresentUnavailable::Present(p) = &mut row.proposal_context.record.arguments_payload { p.len_bytes = 35; }
+            row.stages.proposal.record.arguments_len_bytes = PresentErrored::Present(35);
+            row.stages.proposal.record.arguments_digest = PresentErrored::Present("0".repeat(64));
+            arguments[0] = NotConfigured;
+        }
+        "A3" => arguments[0] = NotConfigured,
+        "A4" => {
+            let bytes = b"not json".to_vec();
+            if let PresentUnavailable::Present(p) = &mut row.proposal_context.record.arguments_payload {
+                p.digest = payload_digest(&bytes); p.len_bytes = bytes.len() as u64;
+            }
+            row.stages.proposal.record.arguments_len_bytes = PresentErrored::Present(bytes.len() as u64);
+            row.stages.proposal.record.arguments_digest = PresentErrored::Present(arguments_digest(&bytes));
+            arguments = vec![Found(bytes); 2];
+        }
+        "D0" => detection[1] = NotFound,
+        "D1" => detection[1] = Found(vec![b'x'; 1213]),
+        "D2"|"D3" => {
+            if let PresentUnavailableAbsent::Present(d) = &mut row.stages.decision.record.detection {
+                d.record_digest = "0".repeat(64);
+                if id == "D2" { d.record_len_bytes = 1214; }
+            }
+            if id == "D2" {
+                if let PresentUnavailableAbsent::Present(p) = &mut row.proposal_context.record.detection_payload { p.len_bytes = 1214; }
+            }
+            detection[0] = NotConfigured;
+        }
+        _ => {}
+    }
+    s5_rechain(&mut row, "");
+    let (reason, ac, dc) = match id {
+        "O1" => (RowRejected(RejectionCode::ArgumentsPayloadMismatch), 1, 0),
+        "O2" => (PolicyNotEvaluated, 1, 0),
+        "O3" => (PolicyDigestMismatch, 0, 0),
+        "O4" => (ArgumentsNotPresent, 0, 0),
+        "O5" => (ArgumentsUnresolved, 2, 1),
+        "A0" => (ArgumentsMismatch(Lookup), 2, 0),
+        "A1" => (ArgumentsMismatch(RawDigest), 2, 0),
+        "A2" => (ArgumentsMismatch(Length), 2, 0),
+        "A3" => (ArgumentsMismatch(TaggedDigest), 2, 0),
+        "A4" => (ArgumentsUnparsable, 2, 0),
+        "D0" => (DetectionMismatch(Lookup), 2, 2),
+        "D1" => (DetectionMismatch(RawDigest), 2, 2),
+        "D2" => (DetectionMismatch(Length), 2, 2),
+        "D3" => (DetectionMismatch(TaggedDigest), 2, 2),
+        _ => unreachable!(),
+    };
+    let resolver = replay_resolver(&row, arguments, detection);
+    replay_assert(id, &row, policy, resolver, NotComparable(reason), ac, dc);
+}
+
+#[test]
+fn replay_fixture_bytes_and_policy_derivations() {
+    let original: ResolvedActionPolicyV0 = serde_json::from_slice(include_bytes!("fixtures/receipt_v0/policy.json")).unwrap();
+    let mut flipped = original.clone(); flipped.tools.get_mut("write_file").unwrap().allowed = false;
+    assert_eq!(canonical_policy_bytes(&flipped).unwrap(), include_bytes!("fixtures/receipt_v0/policy_flipped.json"));
+    assert_eq!(canonical_policy_bytes(&original).unwrap(), include_bytes!("fixtures/receipt_v0/policy.json"));
+    assert_ne!(policy_digest(&canonical_policy_bytes(&original).unwrap()), policy_digest(&canonical_policy_bytes(&flipped).unwrap()));
+    for name in ["a", "b", "f19", "f46", "f76"] {
+        let row = replay_fixture(name);
+        assert_eq!(s5_bytes(&row), replay_fixture_bytes(name), "{name}");
+        let resolver = replay_resolver(&row, vec![s8_args()], vec![s8_detection()]);
+        assert_eq!(validate_receipt(&s5_bytes(&row), &resolver), ValidationResult::Valid, "{name}");
+    }
+}
+
+#[test]
+fn replay_policy_bytes_verbatim_and_inputs_consumed_excluded() {
+    let mut row = replay_fixture("a");
+    let mut policy = include_bytes!("fixtures/receipt_v0/policy.json").to_vec();
+    policy.push(b' ');
+    row.stages.decision.record.policy.policy_digest = policy_digest(&policy);
+    row.stages.decision.record.inputs_consumed.clear();
+    s5_rechain(&mut row, "");
+    let resolver = replay_resolver(&row, vec![s8_args(); 2], vec![]);
+    let function = ReplayFunctionDouble::default();
+    assert_eq!(DecisionReplayer::new(&function, &resolver).replay(&s5_bytes(&row), &policy), ReplayVerdict::Match(replay_allowed()));
+    assert_eq!(function.calls.borrow().len(), 1);
+}
+
+#[test]
+fn replay_o1() { replay_order("O1"); }
+
+#[test]
+fn replay_o2() { replay_order("O2"); }
+
+#[test]
+fn replay_o3() { replay_order("O3"); }
+
+#[test]
+fn replay_o4() { replay_order("O4"); }
+
+#[test]
+fn replay_o5() { replay_order("O5"); }
+
+#[test]
+fn replay_a0() { replay_order("A0"); }
+
+#[test]
+fn replay_a1() { replay_order("A1"); }
+
+#[test]
+fn replay_a2() { replay_order("A2"); }
+
+#[test]
+fn replay_a3() { replay_order("A3"); }
+
+#[test]
+fn replay_a4() { replay_order("A4"); }
+
+#[test]
+fn replay_d0() { replay_order("D0"); }
+
+#[test]
+fn replay_d1() { replay_order("D1"); }
+
+#[test]
+fn replay_d2() { replay_order("D2"); }
+
+#[test]
+fn replay_d3() { replay_order("D3"); }
+
+#[test]
+fn replay_fix1_detection_raw_before_length() {
+    // Contract e7b70be3, section 17 (F74): detection raw digest is verified before
+    // length, so a replayer payload failing both checks reports raw_digest.
+    use PayloadResolution::*;
+    use ReplayCheck::*;
+    use ReplayReason::*;
+    use ReplayVerdict::*;
+    let row = replay_fixture("f74");
+    let policy = include_bytes!("fixtures/receipt_v0/policy.json").as_slice();
+    let resolver = replay_resolver(&row, vec![s8_args(); 2], vec![s8_detection(), Found(vec![b'x'; 1214])]);
+    replay_assert("D1D2", &row, policy, resolver, NotComparable(DetectionMismatch(RawDigest)), 2, 2);
+}
