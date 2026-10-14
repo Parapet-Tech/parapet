@@ -36,7 +36,7 @@ pub struct MethodResult {
     pub comparison: PresentAbsent<Comparison>,
 }
 
-/// Contract e7b70be3, section 12.2 and L4; BQ-9 ruling f8d00d2b.
+/// Contract e7b70be3, section 12.2 and L4.
 /// Checks the domain before all ten ordered lines. None denotes only out-of-domain:
 /// expected_effect is not present, or the attempt was rejected.
 pub fn verify_expected_effect(
