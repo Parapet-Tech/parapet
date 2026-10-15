@@ -1,0 +1,18 @@
+data: {"id":"s","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
+
+data: {"id":"s","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"write_file","arguments":""}}]},"finish_reason":null}]}
+
+data: {"id":"s","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":\"a.txt\","}}]},"finish_reason":null}]}
+
+data: {"id":"s","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_b","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"/safe/x\"}"}}]},"finish_reason":null}]}
+
+data: {"id":"s","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"content\":\"hello\"}"}}]},"finish_reason":null}]}
+
+data: {"id":"s","choices":[{"index":1,"delta":{"tool_calls":[{"index":0,"id":"call_c","type":"function","function":{"name":"write_file","arguments":"{\"path\":\"a.txt\",\"content\":\"hello\"}"}}]},"finish_reason":null}]}
+
+data: {"id":"s","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: {"id":"s","choices":[{"index":1,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: [DONE]
+

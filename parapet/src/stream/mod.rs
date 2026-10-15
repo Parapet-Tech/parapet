@@ -18,7 +18,9 @@ mod types;
 
 pub use classifier::{AnthropicChunkClassifier, ChunkClassifier, OpenAiChunkClassifier};
 pub use processor::StreamProcessor;
-pub use types::{ToolCallBlockMode, ToolCallValidator, ValidationResult};
+pub use types::{
+    ToolCallBlockMode, ToolCallValidator, ValidationResult, MAX_TOOL_CALL_BUFFER_BYTES,
+};
 
 #[cfg(test)]
 mod tests;

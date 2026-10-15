@@ -1,0 +1,136 @@
+{
+ "cases": [
+  {
+   "name": "complete_retained",
+   "mutation": "none",
+   "claimed": null,
+   "expected": "ok"
+  },
+  {
+   "name": "claimed_complete",
+   "mutation": "none",
+   "claimed": "complete",
+   "expected": "ok"
+  },
+  {
+   "name": "claimed_downgrade",
+   "mutation": "none",
+   "claimed": "storage_incomplete",
+   "expected": "terminal_status_mismatch"
+  },
+  {
+   "name": "manifest_missing",
+   "mutation": "delete_manifest",
+   "claimed": null,
+   "expected": "run_manifest_missing"
+  },
+  {
+   "name": "manifest_corrupt",
+   "mutation": "garble_manifest",
+   "claimed": null,
+   "expected": "run_manifest_corrupt"
+  },
+  {
+   "name": "terminal_pending",
+   "mutation": "set_pending_terminal",
+   "claimed": "complete",
+   "expected": "terminal_pending"
+  },
+  {
+   "name": "terminal_missing",
+   "mutation": "clear_terminal_pointer",
+   "claimed": "complete",
+   "expected": "terminal_missing"
+  },
+  {
+   "name": "terminal_corrupt",
+   "mutation": "garble_terminal",
+   "claimed": "complete",
+   "expected": "terminal_corrupt"
+  },
+  {
+   "name": "binding_request",
+   "mutation": "expect_other_request",
+   "claimed": null,
+   "expected": "terminal_binding_mismatch"
+  },
+  {
+   "name": "binding_candidate",
+   "mutation": "expect_fabricated_candidate",
+   "claimed": null,
+   "expected": "terminal_binding_mismatch"
+  },
+  {
+   "name": "binding_row",
+   "mutation": "expect_other_row",
+   "claimed": null,
+   "expected": "terminal_binding_mismatch"
+  },
+  {
+   "name": "history_outcome_flip",
+   "mutation": "forge_incomplete_to_complete_chain",
+   "claimed": "complete",
+   "expected": "terminal_binding_mismatch"
+  },
+  {
+   "name": "history_broken_link",
+   "mutation": "forge_broken_link",
+   "claimed": null,
+   "expected": "terminal_binding_mismatch"
+  },
+  {
+   "name": "storage_incomplete",
+   "mutation": "storage_incomplete_run",
+   "claimed": null,
+   "expected": "storage_incomplete"
+  },
+  {
+   "name": "storage_incomplete_claimed_complete",
+   "mutation": "storage_incomplete_run",
+   "claimed": "complete",
+   "expected": "storage_incomplete"
+  },
+  {
+   "name": "cleanup_in_progress",
+   "mutation": "crash_after_release",
+   "claimed": null,
+   "expected": "cleanup_in_progress"
+  },
+  {
+   "name": "ref_not_listed",
+   "mutation": "unlisted_ref",
+   "claimed": null,
+   "expected": "ref_not_listed"
+  },
+  {
+   "name": "object_pending",
+   "mutation": "entry_pending",
+   "claimed": null,
+   "expected": "object_pending"
+  },
+  {
+   "name": "object_released",
+   "mutation": "cleaned",
+   "claimed": null,
+   "expected": "object_released"
+  },
+  {
+   "name": "object_missing",
+   "mutation": "delete_object",
+   "claimed": null,
+   "expected": "object_missing"
+  },
+  {
+   "name": "object_digest_mismatch",
+   "mutation": "flip_object_byte",
+   "claimed": null,
+   "expected": "object_digest_mismatch"
+  },
+  {
+   "name": "object_length_mismatch",
+   "mutation": "entry_length",
+   "claimed": null,
+   "expected": "object_length_mismatch"
+  }
+ ]
+}

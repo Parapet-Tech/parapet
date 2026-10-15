@@ -59,6 +59,7 @@ flate2 = "1"
 base64 = "0.22"
 phf = { version = "0.11", features = ["macros"] }
 dirs = "5"
+rustix = { version = "=1.1.3", features = ["fs"] }
 
 # Optional L2a dependencies (Prompt Guard 2 ONNX model)
 ort = { version = "2.0.0-rc.11", optional = true }

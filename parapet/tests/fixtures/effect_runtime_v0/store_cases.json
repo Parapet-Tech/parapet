@@ -1,0 +1,64 @@
+{
+ "cases": [
+  {
+   "name": "root_mode_0755",
+   "setup": "root_mode",
+   "expected": "unsafe_layout"
+  },
+  {
+   "name": "root_symlink",
+   "setup": "root_symlink",
+   "expected": "unsafe_layout"
+  },
+  {
+   "name": "root_regular_file",
+   "setup": "root_file",
+   "expected": "unsafe_layout"
+  },
+  {
+   "name": "root_foreign_owner",
+   "setup": "root_foreign_owner",
+   "expected": "unsafe_layout"
+  },
+  {
+   "name": "objects_foreign_owner",
+   "setup": "objects_foreign_owner",
+   "expected": "unsafe_layout"
+  },
+  {
+   "name": "payload_dir_symlink",
+   "setup": "payload_dir_symlink",
+   "expected": "unsafe_layout"
+  },
+  {
+   "name": "payload_dir_mode_0755",
+   "setup": "payload_dir_mode",
+   "expected": "unsafe_layout"
+  },
+  {
+   "name": "object_symlink",
+   "setup": "object_symlink",
+   "expected": "unsafe_object"
+  },
+  {
+   "name": "object_mode_0644",
+   "setup": "object_mode",
+   "expected": "unsafe_object"
+  },
+  {
+   "name": "object_directory",
+   "setup": "object_directory",
+   "expected": "unsafe_object"
+  },
+  {
+   "name": "object_collision",
+   "setup": "object_collision",
+   "expected": "collision"
+  },
+  {
+   "name": "lock_symlink",
+   "setup": "lock_symlink",
+   "expected": "lock_failed"
+  }
+ ]
+}

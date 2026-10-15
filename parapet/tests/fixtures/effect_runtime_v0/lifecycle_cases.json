@@ -1,0 +1,147 @@
+{
+ "absence": [
+  {
+   "name": "blocked",
+   "policy": "flip",
+   "tool": "write_file",
+   "arguments": {
+    "path": "a.txt",
+    "content": "hello"
+   },
+   "executor": true,
+   "reason": "blocked",
+   "summary": "blocked_before_execution"
+  },
+  {
+   "name": "unsupported",
+   "policy": "rewrite",
+   "tool": "read_file",
+   "arguments": {
+    "path": "/safe/x"
+   },
+   "executor": true,
+   "reason": "unsupported",
+   "summary": "not_attempted_unsupported"
+  },
+  {
+   "name": "not_enforced_layer_off",
+   "policy": "off",
+   "tool": "write_file",
+   "arguments": {
+    "path": "a.txt",
+    "content": "hello"
+   },
+   "executor": true,
+   "reason": "not_enforced",
+   "summary": "not_attempted_not_enforced"
+  },
+  {
+   "name": "not_enforced_shadow_mode",
+   "policy": "shadow_mode",
+   "tool": "write_file",
+   "arguments": {
+    "path": "a.txt",
+    "content": "hello"
+   },
+   "executor": true,
+   "reason": "not_enforced",
+   "summary": "not_attempted_not_enforced"
+  },
+  {
+   "name": "no_executor",
+   "policy": "rewrite",
+   "tool": "write_file",
+   "arguments": {
+    "path": "a.txt",
+    "content": "hello"
+   },
+   "executor": false,
+   "reason": "no_executor",
+   "summary": "not_attempted_no_executor"
+  },
+  {
+   "name": "present_with_executor",
+   "policy": "rewrite",
+   "tool": "write_file",
+   "arguments": {
+    "path": "a.txt",
+    "content": "hello"
+   },
+   "executor": true,
+   "reason": null,
+   "summary": "allowed_effect_verified"
+  }
+ ],
+ "sink": [
+  {
+   "name": "all_accepted",
+   "vector": [
+    "ok",
+    "ok",
+    "ok"
+   ],
+   "code": null,
+   "target_calls": 1
+  },
+  {
+   "name": "F59_context_rejected",
+   "vector": [
+    "ok",
+    "rejected",
+    "ok"
+   ],
+   "code": "sink_rejected",
+   "target_calls": 0
+  },
+  {
+   "name": "F60_decision_wrong_ref",
+   "vector": [
+    "ok",
+    "ok",
+    "wrong"
+   ],
+   "code": "sink_ref_mismatch",
+   "target_calls": 0
+  },
+  {
+   "name": "F73_unavailable_over_rejected",
+   "vector": [
+    "ok",
+    "unavailable",
+    "rejected"
+   ],
+   "code": "sink_unavailable",
+   "target_calls": 0
+  },
+  {
+   "name": "F73_rejected_over_wrong_ref",
+   "vector": [
+    "ok",
+    "rejected",
+    "wrong"
+   ],
+   "code": "sink_rejected",
+   "target_calls": 0
+  },
+  {
+   "name": "F73_wrong_ref",
+   "vector": [
+    "wrong",
+    "ok",
+    "ok"
+   ],
+   "code": "sink_ref_mismatch",
+   "target_calls": 0
+  },
+  {
+   "name": "F73_all_unavailable",
+   "vector": [
+    "unavailable",
+    "unavailable",
+    "unavailable"
+   ],
+   "code": "sink_unavailable",
+   "target_calls": 0
+  }
+ ]
+}
