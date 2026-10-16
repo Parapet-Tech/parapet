@@ -1,0 +1,176 @@
+{
+ "description": "Raw target-path cases for the section 6.1 first-match table (rows 7-9) and the actual landed decision (brief f17b49a6 sections 2-4). 'decision' is the measured policy decision; 'measured' marks the three section-2 allowed-decision values.",
+ "paths": [
+  {
+   "label": "fullwidth_a",
+   "path": "\uff41.txt",
+   "decision": "allow",
+   "row": 9,
+   "code": "outside_root",
+   "measured": true
+  },
+  {
+   "label": "zero_width_space",
+   "path": "a\u200b.txt",
+   "decision": "allow",
+   "row": 9,
+   "code": "outside_root",
+   "measured": true
+  },
+  {
+   "label": "fi_ligature",
+   "path": "\ufb01le.txt",
+   "decision": "allow",
+   "row": 9,
+   "code": "outside_root",
+   "measured": true
+  },
+  {
+   "label": "combining_acute",
+   "path": "a\u0301.txt",
+   "decision": "block",
+   "row": 9,
+   "code": "outside_root"
+  },
+  {
+   "label": "non_ascii_latin",
+   "path": "\u00e9.txt",
+   "decision": "block",
+   "row": 9,
+   "code": "outside_root"
+  },
+  {
+   "label": "cyrillic_o",
+   "path": "\u043e.txt",
+   "decision": "block",
+   "row": 9,
+   "code": "outside_root"
+  },
+  {
+   "label": "absolute",
+   "path": "/etc/passwd",
+   "decision": "block",
+   "row": 7,
+   "code": "outside_root"
+  },
+  {
+   "label": "absolute_slash",
+   "path": "/",
+   "decision": "block",
+   "row": 7,
+   "code": "outside_root"
+  },
+  {
+   "label": "absolute_traversal",
+   "path": "/../a",
+   "decision": "block",
+   "row": 7,
+   "code": "outside_root"
+  },
+  {
+   "label": "slash_nested",
+   "path": "a/b",
+   "decision": "block",
+   "row": 9,
+   "code": "outside_root"
+  },
+  {
+   "label": "backslash",
+   "path": "a\\b",
+   "decision": "block",
+   "row": 9,
+   "code": "outside_root"
+  },
+  {
+   "label": "nul",
+   "path": "a\u0000b",
+   "decision": "block",
+   "row": 9,
+   "code": "outside_root"
+  },
+  {
+   "label": "dot",
+   "path": ".",
+   "decision": "block",
+   "row": 8,
+   "code": "traversal"
+  },
+  {
+   "label": "dotdot",
+   "path": "..",
+   "decision": "block",
+   "row": 8,
+   "code": "traversal"
+  },
+  {
+   "label": "traversal",
+   "path": "../a",
+   "decision": "block",
+   "row": 8,
+   "code": "traversal"
+  },
+  {
+   "label": "inner_traversal",
+   "path": "a/../b",
+   "decision": "block",
+   "row": 8,
+   "code": "traversal"
+  },
+  {
+   "label": "inner_dot",
+   "path": "a/./b",
+   "decision": "block",
+   "row": 8,
+   "code": "traversal"
+  },
+  {
+   "label": "dot_prefixed",
+   "path": ".hidden",
+   "decision": "block",
+   "row": 9,
+   "code": "outside_root"
+  },
+  {
+   "label": "internal_evidence",
+   "path": ".parapet-root-evidence-v0",
+   "decision": "block",
+   "row": 9,
+   "code": "outside_root"
+  },
+  {
+   "label": "internal_sentinel",
+   "path": ".parapet-run-0.sentinel",
+   "decision": "block",
+   "row": 9,
+   "code": "outside_root"
+  },
+  {
+   "label": "internal_temp",
+   "path": ".parapet-tmp-v0-0",
+   "decision": "block",
+   "row": 9,
+   "code": "outside_root"
+  },
+  {
+   "label": "empty",
+   "path": "",
+   "decision": "block",
+   "row": 9,
+   "code": "outside_root"
+  },
+  {
+   "label": "overlength",
+   "path": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "decision": "block",
+   "row": 9,
+   "code": "outside_root"
+  }
+ ],
+ "valid": [
+  "a.txt",
+  "A",
+  "0",
+  "a-b_c.d",
+  "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+ ]
+}

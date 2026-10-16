@@ -1,0 +1,18 @@
+{
+ "description": "Mandatory 1C first-use profile (brief b76e6b1b section 7 as corrected by f17b49a6 section 3). {MAX} is the root's max_content_len_bytes; {ACTION} is the L3 block action.",
+ "max_content_len_bytes": 64,
+ "policy_template": "parapet: v1\ntools:\n  _default:\n    allowed: false\n  write_file:\n    allowed: true\n    constraints:\n      path:\n        type: string\n        matches: \"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$\"\n        max_length: 128\n      content:\n        type: string\n        max_length: {MAX}\nlayers:\n  L3_outbound: { mode: block, block_action: {ACTION} }\n",
+ "relaxed_template": "parapet: v1\ntools:\n  _default:\n    allowed: false\n  write_file:\n    allowed: true\n    constraints:\n      path:\n        type: string\n        max_length: 128\n      content:\n        type: string\n        max_length: {MAX}\nlayers:\n  L3_outbound: { mode: block, block_action: {ACTION} }\n",
+ "not_enforced_template": "parapet: v1\ntools:\n  _default:\n    allowed: false\n  write_file:\n    allowed: true\n    constraints:\n      path:\n        type: string\n        matches: \"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$\"\n        max_length: 128\n      content:\n        type: string\n        max_length: {MAX}\nlayers:\n  L3_outbound: { mode: shadow }\n",
+ "limits": {
+  "accepted": [
+   1,
+   64,
+   1048576
+  ],
+  "rejected": [
+   0,
+   1048577
+  ]
+ }
+}

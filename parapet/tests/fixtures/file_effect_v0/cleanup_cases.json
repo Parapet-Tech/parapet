@@ -1,0 +1,60 @@
+{
+ "description": "Cleanup setups after one created effect and their closed results (brief b76e6b1b section 6.4).",
+ "cases": [
+  {
+   "label": "created_effect",
+   "setup": "none",
+   "expected": "clear"
+  },
+  {
+   "label": "no_effect",
+   "setup": "no_effect",
+   "expected": "clear"
+  },
+  {
+   "label": "undeclared_residue",
+   "setup": "residue",
+   "expected": "indeterminate"
+  },
+  {
+   "label": "sentinel_mismatch",
+   "setup": "tamper_sentinel",
+   "expected": "indeterminate"
+  },
+  {
+   "label": "metadata_mismatch",
+   "setup": "tamper_metadata",
+   "expected": "indeterminate"
+  },
+  {
+   "label": "sentinel_missing",
+   "setup": "remove_sentinel",
+   "expected": "indeterminate"
+  },
+  {
+   "label": "sentinel_symlink",
+   "setup": "symlink_sentinel",
+   "expected": "indeterminate"
+  },
+  {
+   "label": "enumeration_uncertain",
+   "setup": "fault_enumerate",
+   "expected": "indeterminate"
+  },
+  {
+   "label": "closed_capability",
+   "setup": "closed",
+   "expected": "indeterminate"
+  },
+  {
+   "label": "declared_removal_fails",
+   "setup": "fault_unlink",
+   "expected": "fail"
+  },
+  {
+   "label": "declared_target_is_directory",
+   "setup": "target_directory",
+   "expected": "fail"
+  }
+ ]
+}
