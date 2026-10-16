@@ -1,0 +1,8 @@
+{
+ "description": "Resolved-policy inputs for 1B fixtures: write_file and read_file allowed; _default denied.",
+ "rewrite": "parapet: v1\ntools:\n  _default:\n    allowed: false\n  write_file:\n    allowed: true\n  read_file:\n    allowed: true\n    constraints:\n      path:\n        type: string\n        starts_with: \"/safe/\"\nlayers:\n  L3_outbound: { mode: block, block_action: rewrite }\n",
+ "error": "parapet: v1\ntools:\n  _default:\n    allowed: false\n  write_file:\n    allowed: true\n  read_file:\n    allowed: true\n    constraints:\n      path:\n        type: string\n        starts_with: \"/safe/\"\nlayers:\n  L3_outbound: { mode: block, block_action: error }\n",
+ "off": "parapet: v1\ntools:\n  _default:\n    allowed: false\n  write_file:\n    allowed: true\n  read_file:\n    allowed: true\n    constraints:\n      path:\n        type: string\n        starts_with: \"/safe/\"\nlayers:\n  L0: { mode: \"off\" }\n",
+ "shadow_mode": "parapet: v1\ntools:\n  _default:\n    allowed: false\n  write_file:\n    allowed: true\n  read_file:\n    allowed: true\n    constraints:\n      path:\n        type: string\n        starts_with: \"/safe/\"\nlayers:\n  L3_outbound: { mode: shadow }\n",
+ "l1": "parapet: v1\ntools:\n  _default:\n    allowed: false\n  write_file:\n    allowed: true\n  read_file:\n    allowed: true\n    constraints:\n      path:\n        type: string\n        starts_with: \"/safe/\"\nlayers:\n  L3_outbound: { mode: block, block_action: rewrite }\n  L1: { mode: shadow, threshold: 0.5 }\n"
+}

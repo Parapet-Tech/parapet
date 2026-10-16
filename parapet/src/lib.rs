@@ -4,6 +4,7 @@
 pub mod config;
 pub mod constraint;
 pub mod defang;
+pub mod effect;
 pub mod engine;
 #[cfg(feature = "eval")]
 pub mod eval;

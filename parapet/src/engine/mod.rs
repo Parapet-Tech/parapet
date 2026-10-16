@@ -21,6 +21,9 @@ use std::io::Read as _;
 
 use crate::config::{Config, FailureMode, L2aMode, PatternAction};
 use crate::constraint::{ConstraintEvaluator, DslConstraintEvaluator, ToolCallVerdict};
+use crate::effect::RequestCaptureV0;
+#[cfg(not(windows))]
+use crate::effect::RuntimeEnvelopeV0;
 use crate::layers::l1::{EnsembleL1Scanner, L1Scanner, L1Verdict, L1Block, SvmModel};
 use crate::layers::l1_harness::{L1Harness, L1Model, L1Signal, threshold_outcome, OutcomeView};
 use crate::layers::l2a::L2aScanner;
@@ -218,11 +221,37 @@ pub struct EngineDeps {
 /// Upstream client that runs the full Parapet pipeline.
 pub struct EngineUpstreamClient {
     deps: EngineDeps,
+    /// Opt-in effect-receipt runtime envelope; `None` unless explicitly attached.
+    #[cfg(not(windows))]
+    envelope: Option<Arc<RuntimeEnvelopeV0>>,
 }
 
 impl EngineUpstreamClient {
     pub fn new_with(deps: EngineDeps) -> Self {
-        Self { deps }
+        Self {
+            deps,
+            #[cfg(not(windows))]
+            envelope: None,
+        }
+    }
+
+    /// Additive constructor: attach the runtime envelope (Routing contract
+    /// 50747a52, section 4). `EngineDeps` and `new_with` are unchanged; the
+    /// envelope's executor binding is whatever it was constructed with.
+    #[cfg(not(windows))]
+    pub fn new_with_envelope(deps: EngineDeps, envelope: Arc<RuntimeEnvelopeV0>) -> Self {
+        Self {
+            deps,
+            envelope: Some(envelope),
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn receipt_provider(provider: Provider) -> crate::receipt::Provider {
+    match provider {
+        Provider::OpenAi => crate::receipt::Provider::Openai,
+        Provider::Anthropic => crate::receipt::Provider::Anthropic,
     }
 }
 
@@ -270,6 +299,27 @@ impl UpstreamClient for EngineUpstreamClient {
         self.deps
             .trust_assigner
             .assign_trust(&mut messages, &self.deps.config);
+
+        // 2.5) Opt-in receipt capture before any L0 mutation (contract 50747a52, step 1).
+        #[cfg(not(windows))]
+        let capture: Option<RequestCaptureV0> = match &self.envelope {
+            Some(envelope) => {
+                if ctx.model.len() > 256 {
+                    let body =
+                        adapter.serialize_error("invalid request: model exceeds 256 bytes", 400);
+                    return Ok(ProxyResponse::from_bytes(StatusCode::BAD_REQUEST, body));
+                }
+                Some(envelope.capture(
+                    &messages,
+                    request.headers.get("x-request-id").map(|v| v.as_bytes()),
+                    &ctx.request_id,
+                    &ctx.model,
+                ))
+            }
+            None => None,
+        };
+        #[cfg(windows)]
+        let capture: Option<RequestCaptureV0> = None;
 
         // 3) L0 normalization (if enabled)
         //
@@ -896,7 +946,7 @@ impl UpstreamClient for EngineUpstreamClient {
             })?;
 
         if stream {
-            let mut resp = self.handle_streaming_response(provider, upstream, &ctx);
+            let mut resp = self.handle_streaming_response_with(provider, upstream, &ctx, capture);
             attach_evidence_headers(&mut resp.headers, evidence_count, &evidence_categories);
             if self.deps.emit_l1_signals {
                 attach_l1_signal_headers(&mut resp.headers, &l1_signals_opt);
@@ -928,7 +978,8 @@ impl UpstreamClient for EngineUpstreamClient {
         // Strips Content-Encoding/Content-Length from forwarded headers.
         let body_bytes = maybe_decompress(&mut resp_headers, body_bytes)?;
 
-        let processed = self.handle_non_streaming_response(provider, &body_bytes, &ctx);
+        let processed =
+            self.handle_non_streaming_response_with(provider, &body_bytes, &ctx, capture.as_ref());
 
         // The body was re-serialized (JSON parse → process → to_vec), so
         // the upstream framing headers are stale.  Strip them and let
@@ -958,7 +1009,14 @@ impl UpstreamClient for EngineUpstreamClient {
 }
 
 impl EngineUpstreamClient {
-    fn handle_streaming_response(&self, provider: Provider, upstream: HttpResponse, ctx: &RequestContext) -> ProxyResponse {
+    #[cfg_attr(windows, allow(unused_variables))]
+    fn handle_streaming_response_with(
+        &self,
+        provider: Provider,
+        upstream: HttpResponse,
+        ctx: &RequestContext,
+        capture: Option<RequestCaptureV0>,
+    ) -> ProxyResponse {
         let compressed_stream = is_gzip(&upstream.headers) || is_deflate(&upstream.headers);
         let content_encoding = upstream
             .headers
@@ -1016,6 +1074,17 @@ impl EngineUpstreamClient {
             HttpBody::Stream(s) => stream_body(s),
         };
 
+        #[cfg(not(windows))]
+        let processor = match (&self.envelope, capture) {
+            (Some(envelope), Some(capture)) => StreamProcessor::with_envelope(
+                classifier,
+                validator,
+                block_mode,
+                envelope.stream_session(capture, receipt_provider(provider)),
+            ),
+            _ => StreamProcessor::new(classifier, validator, block_mode),
+        };
+        #[cfg(windows)]
         let processor = StreamProcessor::new(classifier, validator, block_mode);
         let processed_stream = processor.process(stream);
 
@@ -1052,11 +1121,23 @@ impl EngineUpstreamClient {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn handle_non_streaming_response(
         &self,
         provider: Provider,
         body: &Bytes,
         ctx: &RequestContext,
+    ) -> ProcessedResponse {
+        self.handle_non_streaming_response_with(provider, body, ctx, None)
+    }
+
+    #[cfg_attr(windows, allow(unused_variables))]
+    fn handle_non_streaming_response_with(
+        &self,
+        provider: Provider,
+        body: &Bytes,
+        ctx: &RequestContext,
+        capture: Option<&RequestCaptureV0>,
     ) -> ProcessedResponse {
         let adapter = self.deps.registry.adapter_for(provider);
         let mut json: serde_json::Value = match serde_json::from_slice(body) {
@@ -1070,7 +1151,41 @@ impl EngineUpstreamClient {
             }
         };
 
-        if let Some(layer) = &self.deps.config.policy.layers.l3_outbound {
+        #[cfg(not(windows))]
+        let envelope_settled = if let (Some(envelope), Some(capture)) = (&self.envelope, capture) {
+            // Whole-response suppression is decided before serialization.
+            let (result, delivery) =
+                envelope.process_buffered(capture, receipt_provider(provider), &mut json);
+            tracing::info!(
+                request_id = %ctx.request_id,
+                contract_hash = %ctx.contract_hash,
+                provider = ctx.provider_str,
+                model = %ctx.model,
+                layer = "L3-outbound",
+                envelope_runs = result.runs.len(),
+                envelope_candidates = result.mapping.len(),
+                envelope_completion = ?result.completion,
+                envelope_delivery = ?result.delivery,
+                "effect receipt envelope settled"
+            );
+            if delivery.suppressed {
+                let body = adapter.serialize_error("request blocked by content policy", 403);
+                return ProcessedResponse {
+                    status_override: Some(StatusCode::FORBIDDEN),
+                    body: Bytes::from(body),
+                    extra_headers: None,
+                };
+            }
+            true
+        } else {
+            false
+        };
+        #[cfg(windows)]
+        let envelope_settled = false;
+
+        if envelope_settled {
+            // The envelope above settled every candidate; L3-outbound does not rerun.
+        } else if let Some(layer) = &self.deps.config.policy.layers.l3_outbound {
             if layer.mode == "block" {
                 let l3o_start = Instant::now();
                 let block_action = layer.block_action.as_deref().unwrap_or("rewrite");

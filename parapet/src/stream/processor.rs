@@ -13,8 +13,12 @@ use super::types::{
     ChunkType, StreamError, ToolCallBlockMode, ToolCallBuffer, ToolCallValidator, ValidationResult,
     TOOL_CALL_DELTA_TIMEOUT_SECS,
 };
+#[cfg(not(windows))]
+use crate::effect::{CallDispositionV0, StreamEnvelopeSessionV0, StreamFailureV0, StreamTouchV0};
 use bytes::Bytes;
 use std::collections::HashMap;
+#[cfg(not(windows))]
+use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
@@ -30,6 +34,9 @@ pub struct StreamProcessor {
     classifier: Arc<dyn ChunkClassifier>,
     validator: Arc<dyn ToolCallValidator>,
     block_mode: ToolCallBlockMode,
+    /// Opt-in runtime envelope session; `None` for every existing constructor.
+    #[cfg(not(windows))]
+    envelope: std::sync::Mutex<Option<StreamEnvelopeSessionV0>>,
 }
 
 impl StreamProcessor {
@@ -43,7 +50,24 @@ impl StreamProcessor {
             classifier,
             validator,
             block_mode,
+            #[cfg(not(windows))]
+            envelope: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Envelope-aware constructor (Routing contract 50747a52, section 4.4):
+    /// every materialized call coordinate is finalized and settled by the
+    /// session independently; an earlier released allow is never retracted.
+    #[cfg(not(windows))]
+    pub fn with_envelope(
+        classifier: Arc<dyn ChunkClassifier>,
+        validator: Arc<dyn ToolCallValidator>,
+        block_mode: ToolCallBlockMode,
+        session: StreamEnvelopeSessionV0,
+    ) -> Self {
+        let processor = Self::new(classifier, validator, block_mode);
+        *processor.envelope.lock().expect("envelope slot") = Some(session);
+        processor
     }
 
     /// Process an input byte stream, producing an output byte stream.
@@ -62,6 +86,12 @@ impl StreamProcessor {
         let (tx, rx) = mpsc::channel::<Bytes>(64);
 
         let block_mode = self.block_mode;
+
+        #[cfg(not(windows))]
+        if let Some(session) = self.envelope.lock().expect("envelope slot").take() {
+            tokio::spawn(envelope_task(input, session, block_mode, tx));
+            return ReceiverStream::new(rx);
+        }
 
         tokio::spawn(async move {
             // Accumulate the first chunk to detect SSE vs non-SSE
@@ -578,4 +608,400 @@ fn extract_arguments_delta(data: &serde_json::Value, event: Option<&str>) -> Str
                 .to_string()
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Envelope-aware processing (opt-in)
+// ---------------------------------------------------------------------------
+
+/// One complete SSE event, field lines plus its blank terminator, awaiting the
+/// decisions of every call it touches. An event is released or dropped whole.
+#[cfg(not(windows))]
+struct PendingEvent {
+    lines: Vec<String>,
+    data: String,
+    terminated: bool,
+    touches: Vec<StreamTouchV0>,
+}
+
+#[cfg(not(windows))]
+struct EnvelopeState {
+    openai: bool,
+    line_buffer: String,
+    event_lines: Vec<String>,
+    pending: VecDeque<PendingEvent>,
+    decided: HashMap<StreamTouchV0, CallDispositionV0>,
+    last_delta_time: Instant,
+}
+
+#[cfg(not(windows))]
+async fn emit(tx: &mpsc::Sender<Bytes>, text: String) -> Result<(), ()> {
+    tx.send(Bytes::from(text)).await.map_err(|_| ())
+}
+
+// Emit one event as a unit; the terminator is restored only if the source sent it.
+#[cfg(not(windows))]
+async fn emit_event(
+    tx: &mpsc::Sender<Bytes>,
+    lines: &[String],
+    terminated: bool,
+) -> Result<(), ()> {
+    let mut text = String::new();
+    for line in lines {
+        text.push_str(line);
+        text.push('\n');
+    }
+    if terminated {
+        text.push('\n');
+    }
+    emit(tx, text).await
+}
+
+#[cfg(not(windows))]
+async fn emit_closed_error(tx: &mpsc::Sender<Bytes>, text: &str) -> Result<(), ()> {
+    emit(tx, format!("data: {{\"error\": \"{text}\"}}\n\n")).await
+}
+
+// Closed refusal for a withheld call, as complete SSE events.
+#[cfg(not(windows))]
+fn rewrite_events(refusal: &str, anthropic: bool, index: u32) -> Vec<Vec<String>> {
+    let data = |value: serde_json::Value| format!("data: {value}");
+    if anthropic {
+        vec![
+            vec![
+                "event: content_block_start".to_string(),
+                data(
+                    serde_json::json!({"type": "content_block_start", "index": index,
+                    "content_block": {"type": "text", "text": ""}}),
+                ),
+            ],
+            vec![
+                "event: content_block_delta".to_string(),
+                data(
+                    serde_json::json!({"type": "content_block_delta", "index": index,
+                    "delta": {"type": "text_delta", "text": refusal}}),
+                ),
+            ],
+            vec![
+                "event: content_block_stop".to_string(),
+                data(serde_json::json!({"type": "content_block_stop", "index": index})),
+            ],
+        ]
+    } else {
+        vec![vec![data(
+            serde_json::json!({"choices": [{"delta": {"content": refusal},
+            "finish_reason": null}]}),
+        )]]
+    }
+}
+
+// Queue an event that touches no call; it is released in arrival order.
+#[cfg(not(windows))]
+fn queue_event(state: &mut EnvelopeState, lines: Vec<String>) {
+    state.pending.push_back(PendingEvent {
+        lines,
+        data: String::new(),
+        terminated: true,
+        touches: Vec::new(),
+    });
+}
+
+// Value of an SSE field line (`name:` with one optional leading space).
+#[cfg(not(windows))]
+fn sse_field<'a>(line: &'a str, name: &str) -> Option<&'a str> {
+    let rest = line.trim().strip_prefix(name)?.strip_prefix(':')?;
+    Some(rest.strip_prefix(' ').unwrap_or(rest))
+}
+
+// Remove withheld calls from a multi-call OpenAI payload; `None` drops the event.
+#[cfg(not(windows))]
+fn filter_openai_data(
+    data: &str,
+    decided: &HashMap<StreamTouchV0, CallDispositionV0>,
+) -> Option<String> {
+    let mut json: serde_json::Value = serde_json::from_str(data.trim()).ok()?;
+    let mut kept = 0usize;
+    for choice in json.get_mut("choices")?.as_array_mut()?.iter_mut() {
+        let choice_index = choice.get("index").and_then(|i| i.as_u64());
+        if let Some(calls) = choice
+            .get_mut("delta")
+            .and_then(|d| d.get_mut("tool_calls"))
+            .and_then(|c| c.as_array_mut())
+        {
+            calls.retain(|call| {
+                let index = call.get("index").and_then(|i| i.as_u64());
+                let released = match (choice_index, index) {
+                    (Some(c), Some(i)) => matches!(
+                        decided.get(&StreamTouchV0::Formed(c as u32, i as u32)),
+                        Some(CallDispositionV0::Release)
+                    ),
+                    _ => false,
+                };
+                kept += usize::from(released);
+                released
+            });
+        }
+    }
+    (kept > 0).then(|| serde_json::to_string(&json).ok().unwrap_or_default())
+}
+
+// Release or drop queued events in arrival order; stops at the first event
+// whose calls are not all decided, so released events keep their order.
+#[cfg(not(windows))]
+async fn flush_pending(state: &mut EnvelopeState, tx: &mpsc::Sender<Bytes>) -> Result<(), ()> {
+    while let Some(pending) = state.pending.front() {
+        let dispositions: Option<Vec<&CallDispositionV0>> = pending
+            .touches
+            .iter()
+            .map(|t| state.decided.get(t))
+            .collect();
+        let Some(dispositions) = dispositions else {
+            break;
+        };
+        let all_released = dispositions
+            .iter()
+            .all(|d| **d == CallDispositionV0::Release);
+        let any_released = dispositions
+            .iter()
+            .any(|d| **d == CallDispositionV0::Release);
+        let pending = state.pending.pop_front().expect("front event");
+        if all_released {
+            emit_event(tx, &pending.lines, pending.terminated).await?;
+        } else if state.openai && any_released {
+            if let Some(filtered) = filter_openai_data(&pending.data, &state.decided) {
+                let mut lines = Vec::new();
+                let mut placed = false;
+                for line in &pending.lines {
+                    if sse_field(line, "data").is_none() {
+                        lines.push(line.clone());
+                    } else if !placed {
+                        lines.push(format!("data: {filtered}"));
+                        placed = true;
+                    }
+                }
+                emit_event(tx, &lines, pending.terminated).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+// Record finalized calls; each withheld call queues its closed notice.
+#[cfg(not(windows))]
+fn record_decisions(
+    state: &mut EnvelopeState,
+    decided: Vec<(StreamTouchV0, CallDispositionV0)>,
+    block_mode: ToolCallBlockMode,
+) {
+    for (touch, disposition) in decided {
+        if let CallDispositionV0::Withhold(code) = &disposition {
+            match block_mode {
+                ToolCallBlockMode::Error => {
+                    let text = format!("tool call blocked by policy ({code})");
+                    queue_event(state, vec![format!("data: {{\"error\": \"{text}\"}}")]);
+                }
+                ToolCallBlockMode::Rewrite => {
+                    let index = match touch {
+                        StreamTouchV0::Formed(_, i) => i,
+                        StreamTouchV0::Unformable(_) => 0,
+                    };
+                    let refusal = format!("Tool call was blocked by policy ({code})");
+                    for lines in rewrite_events(&refusal, !state.openai, index) {
+                        queue_event(state, lines);
+                    }
+                }
+            }
+        }
+        state.decided.insert(touch, disposition);
+    }
+}
+
+// Settle one complete event; returns whether a call overflowed its buffer.
+#[cfg(not(windows))]
+async fn envelope_event(
+    lines: Vec<String>,
+    terminated: bool,
+    state: &mut EnvelopeState,
+    session: &mut StreamEnvelopeSessionV0,
+    block_mode: ToolCallBlockMode,
+    tx: &mpsc::Sender<Bytes>,
+) -> Result<bool, ()> {
+    let mut event: Option<String> = None;
+    let mut data: Option<String> = None;
+    for line in &lines {
+        if let Some(name) = sse_field(line, "event") {
+            event = Some(name.trim().to_string());
+        } else if let Some(value) = sse_field(line, "data") {
+            match &mut data {
+                Some(joined) => {
+                    joined.push('\n');
+                    joined.push_str(value);
+                }
+                None => data = Some(value.to_string()),
+            }
+        }
+    }
+    let data = data.filter(|d| d.trim() != "[DONE]");
+    let step = match &data {
+        Some(data) => session.ingest(event.as_deref(), data),
+        None => Default::default(),
+    };
+    record_decisions(state, step.decided, block_mode);
+    if !step.touches.is_empty() {
+        state.last_delta_time = Instant::now();
+    }
+    // Pass-through events (no touches) queue too, so arrival order is kept.
+    state.pending.push_back(PendingEvent {
+        lines,
+        data: data.unwrap_or_default(),
+        terminated,
+        touches: step.touches,
+    });
+    flush_pending(state, tx).await?;
+    Ok(step.overflow)
+}
+
+// Collect field lines; a blank line completes the event under construction.
+#[cfg(not(windows))]
+async fn envelope_line(
+    line: String,
+    state: &mut EnvelopeState,
+    session: &mut StreamEnvelopeSessionV0,
+    block_mode: ToolCallBlockMode,
+    tx: &mpsc::Sender<Bytes>,
+) -> Result<bool, ()> {
+    if !line.trim().is_empty() {
+        state.event_lines.push(line);
+        return Ok(false);
+    }
+    let lines = std::mem::take(&mut state.event_lines);
+    if lines.is_empty() {
+        // A stray blank line dispatches nothing; it keeps its place in order.
+        queue_event(state, lines);
+        flush_pending(state, tx).await?;
+        return Ok(false);
+    }
+    envelope_event(lines, true, state, session, block_mode, tx).await
+}
+
+#[cfg(not(windows))]
+async fn envelope_abort(
+    state: &mut EnvelopeState,
+    session: &mut StreamEnvelopeSessionV0,
+    failure: StreamFailureV0,
+    block_mode: ToolCallBlockMode,
+    tx: &mpsc::Sender<Bytes>,
+) {
+    let decided = session.abort(failure);
+    record_decisions(state, decided, block_mode);
+    let _ = flush_pending(state, tx).await;
+}
+
+#[cfg(not(windows))]
+async fn envelope_task(
+    mut input: impl Stream<Item = Bytes> + Unpin + Send + 'static,
+    mut session: StreamEnvelopeSessionV0,
+    block_mode: ToolCallBlockMode,
+    tx: mpsc::Sender<Bytes>,
+) {
+    let Some(first_chunk) = input.next().await else {
+        session.finish();
+        return;
+    };
+    if !is_sse_content(&first_chunk) {
+        if tx.send(first_chunk).await.is_ok() {
+            while let Some(chunk) = input.next().await {
+                if tx.send(chunk).await.is_err() {
+                    break;
+                }
+            }
+        }
+        session.finish();
+        return;
+    }
+    let mut state = EnvelopeState {
+        openai: session.provider() == crate::receipt::Provider::Openai,
+        line_buffer: String::new(),
+        event_lines: Vec::new(),
+        pending: VecDeque::new(),
+        decided: HashMap::new(),
+        last_delta_time: Instant::now(),
+    };
+    let timeout = Duration::from_secs(TOOL_CALL_DELTA_TIMEOUT_SECS);
+    let mut chunk = Some(first_chunk);
+    while let Some(bytes) = chunk.take() {
+        state.line_buffer.push_str(&String::from_utf8_lossy(&bytes));
+        while let Some(pos) = state.line_buffer.find('\n') {
+            let line = state.line_buffer[..pos].to_string();
+            state.line_buffer.drain(..=pos);
+            match envelope_line(line, &mut state, &mut session, block_mode, &tx).await {
+                Ok(false) => {}
+                Ok(true) => {
+                    envelope_abort(
+                        &mut state,
+                        &mut session,
+                        StreamFailureV0::StreamAborted,
+                        block_mode,
+                        &tx,
+                    )
+                    .await;
+                    let _ = emit_closed_error(&tx, "tool call buffer overflow").await;
+                    session.finish();
+                    return;
+                }
+                Err(()) => {
+                    envelope_abort(
+                        &mut state,
+                        &mut session,
+                        StreamFailureV0::StreamAborted,
+                        block_mode,
+                        &tx,
+                    )
+                    .await;
+                    session.finish();
+                    return;
+                }
+            }
+        }
+        // While a call is open, the next chunk races the delta deadline so a
+        // stalled provider cannot hold the candidate open indefinitely.
+        chunk = if session.has_open() {
+            let deadline = state.last_delta_time + timeout;
+            match tokio::time::timeout_at(deadline, input.next()).await {
+                Ok(next) => next,
+                Err(_) => {
+                    envelope_abort(
+                        &mut state,
+                        &mut session,
+                        StreamFailureV0::DeltaTimeout,
+                        block_mode,
+                        &tx,
+                    )
+                    .await;
+                    let _ = emit_closed_error(&tx, "tool call delta timeout").await;
+                    session.finish();
+                    return;
+                }
+            }
+        } else {
+            input.next().await
+        };
+    }
+    if !state.line_buffer.trim().is_empty() {
+        let line = std::mem::take(&mut state.line_buffer);
+        state.event_lines.push(line);
+    }
+    let lines = std::mem::take(&mut state.event_lines);
+    if !lines.is_empty() {
+        let _ = envelope_event(lines, false, &mut state, &mut session, block_mode, &tx).await;
+    }
+    envelope_abort(
+        &mut state,
+        &mut session,
+        StreamFailureV0::StreamAborted,
+        block_mode,
+        &tx,
+    )
+    .await;
+    session.finish();
 }

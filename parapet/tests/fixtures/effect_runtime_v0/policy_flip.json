@@ -1,0 +1,5 @@
+{
+ "description": "F45 one-key flip of policy_allow.rewrite (write_file allowed: false) and the F66 constraint policy.",
+ "rewrite": "parapet: v1\ntools:\n  _default:\n    allowed: false\n  write_file:\n    allowed: false\n  read_file:\n    allowed: true\n    constraints:\n      path:\n        type: string\n        starts_with: \"/safe/\"\nlayers:\n  L3_outbound: { mode: block, block_action: rewrite }\n",
+ "f66": "parapet: v1\ntools:\n  write_file:\n    allowed: true\n    constraints:\n      path:\n        type: string\n        starts_with: \"/safe/\"\n        max_length: 5\n      content:\n        type: string\n  typed:\n    allowed: true\n    constraints:\n      n:\n        type: number\n        min: 1\n        max: 3\n      url:\n        url_host: [\"example.com\"]\n        not_contains: [\"evil\"]\n        matches: \"^https://\"\n        one_of: [\"https://example.com/a\"]\n  denied:\n    allowed: false\nlayers:\n  L3_outbound: { mode: block, block_action: rewrite }\n"
+}
