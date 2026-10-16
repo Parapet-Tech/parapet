@@ -14,6 +14,10 @@ pub mod capture;
 /// Section 3: one run and one row per formed candidate.
 #[cfg(not(windows))]
 pub mod envelope;
+/// 1C: the concrete file controller, observer, root capability and cleanup;
+/// not compiled on Windows and never selected by default.
+#[cfg(not(windows))]
+pub mod file;
 /// Section 4.2: closed interface types, traits and instruments.
 pub mod interfaces;
 /// Section 3 step 4: resolved policy, build identity and complete decision.
@@ -29,6 +33,8 @@ pub use candidate::*;
 pub use capture::*;
 #[cfg(not(windows))]
 pub use envelope::*;
+#[cfg(not(windows))]
+pub use file::*;
 pub use interfaces::*;
 pub use policy::*;
 #[cfg(not(windows))]
