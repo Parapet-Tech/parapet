@@ -293,7 +293,7 @@ impl L1Model for SvmModel {
                         let entry = matches.entry(feature.clone()).or_insert_with(|| AttributedFeature {
                             feature, weight, contribution: weight, occurrences: 0, spans: Vec::new(),
                         });
-                        if !entry.spans.contains(&span) { entry.spans.push(span); }
+                        entry.spans.push(span);
                     }
                 }
             }
@@ -302,6 +302,7 @@ impl L1Model for SvmModel {
         let mut features: Vec<_> = matches.into_values().collect();
         for feature in &mut features {
             feature.spans.sort_unstable();
+            feature.spans.dedup();
             feature.occurrences = feature.spans.len();
         }
         crate::layers::l1_detection::order_features(&mut features);

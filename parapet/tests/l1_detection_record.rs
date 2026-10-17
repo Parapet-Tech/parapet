@@ -1142,3 +1142,59 @@ fn attribution_margin_equivalence() {
         );
     }
 }
+
+#[test]
+fn repeated_match_stress_spans() {
+    let mut first_bits = None;
+    for n in [1, 2, 17, 8000] {
+        let text = "AI ".repeat(n);
+        let record = scan_text(&text, &cfg(), false).unwrap();
+        assert_eq!(record.top_features.iter().map(|f| f.feature.as_str()).collect::<Vec<_>>(), vec![" ai", " ai "]);
+        for feature in &record.top_features {
+            assert_eq!(feature.spans, positions(&text, &feature.feature));
+            assert_eq!(feature.spans.len(), n);
+            assert_eq!(feature.occurrences, n);
+            assert!(feature.spans.windows(2).all(|pair| pair[0] < pair[1]));
+        }
+        let current = record.effective_raw.to_bits();
+        assert_eq!(*first_bits.get_or_insert(current), current);
+        assert_eq!(record.attribution_status, AttributionStatus::Present);
+        assert!(record_bytes(&record).is_ok());
+    }
+}
+
+#[test]
+fn short_feature_duplicate_emission() {
+    for key in weights::WEIGHTS.keys() {
+        let text = key.trim_matches(' ');
+        if text.is_empty() || text.chars().count() > 4 {
+            continue;
+        }
+        match scan_text(text, &cfg(), false) {
+            Ok(record) => {
+                assert!(truthful(text, &record.top_features));
+                for feature in &record.top_features {
+                    assert!(feature.spans.windows(2).all(|pair| pair[0] != pair[1]));
+                }
+            }
+            Err(ScanError::EmptyInput) => {}
+            Err(error) => panic!("unexpected scan error: {error:?}"),
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn repeated_match_timing_probe() {
+    for n in [1000, 2000, 4000, 8000] {
+        let text = "AI ".repeat(n);
+        let start = std::time::Instant::now();
+        let attributed = SvmModel.score_attributed(&text);
+        let attribution_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let start = std::time::Instant::now();
+        let score = SvmModel.score(&text);
+        let scoring_ms = start.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(attributed.margin.to_bits(), score.to_bits());
+        println!("n={n} bytes={} attribution_ms={attribution_ms} scoring_ms={scoring_ms}", text.len());
+    }
+}
