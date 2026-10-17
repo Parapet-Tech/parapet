@@ -6,6 +6,9 @@ export interface ParapetConfig {
   port?: number;
   extraHosts?: string[];
   autoStart?: boolean;
+  stateDir?: string;
+  engineBinary?: string;
+  engineArgs?: string[];
 }
 
 export interface SessionOptions {

@@ -36,18 +36,96 @@ and current implementation mapping, see [strategy/layers.md](strategy/layers.md)
 
 ## Quick Start
 
-### 1. Install
+### 1. Supported Local First-Use Journey (CLI and Locally Built Wheel)
+
+The currently proven first-use environment is **macOS arm64 with Python 3.10 or newer** using a **locally built wheel** (`parapet-0.1.0-*.whl` built locally from `parapet-py` with Maturin). Parapet is not published to PyPI or npm, the protected runtime, evidence store, control socket, and file-effect lifecycle are POSIX-only (Windows protected-runtime support is not supported or claimed), and deterministic offline fixture checks do not constitute real-model validation.
+
+Build the local wheel from `parapet-py` (replace `<wheel-out-dir>` with a disposable directory outside the checkout):
 
 ```bash
-# Python SDK
-pip install parapet
-
-# TypeScript SDK
-npm install @parapet-tech/parapet
-
-# Or build the Rust engine directly
-cd parapet && cargo build --release
+cd parapet-py
+maturin build --release --locked --out <wheel-out-dir>
 ```
+
+#### Ordinary first use (default)
+
+Create a fresh disposable Python 3.10+ virtual environment outside the checkout, install the pinned runtime dependency `httpx==0.28.1`, then install the locally built wheel with `--no-deps` and activate the environment:
+
+```bash
+python3 -m venv <venv>
+<venv>/bin/python -m pip install httpx==0.28.1
+<venv>/bin/python -m pip install --no-deps <path-to-parapet-wheel>
+source <venv>/bin/activate
+```
+
+Resolving `httpx==0.28.1` and its dependencies in this default path may use the network. In contrast, `<path-to-parapet-wheel>` is the local Section 11.2 wheel artifact built above; it is not a network package name and is not fetched from or published to PyPI.
+
+#### Maintainer frozen offline verification
+
+This variant is executable only on a host with the pre-populated cache and pinned inputs from Section 2.2 of the implementation brief. In both installation paths, `<path-to-parapet-wheel>` is replaced by the local wheel artifact produced in Section 11.2 (never a network package name). Automated dispatch acceptance executes only this second path and never gains network authority from the ordinary-user documentation:
+
+```bash
+python3 -m venv <venv>
+uv pip install --offline --python <venv>/bin/python httpx==0.28.1
+uv pip install --offline --python <venv>/bin/python --no-deps <path-to-parapet-wheel>
+source <venv>/bin/activate
+```
+
+#### Verify `site-packages` and installed binaries
+
+Verify that `parapet` imports from the isolated environment's `site-packages` (never the repository checkout) and that both compiled binaries are present on `PATH`:
+
+```bash
+python -c "import parapet; print(parapet.__file__)"
+command -v parapet
+command -v parapet-engine
+```
+
+The wheel installs only the Python `parapet` package plus the `parapet` and `parapet-engine` binaries; `parapet-fetch`, `parapet-scope-audit`, `pg2-diag`, and `parapet-eval` are intentionally absent.
+
+#### First installed CLI checks (`info` then bounded `scan`)
+
+Run the installed CLI in this order:
+
+```bash
+parapet info --json
+printf 'hello parapet' | parapet scan --stdin --json
+```
+
+Default `parapet scan --json` output is bounded summary metadata (model identity, digests, score, and detection outcome without raw input or matched feature substrings/spans). By contrast, `--record-json` is a separately warned sensitive evidence export that writes exact canonical `l1-detection-record/v0` bytes (including matched feature substrings and character spans) and must never be used on secret or regulated input without appropriate custody.
+
+#### Protected runtime and evidence lifecycle
+
+Run the protected lifecycle in this exact order (`init` -> `run` -> `inspect` -> `restore` -> `disable` -> post-disable `inspect` -> optional explicit `evidence release` -> post-release `inspect`). Because `parapet run` starts a long-lived engine process, keep it running in one terminal and run the control and inspection commands from a second terminal:
+
+```bash
+# Terminal 1: initialize disposable state and start the long-lived engine
+parapet init --state-dir <state-dir> --effect-root <new-effect-root> --json
+parapet run --state-dir <state-dir> --config <config> --effect-root <new-effect-root> --file-effect-profile v0 --run-id 00000000000000000000000000000001 --max-content-bytes 4096 --json
+
+# Terminal 2: inspect -> restore -> disable -> post-disable inspect -> optional evidence release -> post-release inspect
+parapet inspect --state-dir <state-dir> --run-id 00000000000000000000000000000001 --json
+parapet restore --state-dir <state-dir> --json
+parapet disable --state-dir <state-dir> --json
+# protected evidence: retained (use 'parapet evidence release' to release store objects)
+parapet inspect --state-dir <state-dir> --run-id 00000000000000000000000000000001 --json
+parapet evidence release --state-dir <state-dir> --run-id 00000000000000000000000000000001 --json
+parapet inspect --state-dir <state-dir> --run-id 00000000000000000000000000000001 --json
+```
+
+`parapet disable` never performs `restore` itself: it is an observational shutdown gate that refuses to stop an owned effect-enabled engine until file cleanup is already `clear` (after `parapet restore`) or `not_applicable`. Stopping the engine always retains protected receipt evidence (`protected evidence: retained (use 'parapet evidence release' to release store objects)`) so post-restore and post-disable `parapet inspect` continue to succeed until you optionally run explicit `parapet evidence release`, after which `parapet inspect` reports `reader: object_released`.
+
+#### Disposable offline acceptance example
+
+To run a self-contained local acceptance pass against the fixed offline upstream fixture, supply a disposable `<state-dir>` and a disposable `<new-effect-root>` that does not exist beforehand:
+
+```bash
+parapet accept --state-dir <state-dir> --config <config> --scenario allow_verified_write --run-id 00000000000000000000000000000001 --sdk python --effect-root <new-effect-root> --json
+```
+
+`upstream: deterministic offline fixture (no real model contacted)`
+
+Both `<state-dir>` and `<new-effect-root>` are disposable local directories, `<new-effect-root>` must not exist beforehand, and the command contacts only the deterministic local fixture (`"real_model_contacted": false`).
 
 ### 2. Write a policy
 

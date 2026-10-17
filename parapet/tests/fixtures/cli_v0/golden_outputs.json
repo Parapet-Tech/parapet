@@ -1,0 +1,177 @@
+{
+  "info_human_stdout": "parapet 0.1.0 (engine 0.1.0)\nl1_model.schema_version: l1-detection-record/v0\nl1_model.model_id: l1-generalist-2026-04-17\nl1_model.model_digest: fb01f1688ca0559c15f8c9aa3fc22837fe77379613568b2c077ad92defcab5f8\nl1_model.code_version: 0.1.0\n",
+  "info_json_stdout": "{\"schema\":\"parapet-cli-info/v0\",\"cli_version\":\"0.1.0\",\"engine_version\":\"0.1.0\",\"l1_model\":{\"schema_version\":\"l1-detection-record/v0\",\"model_id\":\"l1-generalist-2026-04-17\",\"model_digest\":\"fb01f1688ca0559c15f8c9aa3fc22837fe77379613568b2c077ad92defcab5f8\",\"code_version\":\"0.1.0\"}}\n",
+  "init_human_stdout": "state_status: initialized\nowned_control_entries: control.json, receipt-evidence\neffect_root_policy: must_be_new_on_run\nfile_capability: not_applicable\n",
+  "init_json_stdout": "{\"schema\":\"parapet-cli-init/v0\",\"state_status\":\"initialized\",\"owned_control_entries\":[\"control.json\",\"receipt-evidence\"],\"effect_root_policy\":\"must_be_new_on_run\",\"file_capability\":\"not_applicable\"}\n",
+  "accept_allow_no_executor_json_stdout": "{\"schema\":\"parapet-cli-accept/v0\",\"scenario\":\"allow_no_executor\",\"sdk\":\"rust\",\"run_id\":\"0123456789abcdef0123456789abcdef\",\"real_model_contacted\":false,\"upstream_label\":\"upstream: deterministic offline fixture (no real model contacted)\",\"http_status\":200,\"summary\":\"not_attempted_no_executor\",\"summary_label\":\"not attempted: no executor\",\"enforcement\":\"enforced\",\"enforcement_label\":\"enforcement: enforced\",\"verification_availability\":\"absent_by_contract\",\"verification_outcome\":null,\"verification_error_code\":null,\"verification_label\":\"verification: absent by contract\",\"replay_verdict\":null,\"replay_reason\":null,\"replay_label\":null}\n",
+  "accept_allow_no_executor_human_stdout": "scenario: allow_no_executor\nsdk: rust\nrun_id: 0123456789abcdef0123456789abcdef\nreal_model_contacted: false\nupstream: deterministic offline fixture (no real model contacted)\nhttp_status: 200\nsummary: not attempted: no executor\nenforcement: enforced\nverification: absent by contract\n",
+  "accept_allow_verified_write_json_stdout": "{\"schema\":\"parapet-cli-accept/v0\",\"scenario\":\"allow_verified_write\",\"sdk\":\"rust\",\"run_id\":\"0123456789abcdef0123456789abcdef\",\"real_model_contacted\":false,\"upstream_label\":\"upstream: deterministic offline fixture (no real model contacted)\",\"http_status\":200,\"summary\":\"allowed_effect_verified\",\"summary_label\":\"allowed; effect verified\",\"enforcement\":\"enforced\",\"enforcement_label\":\"enforcement: enforced\",\"verification_availability\":\"present\",\"verification_outcome\":\"verified\",\"verification_error_code\":null,\"verification_label\":\"verification: verified\",\"replay_verdict\":null,\"replay_reason\":null,\"replay_label\":null}\n",
+  "accept_allow_verified_write_human_stdout": "scenario: allow_verified_write\nsdk: rust\nrun_id: 0123456789abcdef0123456789abcdef\nreal_model_contacted: false\nupstream: deterministic offline fixture (no real model contacted)\nhttp_status: 200\nsummary: allowed; effect verified\nenforcement: enforced\nverification: verified\n",
+  "accept_block_no_effect_json_stdout": "{\"schema\":\"parapet-cli-accept/v0\",\"scenario\":\"block_no_effect\",\"sdk\":\"rust\",\"run_id\":\"0123456789abcdef0123456789abcdef\",\"real_model_contacted\":false,\"upstream_label\":\"upstream: deterministic offline fixture (no real model contacted)\",\"http_status\":200,\"summary\":\"blocked_before_execution\",\"summary_label\":\"blocked before execution\",\"enforcement\":\"enforced\",\"enforcement_label\":\"enforcement: enforced\",\"verification_availability\":\"absent_by_contract\",\"verification_outcome\":null,\"verification_error_code\":null,\"verification_label\":\"verification: absent by contract\",\"replay_verdict\":null,\"replay_reason\":null,\"replay_label\":null}\n",
+  "accept_block_no_effect_human_stdout": "scenario: block_no_effect\nsdk: rust\nrun_id: 0123456789abcdef0123456789abcdef\nreal_model_contacted: false\nupstream: deterministic offline fixture (no real model contacted)\nhttp_status: 200\nsummary: blocked before execution\nenforcement: enforced\nverification: absent by contract\n",
+  "accept_shadow_parse_error_l3_off_json_stdout": "{\"schema\":\"parapet-cli-accept/v0\",\"scenario\":\"shadow_parse_error_l3_off\",\"sdk\":\"rust\",\"run_id\":\"0123456789abcdef0123456789abcdef\",\"real_model_contacted\":false,\"upstream_label\":\"upstream: deterministic offline fixture (no real model contacted)\",\"http_status\":200,\"summary\":\"blocked_before_execution\",\"summary_label\":\"blocked before execution\",\"enforcement\":\"shadow\",\"enforcement_label\":\"enforcement: shadow (block computed, not applied)\",\"verification_availability\":\"absent_by_contract\",\"verification_outcome\":null,\"verification_error_code\":null,\"verification_label\":\"verification: absent by contract\",\"replay_verdict\":null,\"replay_reason\":null,\"replay_label\":null}\n",
+  "accept_shadow_parse_error_l3_off_human_stdout": "scenario: shadow_parse_error_l3_off\nsdk: rust\nrun_id: 0123456789abcdef0123456789abcdef\nreal_model_contacted: false\nupstream: deterministic offline fixture (no real model contacted)\nhttp_status: 200\nsummary: blocked before execution\nenforcement: shadow (block computed, not applied)\nverification: absent by contract\n",
+  "restore_clear_json_stdout": "{\"schema\":\"parapet-cli-restore/v0\",\"result\":\"clear\",\"label\":\"file cleanup: clear\",\"a6_booking_required\":false,\"evidence_retained\":true}\n",
+  "restore_clear_human_stdout": "file cleanup: clear\na6_booking_required: false\nprotected evidence: retained (use 'parapet evidence release' to release store objects)\n",
+  "restore_not_applicable_json_stdout": "{\"schema\":\"parapet-cli-restore/v0\",\"result\":\"not_applicable\",\"label\":\"file cleanup: not applicable\",\"a6_booking_required\":false,\"evidence_retained\":true}\n",
+  "restore_not_applicable_human_stdout": "file cleanup: not applicable\na6_booking_required: false\nprotected evidence: retained (use 'parapet evidence release' to release store objects)\n",
+  "restore_indeterminate_json_stdout": "{\"schema\":\"parapet-cli-restore/v0\",\"result\":\"indeterminate\",\"label\":\"file cleanup: indeterminate\",\"a6_booking_required\":true,\"evidence_retained\":true}\n",
+  "restore_indeterminate_human_stdout": "file cleanup: indeterminate\na6_booking_required: true\nprotected evidence: retained (use 'parapet evidence release' to release store objects)\n",
+  "restore_engine_unavailable_json_stdout": "{\"schema\":\"parapet-cli-restore/v0\",\"result\":\"engine_unavailable\",\"label\":\"cleanup: not run (owning engine unavailable)\",\"a6_booking_required\":false,\"evidence_retained\":true}\n",
+  "restore_engine_unavailable_human_stdout": "cleanup: not run (owning engine unavailable)\na6_booking_required: false\nprotected evidence: retained (use 'parapet evidence release' to release store objects)\n",
+  "evidence_release_clear_json_stdout": "{\"schema\":\"parapet-cli-evidence-release/v0\",\"run_id\":\"0123456789abcdef0123456789abcdef\",\"store_open\":\"ok\",\"store_failure_code\":null,\"result\":\"clear\",\"label\":\"evidence cleanup: clear\",\"control_evidence_retained\":true}\n",
+  "evidence_release_clear_human_stdout": "run_id: 0123456789abcdef0123456789abcdef\nevidence cleanup: clear\ncontrol evidence retained: lock, run/0123456789abcdef0123456789abcdef/manifest.json, run/0123456789abcdef0123456789abcdef/terminal/*.json\n",
+  "evidence_release_refused_terminal_unsettled_json_stdout": "{\"schema\":\"parapet-cli-evidence-release/v0\",\"run_id\":\"0123456789abcdef0123456789abcdef\",\"store_open\":\"ok\",\"store_failure_code\":null,\"result\":\"refused_terminal_unsettled\",\"label\":\"evidence cleanup: not started (terminal unsettled)\",\"control_evidence_retained\":true}\n",
+  "evidence_release_refused_terminal_unsettled_human_stdout": "run_id: 0123456789abcdef0123456789abcdef\nevidence cleanup: not started (terminal unsettled)\ncontrol evidence retained: lock, run/0123456789abcdef0123456789abcdef/manifest.json, run/0123456789abcdef0123456789abcdef/terminal/*.json\n",
+  "evidence_release_store_unsafe_layout_json_stdout": "{\"schema\":\"parapet-cli-evidence-release/v0\",\"run_id\":\"0123456789abcdef0123456789abcdef\",\"store_open\":\"failed\",\"store_failure_code\":\"unsafe_layout\",\"result\":null,\"label\":\"evidence store open failed: unsafe_layout\",\"control_evidence_retained\":true}\n",
+  "evidence_release_store_unsafe_layout_human_stdout": "run_id: 0123456789abcdef0123456789abcdef\nevidence store open failed: unsafe_layout\ncontrol_evidence_retained: true\n",
+  "disable_stopped_no_capability_json_stdout": "{\"schema\":\"parapet-cli-disable/v0\",\"status\":\"stopped\",\"refusal_code\":null,\"file_cleanup\":\"not_applicable\",\"file_cleanup_label\":\"file cleanup: not applicable\",\"ownership_label\":\"engine ownership: owned\",\"owned_control_removed\":true,\"evidence_retained\":true}\n",
+  "disable_stopped_no_capability_human_stdout": "status: stopped\nengine ownership: owned\nfile cleanup: not applicable\nprotected evidence: retained (use 'parapet evidence release' to release store objects)\n",
+  "disable_stopped_released_clear_json_stdout": "{\"schema\":\"parapet-cli-disable/v0\",\"status\":\"stopped\",\"refusal_code\":null,\"file_cleanup\":\"clear\",\"file_cleanup_label\":\"file cleanup: clear\",\"ownership_label\":\"engine ownership: owned\",\"owned_control_removed\":true,\"evidence_retained\":true}\n",
+  "disable_stopped_released_clear_human_stdout": "status: stopped\nengine ownership: owned\nfile cleanup: clear\nprotected evidence: retained (use 'parapet evidence release' to release store objects)\n",
+  "disable_refused_file_cleanup_not_run_json_stdout": "{\"schema\":\"parapet-cli-disable/v0\",\"status\":\"refused\",\"refusal_code\":\"file_cleanup_not_run\",\"file_cleanup\":\"not_run\",\"file_cleanup_label\":\"file cleanup: not run (restore required)\",\"ownership_label\":\"engine ownership: owned\",\"owned_control_removed\":false,\"evidence_retained\":true}\n",
+  "disable_refused_file_cleanup_not_run_human_stdout": "status: refused\nengine ownership: owned\nfile cleanup: not run (restore required)\nprotected evidence: retained (use 'parapet evidence release' to release store objects)\n",
+  "disable_refused_file_cleanup_indeterminate_json_stdout": "{\"schema\":\"parapet-cli-disable/v0\",\"status\":\"refused\",\"refusal_code\":\"file_cleanup_indeterminate\",\"file_cleanup\":\"indeterminate\",\"file_cleanup_label\":\"file cleanup: indeterminate\",\"ownership_label\":\"engine ownership: owned\",\"owned_control_removed\":false,\"evidence_retained\":true}\n",
+  "disable_refused_file_cleanup_indeterminate_human_stdout": "status: refused\nengine ownership: owned\nfile cleanup: indeterminate\nprotected evidence: retained (use 'parapet evidence release' to release store objects)\n",
+  "disable_refused_not_owned_json_stdout": "{\"schema\":\"parapet-cli-disable/v0\",\"status\":\"refused\",\"refusal_code\":\"not_owned\",\"file_cleanup\":null,\"file_cleanup_label\":null,\"ownership_label\":\"engine ownership: not owned; no stop attempted\",\"owned_control_removed\":false,\"evidence_retained\":true}\n",
+  "disable_refused_not_owned_human_stdout": "status: refused\nengine ownership: not owned; no stop attempted\nprotected evidence: retained (use 'parapet evidence release' to release store objects)\n",
+  "disable_refused_engine_unavailable_json_stdout": "{\"schema\":\"parapet-cli-disable/v0\",\"status\":\"refused\",\"refusal_code\":\"engine_unavailable\",\"file_cleanup\":\"engine_unavailable\",\"file_cleanup_label\":\"cleanup: not run (owning engine unavailable)\",\"ownership_label\":\"engine ownership: unavailable\",\"owned_control_removed\":false,\"evidence_retained\":true}\n",
+  "disable_refused_engine_unavailable_human_stdout": "status: refused\nengine ownership: unavailable\ncleanup: not run (owning engine unavailable)\nprotected evidence: retained (use 'parapet evidence release' to release store objects)\n",
+  "scan_record_json_help_warning": "SENSITIVE EVIDENCE EXPORT: emits exact canonical l1-detection-record/v0 bytes for caller-supplied input, which may contain matched feature substrings and character spans. Never use on secret or regulated input without appropriate custody.",
+  "f71": {
+    "target_bytes_hex": "1b5b33316d781b5b306d2a2a622a2a3c623e793c2f623e",
+    "escaped_target_text": "\\x1b[31mx\\x1b[0m**b**<b>y</b>",
+    "target_digest": "92853d985910e9db103da5a056caf1d8d5dbbd5e5d46b299b5329897c362ffba",
+    "target_len_bytes": 23
+  },
+  "errors": {
+    "scan_l1_disabled": {
+      "exit_code": 3,
+      "json_stdout": "{\"schema\":\"parapet-cli-error/v0\",\"command\":\"scan\",\"error_code\":\"invalid_config\",\"exit_code\":3}\n",
+      "stderr": "parapet scan: error: L1 configuration is not enabled\n"
+    },
+    "scan_empty_after_normalization": {
+      "exit_code": 3,
+      "json_stdout": "{\"schema\":\"parapet-cli-error/v0\",\"command\":\"scan\",\"error_code\":\"empty_input_after_normalization\",\"exit_code\":3}\n",
+      "stderr": "parapet scan: error: input is empty after normalization\n"
+    },
+    "scan_invalid_input_source": {
+      "exit_code": 2,
+      "json_stdout": "{\"schema\":\"parapet-cli-error/v0\",\"command\":\"scan\",\"error_code\":\"invalid_scan_input_source\",\"exit_code\":2}\n",
+      "stderr": "parapet scan: error: exactly one of --input <path> or --stdin must be specified\n"
+    },
+    "scan_conflicting_output_flags": {
+      "exit_code": 2,
+      "json_stdout": "{\"schema\":\"parapet-cli-error/v0\",\"command\":\"scan\",\"error_code\":\"conflicting_output_flags\",\"exit_code\":2}\n",
+      "stderr": "parapet scan: error: --json and --record-json are mutually exclusive\n"
+    },
+    "scan_invalid_arguments": {
+      "exit_code": 2,
+      "json_stdout": "{\"schema\":\"parapet-cli-error/v0\",\"command\":\"scan\",\"error_code\":\"invalid_arguments\",\"exit_code\":2}\n",
+      "stderr": "parapet scan: error: invalid command-line arguments\n"
+    },
+    "cli_invalid_arguments": {
+      "exit_code": 2,
+      "json_stdout": "{\"schema\":\"parapet-cli-error/v0\",\"command\":\"cli\",\"error_code\":\"invalid_arguments\",\"exit_code\":2}\n",
+      "stderr": "parapet cli: error: invalid command-line arguments\n"
+    },
+    "scan_input_too_large": {
+      "exit_code": 3,
+      "json_stdout": "{\"schema\":\"parapet-cli-error/v0\",\"command\":\"scan\",\"error_code\":\"input_too_large\",\"exit_code\":3}\n",
+      "stderr": "parapet scan: error: input exceeds --max-bytes limit\n"
+    },
+    "scan_invalid_utf8_input": {
+      "exit_code": 3,
+      "json_stdout": "{\"schema\":\"parapet-cli-error/v0\",\"command\":\"scan\",\"error_code\":\"invalid_utf8_input\",\"exit_code\":3}\n",
+      "stderr": "parapet scan: error: input is not valid UTF-8\n"
+    },
+    "scan_input_read_failed": {
+      "exit_code": 3,
+      "json_stdout": "{\"schema\":\"parapet-cli-error/v0\",\"command\":\"scan\",\"error_code\":\"input_read_failed\",\"exit_code\":3}\n",
+      "stderr": "parapet scan: error: unable to read input file\n"
+    },
+    "scan_invalid_config": {
+      "exit_code": 3,
+      "json_stdout": "{\"schema\":\"parapet-cli-error/v0\",\"command\":\"scan\",\"error_code\":\"invalid_config\",\"exit_code\":3}\n",
+      "stderr": "parapet scan: error: failed to load configuration\n"
+    },
+    "init_effect_root_already_exists": {
+      "exit_code": 2,
+      "json_stdout": "{\"schema\":\"parapet-cli-error/v0\",\"command\":\"init\",\"error_code\":\"effect_root_already_exists\",\"exit_code\":2}\n",
+      "stderr": "parapet init: error: effect-root must not exist before engine startup\n"
+    },
+    "init_invalid_path": {
+      "exit_code": 2,
+      "json_stdout": "{\"schema\":\"parapet-cli-error/v0\",\"command\":\"init\",\"error_code\":\"invalid_path\",\"exit_code\":2}\n",
+      "stderr": "parapet init: error: path arguments must not contain parent directory traversal\n"
+    },
+    "init_unsafe_state_dir": {
+      "exit_code": 4,
+      "json_stdout": "{\"schema\":\"parapet-cli-error/v0\",\"command\":\"init\",\"error_code\":\"unsafe_state_dir\",\"exit_code\":4}\n",
+      "stderr": "parapet init: error: state-dir must be a private 0700 directory owned by current user\n"
+    },
+    "init_store_unsafe_layout": {
+      "exit_code": 4,
+      "json_stdout": "{\"schema\":\"parapet-cli-error/v0\",\"command\":\"init\",\"error_code\":\"unsafe_layout\",\"exit_code\":4}\n",
+      "stderr": "parapet init: error: evidence store open failed: unsafe_layout\n"
+    },
+    "inspect_invalid_run_id": {
+      "exit_code": 2,
+      "json_stdout": "{\"schema\":\"parapet-cli-error/v0\",\"command\":\"inspect\",\"error_code\":\"invalid_run_id\",\"exit_code\":2}\n",
+      "stderr": "parapet inspect: error: --run-id must be 32 lowercase hex characters\n"
+    },
+    "inspect_invalid_claimed_outcome": {
+      "exit_code": 2,
+      "json_stdout": "{\"schema\":\"parapet-cli-error/v0\",\"command\":\"inspect\",\"error_code\":\"invalid_claimed_outcome\",\"exit_code\":2}\n",
+      "stderr": "parapet inspect: error: --claimed-outcome must be complete or storage_incomplete\n"
+    },
+    "inspect_invalid_path": {
+      "exit_code": 2,
+      "json_stdout": "{\"schema\":\"parapet-cli-error/v0\",\"command\":\"inspect\",\"error_code\":\"invalid_path\",\"exit_code\":2}\n",
+      "stderr": "parapet inspect: error: path arguments must not contain parent directory traversal\n"
+    },
+    "inspect_store_unsafe_layout": {
+      "exit_code": 4,
+      "json_stdout": "{\"schema\":\"parapet-cli-error/v0\",\"command\":\"inspect\",\"error_code\":\"unsafe_layout\",\"exit_code\":4}\n",
+      "stderr": "parapet inspect: error: evidence store open failed: unsafe_layout\n"
+    },
+    "accept_invalid_combination": {
+      "exit_code": 2,
+      "json_stdout": "{\"schema\":\"parapet-cli-error/v0\",\"command\":\"accept\",\"error_code\":\"invalid_accept_combination\",\"exit_code\":2}\n"
+    },
+    "run_state_dir_not_initialized": {
+      "exit_code": 4,
+      "json_stdout": "{\"schema\":\"parapet-cli-error/v0\",\"command\":\"run\",\"error_code\":\"state_dir_not_initialized\",\"exit_code\":4}\n",
+      "stderr": "parapet run: error: state-dir is not initialized (run 'parapet init' first)\n"
+    },
+    "run_effect_root_already_exists": {
+      "exit_code": 2,
+      "json_stdout": "{\"schema\":\"parapet-cli-error/v0\",\"command\":\"run\",\"error_code\":\"effect_root_already_exists\",\"exit_code\":2}\n",
+      "stderr": "parapet run: error: effect-root must be a new non-existent path\n"
+    },
+    "run_invalid_effect_arguments": {
+      "exit_code": 2,
+      "json_stdout": "{\"schema\":\"parapet-cli-error/v0\",\"command\":\"run\",\"error_code\":\"invalid_effect_arguments\",\"exit_code\":2}\n"
+    },
+    "restore_invalid_path": {
+      "exit_code": 2,
+      "json_stdout": "{\"schema\":\"parapet-cli-error/v0\",\"command\":\"restore\",\"error_code\":\"invalid_path\",\"exit_code\":2}\n",
+      "stderr": "parapet restore: error: path arguments must not contain parent directory traversal\n"
+    },
+    "evidence_release_invalid_path": {
+      "exit_code": 2,
+      "json_stdout": "{\"schema\":\"parapet-cli-error/v0\",\"command\":\"evidence release\",\"error_code\":\"invalid_path\",\"exit_code\":2}\n",
+      "stderr": "parapet evidence release: error: path arguments must not contain parent directory traversal\n"
+    },
+    "evidence_release_invalid_run_id": {
+      "exit_code": 2,
+      "json_stdout": "{\"schema\":\"parapet-cli-error/v0\",\"command\":\"evidence release\",\"error_code\":\"invalid_run_id\",\"exit_code\":2}\n",
+      "stderr": "parapet evidence release: error: --run-id must be 32 lowercase hex characters\n"
+    },
+    "disable_invalid_path": {
+      "exit_code": 2,
+      "json_stdout": "{\"schema\":\"parapet-cli-error/v0\",\"command\":\"disable\",\"error_code\":\"invalid_path\",\"exit_code\":2}\n",
+      "stderr": "parapet disable: error: path arguments must not contain parent directory traversal\n"
+    }
+  }
+}

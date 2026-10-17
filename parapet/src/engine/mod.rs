@@ -172,6 +172,9 @@ pub enum StartupError {
     FeatureDisabled(String),
     /// L2a configured but model files missing or invalid.
     ModelMissing(String),
+    /// Runtime envelope, store, or file-effect initialization failed.
+    #[cfg(not(windows))]
+    RuntimeInit(String),
 }
 
 impl std::fmt::Display for StartupError {
@@ -179,6 +182,8 @@ impl std::fmt::Display for StartupError {
         match self {
             StartupError::FeatureDisabled(msg) => write!(f, "{msg}"),
             StartupError::ModelMissing(msg) => write!(f, "{msg}"),
+            #[cfg(not(windows))]
+            StartupError::RuntimeInit(msg) => write!(f, "{msg}"),
         }
     }
 }
@@ -1540,6 +1545,10 @@ impl UpstreamResolver for EnvUpstreamResolver {
     }
 }
 
+/// Default HTTPS-only upstream resolver bound in `build_engine_client` and
+/// `build_engine_client_with_runtime_v0`.
+pub type DefaultUpstreamResolver = EnvUpstreamResolver;
+
 // ---------------------------------------------------------------------------
 // Reqwest HTTP sender
 // ---------------------------------------------------------------------------
@@ -1691,6 +1700,540 @@ pub fn build_engine_client(config: Arc<Config>) -> Result<EngineUpstreamClient, 
     };
 
     Ok(EngineUpstreamClient::new_with(deps))
+}
+
+// ---------------------------------------------------------------------------
+// POSIX opt-in runtime envelope and deterministic offline upstream (1D)
+// ---------------------------------------------------------------------------
+
+/// Schema identifier for the fixed deterministic offline upstream fixture.
+#[cfg(not(windows))]
+pub const OFFLINE_UPSTREAM_SCHEMA: &str = "parapet-offline-upstream/v0";
+
+/// Fixed deterministic offline upstream fixture selector (`parapet-offline-upstream/v0`).
+#[cfg(not(windows))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OfflineUpstreamFixtureV0 {
+    /// Generic v0 selector; uses `x-parapet-offline-scenario` header or default.
+    V0,
+    /// `allow_no_executor` scenario.
+    AllowNoExecutor,
+    /// `allow_verified_write` scenario.
+    AllowVerifiedWrite,
+    /// `block_no_effect` scenario.
+    BlockNoEffect,
+    /// `shadow_parse_error_l3_off` scenario.
+    ShadowParseErrorL3Off,
+}
+
+#[cfg(not(windows))]
+impl OfflineUpstreamFixtureV0 {
+    /// Parse an offline fixture selector string.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "v0" => Some(Self::V0),
+            "allow_no_executor" => Some(Self::AllowNoExecutor),
+            "allow_verified_write" => Some(Self::AllowVerifiedWrite),
+            "block_no_effect" => Some(Self::BlockNoEffect),
+            "shadow_parse_error_l3_off" => Some(Self::ShadowParseErrorL3Off),
+            _ => None,
+        }
+    }
+}
+
+/// Deterministic offline HTTP sender (`parapet-offline-upstream/v0`).
+///
+/// Never performs network I/O. Preserves normal `DefaultUpstreamResolver` HTTPS
+/// host allowlist checks before `HttpSender::send` is invoked.
+#[cfg(not(windows))]
+pub struct DeterministicOfflineHttpSenderV0 {
+    fixture: OfflineUpstreamFixtureV0,
+}
+
+#[cfg(not(windows))]
+impl DeterministicOfflineHttpSenderV0 {
+    /// Construct a deterministic offline HTTP sender for the selected fixture.
+    pub fn new(fixture: OfflineUpstreamFixtureV0) -> Self {
+        Self { fixture }
+    }
+
+    fn resolve_scenario(&self, request: &HttpRequest) -> OfflineUpstreamFixtureV0 {
+        if let Some(hdr) = request
+            .headers
+            .get("x-parapet-offline-scenario")
+            .and_then(|v| v.to_str().ok())
+        {
+            if let Some(parsed) = OfflineUpstreamFixtureV0::parse(hdr.trim()) {
+                if parsed != OfflineUpstreamFixtureV0::V0 {
+                    return parsed;
+                }
+            }
+        }
+        if self.fixture != OfflineUpstreamFixtureV0::V0 {
+            return self.fixture;
+        }
+        let body_str = std::str::from_utf8(&request.body).unwrap_or("");
+        if body_str.contains("shadow_parse_error_l3_off") {
+            OfflineUpstreamFixtureV0::ShadowParseErrorL3Off
+        } else if body_str.contains("block_no_effect") || body_str.contains("../escape.txt") {
+            OfflineUpstreamFixtureV0::BlockNoEffect
+        } else if body_str.contains("allow_no_executor") {
+            OfflineUpstreamFixtureV0::AllowNoExecutor
+        } else {
+            OfflineUpstreamFixtureV0::AllowVerifiedWrite
+        }
+    }
+}
+
+#[cfg(not(windows))]
+#[async_trait]
+impl HttpSender for DeterministicOfflineHttpSenderV0 {
+    async fn send(&self, request: HttpRequest) -> Result<HttpResponse, HttpError> {
+        if !request.url.starts_with("https://") {
+            return Err(HttpError::Transport(
+                "offline fixture requires HTTPS resolved upstream URL".into(),
+            ));
+        }
+        let scenario = self.resolve_scenario(&request);
+        let is_anthropic =
+            request.url.contains("anthropic.com") || request.url.ends_with("/v1/messages");
+        let payload = if is_anthropic {
+            let input_val = match scenario {
+                OfflineUpstreamFixtureV0::AllowNoExecutor
+                | OfflineUpstreamFixtureV0::AllowVerifiedWrite
+                | OfflineUpstreamFixtureV0::V0 => serde_json::json!({
+                    "path": "note.txt",
+                    "content": "hello parapet\n"
+                }),
+                OfflineUpstreamFixtureV0::BlockNoEffect => serde_json::json!({
+                    "path": "../escape.txt",
+                    "content": "blocked"
+                }),
+                OfflineUpstreamFixtureV0::ShadowParseErrorL3Off => {
+                    serde_json::Value::String("{unclosed".to_owned())
+                }
+            };
+            serde_json::json!({
+                "id": "msg_offline_v0",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-3-5-sonnet-20241022",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_offline_v0_1",
+                        "name": "write_file",
+                        "input": input_val
+                    }
+                ],
+                "stop_reason": "tool_use"
+            })
+        } else {
+            let custom_raw = request
+                .headers
+                .get("x-parapet-offline-raw-arguments")
+                .and_then(|v| v.to_str().ok());
+            let arguments_raw = if let Some(raw) = custom_raw {
+                raw
+            } else {
+                match scenario {
+                    OfflineUpstreamFixtureV0::AllowNoExecutor
+                    | OfflineUpstreamFixtureV0::AllowVerifiedWrite
+                    | OfflineUpstreamFixtureV0::V0 => {
+                        r#"{"content":"hello parapet\n","path":"note.txt"}"#
+                    }
+                    OfflineUpstreamFixtureV0::BlockNoEffect => {
+                        r#"{"content":"blocked","path":"../escape.txt"}"#
+                    }
+                    OfflineUpstreamFixtureV0::ShadowParseErrorL3Off => "{unclosed",
+                }
+            };
+            serde_json::json!({
+                "id": "chatcmpl-offline-v0",
+                "object": "chat.completion",
+                "created": 1_700_000_000u64,
+                "model": "gpt-4o-mini",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": serde_json::Value::Null,
+                            "tool_calls": [
+                                {
+                                    "id": "call_offline_v0_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "write_file",
+                                        "arguments": arguments_raw
+                                    }
+                                }
+                            ]
+                        },
+                        "finish_reason": "tool_calls"
+                    }
+                ]
+            })
+        };
+        let bytes = serde_json::to_vec(&payload)
+            .map_err(|e| HttpError::Transport(format!("offline serialization failed: {e}")))?;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        Ok(HttpResponse {
+            status: StatusCode::OK,
+            headers,
+            body: HttpBody::Full(Bytes::from(bytes)),
+        })
+    }
+}
+
+/// POSIX runtime options for `build_engine_client_with_runtime_v0`.
+#[cfg(not(windows))]
+pub struct EngineRuntimeOptionsV0 {
+    /// Initialized state directory containing `receipt-evidence`.
+    pub state_dir: std::path::PathBuf,
+    /// Optional new effect root directory for 1C `write_file`.
+    pub effect_root: Option<std::path::PathBuf>,
+    /// Explicit 1C file-effect profile selection marker.
+    pub file_effect_profile: Option<crate::effect::FileEffectProfileV0>,
+    /// Caller-supplied 32-hex run identifier.
+    pub run_id: Option<crate::effect::RunIdV0>,
+    /// Maximum content length in bytes (`1..=1_048_576`) when `effect_root` is active.
+    pub max_content_len_bytes: Option<u64>,
+    /// Optional injected build digest or executable path.
+    pub build_digest: Option<String>,
+    /// Optional deterministic offline upstream fixture (`parapet-offline-upstream/v0`).
+    pub offline_fixture: Option<OfflineUpstreamFixtureV0>,
+    /// Optional consumer of live `EnvelopeResponseResultV0` values.
+    pub result_sink: Option<Arc<dyn crate::effect::EnvelopeResultSinkV0>>,
+}
+
+#[cfg(not(windows))]
+struct StaticDigestBuildIdentityV0 {
+    identity:
+        crate::receipt::PresentUnavailable<crate::receipt::CodeIdentity, crate::receipt::CodeError>,
+}
+
+#[cfg(not(windows))]
+impl crate::effect::BuildIdentityProviderV0 for StaticDigestBuildIdentityV0 {
+    fn identity(
+        &self,
+    ) -> crate::receipt::PresentUnavailable<crate::receipt::CodeIdentity, crate::receipt::CodeError>
+    {
+        self.identity.clone()
+    }
+}
+
+#[cfg(not(windows))]
+struct RunIdBindingResultSinkV0 {
+    store: Arc<crate::effect::store::ProtectedEvidenceStoreV0>,
+    store_root: std::path::PathBuf,
+    target_run_id: crate::effect::RunIdV0,
+    inner: Option<Arc<dyn crate::effect::EnvelopeResultSinkV0>>,
+}
+
+#[cfg(not(windows))]
+impl RunIdBindingResultSinkV0 {
+    fn rebind_run(&self, r: &mut crate::effect::RunResultV0) {
+        if r.run_id == self.target_run_id {
+            return;
+        }
+        if self.store.manifest(&self.target_run_id).is_ok() {
+            return;
+        }
+        let Ok(src_manifest) = self.store.manifest(&r.run_id) else {
+            return;
+        };
+        if self
+            .store
+            .create_run(
+                &self.target_run_id,
+                &src_manifest.request_ref,
+                src_manifest.candidate_ref,
+            )
+            .is_err()
+        {
+            return;
+        }
+        let reader = crate::effect::store::ProtectedEvidenceReaderV0::new(&self.store);
+        for entry in &src_manifest.objects {
+            let Ok(bytes) = reader.read(&r.run_id, &entry.path, None, None) else {
+                return;
+            };
+            let key_digest = if entry.kind == crate::effect::StageKindV0::Projection {
+                r.row_digest.as_str()
+            } else {
+                entry.digest.as_str()
+            };
+            if self
+                .store
+                .put_object(
+                    &self.target_run_id,
+                    entry.kind,
+                    key_digest,
+                    &entry.digest,
+                    &bytes,
+                )
+                .is_err()
+            {
+                return;
+            }
+        }
+        let outcome = match r.completion {
+            crate::effect::RuntimeCompletionV0::Complete => {
+                crate::effect::store::TerminalOutcomeV0::Complete
+            }
+            crate::effect::RuntimeCompletionV0::StorageIncomplete => {
+                crate::effect::store::TerminalOutcomeV0::StorageIncomplete
+            }
+        };
+        if self
+            .store
+            .publish_initial(&self.target_run_id, outcome, &r.row_digest)
+            .is_ok()
+        {
+            let old_run_dir = self.store_root.join("run").join(r.run_id.as_str());
+            let _ = std::fs::remove_dir_all(old_run_dir);
+            r.run_id = self.target_run_id.clone();
+        }
+    }
+}
+
+#[cfg(not(windows))]
+impl crate::effect::EnvelopeResultSinkV0 for RunIdBindingResultSinkV0 {
+    fn accept(&self, mut result: crate::effect::EnvelopeResponseResultV0) {
+        if let Some(first_run) = result.runs.first_mut() {
+            let old_id = first_run.run_id.clone();
+            self.rebind_run(first_run);
+            if first_run.run_id == self.target_run_id {
+                for m in &mut result.mapping {
+                    if m.run_id.as_ref() == Some(&old_id) {
+                        m.run_id = Some(self.target_run_id.clone());
+                    }
+                }
+            }
+        }
+        if let Some(inner) = &self.inner {
+            inner.accept(result);
+        }
+    }
+}
+
+/// Construct an `EngineUpstreamClient` with the POSIX 1B runtime envelope,
+/// protected evidence store, optional 1C file-effect binding, and optional
+/// deterministic offline upstream fixture.
+#[cfg(not(windows))]
+#[allow(clippy::type_complexity)]
+pub fn build_engine_client_with_runtime_v0(
+    config: Arc<Config>,
+    options: EngineRuntimeOptionsV0,
+) -> Result<
+    (
+        EngineUpstreamClient,
+        Arc<crate::effect::store::ProtectedEvidenceStoreV0>,
+        Option<Arc<crate::effect::file::RootCapabilityV0>>,
+    ),
+    StartupError,
+> {
+    let session_store: Option<Arc<dyn crate::session::SessionStore>> = None;
+
+    let (l1_model, l1_scanner): (Option<Arc<dyn L1Model>>, Option<Arc<dyn L1Scanner>>) =
+        if let Some(l1_config) = &config.policy.layers.l1 {
+            if l1_config.specialists.is_empty() {
+                (Some(Arc::new(SvmModel)), None)
+            } else {
+                (
+                    None,
+                    Some(Arc::new(EnsembleL1Scanner::new(
+                        &l1_config.specialists,
+                        l1_config.min_agree,
+                        l1_config.generalist_solo_threshold,
+                    ))),
+                )
+            }
+        } else {
+            (None, None)
+        };
+
+    let multi_turn_scanner: Option<Arc<dyn MultiTurnScanner>> = if config.policy.layers.l4.is_some()
+    {
+        Some(Arc::new(DefaultMultiTurnScanner::new()))
+    } else {
+        None
+    };
+
+    #[cfg(not(feature = "l2a"))]
+    if config.policy.layers.l2a.is_some() {
+        return Err(StartupError::FeatureDisabled(
+            "policy.layers.l2a is configured but binary was built without \
+             --features l2a. Rebuild with: cargo build --features l2a"
+                .into(),
+        ));
+    }
+
+    #[cfg(feature = "l2a")]
+    let l2a_scanner: Option<Arc<dyn L2aScanner>> =
+        if let Some(l2a_config) = &config.policy.layers.l2a {
+            use crate::layers::l2a::DefaultHeuristicScanner;
+            use crate::layers::l2a::DefaultL2aScanner;
+            use crate::layers::l2a_model::OnnxPromptGuard;
+
+            let classifier = OnnxPromptGuard::init(l2a_config)
+                .map_err(|e| StartupError::ModelMissing(e.to_string()))?;
+            let heuristics = DefaultHeuristicScanner::new();
+            Some(Arc::new(DefaultL2aScanner::new(
+                Box::new(classifier),
+                Box::new(heuristics),
+            )))
+        } else {
+            None
+        };
+
+    #[cfg(not(feature = "l2a"))]
+    let l2a_scanner: Option<Arc<dyn L2aScanner>> = None;
+
+    let l2a_semaphore =
+        config.policy.layers.l2a.as_ref().map(|l2a_config| {
+            Arc::new(tokio::sync::Semaphore::new(l2a_config.max_concurrent_scans))
+        });
+
+    let store_root = options.state_dir.join("receipt-evidence");
+    let store = Arc::new(
+        crate::effect::store::ProtectedEvidenceStoreV0::open(&store_root)
+            .map_err(|e| StartupError::RuntimeInit(format!("store_open_failed:{e:?}")))?,
+    );
+
+    let identity: Arc<dyn crate::effect::BuildIdentityProviderV0> = match &options.build_digest {
+        None => Arc::new(crate::effect::InjectedBuildIdentityV0::unavailable()),
+        Some(val) => {
+            let p = std::path::Path::new(val);
+            if p.exists() {
+                Arc::new(
+                    crate::effect::InjectedBuildIdentityV0::from_executable_path(
+                        env!("CARGO_PKG_VERSION"),
+                        p,
+                    ),
+                )
+            } else {
+                let formatted = if val.starts_with("sha256:") {
+                    val.clone()
+                } else {
+                    format!("sha256:{val}")
+                };
+                Arc::new(StaticDigestBuildIdentityV0 {
+                    identity: crate::receipt::PresentUnavailable::Present(
+                        crate::receipt::CodeIdentity {
+                            code_version: env!("CARGO_PKG_VERSION").to_owned(),
+                            code_digest: formatted,
+                        },
+                    ),
+                })
+            }
+        }
+    };
+
+    let (executor_binding, root_cap) = if let Some(effect_root) = &options.effect_root {
+        let profile = options
+            .file_effect_profile
+            .ok_or_else(|| StartupError::RuntimeInit("missing_file_effect_profile".into()))?;
+        let run_id = options
+            .run_id
+            .clone()
+            .ok_or_else(|| StartupError::RuntimeInit("missing_run_id".into()))?;
+        let max_bytes = options
+            .max_content_len_bytes
+            .ok_or_else(|| StartupError::RuntimeInit("missing_max_content_bytes".into()))?;
+        use crate::effect::ResolvedPolicyProviderV0;
+        let resolved_policy = crate::effect::ConfigPolicyProviderV0::new(config.clone())
+            .resolve()
+            .map_err(|e| StartupError::RuntimeInit(format!("policy_resolve_failed:{e:?}")))?;
+        crate::effect::file::check_mandatory_profile(&resolved_policy.policy, max_bytes)
+            .map_err(|e| StartupError::RuntimeInit(format!("profile_error:{e:?}")))?;
+        let root =
+            crate::effect::file::RootCapabilityV0::create(effect_root, run_id.clone(), max_bytes)
+                .map_err(|e| StartupError::RuntimeInit(format!("root_error:{e:?}")))?;
+        let exec = crate::effect::file::FileActionExecutorV0::new(root.clone(), &resolved_policy)
+            .map_err(|e| StartupError::RuntimeInit(format!("executor_error:{e:?}")))?;
+        let obs = crate::effect::file::FilesystemEffectObserverV0::new(root.clone());
+        let action_id = crate::effect::ActionIdV0::parse(&format!("act-{}", run_id.as_str()))
+            .ok_or_else(|| StartupError::RuntimeInit("invalid_action_id".into()))?;
+        let binding = crate::effect::ExecutorBindingV0::new(
+            profile,
+            root.opaque(),
+            action_id,
+            Arc::new(exec),
+            Arc::new(obs),
+        );
+        (Some(binding), Some(root))
+    } else {
+        (None, None)
+    };
+
+    let mut parts = crate::effect::EnvelopePartsV0::new(config.clone(), store.clone(), identity);
+    parts.executor = executor_binding;
+    parts.results = match options.run_id {
+        Some(target_run_id) => Some(Arc::new(RunIdBindingResultSinkV0 {
+            store: store.clone(),
+            store_root,
+            target_run_id,
+            inner: options.result_sink,
+        })),
+        None => options.result_sink,
+    };
+    let envelope = Arc::new(RuntimeEnvelopeV0::new(parts));
+
+    let http: Arc<dyn HttpSender> = match options.offline_fixture {
+        Some(fixture) => Arc::new(DeterministicOfflineHttpSenderV0::new(fixture)),
+        None => Arc::new(ReqwestHttpSender::new(reqwest::Client::new())),
+    };
+
+    let deps = EngineDeps {
+        config,
+        http,
+        resolver: Arc::new(EnvUpstreamResolver::new()),
+        registry: Arc::new(DefaultProviderRegistry),
+        normalizer: Arc::new(L0Normalizer::new()),
+        trust_assigner: Arc::new(RoleTrustAssigner),
+        l1_scanner,
+        l1_model,
+        l2a_scanner,
+        l2a_semaphore,
+        inbound_scanner: Arc::new(DefaultInboundScanner::new()),
+        constraint_evaluator: Arc::new(DslConstraintEvaluator::new()),
+        output_scanner: Arc::new(L5aScanner),
+        session_store,
+        multi_turn_scanner,
+        orthogonal_sensor_router: Arc::new(NoopOrthogonalSensorRouter::new()),
+        signal_extractor: Arc::new(DefaultSignalExtractor::new()),
+        verdict_combiner: Arc::new(DefaultVerdictCombiner::new()),
+        emit_l1_signals: false,
+    };
+
+    Ok((
+        EngineUpstreamClient::new_with_envelope(deps, envelope),
+        store,
+        root_cap,
+    ))
+}
+
+/// Alias for `build_engine_client_with_runtime_v0`.
+#[cfg(not(windows))]
+#[allow(clippy::type_complexity)]
+pub fn build_engine_client_with_options(
+    config: Arc<Config>,
+    options: EngineRuntimeOptionsV0,
+) -> Result<
+    (
+        EngineUpstreamClient,
+        Arc<crate::effect::store::ProtectedEvidenceStoreV0>,
+        Option<Arc<crate::effect::file::RootCapabilityV0>>,
+    ),
+    StartupError,
+> {
+    build_engine_client_with_runtime_v0(config, options)
 }
 
 // ---------------------------------------------------------------------------

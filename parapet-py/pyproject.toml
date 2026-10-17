@@ -24,4 +24,9 @@ dev = [
 bindings = "bin"
 manifest-path = "../parapet/Cargo.toml"
 python-source = "."
+python-packages = ["parapet"]
+targets = [
+  { name = "parapet-engine", kind = "bin" },
+  { name = "parapet", kind = "bin" },
+]
 strip = true

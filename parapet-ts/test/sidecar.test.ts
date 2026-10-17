@@ -1,8 +1,22 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type { ChildProcess } from "node:child_process";
+import { spawn as spawnChild } from "node:child_process";
 import { EventEmitter } from "node:events";
+import {
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+  chmodSync,
+} from "node:fs";
+import { createServer } from "node:net";
 import { join } from "node:path";
-import { EngineManager, type SidecarDeps } from "../src/sidecar.js";
+import {
+  EngineManager,
+  defaultRequestControlDisable,
+  defaultRequestControlDisableSync,
+  type SidecarDeps,
+} from "../src/sidecar.js";
 
 // ---------------------------------------------------------------------------
 // Mock ChildProcess
@@ -248,6 +262,44 @@ describe("EngineManager", () => {
       expect(spawnedProcesses).toHaveLength(2);
 
       spawnedProcesses[1].exitAfter(10);
+      await mgr.stop();
+    });
+
+    it("uses the SDK source hash when engine.owner.json carries a different contract hash", async () => {
+      const { deps, fs, spawnedProcesses } = createMockDeps({
+        requestControlDisable: async () => true,
+      });
+      setupConfigFile(fs);
+
+      const stateDir = "/var/tmp/parapet-sdk-config-hash";
+      const mgr = new EngineManager({
+        configPath: CONFIG_PATH,
+        port: 9800,
+        stateDir,
+        deps,
+      });
+      await mgr.start();
+      expect(spawnedProcesses).toHaveLength(1);
+
+      const metaPath = join(stateDir, "engine.meta");
+      const ownerPath = join(stateDir, "engine.owner.json");
+      const meta = JSON.parse(fs.files.get(metaPath)!);
+      meta.configHash = "engine-contract-hash";
+      fs.files.set(metaPath, JSON.stringify(meta));
+      fs.files.set(
+        ownerPath,
+        JSON.stringify({
+          schema: "parapet-engine-owner/v0",
+          pid: 12345,
+          port: 9800,
+          config_hash: "engine-contract-hash",
+        }),
+      );
+
+      fs.files.set(CONFIG_PATH, "port: 9800\nrules: [changed]");
+      await mgr.start();
+
+      expect(spawnedProcesses).toHaveLength(2);
       await mgr.stop();
     });
   });
@@ -867,6 +919,681 @@ describe("EngineManager", () => {
       expect(mgr.matchesCanonicalConfig("/other/config.yaml")).toBe(false);
 
       await mgr.stop();
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Explicit stateDir and engineArgs (1D T1)
+  // -----------------------------------------------------------------------
+
+  describe("stateDir and engineArgs", () => {
+    it("uses stateDir instead of ~/.parapet and forwards --state-dir + engineArgs", async () => {
+      let capturedArgs: string[] = [];
+      let mkdirpPath = "";
+      const { deps, fs } = createMockDeps({
+        mkdirp: (p) => {
+          mkdirpPath = p;
+        },
+        spawnProcess: (_cmd, args) => {
+          capturedArgs = args;
+          return new MockProcess() as unknown as ChildProcess;
+        },
+      });
+      setupConfigFile(fs);
+
+      const stateDir = "/var/tmp/parapet-state-1";
+      const mgr = new EngineManager({
+        configPath: CONFIG_PATH,
+        port: 9811,
+        stateDir,
+        engineArgs: ["--offline-fixture", "v0", "--ready-file", "ready.port"],
+        deps,
+      });
+
+      await mgr.start();
+
+      expect(mgr.stateDir).toBe(stateDir);
+      expect(mgr.engineArgs).toEqual([
+        "--offline-fixture",
+        "v0",
+        "--ready-file",
+        "ready.port",
+      ]);
+      expect(mkdirpPath).toBe(stateDir);
+      expect(capturedArgs).toEqual([
+        "--config",
+        CONFIG_PATH,
+        "--port",
+        "9811",
+        "--state-dir",
+        stateDir,
+        "--offline-fixture",
+        "v0",
+        "--ready-file",
+        "ready.port",
+      ]);
+      // Writes PID + meta inside stateDir, never ~/.parapet.
+      expect(fs.files.has(join(stateDir, "engine.pid"))).toBe(true);
+      expect(fs.files.has(join(stateDir, "engine.meta"))).toBe(true);
+      expect(fs.files.has(PID_PATH)).toBe(false);
+      expect(fs.files.has(META_PATH)).toBe(false);
+
+      await mgr.stop();
+      expect(fs.files.has(join(stateDir, "engine.pid"))).toBe(false);
+      expect(fs.files.has(join(stateDir, "engine.meta"))).toBe(false);
+    });
+
+    it("extracts --state-dir from engineArgs without duplicating the flag", async () => {
+      let capturedArgs: string[] = [];
+      const { deps, fs } = createMockDeps({
+        spawnProcess: (_cmd, args) => {
+          capturedArgs = args;
+          return new MockProcess() as unknown as ChildProcess;
+        },
+      });
+      setupConfigFile(fs);
+
+      const stateDir = "/var/tmp/parapet-state-from-args";
+      const mgr = new EngineManager({
+        configPath: CONFIG_PATH,
+        port: 9812,
+        engineArgs: ["--state-dir", stateDir, "--offline-fixture", "v0"],
+        deps,
+      });
+
+      await mgr.start();
+
+      expect(mgr.stateDir).toBe(stateDir);
+      expect(capturedArgs.filter((a) => a === "--state-dir")).toHaveLength(1);
+      expect(fs.files.has(join(stateDir, "engine.pid"))).toBe(true);
+
+      await mgr.stop();
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Reused engines across all six shutdown paths (1D T1)
+  // -----------------------------------------------------------------------
+
+  describe("reused engine across all six shutdown paths", () => {
+    it.each(["stop", "stopSync", "SIGINT", "SIGTERM", "beforeExit", "exit"] as const)(
+      "never signals process, calls control gate, or unlinks files on %s when reused",
+      async (pathName) => {
+        let asyncGateCalls = 0;
+        let syncGateCalls = 0;
+        const {
+          deps,
+          fs,
+          spawnedProcesses,
+          signalHandlers,
+          beforeExitHandlers,
+          exitHandlers,
+        } = createMockDeps({
+          requestControlDisable: async () => {
+            asyncGateCalls++;
+            return true;
+          },
+          requestControlDisableSync: () => {
+            syncGateCalls++;
+            return true;
+          },
+        });
+        setupConfigFile(fs);
+
+        const stateDir = "/var/tmp/parapet-reused-state";
+        const pidFile = join(stateDir, "engine.pid");
+        const metaFile = join(stateDir, "engine.meta");
+        const sockFile = join(stateDir, "control.sock");
+        const tokenFile = join(stateDir, "control.token");
+        const ownerFile = join(stateDir, "engine.owner.json");
+
+        const { createHash } = require("node:crypto");
+        const hash = createHash("sha256")
+          .update(CONFIG_CONTENT, "utf-8")
+          .digest("hex");
+
+        fs.files.set(pidFile, "77777");
+        fs.files.set(
+          metaFile,
+          JSON.stringify({
+            port: 9800,
+            configPath: CONFIG_PATH,
+            configHash: hash,
+            startedAt: new Date().toISOString(),
+          }),
+        );
+        fs.files.set(sockFile, "");
+        fs.files.set(tokenFile, "a".repeat(64));
+        fs.files.set(
+          ownerFile,
+          JSON.stringify({
+            schema: "parapet-engine-owner/v0",
+            pid: 77777,
+            port: 9800,
+            config_hash: hash,
+          }),
+        );
+
+        const killSpy = vi
+          .spyOn(process, "kill")
+          .mockImplementation(() => true);
+        const exitSpy = vi
+          .spyOn(process, "exit")
+          .mockImplementation((() => undefined) as never);
+
+        try {
+          const mgr = new EngineManager({
+            configPath: CONFIG_PATH,
+            port: 9800,
+            stateDir,
+            deps,
+          });
+          await mgr.start();
+          expect(spawnedProcesses).toHaveLength(0);
+          expect(mgr.isInitialized).toBe(true);
+
+          if (pathName === "stop") {
+            await mgr.stop();
+          } else if (pathName === "stopSync") {
+            mgr.stopSync();
+          } else if (pathName === "SIGINT") {
+            const h = [...(signalHandlers.get("SIGINT") ?? [])][0];
+            h();
+            await new Promise((r) => setTimeout(r, 10));
+          } else if (pathName === "SIGTERM") {
+            const h = [...(signalHandlers.get("SIGTERM") ?? [])][0];
+            h();
+            await new Promise((r) => setTimeout(r, 10));
+          } else if (pathName === "beforeExit") {
+            const h = [...beforeExitHandlers][0];
+            h();
+            await new Promise((r) => setTimeout(r, 10));
+          } else if (pathName === "exit") {
+            const h = [...exitHandlers][0];
+            h();
+          }
+
+          expect(asyncGateCalls).toBe(0);
+          expect(syncGateCalls).toBe(0);
+          expect(killSpy).not.toHaveBeenCalled();
+          expect(fs.files.has(pidFile)).toBe(true);
+          expect(fs.files.has(metaFile)).toBe(true);
+          expect(fs.files.has(sockFile)).toBe(true);
+          expect(fs.files.has(tokenFile)).toBe(true);
+          expect(fs.files.has(ownerFile)).toBe(true);
+        } finally {
+          killSpy.mockRestore();
+          exitSpy.mockRestore();
+        }
+      },
+    );
+
+    it("reuses engine from engine.owner.json when engine.pid is absent", async () => {
+      const { deps, fs, spawnedProcesses } = createMockDeps();
+      setupConfigFile(fs);
+
+      const stateDir = "/var/tmp/parapet-owner-only";
+      const ownerFile = join(stateDir, "engine.owner.json");
+      const sockFile = join(stateDir, "control.sock");
+      const tokenFile = join(stateDir, "control.token");
+      fs.files.set(
+        ownerFile,
+        JSON.stringify({
+          schema: "parapet-engine-owner/v0",
+          pid: 88888,
+          port: 9800,
+          config_hash: "abc",
+        }),
+      );
+      fs.files.set(sockFile, "");
+      fs.files.set(tokenFile, "b".repeat(64));
+
+      const mgr = new EngineManager({
+        configPath: CONFIG_PATH,
+        port: 9800,
+        stateDir,
+        deps,
+      });
+      await mgr.start();
+
+      expect(spawnedProcesses).toHaveLength(0);
+      expect(mgr.isInitialized).toBe(true);
+
+      await mgr.stop();
+      expect(fs.files.has(ownerFile)).toBe(true);
+      expect(fs.files.has(sockFile)).toBe(true);
+      expect(fs.files.has(tokenFile)).toBe(true);
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Authenticated cleanup gate across all six shutdown paths (1D T1 / AC-1D-11)
+  // -----------------------------------------------------------------------
+
+  describe("authenticated cleanup gate across all six shutdown paths", () => {
+    it.each(["stop", "SIGINT", "SIGTERM", "beforeExit"] as const)(
+      "async path %s refuses to kill or unlink when gate returns false, then stops cleanly after restore approves",
+      async (pathName) => {
+        let gateApproved = false;
+        const gateDirs: string[] = [];
+        const {
+          deps,
+          fs,
+          spawnedProcesses,
+          signalHandlers,
+          beforeExitHandlers,
+        } = createMockDeps({
+          requestControlDisable: async (dir) => {
+            gateDirs.push(dir);
+            return gateApproved;
+          },
+        });
+        setupConfigFile(fs);
+
+        const stateDir = `/var/tmp/parapet-async-gate-${pathName}`;
+        const pidFile = join(stateDir, "engine.pid");
+        const metaFile = join(stateDir, "engine.meta");
+        const sockFile = join(stateDir, "control.sock");
+        const tokenFile = join(stateDir, "control.token");
+        const ownerFile = join(stateDir, "engine.owner.json");
+        const controlJsonFile = join(stateDir, "control.json");
+
+        const exitSpy = vi
+          .spyOn(process, "exit")
+          .mockImplementation((() => undefined) as never);
+
+        try {
+          const mgr = new EngineManager({
+            configPath: CONFIG_PATH,
+            port: 9800,
+            stateDir,
+            engineArgs: ["--effect-root", "/var/tmp/parapet-effect"],
+            deps,
+          });
+          await mgr.start();
+
+          fs.files.set(sockFile, "");
+          fs.files.set(tokenFile, "c".repeat(64));
+          fs.files.set(
+            ownerFile,
+            JSON.stringify({ schema: "parapet-engine-owner/v0", pid: 12345 }),
+          );
+          fs.files.set(
+            controlJsonFile,
+            JSON.stringify({
+              schema: "parapet-control-state/v0",
+              effect_root_must_be_new: true,
+            }),
+          );
+
+          const proc = spawnedProcesses[0];
+
+          const invokePath = async (): Promise<void> => {
+            if (pathName === "stop") {
+              await mgr.stop();
+            } else if (pathName === "SIGINT") {
+              const h = [...(signalHandlers.get("SIGINT") ?? [])][0];
+              h();
+              await new Promise((r) => setTimeout(r, 15));
+            } else if (pathName === "SIGTERM") {
+              const h = [...(signalHandlers.get("SIGTERM") ?? [])][0];
+              h();
+              await new Promise((r) => setTimeout(r, 15));
+            } else if (pathName === "beforeExit") {
+              const h = [...beforeExitHandlers][0];
+              h();
+              await new Promise((r) => setTimeout(r, 15));
+            }
+          };
+
+          // 1. Gate returns false (file cleanup not_run / fail / indeterminate).
+          await invokePath();
+
+          expect(gateDirs).toEqual([stateDir]);
+          expect(proc.killed).toBe(false);
+          expect(proc.killSignals).toEqual([]);
+          expect(exitSpy).not.toHaveBeenCalled();
+          expect(mgr.isInitialized).toBe(true);
+          expect(fs.files.has(pidFile)).toBe(true);
+          expect(fs.files.has(metaFile)).toBe(true);
+          expect(fs.files.has(sockFile)).toBe(true);
+          expect(fs.files.has(tokenFile)).toBe(true);
+          expect(fs.files.has(ownerFile)).toBe(true);
+          expect(fs.files.has(controlJsonFile)).toBe(true);
+
+          // 2. Subsequent restore -> clear (gateApproved = true) allows clean stop.
+          gateApproved = true;
+          await invokePath();
+
+          expect(gateDirs).toEqual([stateDir, stateDir]);
+          expect(proc.killSignals).not.toContain("SIGKILL");
+          expect(mgr.isInitialized).toBe(false);
+          expect(fs.files.has(pidFile)).toBe(false);
+          expect(fs.files.has(metaFile)).toBe(false);
+          expect(fs.files.has(sockFile)).toBe(false);
+          expect(fs.files.has(tokenFile)).toBe(false);
+          expect(fs.files.has(ownerFile)).toBe(false);
+          // Persistent state metadata is retained.
+          expect(fs.files.has(controlJsonFile)).toBe(true);
+        } finally {
+          exitSpy.mockRestore();
+        }
+      },
+    );
+
+    it.each(["stopSync", "exit"] as const)(
+      "sync path %s refuses to SIGKILL or unlink when gate returns false or has no handshake, then cleans up when approved",
+      async (pathName) => {
+        let syncApproved = false;
+        const syncDirs: string[] = [];
+        const { deps, fs, spawnedProcesses, exitHandlers } = createMockDeps({
+          requestControlDisableSync: (dir) => {
+            syncDirs.push(dir);
+            return syncApproved;
+          },
+        });
+        setupConfigFile(fs);
+
+        const stateDir = `/var/tmp/parapet-sync-gate-${pathName}`;
+        const pidFile = join(stateDir, "engine.pid");
+        const metaFile = join(stateDir, "engine.meta");
+        const sockFile = join(stateDir, "control.sock");
+        const tokenFile = join(stateDir, "control.token");
+        const ownerFile = join(stateDir, "engine.owner.json");
+        const controlJsonFile = join(stateDir, "control.json");
+
+        const killSpy = vi
+          .spyOn(process, "kill")
+          .mockImplementation(() => true);
+
+        try {
+          const mgr = new EngineManager({
+            configPath: CONFIG_PATH,
+            port: 9800,
+            stateDir,
+            engineArgs: ["--effect-root", "/var/tmp/parapet-effect"],
+            deps,
+          });
+          await mgr.start();
+
+          fs.files.set(sockFile, "");
+          fs.files.set(tokenFile, "d".repeat(64));
+          fs.files.set(
+            ownerFile,
+            JSON.stringify({ schema: "parapet-engine-owner/v0", pid: 12345 }),
+          );
+          fs.files.set(
+            controlJsonFile,
+            JSON.stringify({
+              schema: "parapet-control-state/v0",
+              effect_root_must_be_new: true,
+            }),
+          );
+
+          const proc = spawnedProcesses[0];
+          const invokeSync = (): void => {
+            if (pathName === "stopSync") {
+              mgr.stopSync();
+            } else {
+              const h = [...exitHandlers][0];
+              h();
+            }
+          };
+
+          // 1. Refused synchronous gate.
+          invokeSync();
+
+          expect(syncDirs).toEqual([stateDir]);
+          expect(killSpy).not.toHaveBeenCalled();
+          expect(proc.killed).toBe(false);
+          expect(mgr.isInitialized).toBe(true);
+          expect(fs.files.has(pidFile)).toBe(true);
+          expect(fs.files.has(metaFile)).toBe(true);
+          expect(fs.files.has(sockFile)).toBe(true);
+          expect(fs.files.has(tokenFile)).toBe(true);
+          expect(fs.files.has(ownerFile)).toBe(true);
+
+          // 2. Approved synchronous gate after restore -> clear.
+          syncApproved = true;
+          invokeSync();
+
+          expect(syncDirs).toEqual([stateDir, stateDir]);
+          expect(killSpy).toHaveBeenCalledOnce();
+          expect(killSpy).toHaveBeenCalledWith(proc.pid, "SIGKILL");
+          expect(mgr.isInitialized).toBe(false);
+          expect(fs.files.has(pidFile)).toBe(false);
+          expect(fs.files.has(metaFile)).toBe(false);
+          expect(fs.files.has(sockFile)).toBe(false);
+          expect(fs.files.has(tokenFile)).toBe(false);
+          expect(fs.files.has(ownerFile)).toBe(false);
+          expect(fs.files.has(controlJsonFile)).toBe(true);
+        } finally {
+          killSpy.mockRestore();
+        }
+      },
+    );
+
+    it("synchronous no-handshake hook (missing requestControlDisableSync) leaves engine and control files intact", async () => {
+      const { deps, fs, spawnedProcesses, exitHandlers } = createMockDeps({
+        requestControlDisableSync: undefined,
+      });
+      setupConfigFile(fs);
+
+      const stateDir = "/var/tmp/parapet-no-sync-hook";
+      const pidFile = join(stateDir, "engine.pid");
+      const metaFile = join(stateDir, "engine.meta");
+      const sockFile = join(stateDir, "control.sock");
+      const tokenFile = join(stateDir, "control.token");
+
+      const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+      try {
+        const mgr = new EngineManager({
+          configPath: CONFIG_PATH,
+          port: 9800,
+          stateDir,
+          deps,
+        });
+        await mgr.start();
+
+        fs.files.set(sockFile, "");
+        fs.files.set(tokenFile, "e".repeat(64));
+
+        const exitFn = [...exitHandlers][0];
+        exitFn();
+        mgr.stopSync();
+
+        expect(killSpy).not.toHaveBeenCalled();
+        expect(spawnedProcesses[0].killed).toBe(false);
+        expect(mgr.isInitialized).toBe(true);
+        expect(fs.files.has(pidFile)).toBe(true);
+        expect(fs.files.has(metaFile)).toBe(true);
+        expect(fs.files.has(sockFile)).toBe(true);
+        expect(fs.files.has(tokenFile)).toBe(true);
+      } finally {
+        killSpy.mockRestore();
+      }
+    });
+
+    it("approved async gate preserves live state when the child does not exit", async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      try {
+        const { deps, fs, spawnedProcesses } = createMockDeps({
+          requestControlDisable: async () => true,
+        });
+        setupConfigFile(fs);
+        const stateDir = "/var/tmp/parapet-approved-timeout";
+        const mgr = new EngineManager({
+          configPath: CONFIG_PATH,
+          stateDir,
+          engineArgs: ["--effect-root", "/var/tmp/parapet-effect"],
+          deps,
+        });
+        await mgr.start();
+        fs.files.set(join(stateDir, "control.sock"), "");
+        fs.files.set(join(stateDir, "control.token"), "a".repeat(64));
+        fs.files.set(join(stateDir, "engine.owner.json"), "{}");
+
+        const proc = spawnedProcesses[0];
+        proc.stubborn = true;
+        const stopping = mgr.stop();
+        await vi.advanceTimersByTimeAsync(5_000);
+        await stopping;
+
+        expect(proc.killSignals).toEqual(["SIGTERM"]);
+        expect(mgr.isInitialized).toBe(true);
+        expect(fs.files.has(join(stateDir, "engine.pid"))).toBe(true);
+        expect(fs.files.has(join(stateDir, "control.sock"))).toBe(true);
+        expect(fs.files.has(join(stateDir, "control.token"))).toBe(true);
+        expect(fs.files.has(join(stateDir, "engine.owner.json"))).toBe(true);
+
+        proc.stubborn = false;
+        await mgr.stop();
+        expect(mgr.isInitialized).toBe(false);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Default Unix domain socket control-gate helpers (parapet-control/v0)
+  // -----------------------------------------------------------------------
+
+  describe("defaultRequestControlDisable and defaultRequestControlDisableSync", () => {
+    it("returns false when control.sock or control.token is missing or empty", async () => {
+      const tmpDir = mkdtempSync("/tmp/p1d_ts_ctrl_missing_");
+      chmodSync(tmpDir, 0o700);
+      try {
+        expect(await defaultRequestControlDisable(tmpDir)).toBe(false);
+        expect(defaultRequestControlDisableSync(tmpDir)).toBe(false);
+
+        writeFileSync(join(tmpDir, "control.token"), "   \n", { mode: 0o600 });
+        writeFileSync(join(tmpDir, "control.sock"), "", { mode: 0o600 });
+        expect(await defaultRequestControlDisable(tmpDir)).toBe(false);
+        expect(defaultRequestControlDisableSync(tmpDir)).toBe(false);
+      } finally {
+        rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    it("authenticates over control.sock and enforces stop_approved + file_cleanup", async () => {
+      const tmpDir = mkdtempSync("/tmp/p1d_ts_ctrl_");
+      chmodSync(tmpDir, 0o700);
+      const sockPath = join(tmpDir, "control.sock");
+      const tokenPath = join(tmpDir, "control.token");
+      const expectedToken = "f".repeat(64);
+      writeFileSync(tokenPath, expectedToken, { mode: 0o600 });
+
+      let nextResponse: Record<string, unknown> = {
+        schema: "parapet-control/v0",
+        ok: false,
+        stop_approved: false,
+        file_cleanup: "not_run",
+        evidence_retained: true,
+      };
+      const receivedRequests: Array<Record<string, unknown>> = [];
+
+      const server = createServer((conn) => {
+        let buf = "";
+        conn.on("data", (chunk) => {
+          buf += chunk.toString("utf-8");
+          if (buf.includes("\n")) {
+            const line = buf.split("\n", 1)[0].trim();
+            receivedRequests.push(JSON.parse(line));
+            conn.end(JSON.stringify(nextResponse) + "\n");
+          }
+        });
+      });
+
+      await new Promise<void>((resolve) => server.listen(sockPath, resolve));
+      chmodSync(sockPath, 0o600);
+
+      try {
+        // 1. Refused (not_run) -> false.
+        expect(await defaultRequestControlDisable(tmpDir)).toBe(false);
+        expect(receivedRequests).toHaveLength(1);
+        expect(receivedRequests[0]).toEqual({
+          schema: "parapet-control/v0",
+          token: expectedToken,
+          action: "disable",
+        });
+
+        // 2. Approved (clear) -> true.
+        nextResponse = {
+          schema: "parapet-control/v0",
+          ok: true,
+          stop_approved: true,
+          file_cleanup: "clear",
+          evidence_retained: true,
+        };
+        expect(await defaultRequestControlDisable(tmpDir)).toBe(true);
+        expect(receivedRequests).toHaveLength(2);
+      } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+        rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    it("performs the synchronous authenticated handshake in a separate server process", async () => {
+      const tmpDir = mkdtempSync("/tmp/p1d_ts_ctrl_sync_");
+      chmodSync(tmpDir, 0o700);
+      const sockPath = join(tmpDir, "control.sock");
+      const tokenPath = join(tmpDir, "control.token");
+      const requestPath = join(tmpDir, "request.json");
+      const expectedToken = "9".repeat(64);
+      writeFileSync(tokenPath, expectedToken, { mode: 0o600 });
+
+      const serverScript = [
+        'const fs = require("node:fs");',
+        'const net = require("node:net");',
+        "const [sockPath, requestPath] = process.argv.slice(1);",
+        "const server = net.createServer((conn) => {",
+        '  let buf = "";',
+        '  conn.on("data", (chunk) => {',
+        '    buf += chunk.toString("utf-8");',
+        '    if (!buf.includes("\\n")) return;',
+        '    fs.writeFileSync(requestPath, buf.split("\\n", 1)[0]);',
+        '    conn.end(JSON.stringify({ schema: "parapet-control/v0", ok: true, stop_approved: true, file_cleanup: "clear" }) + "\\n");',
+        "    server.close();",
+        "  });",
+        "});",
+        'server.listen(sockPath, () => process.stdout.write("READY\\n"));',
+      ].join("\n");
+      const server = spawnChild(
+        process.execPath,
+        ["-e", serverScript, sockPath, requestPath],
+        { stdio: ["ignore", "pipe", "inherit"] },
+      );
+      const exited = new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.once("exit", (code) => {
+          if (code === 0) resolve();
+          else reject(new Error(`control test server exited ${code}`));
+        });
+      });
+
+      try {
+        await new Promise<void>((resolve, reject) => {
+          server.stdout!.once("data", (chunk) => {
+            if (chunk.toString("utf-8").includes("READY")) resolve();
+            else reject(new Error("control test server did not become ready"));
+          });
+          server.once("error", reject);
+        });
+        chmodSync(sockPath, 0o600);
+
+        expect(defaultRequestControlDisableSync(tmpDir)).toBe(true);
+        await exited;
+        expect(JSON.parse(readFileSync(requestPath, "utf-8"))).toEqual({
+          schema: "parapet-control/v0",
+          token: expectedToken,
+          action: "disable",
+        });
+      } finally {
+        if (server.exitCode === null) server.kill();
+        rmSync(tmpDir, { recursive: true, force: true });
+      }
     });
   });
 });

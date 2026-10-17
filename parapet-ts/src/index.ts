@@ -114,17 +114,30 @@ export async function init(config: ParapetConfig): Promise<void> {
     if (
       engine &&
       engine.port === port &&
-      engine.matchesCanonicalConfig(config.configPath)
+      engine.matchesCanonicalConfig(config.configPath) &&
+      engine.matchesRuntimeOptions({
+        stateDir: config.stateDir,
+        engineBinary: config.engineBinary,
+        engineArgs: config.engineArgs,
+      })
     ) {
       await engine.start(); // No-op if config content unchanged.
     } else {
       // Different port, different config, or no engine — stop old, create new.
       if (engine) {
         await engine.stop();
+        if (engine.isInitialized) {
+          throw new Error(
+            "Cannot replace the active Parapet engine: authenticated shutdown was not approved.",
+          );
+        }
       }
       engine = new EngineManager({
         configPath: config.configPath,
         port,
+        stateDir: config.stateDir,
+        engineBinary: config.engineBinary,
+        engineArgs: config.engineArgs,
         deps: _testDeps ?? undefined,
       });
       await engine.start();
@@ -132,6 +145,11 @@ export async function init(config: ParapetConfig): Promise<void> {
   } else if (engine) {
     // autoStart disabled but old engine exists — stop it.
     await engine.stop();
+    if (engine.isInitialized) {
+      throw new Error(
+        "Cannot disable automatic engine management: authenticated shutdown was not approved.",
+      );
+    }
     engine = null;
   }
 
@@ -168,7 +186,9 @@ export function getParapetFetch(): typeof globalThis.fetch {
 export async function shutdown(): Promise<void> {
   if (engine) {
     await engine.stop();
-    engine = null;
+    if (!engine.isInitialized) {
+      engine = null;
+    }
   }
   parapetFetch = null;
 }

@@ -6,6 +6,7 @@
 # Public API:
 #   parapet.init(config_path)  — validate config, start engine sidecar, patch httpx
 #   parapet.session(...)       — context manager that sets W3C Baggage for the scope
+#   parapet.shutdown()         — stop owned engine if permitted by file-cleanup gate
 #   parapet.untrusted(content) — mark a string as untrusted content
 from __future__ import annotations
 
@@ -15,12 +16,12 @@ from pathlib import Path
 from typing import Generator
 
 from parapet.header import _active_baggage, build_baggage_header
-from parapet.sidecar import EngineState, start_engine
+from parapet.sidecar import EngineState, start_engine, stop_engine
 from parapet.transport import patch_httpx
 from parapet.trust import _ensure_registry, _restore_registry, _swap_registry
 from typing import Iterable
 
-__all__ = ["init", "session", "untrusted"]
+__all__ = ["init", "session", "shutdown", "untrusted"]
 
 logger = logging.getLogger("parapet")
 
@@ -45,6 +46,8 @@ def init(
     port: int = _DEFAULT_PORT,
     engine_bin: str | None = None,
     extra_hosts: Iterable[str] | None = None,
+    state_dir: str | Path | None = None,
+    engine_args: Iterable[str] | None = None,
 ) -> None:
     """Initialize the parapet SDK.
 
@@ -59,6 +62,9 @@ def init(
             Falls back to ``PARAPET_ENGINE_PATH`` env var, then ``PATH``.
         extra_hosts: Additional LLM API hosts to intercept beyond the
             built-in defaults (e.g., ``["api.together.xyz"]``).
+        state_dir: Optional private state directory for receipt evidence
+            and the ``parapet-control/v0`` channel.
+        engine_args: Optional additional CLI flags passed to ``parapet-engine``.
 
     Raises:
         FileNotFoundError: If *config_path* does not exist or the engine
@@ -71,8 +77,27 @@ def init(
         )
 
     hosts = frozenset(extra_hosts) if extra_hosts else None
-    start_engine(config_path=config_path, port=port, engine_bin=engine_bin, state=_engine_state)
+    resolved_state_dir = Path(state_dir) if state_dir is not None else None
+    extra_engine_args = list(engine_args) if engine_args is not None else None
+    start_engine(
+        config_path=config_path,
+        port=port,
+        engine_bin=engine_bin,
+        state=_engine_state,
+        state_dir=resolved_state_dir,
+        engine_args=extra_engine_args,
+    )
     patch_httpx(port=port, extra_hosts=hosts)
+
+
+def shutdown() -> bool:
+    """Stop the owned engine sidecar if permitted by the file-cleanup gate.
+
+    Returns:
+        ``True`` if an owned engine was stopped, ``False`` if the engine is
+        not owned or shutdown was refused by the cleanup gate.
+    """
+    return stop_engine(state=_engine_state)
 
 
 @contextmanager
