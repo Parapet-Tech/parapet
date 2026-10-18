@@ -5429,3 +5429,28 @@ fn replay_fix1_detection_raw_before_length() {
     let resolver = replay_resolver(&row, vec![s8_args(); 2], vec![s8_detection(), Found(vec![b'x'; 1214])]);
     replay_assert("D1D2", &row, policy, resolver, NotComparable(DetectionMismatch(RawDigest)), 2, 2);
 }
+
+#[test]
+fn replay_fix2_arguments_raw_before_length_o1() {
+    // Contract e7b70be3, section 17 (F58): arguments raw digest is verified before length.
+    use PayloadResolution::*;
+    use ReplayCheck::*;
+    use ReplayReason::*;
+    use ReplayVerdict::*;
+    let row = replay_fixture("f58");
+    let policy = include_bytes!("fixtures/receipt_v0/policy.json").as_slice();
+    let resolver = replay_resolver(
+        &row,
+        vec![s8_args(), Found(vec![b'x'; 35])],
+        vec![s8_detection(); 2],
+    );
+    replay_assert(
+        "A1A2",
+        &row,
+        policy,
+        resolver,
+        NotComparable(ArgumentsMismatch(RawDigest)),
+        2,
+        0,
+    );
+}

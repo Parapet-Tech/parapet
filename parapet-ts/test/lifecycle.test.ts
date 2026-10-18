@@ -32,11 +32,14 @@ const CONFIG_PATH = "/etc/parapet/parapet.yaml";
 
 function createMockDeps(): {
   deps: SidecarDeps;
+  files: Map<string, string>;
+  spawnCalls: Array<{ cmd: string; args: string[] }>;
   spawnCount: () => number;
   stopCount: () => number;
 } {
   const files = new Map<string, string>();
   files.set(CONFIG_PATH, CONFIG_CONTENT);
+  const spawnCalls: Array<{ cmd: string; args: string[] }> = [];
   let spawns = 0;
   let stops = 0;
 
@@ -55,8 +58,9 @@ function createMockDeps(): {
     closeFile: () => {
       stops++;
     },
-    spawnProcess: () => {
+    spawnProcess: (cmd, args) => {
       spawns++;
+      spawnCalls.push({ cmd, args: [...args] });
       return new MockProcess() as unknown as ChildProcess;
     },
     fetch: async () => ({ ok: true, status: 200 }) as Response,
@@ -69,7 +73,13 @@ function createMockDeps(): {
     removeExitHandler: () => {},
   };
 
-  return { deps, spawnCount: () => spawns, stopCount: () => stops };
+  return {
+    deps,
+    files,
+    spawnCalls,
+    spawnCount: () => spawns,
+    stopCount: () => stops,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -208,5 +218,104 @@ describe("init() idempotency with autoStart: true", () => {
     // Second init with the resolved real path — should reuse.
     await init({ configPath: CONFIG_PATH, port: 9800 });
     expect(mock.spawnCount()).toBe(1); // No second spawn.
+  });
+
+  it("forwards stateDir, engineBinary, and engineArgs without touching ~/.parapet", async () => {
+    const stateDir = "/var/tmp/parapet-lifecycle-state";
+    await init({
+      configPath: CONFIG_PATH,
+      port: 9821,
+      stateDir,
+      engineBinary: "/opt/parapet/bin/parapet-engine",
+      engineArgs: ["--offline-fixture", "v0", "--ready-file", "ready.port"],
+    });
+
+    expect(mock.spawnCount()).toBe(1);
+    expect(mock.spawnCalls[0]).toEqual({
+      cmd: "/opt/parapet/bin/parapet-engine",
+      args: [
+        "--config",
+        CONFIG_PATH,
+        "--port",
+        "9821",
+        "--state-dir",
+        stateDir,
+        "--offline-fixture",
+        "v0",
+        "--ready-file",
+        "ready.port",
+      ],
+    });
+    expect(mock.files.has(`${stateDir}/engine.pid`)).toBe(true);
+    expect(mock.files.has(`${stateDir}/engine.meta`)).toBe(true);
+    expect(mock.files.has("/home/test/.parapet/engine.pid")).toBe(false);
+
+    // Repeat init with identical options -> no second spawn.
+    await init({
+      configPath: CONFIG_PATH,
+      port: 9821,
+      stateDir,
+      engineBinary: "/opt/parapet/bin/parapet-engine",
+      engineArgs: ["--offline-fixture", "v0", "--ready-file", "ready.port"],
+    });
+    expect(mock.spawnCount()).toBe(1);
+
+    await shutdown();
+    expect(mock.files.has(`${stateDir}/engine.pid`)).toBe(false);
+    expect(mock.files.has(`${stateDir}/engine.meta`)).toBe(false);
+  });
+
+  it("retains engine across refused shutdown() until control gate approves", async () => {
+    let gateApproved = false;
+    mock.deps.requestControlDisable = async () =>
+      gateApproved ? { kind: "approved", fileCleanup: "clear" } : { kind: "refused" };
+
+    const stateDir = "/var/tmp/parapet-lifecycle-gated";
+    await init({
+      configPath: CONFIG_PATH,
+      port: 9822,
+      stateDir,
+      engineArgs: ["--effect-root", "/var/tmp/parapet-lifecycle-effect"],
+    });
+    mock.files.set(`${stateDir}/control.sock`, "");
+    mock.files.set(`${stateDir}/control.token`, "a".repeat(64));
+
+    // 1. Refused shutdown() leaves files intact.
+    await shutdown();
+    expect(mock.files.has(`${stateDir}/engine.pid`)).toBe(true);
+    expect(mock.files.has(`${stateDir}/control.sock`)).toBe(true);
+
+    // 2. Approved shutdown() after restore cleans up files.
+    gateApproved = true;
+    await shutdown();
+    expect(mock.files.has(`${stateDir}/engine.pid`)).toBe(false);
+    expect(mock.files.has(`${stateDir}/control.sock`)).toBe(false);
+  });
+
+  it("does not replace a protected live engine when changed options cannot stop it", async () => {
+    let gateApproved = false;
+    mock.deps.requestControlDisable = async () =>
+      gateApproved ? { kind: "approved", fileCleanup: "clear" } : { kind: "refused" };
+
+    const stateDir = "/var/tmp/parapet-lifecycle-replace-refused";
+    await init({
+      configPath: CONFIG_PATH,
+      port: 9823,
+      stateDir,
+      engineArgs: ["--effect-root", "/var/tmp/parapet-protected-effect"],
+    });
+
+    await expect(
+      init({
+        configPath: CONFIG_PATH,
+        port: 9824,
+        stateDir: "/var/tmp/parapet-replacement-state",
+      }),
+    ).rejects.toThrow(/shutdown was not approved/);
+    expect(mock.spawnCount()).toBe(1);
+    expect(mock.files.has(`${stateDir}/engine.pid`)).toBe(true);
+
+    gateApproved = true;
+    await shutdown();
   });
 });

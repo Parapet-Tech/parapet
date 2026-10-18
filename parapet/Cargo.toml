@@ -10,6 +10,10 @@ name = "parapet-engine"
 path = "src/main.rs"
 
 [[bin]]
+name = "parapet"
+path = "src/bin/parapet.rs"
+
+[[bin]]
 name = "parapet-eval"
 path = "src/bin/parapet_eval.rs"
 required-features = ["eval"]

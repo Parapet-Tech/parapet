@@ -1,6 +1,7 @@
 // Copyright 2026 The Parapet Project
 // SPDX-License-Identifier: Apache-2.0
 
+pub mod cli;
 pub mod config;
 pub mod constraint;
 pub mod defang;
@@ -15,10 +16,10 @@ pub mod model_path;
 pub mod normalize;
 pub mod provider;
 pub mod proxy;
+pub mod receipt;
 pub mod routing;
 pub mod sensor;
 pub mod session;
 pub mod signal;
 pub(crate) mod stream;
 pub mod trust;
-pub mod receipt;

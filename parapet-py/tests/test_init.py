@@ -139,3 +139,80 @@ class TestSessionTrustIsolation:
         # After the failed session, registry should be restored (not leaked).
         with parapet.session(user_id="u_next"):
             assert get_registry().entry_count == 0
+
+
+class TestInitStateDirEngineArgsAndShutdown:
+    """init() forwards state_dir/engine_args and shutdown() delegates to stop_engine."""
+
+    def setup_method(self):
+        _engine_state.initialized = False
+        _engine_state.process = None
+        _engine_state.port = None
+        _engine_state.owns_process = False
+        _engine_state.state_dir = None
+        _engine_state.engine_args = []
+
+    def teardown_method(self):
+        _engine_state.initialized = False
+        _engine_state.process = None
+        _engine_state.port = None
+        _engine_state.owns_process = False
+        _engine_state.state_dir = None
+        _engine_state.engine_args = []
+
+    @patch("parapet.patch_httpx")
+    @patch("parapet.start_engine")
+    def test_init_forwards_state_dir_and_engine_args(
+        self, mock_start_engine, mock_patch_httpx, tmp_path
+    ):
+        cfg = tmp_path / "parapet.yaml"
+        cfg.write_text("parapet: v1\n")
+        state_dir = tmp_path / "state"
+
+        parapet.init(
+            str(cfg),
+            port=9812,
+            engine_bin="/custom/parapet-engine",
+            state_dir=str(state_dir),
+            engine_args=("--offline-fixture", "v0", "--ready-file", "ready.port"),
+        )
+
+        mock_start_engine.assert_called_once_with(
+            config_path=str(cfg),
+            port=9812,
+            engine_bin="/custom/parapet-engine",
+            state=_engine_state,
+            state_dir=state_dir,
+            engine_args=["--offline-fixture", "v0", "--ready-file", "ready.port"],
+        )
+        mock_patch_httpx.assert_called_once_with(port=9812, extra_hosts=None)
+
+    @patch("parapet.patch_httpx")
+    @patch("parapet.start_engine")
+    def test_init_defaults_state_dir_and_engine_args_to_none(
+        self, mock_start_engine, mock_patch_httpx, tmp_path
+    ):
+        cfg = tmp_path / "parapet.yaml"
+        cfg.write_text("parapet: v1\n")
+
+        parapet.init(str(cfg))
+
+        mock_start_engine.assert_called_once_with(
+            config_path=str(cfg),
+            port=9800,
+            engine_bin=None,
+            state=_engine_state,
+            state_dir=None,
+            engine_args=None,
+        )
+        mock_patch_httpx.assert_called_once_with(port=9800, extra_hosts=None)
+
+    @patch("parapet.stop_engine", return_value=True)
+    def test_shutdown_delegates_to_stop_engine_approved(self, mock_stop):
+        assert parapet.shutdown() is True
+        mock_stop.assert_called_once_with(state=_engine_state)
+
+    @patch("parapet.stop_engine", return_value=False)
+    def test_shutdown_delegates_to_stop_engine_refused(self, mock_stop):
+        assert parapet.shutdown() is False
+        mock_stop.assert_called_once_with(state=_engine_state)
