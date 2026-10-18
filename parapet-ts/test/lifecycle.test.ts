@@ -267,7 +267,8 @@ describe("init() idempotency with autoStart: true", () => {
 
   it("retains engine across refused shutdown() until control gate approves", async () => {
     let gateApproved = false;
-    mock.deps.requestControlDisable = async () => gateApproved;
+    mock.deps.requestControlDisable = async () =>
+      gateApproved ? { kind: "approved", fileCleanup: "clear" } : { kind: "refused" };
 
     const stateDir = "/var/tmp/parapet-lifecycle-gated";
     await init({
@@ -293,7 +294,8 @@ describe("init() idempotency with autoStart: true", () => {
 
   it("does not replace a protected live engine when changed options cannot stop it", async () => {
     let gateApproved = false;
-    mock.deps.requestControlDisable = async () => gateApproved;
+    mock.deps.requestControlDisable = async () =>
+      gateApproved ? { kind: "approved", fileCleanup: "clear" } : { kind: "refused" };
 
     const stateDir = "/var/tmp/parapet-lifecycle-replace-refused";
     await init({

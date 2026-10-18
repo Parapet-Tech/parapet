@@ -609,7 +609,7 @@ describe("Installed-engine offline TypeScript SDK E2E", () => {
       // The engine generates the only run identity; its effect-root sentinel
       // names it. No caller-supplied run id exists.
       const sentinels = readdirSync(effectRoot)
-        .map((name) => /^\.parapet-run-([0-9a-f]{64})\.sentinel$/.exec(name))
+        .map((name) => /^\.parapet-run-([0-9a-f]{32})\.sentinel$/.exec(name))
         .filter((m): m is RegExpExecArray => m !== null);
       expect(sentinels).toHaveLength(1);
       const runId = sentinels[0][1];
