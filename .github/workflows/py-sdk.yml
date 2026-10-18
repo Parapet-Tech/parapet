@@ -51,6 +51,7 @@ jobs:
           printf '%s\n' "$listing" | awk '$1 ~ /(parapet-fetch|parapet-scope-audit|pg2-diag|parapet-eval)$/ { found=1 } END { exit found }'
           python -m venv /tmp/parapet-ci-venv
           /tmp/parapet-ci-venv/bin/python -m pip install "$wheel"
+          cd /tmp
           /tmp/parapet-ci-venv/bin/python -c 'import pathlib, parapet; assert "site-packages" in pathlib.Path(parapet.__file__).resolve().parts'
           test -x /tmp/parapet-ci-venv/bin/parapet
           test -x /tmp/parapet-ci-venv/bin/parapet-engine
