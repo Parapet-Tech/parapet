@@ -18,6 +18,7 @@ use crate::message::Message;
 use crate::receipt::*;
 use serde_json::Value;
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 const ARGUMENTS_MEDIA_TYPE: &str = "application/json";
@@ -37,6 +38,9 @@ pub struct EnvelopePartsV0 {
     pub sink: Option<Arc<dyn ReceiptSinkV0>>,
     /// Optional consumer of live results.
     pub results: Option<Arc<dyn EnvelopeResultSinkV0>>,
+    /// One-shot effect run reserved through `RuntimeEnvelopeV0::allocate_run_id`;
+    /// `None` allocates one run per formed candidate.
+    pub fixed_run_id: Option<RunIdV0>,
 }
 
 impl EnvelopePartsV0 {
@@ -53,6 +57,7 @@ impl EnvelopePartsV0 {
             executor: None,
             sink: None,
             results: None,
+            fixed_run_id: None,
         }
     }
 }
@@ -67,6 +72,8 @@ pub struct RuntimeEnvelopeV0 {
     sink: Arc<dyn ReceiptSinkV0>,
     executor: Option<ExecutorBindingV0>,
     results: Option<Arc<dyn EnvelopeResultSinkV0>>,
+    fixed_run_id: Option<RunIdV0>,
+    fixed_run_claimed: AtomicBool,
 }
 
 /// Buffered delivery decision applied before serialization.
@@ -225,7 +232,43 @@ impl RuntimeEnvelopeV0 {
             sink,
             executor: parts.executor,
             results: parts.results,
+            fixed_run_id: parts.fixed_run_id,
+            fixed_run_claimed: AtomicBool::new(false),
         }
+    }
+
+    /// The sole run identifier allocator.
+    pub fn allocate_run_id() -> RunIdV0 {
+        RunIdV0::generate()
+    }
+
+    /// The reserved one-shot run, when this envelope is effect-enabled.
+    pub fn fixed_run_id(&self) -> Option<&RunIdV0> {
+        self.fixed_run_id.as_ref()
+    }
+
+    /// Atomically consume the one-shot fixed run. Only the first caller
+    /// succeeds; consumption is permanent. Always `false` without a fixed run.
+    pub fn claim_fixed_run(&self) -> bool {
+        self.fixed_run_id.is_some()
+            && self
+                .fixed_run_claimed
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+    }
+
+    /// Whether the fixed run may settle these candidates: exactly one, with a
+    /// formed coordinate. Always `true` without a fixed run.
+    pub fn fixed_cardinality_ok(&self, candidates: &[ProposalCandidateV0]) -> bool {
+        self.fixed_run_id.is_none() || matches!(candidates, [c] if c.coordinate.is_ok())
+    }
+
+    /// Enumerate a fully buffered response and apply `fixed_cardinality_ok`.
+    pub fn fixed_buffered_cardinality_ok(&self, provider: Provider, body: &Value) -> bool {
+        use super::interfaces::ProposalCandidateEnumeratorV0;
+        self.fixed_run_id.is_none()
+            || self
+                .fixed_cardinality_ok(&RawCandidateEnumeratorV0.enumerate_buffered(provider, body))
     }
 
     /// The bound protected store.
@@ -400,7 +443,10 @@ impl RuntimeEnvelopeV0 {
         suppressed: bool,
         instruments: &mut Vec<EnvelopeInstrumentV0>,
     ) -> RunResultV0 {
-        let run = RunIdV0::generate();
+        let run = self
+            .fixed_run_id
+            .clone()
+            .unwrap_or_else(Self::allocate_run_id);
         let mut storage: Option<StoreFailureV0> = None;
         let mut refs = StableRefsV0::default();
         if let Err(e) = self
@@ -832,6 +878,25 @@ impl RuntimeEnvelopeV0 {
         BufferedDeliveryV0,
         Vec<(ProposalCandidateV0, Option<&'static str>)>,
     ) {
+        if !self.fixed_cardinality_ok(&candidates) {
+            // The one-shot run never settles a zero, multiple or unformable set.
+            let instrument = EnvelopeInstrumentV0::ProposalCountMismatch;
+            let mapping = candidates
+                .iter()
+                .map(|c| Self::unformable_entry(c, instrument))
+                .collect();
+            let blocked = candidates
+                .into_iter()
+                .map(|c| (c, Some("effect_candidate_cardinality")))
+                .collect();
+            let result = Self::assemble(
+                DeliveryOutcomeV0::SuppressedWholeResponse,
+                mapping,
+                vec![],
+                vec![instrument],
+            );
+            return (result, BufferedDeliveryV0 { suppressed: true }, blocked);
+        }
         let mut instruments = Vec::new();
         let policy = match self.policy.resolve() {
             Ok(policy) => policy,
@@ -918,11 +983,14 @@ impl RuntimeEnvelopeV0 {
     ) -> (EnvelopeResponseResultV0, BufferedDeliveryV0) {
         use super::interfaces::ProposalCandidateEnumeratorV0;
         let candidates = RawCandidateEnumeratorV0.enumerate_buffered(provider, body);
+        let cardinality_ok = self.fixed_cardinality_ok(&candidates);
         let (result, delivery, withheld) = self.process_candidates(capture, candidates);
         if !delivery.suppressed {
             rewrite_buffered(provider, body, &withheld);
         }
-        self.deliver(&result);
+        if cardinality_ok {
+            self.deliver(&result);
+        }
         (result, delivery)
     }
 
@@ -1044,6 +1112,13 @@ impl StreamEnvelopeSessionV0 {
         touch: StreamTouchV0,
         c: ProposalCandidateV0,
     ) -> (StreamTouchV0, CallDispositionV0) {
+        if self.envelope.fixed_run_id.is_some() {
+            // The one-shot effect run is buffered-only; no streamed call settles it.
+            return (
+                touch,
+                CallDispositionV0::Withhold("effect_streaming_unsupported"),
+            );
+        }
         let policy = match &self.policy {
             Ok(p) => p,
             Err(e) => {

@@ -2146,6 +2146,24 @@ mod story3_r2a {
         }
     }
 
+    /// Golden outputs pin this placeholder; the envelope generates the real id.
+    const GOLDEN_RUN_ID: &str = "0123456789abcdef0123456789abcdef";
+
+    /// Replace the generated `run_id` in accept stdout with `GOLDEN_RUN_ID`,
+    /// returning the normalized stdout and the generated id.
+    fn golden_run_id(stdout: &str) -> (String, String) {
+        let start = ["\"run_id\":\"", "run_id: "]
+            .iter()
+            .find_map(|k| stdout.find(k).map(|at| at + k.len()))
+            .expect("accept stdout carries run_id");
+        let id = stdout[start..start + 32].to_owned();
+        assert!(
+            RunIdV0::parse(&id).is_some(),
+            "generated run_id is 32 lowercase hex"
+        );
+        (stdout.replacen(&id, GOLDEN_RUN_ID, 1), id)
+    }
+
     fn mandatory_profile_yaml() -> &'static str {
         r#"parapet: v1
 tools:
@@ -2188,7 +2206,6 @@ layers:
 
         // 1. Run `parapet accept --scenario shadow_parse_error_l3_off` in both JSON and human modes
         let state_json = dir.path().join("shadow_accept_json");
-        let run_id_hex = "0123456789abcdef0123456789abcdef";
         let accept_json = run_parapet(
             &[
                 "accept",
@@ -2198,8 +2215,6 @@ layers:
                 cfg_path.to_str().unwrap(),
                 "--scenario",
                 "shadow_parse_error_l3_off",
-                "--run-id",
-                run_id_hex,
                 "--sdk",
                 "rust",
                 "--json",
@@ -2213,8 +2228,11 @@ layers:
             String::from_utf8_lossy(&accept_json.stderr)
         );
         assert!(accept_json.stderr.is_empty());
+        let (accept_json_stdout, run_id_hex) =
+            golden_run_id(&String::from_utf8(accept_json.stdout).unwrap());
+        let run_id_hex = run_id_hex.as_str();
         assert_eq!(
-            String::from_utf8(accept_json.stdout).unwrap(),
+            accept_json_stdout,
             golden["accept_shadow_parse_error_l3_off_json_stdout"]
                 .as_str()
                 .unwrap()
@@ -2230,8 +2248,6 @@ layers:
                 cfg_path.to_str().unwrap(),
                 "--scenario",
                 "shadow_parse_error_l3_off",
-                "--run-id",
-                run_id_hex,
                 "--sdk",
                 "rust",
             ],
@@ -2240,7 +2256,7 @@ layers:
         assert_eq!(accept_human.status.code(), Some(0));
         assert!(accept_human.stderr.is_empty());
         assert_eq!(
-            String::from_utf8(accept_human.stdout).unwrap(),
+            golden_run_id(&String::from_utf8(accept_human.stdout).unwrap()).0,
             golden["accept_shadow_parse_error_l3_off_human_stdout"]
                 .as_str()
                 .unwrap()
@@ -2354,12 +2370,10 @@ layers:
                 let sink = Arc::new(CaptureSink {
                     results: Mutex::new(Vec::new()),
                 });
-                let run_id = RunIdV0::parse(&format!("{:032x}", 0x900 + idx)).unwrap();
                 let options = EngineRuntimeOptionsV0 {
                     state_dir: case_state.clone(),
                     effect_root: None,
                     file_effect_profile: None,
-                    run_id: Some(run_id.clone()),
                     max_content_len_bytes: None,
                     build_digest: None,
                     offline_fixture: Some(OfflineUpstreamFixtureV0::V0),
@@ -2432,7 +2446,8 @@ layers:
                 assert_eq!(proj.summary, Summary::BlockedBeforeExecution);
                 assert_eq!(proj.policy.enforcement, Enforcement::Shadow);
 
-                let reader_view = RedactedEvidenceReaderV0::new(&store).view(&run_id, None);
+                let reader_view =
+                    RedactedEvidenceReaderV0::new(&store).view(&run_out.run_id, None);
                 assert_eq!(
                     reader_view.outcome,
                     Some(parapet::effect::store::TerminalOutcomeV0::Complete)
@@ -2592,7 +2607,6 @@ layers:
         std::fs::write(&cfg_path, mandatory_profile_yaml()).expect("write config");
         let state_dir = dir.path().join("run_state");
         let effect_root = dir.path().join("run_effect");
-        let run_id_hex = "000000000000000000000000000000e1";
 
         let init_out = run_parapet(
             &[
@@ -2630,8 +2644,6 @@ layers:
                     effect_root.to_str().unwrap(),
                     "--file-effect-profile",
                     "v0",
-                    "--run-id",
-                    run_id_hex,
                     "--max-content-bytes",
                     "4096",
                     "--offline-fixture",
@@ -2672,7 +2684,12 @@ layers:
         assert_eq!(cfg_hash.len(), 64);
         assert!(cfg_hash.chars().all(|c| c.is_ascii_hexdigit()));
         assert_eq!(owner_val["file_capability_active"].as_bool(), Some(true));
-        assert_eq!(owner_val["run_id"].as_str(), Some(run_id_hex));
+        let run_id_hex = owner_val["run_id"]
+            .as_str()
+            .expect("owner run_id")
+            .to_owned();
+        let run_id_hex = run_id_hex.as_str();
+        assert!(RunIdV0::parse(run_id_hex).is_some());
 
         // Send a proxy request through the live `parapet run` listener over loopback TCP
         rt.block_on(async {
@@ -2814,8 +2831,6 @@ layers:
         let cfg_path = dir.path().join("parapet_accept.yaml");
         std::fs::write(&cfg_path, mandatory_profile_yaml()).expect("write accept yaml");
 
-        let run_id_hex = "0123456789abcdef0123456789abcdef";
-
         // 1. Verify all 4 scenarios in both `--json` and human modes match golden outputs
         //    and satisfy all Rev 8 Section 5.2.5 / AC-1D-14 / AC-1D-20 invariants.
         for (scenario, needs_er, json_golden_key, human_golden_key) in [
@@ -2855,8 +2870,6 @@ layers:
                 cfg_path.to_str().unwrap(),
                 "--scenario",
                 scenario,
-                "--run-id",
-                run_id_hex,
                 "--sdk",
                 "rust",
                 "--json",
@@ -2873,7 +2886,7 @@ layers:
                 String::from_utf8_lossy(&out_j.stderr)
             );
             assert!(out_j.stderr.is_empty());
-            let stdout_j = String::from_utf8(out_j.stdout).unwrap();
+            let (stdout_j, _) = golden_run_id(&String::from_utf8(out_j.stdout).unwrap());
             assert_eq!(stdout_j, golden[json_golden_key].as_str().unwrap());
 
             let val_j: Value = serde_json::from_str(&stdout_j).unwrap();
@@ -2911,8 +2924,6 @@ layers:
                 cfg_path.to_str().unwrap(),
                 "--scenario",
                 scenario,
-                "--run-id",
-                run_id_hex,
                 "--sdk",
                 "rust",
             ];
@@ -2923,7 +2934,7 @@ layers:
             let out_h = run_parapet(&args_h, None);
             assert_eq!(out_h.status.code(), Some(0));
             assert!(out_h.stderr.is_empty());
-            let stdout_h = String::from_utf8(out_h.stdout).unwrap();
+            let (stdout_h, _) = golden_run_id(&String::from_utf8(out_h.stdout).unwrap());
             assert_eq!(stdout_h, golden[human_golden_key].as_str().unwrap());
             assert!(
                 !stdout_h.contains("replay:"),
@@ -2946,8 +2957,6 @@ layers:
                     min_cfg_path.to_str().unwrap(),
                     "--scenario",
                     "allow_verified_write",
-                    "--run-id",
-                    run_id_hex,
                     "--sdk",
                     sdk,
                     "--effect-root",
@@ -2977,23 +2986,6 @@ layers:
                     dir.path().join("never_created_1").to_str().unwrap().into(),
                     "--config".into(),
                     cfg_path.to_str().unwrap().into(),
-                    "--run-id".into(),
-                    run_id_hex.into(),
-                    "--sdk".into(),
-                    "rust".into(),
-                    "--json".into(),
-                ],
-            ),
-            (
-                "missing_run_id",
-                vec![
-                    "accept".into(),
-                    "--state-dir".into(),
-                    dir.path().join("never_created_2").to_str().unwrap().into(),
-                    "--config".into(),
-                    cfg_path.to_str().unwrap().into(),
-                    "--scenario".into(),
-                    "allow_no_executor".into(),
                     "--sdk".into(),
                     "rust".into(),
                     "--json".into(),
@@ -3009,8 +3001,6 @@ layers:
                     cfg_path.to_str().unwrap().into(),
                     "--scenario".into(),
                     "allow_no_executor".into(),
-                    "--run-id".into(),
-                    run_id_hex.into(),
                     "--json".into(),
                 ],
             ),
@@ -3024,27 +3014,8 @@ layers:
                     cfg_path.to_str().unwrap().into(),
                     "--scenario".into(),
                     "allow_no_executor".into(),
-                    "--run-id".into(),
-                    run_id_hex.into(),
                     "--sdk".into(),
                     "go".into(),
-                    "--json".into(),
-                ],
-            ),
-            (
-                "invalid_run_id",
-                vec![
-                    "accept".into(),
-                    "--state-dir".into(),
-                    dir.path().join("never_created_5").to_str().unwrap().into(),
-                    "--config".into(),
-                    cfg_path.to_str().unwrap().into(),
-                    "--scenario".into(),
-                    "allow_no_executor".into(),
-                    "--run-id".into(),
-                    "NOT_32_LOWER_HEX".into(),
-                    "--sdk".into(),
-                    "rust".into(),
                     "--json".into(),
                 ],
             ),
@@ -3058,8 +3029,6 @@ layers:
                     cfg_path.to_str().unwrap().into(),
                     "--scenario".into(),
                     "replay_check".into(),
-                    "--run-id".into(),
-                    run_id_hex.into(),
                     "--sdk".into(),
                     "rust".into(),
                     "--json".into(),
@@ -3075,8 +3044,6 @@ layers:
                     cfg_path.to_str().unwrap().into(),
                     "--scenario".into(),
                     "allow_no_executor".into(),
-                    "--run-id".into(),
-                    run_id_hex.into(),
                     "--sdk".into(),
                     "rust".into(),
                     "--effect-root".into(),
@@ -3094,8 +3061,6 @@ layers:
                     cfg_path.to_str().unwrap().into(),
                     "--scenario".into(),
                     "shadow_parse_error_l3_off".into(),
-                    "--run-id".into(),
-                    run_id_hex.into(),
                     "--sdk".into(),
                     "rust".into(),
                     "--effect-root".into(),
@@ -3113,8 +3078,6 @@ layers:
                     cfg_path.to_str().unwrap().into(),
                     "--scenario".into(),
                     "allow_verified_write".into(),
-                    "--run-id".into(),
-                    run_id_hex.into(),
                     "--sdk".into(),
                     "rust".into(),
                     "--json".into(),
@@ -3130,8 +3093,6 @@ layers:
                     cfg_path.to_str().unwrap().into(),
                     "--scenario".into(),
                     "block_no_effect".into(),
-                    "--run-id".into(),
-                    run_id_hex.into(),
                     "--sdk".into(),
                     "rust".into(),
                     "--json".into(),
@@ -3147,8 +3108,6 @@ layers:
                     cfg_path.to_str().unwrap().into(),
                     "--scenario".into(),
                     "allow_verified_write".into(),
-                    "--run-id".into(),
-                    run_id_hex.into(),
                     "--sdk".into(),
                     "rust".into(),
                     "--effect-root".into(),
@@ -3166,8 +3125,6 @@ layers:
                     cfg_path.to_str().unwrap().into(),
                     "--scenario".into(),
                     "allow_no_executor".into(),
-                    "--run-id".into(),
-                    run_id_hex.into(),
                     "--sdk".into(),
                     "rust".into(),
                     "--json".into(),
@@ -3505,7 +3462,6 @@ layers:
         let effect_root = dir.path().join("er_restore");
         let cfg_path = dir.path().join("parapet.yaml");
         std::fs::write(&cfg_path, mandatory_profile_yaml()).expect("write parapet.yaml");
-        let run_id_hex = "0123456789abcdef0123456789abcdef";
 
         let init_out = run_parapet(
             &[
@@ -3537,8 +3493,6 @@ layers:
                     effect_root.to_str().unwrap(),
                     "--file-effect-profile",
                     "v0",
-                    "--run-id",
-                    run_id_hex,
                     "--max-content-bytes",
                     "4096",
                     "--offline-fixture",
@@ -3728,8 +3682,6 @@ layers:
                     er_a.to_str().unwrap(),
                     "--file-effect-profile",
                     "v0",
-                    "--run-id",
-                    "0123456789abcdef0123456789abcdef",
                     "--max-content-bytes",
                     "4096",
                     "--offline-fixture",
@@ -3833,7 +3785,6 @@ layers:
         let effect_root = dir.path().join("er_lifecycle");
         let cfg_path = dir.path().join("parapet.yaml");
         std::fs::write(&cfg_path, mandatory_profile_yaml()).expect("write parapet.yaml");
-        let run_id_hex = "0123456789abcdef0123456789abcdef";
 
         assert_eq!(
             run_parapet(
@@ -3865,8 +3816,6 @@ layers:
                     effect_root.to_str().unwrap(),
                     "--file-effect-profile",
                     "v0",
-                    "--run-id",
-                    run_id_hex,
                     "--max-content-bytes",
                     "4096",
                     "--offline-fixture",
@@ -3882,6 +3831,13 @@ layers:
         ));
 
         let port = wait_for_ready_port(&state_dir.join("ready.port"));
+        // The one-shot effect run id is reserved by the engine, never supplied.
+        let owner: Value = serde_json::from_slice(
+            &std::fs::read(state_dir.join("engine.owner.json")).expect("read engine.owner.json"),
+        )
+        .expect("parse engine.owner.json");
+        let run_id_hex = owner["run_id"].as_str().expect("owner run_id").to_owned();
+        let run_id_hex = run_id_hex.as_str();
 
         // Execute a verified write run so `note.txt` exists in `effect_root` and evidence is persisted
         let (http_status, _) =
@@ -4027,7 +3983,9 @@ layers:
         assert_eq!(release_json.status.code(), Some(0));
         assert!(release_json.stderr.is_empty());
         assert_eq!(
-            String::from_utf8(release_json.stdout).unwrap(),
+            String::from_utf8(release_json.stdout)
+                .unwrap()
+                .replace(run_id_hex, "0123456789abcdef0123456789abcdef"),
             golden["evidence_release_clear_json_stdout"]
                 .as_str()
                 .unwrap()
@@ -4485,7 +4443,6 @@ layers:
         let effect_root = dir.path().join("er_indet");
         let cfg_path = dir.path().join("parapet.yaml");
         std::fs::write(&cfg_path, mandatory_profile_yaml()).expect("write parapet.yaml");
-        let run_id_hex = "0123456789abcdef0123456789abcdef";
 
         assert_eq!(
             run_parapet(
@@ -4517,8 +4474,6 @@ layers:
                     effect_root.to_str().unwrap(),
                     "--file-effect-profile",
                     "v0",
-                    "--run-id",
-                    run_id_hex,
                     "--max-content-bytes",
                     "4096",
                     "--offline-fixture",
@@ -4885,4 +4840,150 @@ fn cli_undeclared_residue_maps_to_indeterminate_and_refuses_disable() {
 #[test]
 fn cli_disable_not_owned_refusal_is_distinct() {
     story4_r2b::cli_disable_not_owned_refusal_is_distinct();
+}
+
+/// Rev 9 D1: no run-creating command accepts a caller run id. Clap rejects the
+/// obsolete flag (exit 2) before any state, store, effect root, socket or child.
+#[cfg(not(windows))]
+#[test]
+fn cli_rev9_run_creators_reject_caller_run_id_before_side_effects() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let cfg_path = dir.path().join("parapet.yaml");
+    std::fs::write(&cfg_path, "parapet: v1\n").expect("write config");
+    let cfg = cfg_path.to_str().unwrap();
+    let run_id = "0123456789abcdef0123456789abcdef";
+
+    // `parapet run` against an initialized state-dir: nothing new appears.
+    let run_state = dir.path().join("run_state");
+    let run_er = dir.path().join("run_er");
+    let init = run_parapet(&["init", "--state-dir", run_state.to_str().unwrap()], None);
+    assert_eq!(init.status.code(), Some(0));
+    let listing = |p: &std::path::Path| {
+        let mut names: Vec<_> = std::fs::read_dir(p)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        names.sort();
+        names
+    };
+    let before = listing(&run_state);
+
+    let accept_state = dir.path().join("accept_state");
+    let accept_er = dir.path().join("accept_er");
+    let engine_state = dir.path().join("engine_state");
+    let engine_er = dir.path().join("engine_er");
+    let run_id_eq = format!("--run-id={run_id}");
+    let cases: Vec<(&str, &str, Vec<&str>)> = vec![
+        (
+            "parapet",
+            "run",
+            vec![
+                "run",
+                "--state-dir",
+                run_state.to_str().unwrap(),
+                "--config",
+                cfg,
+                "--port",
+                "0",
+                "--effect-root",
+                run_er.to_str().unwrap(),
+                "--file-effect-profile",
+                "v0",
+                "--max-content-bytes",
+                "4096",
+                "--offline-fixture",
+                "v0",
+                "--run-id",
+                run_id,
+                "--json",
+            ],
+        ),
+        (
+            "parapet",
+            "accept",
+            vec![
+                "accept",
+                "--state-dir",
+                accept_state.to_str().unwrap(),
+                "--config",
+                cfg,
+                "--scenario",
+                "allow_verified_write",
+                "--effect-root",
+                accept_er.to_str().unwrap(),
+                "--sdk",
+                "rust",
+                &run_id_eq,
+                "--json",
+            ],
+        ),
+        (
+            env!("CARGO_BIN_EXE_parapet-engine"),
+            "parapet-engine",
+            vec![
+                "--config",
+                cfg,
+                "--port",
+                "0",
+                "--state-dir",
+                engine_state.to_str().unwrap(),
+                "--effect-root",
+                engine_er.to_str().unwrap(),
+                "--file-effect-profile",
+                "v0",
+                "--max-content-bytes",
+                "4096",
+                "--offline-fixture",
+                "v0",
+                "--run-id",
+                run_id,
+            ],
+        ),
+    ];
+    for (bin, name, args) in cases {
+        let bin = if bin == "parapet" { parapet_bin() } else { bin };
+        let out = Command::new(bin)
+            .args(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("spawn run creator");
+        assert_eq!(out.status.code(), Some(2), "{name} must exit 2");
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if name == "parapet-engine" {
+            assert!(stdout.is_empty(), "{name}: no output");
+            assert!(
+                stderr.contains("unexpected argument '--run-id"),
+                "{name}: clap usage error; got {stderr}"
+            );
+        } else {
+            let code = if name == "accept" {
+                "invalid_accept_combination"
+            } else {
+                "invalid_arguments"
+            };
+            assert_eq!(
+                stdout,
+                format!(
+                    "{{\"schema\":\"parapet-cli-error/v0\",\"command\":\"{name}\",\"error_code\":\"{code}\",\"exit_code\":2}}\n"
+                )
+            );
+            assert!(
+                stderr.starts_with(&format!("parapet {name}: error: ")),
+                "{name}: usage error; got {stderr}"
+            );
+        }
+    }
+    assert_eq!(listing(&run_state), before, "run created nothing");
+    for absent in [
+        &run_er,
+        &accept_state,
+        &accept_er,
+        &engine_state,
+        &engine_er,
+    ] {
+        assert!(!absent.exists(), "{} must not be created", absent.display());
+    }
 }

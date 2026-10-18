@@ -288,6 +288,28 @@ impl UpstreamClient for EngineUpstreamClient {
             "processing request"
         );
 
+        // 0.5) C2.2 one-shot effect run: streaming never consumes it, and only
+        // the first non-streaming request claims it, before parsing or upstream.
+        #[cfg(not(windows))]
+        if let Some(envelope) = &self.envelope {
+            if envelope.fixed_run_id().is_some() {
+                if is_streaming_request(&request.headers, &request.body) {
+                    return Ok(effect_runtime_error(
+                        adapter.as_ref(),
+                        StatusCode::BAD_REQUEST,
+                        EFFECT_STREAMING_UNSUPPORTED,
+                    ));
+                }
+                if !envelope.claim_fixed_run() {
+                    return Ok(effect_runtime_error(
+                        adapter.as_ref(),
+                        StatusCode::CONFLICT,
+                        EFFECT_RUN_CONSUMED,
+                    ));
+                }
+            }
+        }
+
         // 1) Parse request into messages
         let mut messages = match adapter.parse_request(&request.body) {
             Ok(msgs) => msgs,
@@ -1145,9 +1167,28 @@ impl EngineUpstreamClient {
         capture: Option<&RequestCaptureV0>,
     ) -> ProcessedResponse {
         let adapter = self.deps.registry.adapter_for(provider);
-        let mut json: serde_json::Value = match serde_json::from_slice(body) {
-            Ok(v) => v,
-            Err(_) => {
+        let parsed: Option<serde_json::Value> = serde_json::from_slice(body).ok();
+
+        // C2.2: the one-shot effect run settles exactly one formed candidate;
+        // otherwise nothing reaches finish, executor, store or the result sink.
+        #[cfg(not(windows))]
+        if let (Some(envelope), Some(_)) = (&self.envelope, capture) {
+            if envelope.fixed_run_id().is_some()
+                && !parsed.as_ref().is_some_and(|json| {
+                    envelope.fixed_buffered_cardinality_ok(receipt_provider(provider), json)
+                })
+            {
+                return ProcessedResponse {
+                    status_override: Some(StatusCode::BAD_GATEWAY),
+                    body: Bytes::from(adapter.serialize_error(EFFECT_CANDIDATE_CARDINALITY, 502)),
+                    extra_headers: Some(effect_runtime_headers(EFFECT_CANDIDATE_CARDINALITY)),
+                };
+            }
+        }
+
+        let mut json: serde_json::Value = match parsed {
+            Some(v) => v,
+            None => {
                 return ProcessedResponse {
                     status_override: None,
                     body: body.clone(),
@@ -1899,8 +1940,6 @@ pub struct EngineRuntimeOptionsV0 {
     pub effect_root: Option<std::path::PathBuf>,
     /// Explicit 1C file-effect profile selection marker.
     pub file_effect_profile: Option<crate::effect::FileEffectProfileV0>,
-    /// Caller-supplied 32-hex run identifier.
-    pub run_id: Option<crate::effect::RunIdV0>,
     /// Maximum content length in bytes (`1..=1_048_576`) when `effect_root` is active.
     pub max_content_len_bytes: Option<u64>,
     /// Optional injected build digest or executable path.
@@ -1924,101 +1963,6 @@ impl crate::effect::BuildIdentityProviderV0 for StaticDigestBuildIdentityV0 {
     ) -> crate::receipt::PresentUnavailable<crate::receipt::CodeIdentity, crate::receipt::CodeError>
     {
         self.identity.clone()
-    }
-}
-
-#[cfg(not(windows))]
-struct RunIdBindingResultSinkV0 {
-    store: Arc<crate::effect::store::ProtectedEvidenceStoreV0>,
-    store_root: std::path::PathBuf,
-    target_run_id: crate::effect::RunIdV0,
-    inner: Option<Arc<dyn crate::effect::EnvelopeResultSinkV0>>,
-}
-
-#[cfg(not(windows))]
-impl RunIdBindingResultSinkV0 {
-    fn rebind_run(&self, r: &mut crate::effect::RunResultV0) {
-        if r.run_id == self.target_run_id {
-            return;
-        }
-        if self.store.manifest(&self.target_run_id).is_ok() {
-            return;
-        }
-        let Ok(src_manifest) = self.store.manifest(&r.run_id) else {
-            return;
-        };
-        if self
-            .store
-            .create_run(
-                &self.target_run_id,
-                &src_manifest.request_ref,
-                src_manifest.candidate_ref,
-            )
-            .is_err()
-        {
-            return;
-        }
-        let reader = crate::effect::store::ProtectedEvidenceReaderV0::new(&self.store);
-        for entry in &src_manifest.objects {
-            let Ok(bytes) = reader.read(&r.run_id, &entry.path, None, None) else {
-                return;
-            };
-            let key_digest = if entry.kind == crate::effect::StageKindV0::Projection {
-                r.row_digest.as_str()
-            } else {
-                entry.digest.as_str()
-            };
-            if self
-                .store
-                .put_object(
-                    &self.target_run_id,
-                    entry.kind,
-                    key_digest,
-                    &entry.digest,
-                    &bytes,
-                )
-                .is_err()
-            {
-                return;
-            }
-        }
-        let outcome = match r.completion {
-            crate::effect::RuntimeCompletionV0::Complete => {
-                crate::effect::store::TerminalOutcomeV0::Complete
-            }
-            crate::effect::RuntimeCompletionV0::StorageIncomplete => {
-                crate::effect::store::TerminalOutcomeV0::StorageIncomplete
-            }
-        };
-        if self
-            .store
-            .publish_initial(&self.target_run_id, outcome, &r.row_digest)
-            .is_ok()
-        {
-            let old_run_dir = self.store_root.join("run").join(r.run_id.as_str());
-            let _ = std::fs::remove_dir_all(old_run_dir);
-            r.run_id = self.target_run_id.clone();
-        }
-    }
-}
-
-#[cfg(not(windows))]
-impl crate::effect::EnvelopeResultSinkV0 for RunIdBindingResultSinkV0 {
-    fn accept(&self, mut result: crate::effect::EnvelopeResponseResultV0) {
-        if let Some(first_run) = result.runs.first_mut() {
-            let old_id = first_run.run_id.clone();
-            self.rebind_run(first_run);
-            if first_run.run_id == self.target_run_id {
-                for m in &mut result.mapping {
-                    if m.run_id.as_ref() == Some(&old_id) {
-                        m.run_id = Some(self.target_run_id.clone());
-                    }
-                }
-            }
-        }
-        if let Some(inner) = &self.inner {
-            inner.accept(result);
-        }
     }
 }
 
@@ -2135,14 +2079,10 @@ pub fn build_engine_client_with_runtime_v0(
         }
     };
 
-    let (executor_binding, root_cap) = if let Some(effect_root) = &options.effect_root {
+    let (executor_binding, root_cap, run_id) = if let Some(effect_root) = &options.effect_root {
         let profile = options
             .file_effect_profile
             .ok_or_else(|| StartupError::RuntimeInit("missing_file_effect_profile".into()))?;
-        let run_id = options
-            .run_id
-            .clone()
-            .ok_or_else(|| StartupError::RuntimeInit("missing_run_id".into()))?;
         let max_bytes = options
             .max_content_len_bytes
             .ok_or_else(|| StartupError::RuntimeInit("missing_max_content_bytes".into()))?;
@@ -2152,6 +2092,8 @@ pub fn build_engine_client_with_runtime_v0(
             .map_err(|e| StartupError::RuntimeInit(format!("policy_resolve_failed:{e:?}")))?;
         crate::effect::file::check_mandatory_profile(&resolved_policy.policy, max_bytes)
             .map_err(|e| StartupError::RuntimeInit(format!("profile_error:{e:?}")))?;
+        // C2.2: exactly one envelope-allocated id, reserved before the root exists.
+        let run_id = RuntimeEnvelopeV0::allocate_run_id();
         let root =
             crate::effect::file::RootCapabilityV0::create(effect_root, run_id.clone(), max_bytes)
                 .map_err(|e| StartupError::RuntimeInit(format!("root_error:{e:?}")))?;
@@ -2167,22 +2109,15 @@ pub fn build_engine_client_with_runtime_v0(
             Arc::new(exec),
             Arc::new(obs),
         );
-        (Some(binding), Some(root))
+        (Some(binding), Some(root), Some(run_id))
     } else {
-        (None, None)
+        (None, None, None)
     };
 
     let mut parts = crate::effect::EnvelopePartsV0::new(config.clone(), store.clone(), identity);
     parts.executor = executor_binding;
-    parts.results = match options.run_id {
-        Some(target_run_id) => Some(Arc::new(RunIdBindingResultSinkV0 {
-            store: store.clone(),
-            store_root,
-            target_run_id,
-            inner: options.result_sink,
-        })),
-        None => options.result_sink,
-    };
+    parts.fixed_run_id = run_id;
+    parts.results = options.result_sink;
     let envelope = Arc::new(RuntimeEnvelopeV0::new(parts));
 
     let http: Arc<dyn HttpSender> = match options.offline_fixture {
@@ -2239,6 +2174,37 @@ pub fn build_engine_client_with_options(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Stable C2.2 one-shot effect runtime codes.
+#[cfg(not(windows))]
+pub const EFFECT_STREAMING_UNSUPPORTED: &str = "effect_streaming_unsupported";
+#[cfg(not(windows))]
+pub const EFFECT_RUN_CONSUMED: &str = "effect_run_consumed";
+#[cfg(not(windows))]
+pub const EFFECT_CANDIDATE_CARDINALITY: &str = "effect_candidate_cardinality";
+
+#[cfg(not(windows))]
+fn effect_runtime_headers(code: &'static str) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert("x-parapet-action", HeaderValue::from_static("error"));
+    headers.insert("x-parapet-error", HeaderValue::from_static(code));
+    headers
+}
+
+/// Error response carrying a stable effect runtime code in the body message
+/// and `X-Parapet-Error`.
+#[cfg(not(windows))]
+fn effect_runtime_error(
+    adapter: &dyn ProviderAdapter,
+    status: StatusCode,
+    code: &'static str,
+) -> ProxyResponse {
+    ProxyResponse {
+        status,
+        headers: effect_runtime_headers(code),
+        body: Body::from(adapter.serialize_error(code, status.as_u16())),
+    }
+}
 
 /// Build a 503 error response for a layer runtime failure (`on_failure: closed`).
 ///

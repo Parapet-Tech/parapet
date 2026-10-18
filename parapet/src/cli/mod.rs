@@ -142,10 +142,6 @@ struct RunArgs {
     #[arg(long)]
     file_effect_profile: Option<String>,
 
-    /// Caller-supplied 32-hex run identifier
-    #[arg(long)]
-    run_id: Option<String>,
-
     /// Maximum content length in bytes (1..=1048576) for 1C write_file
     #[arg(long)]
     max_content_bytes: Option<u64>,
@@ -172,10 +168,6 @@ struct AcceptArgs {
     /// Acceptance scenario (allow_no_executor | allow_verified_write | block_no_effect | shadow_parse_error_l3_off)
     #[arg(long)]
     scenario: Option<String>,
-
-    /// Required 32-character lowercase hex run identifier
-    #[arg(long)]
-    run_id: Option<String>,
 
     /// Required SDK selector (rust | python | ts)
     #[arg(long)]
@@ -861,7 +853,7 @@ fn run_engine_cmd(args: RunArgs, json_mode: bool) -> i32 {
         );
     }
 
-    let (profile, run_id, max_bytes) = if let Some(ref er) = args.effect_root {
+    let (profile, max_bytes) = if let Some(ref er) = args.effect_root {
         if std::fs::symlink_metadata(er).is_ok() {
             return emit_cli_error(
                 "run",
@@ -880,24 +872,6 @@ fn run_engine_cmd(args: RunArgs, json_mode: bool) -> i32 {
                 json_mode,
             );
         }
-        let Some(raw_run) = args.run_id.as_deref() else {
-            return emit_cli_error(
-                "run",
-                "invalid_effect_arguments",
-                2,
-                "--run-id <32-hex> is required when --effect-root is set",
-                json_mode,
-            );
-        };
-        let Some(parsed_run) = RunIdV0::parse(raw_run) else {
-            return emit_cli_error(
-                "run",
-                "invalid_run_id",
-                2,
-                "--run-id must be 32 lowercase hex characters",
-                json_mode,
-            );
-        };
         let Some(mb) = args.max_content_bytes else {
             return emit_cli_error(
                 "run",
@@ -916,11 +890,7 @@ fn run_engine_cmd(args: RunArgs, json_mode: bool) -> i32 {
                 json_mode,
             );
         }
-        (
-            Some(FileEffectProfileV0::select_explicitly()),
-            Some(parsed_run),
-            Some(mb),
-        )
+        (Some(FileEffectProfileV0::select_explicitly()), Some(mb))
     } else {
         if args.file_effect_profile.is_some() || args.max_content_bytes.is_some() {
             return emit_cli_error(
@@ -931,22 +901,7 @@ fn run_engine_cmd(args: RunArgs, json_mode: bool) -> i32 {
                 json_mode,
             );
         }
-        let parsed_run = match args.run_id.as_deref() {
-            None => None,
-            Some(r) => match RunIdV0::parse(r) {
-                Some(id) => Some(id),
-                None => {
-                    return emit_cli_error(
-                        "run",
-                        "invalid_run_id",
-                        2,
-                        "--run-id must be 32 lowercase hex characters",
-                        json_mode,
-                    );
-                }
-            },
-        };
-        (None, parsed_run, None)
+        (None, None)
     };
 
     let offline_fixture = match args.offline_fixture.as_deref() {
@@ -1016,7 +971,6 @@ fn run_engine_cmd(args: RunArgs, json_mode: bool) -> i32 {
             state_dir: args.state_dir.clone(),
             effect_root: args.effect_root.clone(),
             file_effect_profile: profile,
-            run_id,
             max_content_len_bytes: max_bytes,
             build_digest: None,
             offline_fixture,
@@ -1152,18 +1106,14 @@ fn run_accept(_args: AcceptArgs, json_mode: bool) -> i32 {
 fn run_accept(args: AcceptArgs, json_mode: bool) -> i32 {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
-    let (Some(state_dir), Some(config_path), Some(scenario), Some(run_id_str), Some(sdk)) = (
-        args.state_dir,
-        args.config,
-        args.scenario,
-        args.run_id,
-        args.sdk,
-    ) else {
+    let (Some(state_dir), Some(config_path), Some(scenario), Some(sdk)) =
+        (args.state_dir, args.config, args.scenario, args.sdk)
+    else {
         return emit_cli_error(
             "accept",
             "invalid_accept_combination",
             2,
-            "missing required --state-dir, --config, --scenario, --run-id, or --sdk",
+            "missing required --state-dir, --config, --scenario, or --sdk",
             json_mode,
         );
     };
@@ -1193,16 +1143,6 @@ fn run_accept(args: AcceptArgs, json_mode: bool) -> i32 {
             json_mode,
         );
     }
-
-    let Some(run_id) = RunIdV0::parse(&run_id_str) else {
-        return emit_cli_error(
-            "accept",
-            "invalid_accept_combination",
-            2,
-            "--run-id must be 32 lowercase hex characters",
-            json_mode,
-        );
-    };
 
     let fixture = match scenario.as_str() {
         "allow_no_executor" => OfflineUpstreamFixtureV0::AllowNoExecutor,
@@ -1404,7 +1344,6 @@ fn run_accept(args: AcceptArgs, json_mode: bool) -> i32 {
                 .effect_root
                 .as_ref()
                 .map(|_| FileEffectProfileV0::select_explicitly()),
-            run_id: Some(run_id.clone()),
             max_content_len_bytes: args.effect_root.as_ref().map(|_| max_content_len_bytes),
             build_digest: None,
             offline_fixture: Some(fixture),
@@ -1462,7 +1401,6 @@ fn run_accept(args: AcceptArgs, json_mode: bool) -> i32 {
             .header("content-type", "application/json")
             .header("x-parapet-original-host", "api.openai.com")
             .header("x-parapet-offline-scenario", scenario.as_str())
-            .header("x-request-id", format!("req-{}", run_id.as_str()))
             .json(&req_body)
             .send()
             .await;
@@ -1519,7 +1457,7 @@ fn run_accept(args: AcceptArgs, json_mode: bool) -> i32 {
                 schema: "parapet-cli-accept/v0",
                 scenario: &scenario,
                 sdk: &sdk,
-                run_id: run_id.as_str(),
+                run_id: first_run.run_id.as_str(),
                 real_model_contacted: false,
                 upstream_label: upstream_lbl,
                 http_status,
@@ -1539,7 +1477,7 @@ fn run_accept(args: AcceptArgs, json_mode: bool) -> i32 {
         } else {
             println!("scenario: {scenario}");
             println!("sdk: {sdk}");
-            println!("run_id: {}", run_id.as_str());
+            println!("run_id: {}", first_run.run_id.as_str());
             println!("real_model_contacted: false");
             println!("{upstream_lbl}");
             println!("http_status: {http_status}");

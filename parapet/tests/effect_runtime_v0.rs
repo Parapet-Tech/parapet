@@ -3224,3 +3224,439 @@ async fn streaming_malformed_outer_data_fails_closed() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Rev 9 D1 (correction 2 C2.2): single generated identity, one-shot runtime
+// ---------------------------------------------------------------------------
+
+mod rev9_d1 {
+    use super::*;
+    use parapet::engine::{
+        build_engine_client_with_runtime_v0, EngineRuntimeOptionsV0, OfflineUpstreamFixtureV0,
+    };
+
+    const PROFILE_YAML: &str = r#"parapet: v1
+tools:
+  _default:
+    allowed: false
+  write_file:
+    allowed: true
+    constraints:
+      content:
+        type: string
+        max_length: 4096
+      path:
+        type: string
+        matches: "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+        max_length: 128
+layers:
+  L3_outbound: { mode: block, block_action: rewrite }
+"#;
+
+    /// Upstream double that records every contact.
+    struct CountingSender {
+        body: Bytes,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl HttpSender for CountingSender {
+        async fn send(&self, _request: HttpRequest) -> Result<HttpResponse, HttpError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut headers = HeaderMap::new();
+            headers.insert("content-type", HeaderValue::from_static("application/json"));
+            Ok(HttpResponse {
+                status: StatusCode::OK,
+                headers,
+                body: HttpBody::Full(self.body.clone()),
+            })
+        }
+    }
+
+    fn tool_call(id: &str) -> Value {
+        json!({"id": id, "type": "function", "function": {"name": "write_file",
+            "arguments": "{\"path\":\"a.txt\",\"content\":\"hello\"}"}})
+    }
+
+    fn openai_body(calls: Vec<Value>) -> Value {
+        let message = if calls.is_empty() {
+            json!({"role": "assistant", "content": "no tool call"})
+        } else {
+            json!({"role": "assistant", "content": null, "tool_calls": calls})
+        };
+        json!({"id": "x", "object": "chat.completion", "model": "fixture-model",
+            "choices": [{"index": 0, "message": message, "finish_reason": "tool_calls"}]})
+    }
+
+    struct Rev9Live {
+        engine: Arc<EngineUpstreamClient>,
+        sender: Arc<CountingSender>,
+        results: Arc<CollectingResults>,
+        executor: Arc<CountingExecutor>,
+        run: Option<RunIdV0>,
+        ev: Evidence,
+    }
+
+    impl Rev9Live {
+        fn run_dirs(&self) -> Vec<String> {
+            let mut out: Vec<String> = std::fs::read_dir(self.ev.root.join("run"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            out.sort();
+            out
+        }
+
+        async fn send(&self, stream: bool) -> (StatusCode, HeaderMap, String) {
+            let resp = self
+                .engine
+                .forward(
+                    ProxyProvider::OpenAi,
+                    request(ProxyProvider::OpenAi, stream, None),
+                )
+                .await
+                .unwrap();
+            let headers = resp.headers.clone();
+            let (status, text) = body_text(resp).await;
+            (status, headers, text)
+        }
+    }
+
+    /// Engine over a counting upstream; `effect` reserves one fixed run the
+    /// way the runtime builder does.
+    fn rev9_live(body: Value, effect: bool) -> Rev9Live {
+        let ev = evidence();
+        let config = named_config("rewrite");
+        let results = Arc::new(CollectingResults::default());
+        let executor = Arc::new(CountingExecutor::default());
+        let run = effect.then(RuntimeEnvelopeV0::allocate_run_id);
+        let mut parts = EnvelopePartsV0::new(config.clone(), ev.store.clone(), identity());
+        parts.results = Some(results.clone());
+        if effect {
+            parts.executor = Some(binding(executor.clone(), ObserverMode::Matching));
+        }
+        parts.fixed_run_id = run.clone();
+        let envelope = Arc::new(RuntimeEnvelopeV0::new(parts));
+        let sender = Arc::new(CountingSender {
+            body: Bytes::from(body.to_string()),
+            calls: AtomicUsize::new(0),
+        });
+        let mut d = deps(config, Bytes::new(), "application/json");
+        d.http = sender.clone();
+        Rev9Live {
+            engine: Arc::new(EngineUpstreamClient::new_with_envelope(d, envelope)),
+            sender,
+            results,
+            executor,
+            run,
+            ev,
+        }
+    }
+
+    fn assert_effect_code(status: StatusCode, headers: &HeaderMap, text: &str, want: (u16, &str)) {
+        assert_eq!(status.as_u16(), want.0, "{text}");
+        assert_eq!(
+            headers.get("x-parapet-error").and_then(|v| v.to_str().ok()),
+            Some(want.1)
+        );
+        assert!(text.contains(want.1), "{text}");
+    }
+
+    #[tokio::test]
+    async fn engine_rev9_effect_runtime_single_generated_identity_end_to_end() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir(&state_dir).unwrap();
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let effect_root = dir.path().join("effect");
+        let results = Arc::new(CollectingResults::default());
+        let (client, store, root_cap) = build_engine_client_with_runtime_v0(
+            config_from(PROFILE_YAML),
+            EngineRuntimeOptionsV0 {
+                state_dir: state_dir.clone(),
+                effect_root: Some(effect_root.clone()),
+                file_effect_profile: Some(FileEffectProfileV0::select_explicitly()),
+                max_content_len_bytes: Some(4096),
+                build_digest: None,
+                offline_fixture: Some(OfflineUpstreamFixtureV0::AllowVerifiedWrite),
+                result_sink: Some(results.clone()),
+            },
+        )
+        .expect("effect runtime builds");
+        // The id exists, and is bound to the root, before any request.
+        let root = root_cap.expect("effect root capability");
+        let reserved = root.run_id().clone();
+        let sentinel: Value = serde_json::from_slice(
+            &std::fs::read(effect_root.join(sentinel_name(&reserved))).expect("sentinel"),
+        )
+        .unwrap();
+        assert_eq!(sentinel["run_id"].as_str(), Some(reserved.as_str()));
+        let metadata: Value = serde_json::from_slice(
+            &std::fs::read(effect_root.join(ROOT_EVIDENCE_DIR).join(ROOT_METADATA_NAME))
+                .expect("root metadata"),
+        )
+        .unwrap();
+        assert_eq!(metadata["run_id"].as_str(), Some(reserved.as_str()));
+
+        let mut req = request(ProxyProvider::OpenAi, false, Some("req-independent-1"));
+        req.headers.insert(
+            "x-parapet-original-host",
+            HeaderValue::from_static("api.openai.com"),
+        );
+        let resp = client.forward(ProxyProvider::OpenAi, req).await.unwrap();
+        let (status, _) = body_text(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            std::fs::read_to_string(effect_root.join("note.txt")).unwrap(),
+            "hello parapet\n"
+        );
+
+        let delivered = results.0.lock().unwrap().clone();
+        assert_eq!(delivered.len(), 1, "result sink delivered exactly once");
+        let result = &delivered[0];
+        assert_eq!(result.runs.len(), 1);
+        let run = &result.runs[0];
+        assert_eq!(run.run_id, reserved, "result id is the reserved id");
+        assert_eq!(result.mapping[0].run_id.as_ref(), Some(&reserved));
+        assert_eq!(
+            run.row.action_id,
+            Some(format!("act-{}", reserved.as_str()))
+        );
+        assert_eq!(run.completion, RuntimeCompletionV0::Complete);
+        assert_eq!(run.row.summary, Summary::AllowedEffectVerified);
+        // Store run and terminal are the same bytes; no other run exists.
+        let runs: Vec<String> = std::fs::read_dir(state_dir.join("receipt-evidence/run"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(runs, vec![reserved.as_str().to_owned()]);
+        let manifest = store.manifest(&reserved).expect("store run");
+        assert_eq!(manifest.candidate_ref, run.candidate_ref);
+        let view = RedactedEvidenceReaderV0::new(&store).view(&reserved, None);
+        assert_eq!(view.outcome, Some(TerminalOutcomeV0::Complete));
+        assert!(view.projection_bytes.is_some());
+        // The HTTP request id is independent of the run id.
+        let request_ref =
+            serde_json::to_string(&run.row.proposal_context.record.request_ref).unwrap();
+        assert!(!request_ref.contains(reserved.as_str()), "{request_ref}");
+
+        // The runtime is consumed: a later request never reaches the effect.
+        let mut again = request(ProxyProvider::OpenAi, false, None);
+        again.headers.insert(
+            "x-parapet-original-host",
+            HeaderValue::from_static("api.openai.com"),
+        );
+        let resp = client.forward(ProxyProvider::OpenAi, again).await.unwrap();
+        let headers = resp.headers.clone();
+        let (status, text) = body_text(resp).await;
+        assert_effect_code(status, &headers, &text, (409, "effect_run_consumed"));
+        assert_eq!(results.0.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn engine_rev9_effect_runtime_second_request_rejected_before_upstream() {
+        let lv = rev9_live(openai_body(vec![tool_call("call_1")]), true);
+        let run = lv.run.clone().unwrap();
+        let (status, _, _) = lv.send(false).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(lv.sender.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(lv.run_dirs(), vec![run.as_str().to_owned()]);
+
+        for _ in 0..2 {
+            let (status, headers, text) = lv.send(false).await;
+            assert_effect_code(status, &headers, &text, (409, "effect_run_consumed"));
+        }
+        assert_eq!(
+            lv.sender.calls.load(Ordering::SeqCst),
+            1,
+            "no upstream contact"
+        );
+        assert_eq!(lv.executor.invocations.load(Ordering::SeqCst), 1);
+        let delivered = lv.results.0.lock().unwrap().clone();
+        assert_eq!(delivered.len(), 1, "no later result delivery");
+        assert_eq!(delivered[0].runs[0].run_id, run);
+        assert_eq!(lv.run_dirs(), vec![run.as_str().to_owned()]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn engine_rev9_effect_runtime_concurrent_claim_allows_exactly_one() {
+        let lv = rev9_live(openai_body(vec![tool_call("call_1")]), true);
+        let run = lv.run.clone().unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(8));
+        let tasks: Vec<_> = (0..8)
+            .map(|_| {
+                let engine = lv.engine.clone();
+                let barrier = barrier.clone();
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    let resp = engine
+                        .forward(
+                            ProxyProvider::OpenAi,
+                            request(ProxyProvider::OpenAi, false, None),
+                        )
+                        .await
+                        .unwrap();
+                    resp.status
+                })
+            })
+            .collect();
+        let mut statuses = Vec::new();
+        for t in tasks {
+            statuses.push(t.await.unwrap());
+        }
+        assert_eq!(
+            statuses.iter().filter(|s| **s == StatusCode::OK).count(),
+            1,
+            "{statuses:?}"
+        );
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|s| **s == StatusCode::CONFLICT)
+                .count(),
+            7
+        );
+        assert_eq!(lv.sender.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(lv.executor.invocations.load(Ordering::SeqCst), 1);
+        assert_eq!(lv.results.0.lock().unwrap().len(), 1);
+        assert_eq!(lv.run_dirs(), vec![run.as_str().to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn engine_rev9_effect_streaming_rejected_without_consuming_run() {
+        let lv = rev9_live(openai_body(vec![tool_call("call_1")]), true);
+        let run = lv.run.clone().unwrap();
+        let (status, headers, text) = lv.send(true).await;
+        assert_effect_code(
+            status,
+            &headers,
+            &text,
+            (400, "effect_streaming_unsupported"),
+        );
+        assert_eq!(
+            lv.sender.calls.load(Ordering::SeqCst),
+            0,
+            "no upstream contact"
+        );
+        assert_eq!(lv.executor.invocations.load(Ordering::SeqCst), 0);
+        assert!(lv.results.0.lock().unwrap().is_empty());
+        assert!(lv.run_dirs().is_empty(), "no store run");
+        // The run was not consumed: the first non-streaming request settles it.
+        let (status, _, _) = lv.send(false).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(lv.results.0.lock().unwrap()[0].runs[0].run_id, run);
+    }
+
+    #[tokio::test]
+    async fn engine_rev9_effect_candidate_cardinality_fails_before_effect_or_store() {
+        let mut unformable = openai_body(vec![tool_call("call_1")]);
+        unformable["choices"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("index");
+        for (case, body) in [
+            ("zero", openai_body(vec![])),
+            (
+                "multiple",
+                openai_body(vec![tool_call("call_1"), tool_call("call_2")]),
+            ),
+            ("unformable", unformable),
+        ] {
+            let lv = rev9_live(body, true);
+            let (status, headers, text) = lv.send(false).await;
+            assert_effect_code(
+                status,
+                &headers,
+                &text,
+                (502, "effect_candidate_cardinality"),
+            );
+            assert!(!text.contains("call_1"), "{case}: response suppressed");
+            assert_eq!(lv.sender.calls.load(Ordering::SeqCst), 1, "{case}");
+            assert_eq!(lv.executor.invocations.load(Ordering::SeqCst), 0, "{case}");
+            assert!(lv.results.0.lock().unwrap().is_empty(), "{case}: no sink");
+            assert!(lv.run_dirs().is_empty(), "{case}: no store run");
+            // The runtime stays consumed.
+            let (status, headers, text) = lv.send(false).await;
+            assert_effect_code(status, &headers, &text, (409, "effect_run_consumed"));
+            assert_eq!(lv.sender.calls.load(Ordering::SeqCst), 1, "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn engine_rev9_effect_disabled_multi_request_per_candidate_preserved() {
+        let lv = rev9_live(
+            openai_body(vec![tool_call("call_1"), tool_call("call_2")]),
+            false,
+        );
+        for _ in 0..2 {
+            let (status, _, _) = lv.send(false).await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        let (status, _, _) = lv.send(true).await;
+        assert_ne!(status.as_u16(), 400, "streaming stays supported");
+        assert_eq!(lv.sender.calls.load(Ordering::SeqCst), 3);
+        let delivered = lv.results.0.lock().unwrap().clone();
+        let ids: std::collections::BTreeSet<_> = delivered
+            .iter()
+            .take(2)
+            .flat_map(|r| r.runs.iter().map(|run| run.run_id.clone()))
+            .collect();
+        assert_eq!(ids.len(), 4, "one generated run per candidate per request");
+        assert_eq!(lv.run_dirs().len(), 4);
+    }
+
+    fn rust_sources(dir: &Path, out: &mut Vec<(PathBuf, String)>) {
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                rust_sources(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let text = std::fs::read_to_string(&path).unwrap();
+                out.push((path, text));
+            }
+        }
+    }
+
+    #[test]
+    fn engine_rev9_effect_runtime_source_scope_single_allocator() {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut sources = Vec::new();
+        rust_sources(&src, &mut sources);
+        let generate: Vec<_> = sources
+            .iter()
+            .filter(|(_, text)| text.contains("RunIdV0::generate"))
+            .map(|(path, text)| (path.clone(), text.matches("RunIdV0::generate").count()))
+            .collect();
+        assert_eq!(
+            generate,
+            vec![(src.join("effect/envelope.rs"), 1)],
+            "the envelope-owned allocator is the only generator"
+        );
+        let envelope = std::fs::read_to_string(src.join("effect/envelope.rs")).unwrap();
+        let allocator = envelope
+            .find("pub fn allocate_run_id() -> RunIdV0 {")
+            .expect("envelope-owned allocator");
+        assert!(envelope[allocator..allocator + 80].contains("RunIdV0::generate()"));
+
+        for file in ["engine/mod.rs", "cli/mod.rs", "main.rs"] {
+            let text = std::fs::read_to_string(src.join(file)).unwrap();
+            assert!(!text.contains("RunIdBindingResultSinkV0"), "{file}");
+            assert!(
+                !text.contains("remove_dir_all"),
+                "{file}: no store run deletion"
+            );
+            assert!(!text.contains("target_run_id"), "{file}: no rebinding");
+        }
+        let engine = std::fs::read_to_string(src.join("engine/mod.rs")).unwrap();
+        let start = engine
+            .find("pub struct EngineRuntimeOptionsV0 {")
+            .expect("runtime options");
+        let options = &engine[start..start + engine[start..].find("\n}").unwrap()];
+        assert!(!options.contains("run_id"), "no runtime run-id override");
+        let main = std::fs::read_to_string(src.join("main.rs")).unwrap();
+        assert!(!main.contains("run_id"), "parapet-engine takes no run id");
+    }
+}

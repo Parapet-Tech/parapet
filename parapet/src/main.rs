@@ -32,10 +32,6 @@ struct Cli {
     #[arg(long)]
     file_effect_profile: Option<String>,
 
-    /// Caller-supplied 32-hex run identifier
-    #[arg(long)]
-    run_id: Option<String>,
-
     /// Maximum content length in bytes (1..=1048576) for 1C write_file
     #[arg(long)]
     max_content_bytes: Option<u64>,
@@ -127,16 +123,6 @@ async fn main() {
                     std::process::exit(2);
                 }
             };
-            let run_id = match cli.run_id.as_deref() {
-                None => None,
-                Some(raw) => match parapet::effect::RunIdV0::parse(raw) {
-                    Some(id) => Some(id),
-                    None => {
-                        tracing::error!("invalid run-id");
-                        std::process::exit(2);
-                    }
-                },
-            };
             let offline_fixture = match cli.offline_fixture.as_deref() {
                 None => None,
                 Some(raw) => match engine::OfflineUpstreamFixtureV0::parse(raw) {
@@ -181,7 +167,6 @@ async fn main() {
                 state_dir: state_dir.clone(),
                 effect_root: cli.effect_root,
                 file_effect_profile: profile,
-                run_id,
                 max_content_len_bytes: cli.max_content_bytes,
                 build_digest: None,
                 offline_fixture,
@@ -241,7 +226,6 @@ async fn main() {
         } else {
             if cli.effect_root.is_some()
                 || cli.file_effect_profile.is_some()
-                || cli.run_id.is_some()
                 || cli.max_content_bytes.is_some()
                 || cli.offline_fixture.is_some()
                 || cli.ready_file.is_some()
