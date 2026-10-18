@@ -5918,13 +5918,13 @@ mod rev9_r4 {
                 "pub mod normalize;",
                 "pub mod provider;",
                 "pub mod proxy;",
+                "pub mod receipt;",
                 "pub mod routing;",
                 "pub mod sensor;",
                 "pub mod session;",
                 "pub mod signal;",
                 "pub(crate) mod stream;",
                 "pub mod trust;",
-                "pub mod receipt;",
             ]
         );
     }
