@@ -12,7 +12,7 @@ use crate::effect::store::{
 use crate::effect::{FileCleanupResultV0, StoreFailureV0};
 use crate::receipt::{
     Availability, Enforcement, Projection, ProjectionVerification, ReplayReason, ReplayVerdict,
-    Summary, TargetForm, VerificationOutcome,
+    Summary, TargetForm, VerificationOutcome, VerificationReason,
 };
 use serde::Serialize;
 
@@ -117,6 +117,27 @@ pub fn verification_availability_label(
             format!("verification: errored ({code})")
         }
     }
+}
+
+/// Exact machine code for `VerificationReason` (its serialized form).
+pub fn verification_reason_code(reason: VerificationReason) -> &'static str {
+    match reason {
+        VerificationReason::AttemptAmbiguous => "attempt_ambiguous",
+        VerificationReason::ObservationMissing => "observation_missing",
+        VerificationReason::AttemptErrored => "attempt_errored",
+        VerificationReason::OutsideRoot => "outside_root",
+        VerificationReason::TargetMissing => "target_missing",
+        VerificationReason::LengthMismatch => "length_mismatch",
+        VerificationReason::DigestMismatch => "digest_mismatch",
+        VerificationReason::BeforeStateMissing => "before_state_missing",
+        VerificationReason::NoDeltaObserved => "no_delta_observed",
+    }
+}
+
+/// `verification_error_code` (Rev 9 L5): exactly the projection verification
+/// `reason_code`, null only when that field is `None`.
+pub fn verification_error_code(v: &ProjectionVerification) -> Option<&'static str> {
+    v.reason_code.map(verification_reason_code)
 }
 
 /// Frozen one-to-one human label for `ProjectionVerification`.

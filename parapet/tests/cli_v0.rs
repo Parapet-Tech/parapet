@@ -2479,37 +2479,14 @@ mod story3_r2a {
         (stdout.replacen(&id, GOLDEN_RUN_ID, 1), id)
     }
 
+    /// Rev 9 D5 immutable scenario config for the three enforced scenarios.
     fn mandatory_profile_yaml() -> &'static str {
-        r#"parapet: v1
-tools:
-  _default:
-    allowed: false
-  write_file:
-    allowed: true
-    constraints:
-      content:
-        type: string
-        max_length: 4096
-      path:
-        type: string
-        matches: "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
-        max_length: 128
-layers:
-  L0: { mode: sanitize }
-  L3_inbound: { mode: block }
-  L3_outbound: { mode: block, block_action: rewrite }
-  L5a: { mode: redact }
-"#
+        include_str!("fixtures/cli_v0/accept_enforced_v0.yaml")
     }
 
+    /// Rev 9 D5 immutable scenario config for `shadow_parse_error_l3_off`.
     fn l3_off_yaml() -> &'static str {
-        r#"parapet: v1
-layers:
-  L0: { mode: sanitize }
-  L3_inbound: { mode: block }
-  L3_outbound: { mode: shadow }
-  L5a: { mode: redact }
-"#
+        include_str!("fixtures/cli_v0/accept_shadow_l3_off_v0.yaml")
     }
 
     pub(super) fn cli_shadow_enforcement_parse_error_with_l3_off() {
@@ -2530,8 +2507,6 @@ layers:
                 cfg_path.to_str().unwrap(),
                 "--scenario",
                 "shadow_parse_error_l3_off",
-                "--sdk",
-                "rust",
                 "--json",
             ],
             None,
@@ -2563,8 +2538,6 @@ layers:
                 cfg_path.to_str().unwrap(),
                 "--scenario",
                 "shadow_parse_error_l3_off",
-                "--sdk",
-                "rust",
             ],
             None,
         );
@@ -3145,6 +3118,8 @@ layers:
 
         let cfg_path = dir.path().join("parapet_accept.yaml");
         std::fs::write(&cfg_path, mandatory_profile_yaml()).expect("write accept yaml");
+        let shadow_cfg_path = dir.path().join("parapet_accept_shadow.yaml");
+        std::fs::write(&shadow_cfg_path, l3_off_yaml()).expect("write shadow accept yaml");
 
         // 1. Verify all 4 scenarios in both `--json` and human modes match golden outputs
         //    and satisfy all Rev 8 Section 5.2.5 / AC-1D-14 / AC-1D-20 invariants.
@@ -3174,6 +3149,11 @@ layers:
                 "accept_shadow_parse_error_l3_off_human_stdout",
             ),
         ] {
+            let scenario_cfg = if scenario == "shadow_parse_error_l3_off" {
+                &shadow_cfg_path
+            } else {
+                &cfg_path
+            };
             // JSON mode
             let state_j = dir.path().join(format!("state_{scenario}_json"));
             let er_j = dir.path().join(format!("er_{scenario}_json"));
@@ -3182,11 +3162,9 @@ layers:
                 "--state-dir",
                 state_j.to_str().unwrap(),
                 "--config",
-                cfg_path.to_str().unwrap(),
+                scenario_cfg.to_str().unwrap(),
                 "--scenario",
                 scenario,
-                "--sdk",
-                "rust",
                 "--json",
             ];
             if needs_er {
@@ -3236,11 +3214,9 @@ layers:
                 "--state-dir",
                 state_h.to_str().unwrap(),
                 "--config",
-                cfg_path.to_str().unwrap(),
+                scenario_cfg.to_str().unwrap(),
                 "--scenario",
                 scenario,
-                "--sdk",
-                "rust",
             ];
             if needs_er {
                 args_h.push("--effect-root");
@@ -3257,35 +3233,9 @@ layers:
             );
         }
 
-        // 2. Also verify `--sdk python` and `--sdk ts` work and work with a minimal `parapet: v1\n` config
-        let min_cfg_path = dir.path().join("minimal.yaml");
-        std::fs::write(&min_cfg_path, "parapet: v1\n").expect("write minimal.yaml");
-        for sdk in ["python", "ts"] {
-            let state_sdk = dir.path().join(format!("state_sdk_{sdk}"));
-            let er_sdk = dir.path().join(format!("er_sdk_{sdk}"));
-            let out_sdk = run_parapet(
-                &[
-                    "accept",
-                    "--state-dir",
-                    state_sdk.to_str().unwrap(),
-                    "--config",
-                    min_cfg_path.to_str().unwrap(),
-                    "--scenario",
-                    "allow_verified_write",
-                    "--sdk",
-                    sdk,
-                    "--effect-root",
-                    er_sdk.to_str().unwrap(),
-                    "--json",
-                ],
-                None,
-            );
-            assert_eq!(out_sdk.status.code(), Some(0));
-            let val_sdk: Value = serde_json::from_slice(&out_sdk.stdout).unwrap();
-            assert_eq!(val_sdk["sdk"].as_str(), Some(sdk));
-            assert_eq!(val_sdk["summary"].as_str(), Some("allowed_effect_verified"));
-            assert_eq!(val_sdk["verification_outcome"].as_str(), Some("verified"));
-        }
+        // 2. Rev 9 D3/D5: the obsolete `--sdk` selector is a usage error and a minimal
+        //    `parapet: v1` config is a mismatch; neither is silently accepted.
+        //    (Covered with zero-side-effect witnesses below and in the Rev 9 tests.)
 
         // 3. Verify all invalid argument combinations return exit code 2 and `invalid_accept_combination`
         //    BEFORE any engine startup, store creation, or effect-root creation (`AC-1D-20`).
@@ -3301,13 +3251,11 @@ layers:
                     dir.path().join("never_created_1").to_str().unwrap().into(),
                     "--config".into(),
                     cfg_path.to_str().unwrap().into(),
-                    "--sdk".into(),
-                    "rust".into(),
                     "--json".into(),
                 ],
             ),
             (
-                "missing_sdk",
+                "obsolete_sdk_python",
                 vec![
                     "accept".into(),
                     "--state-dir".into(),
@@ -3316,11 +3264,13 @@ layers:
                     cfg_path.to_str().unwrap().into(),
                     "--scenario".into(),
                     "allow_no_executor".into(),
+                    "--sdk".into(),
+                    "python".into(),
                     "--json".into(),
                 ],
             ),
             (
-                "invalid_sdk",
+                "obsolete_sdk_rust",
                 vec![
                     "accept".into(),
                     "--state-dir".into(),
@@ -3330,7 +3280,7 @@ layers:
                     "--scenario".into(),
                     "allow_no_executor".into(),
                     "--sdk".into(),
-                    "go".into(),
+                    "rust".into(),
                     "--json".into(),
                 ],
             ),
@@ -3344,8 +3294,6 @@ layers:
                     cfg_path.to_str().unwrap().into(),
                     "--scenario".into(),
                     "replay_check".into(),
-                    "--sdk".into(),
-                    "rust".into(),
                     "--json".into(),
                 ],
             ),
@@ -3359,8 +3307,6 @@ layers:
                     cfg_path.to_str().unwrap().into(),
                     "--scenario".into(),
                     "allow_no_executor".into(),
-                    "--sdk".into(),
-                    "rust".into(),
                     "--effect-root".into(),
                     dir.path().join("never_er_7").to_str().unwrap().into(),
                     "--json".into(),
@@ -3376,8 +3322,6 @@ layers:
                     cfg_path.to_str().unwrap().into(),
                     "--scenario".into(),
                     "shadow_parse_error_l3_off".into(),
-                    "--sdk".into(),
-                    "rust".into(),
                     "--effect-root".into(),
                     dir.path().join("never_er_8").to_str().unwrap().into(),
                     "--json".into(),
@@ -3393,8 +3337,6 @@ layers:
                     cfg_path.to_str().unwrap().into(),
                     "--scenario".into(),
                     "allow_verified_write".into(),
-                    "--sdk".into(),
-                    "rust".into(),
                     "--json".into(),
                 ],
             ),
@@ -3408,8 +3350,6 @@ layers:
                     cfg_path.to_str().unwrap().into(),
                     "--scenario".into(),
                     "block_no_effect".into(),
-                    "--sdk".into(),
-                    "rust".into(),
                     "--json".into(),
                 ],
             ),
@@ -3423,8 +3363,6 @@ layers:
                     cfg_path.to_str().unwrap().into(),
                     "--scenario".into(),
                     "allow_verified_write".into(),
-                    "--sdk".into(),
-                    "rust".into(),
                     "--effect-root".into(),
                     existing_er.to_str().unwrap().into(),
                     "--json".into(),
@@ -3440,8 +3378,6 @@ layers:
                     cfg_path.to_str().unwrap().into(),
                     "--scenario".into(),
                     "allow_no_executor".into(),
-                    "--sdk".into(),
-                    "rust".into(),
                     "--json".into(),
                 ],
             ),
@@ -5231,8 +5167,6 @@ fn cli_rev9_run_creators_reject_caller_run_id_before_side_effects() {
                 "allow_verified_write",
                 "--effect-root",
                 accept_er.to_str().unwrap(),
-                "--sdk",
-                "rust",
                 &run_id_eq,
                 "--json",
             ],
@@ -5305,4 +5239,815 @@ fn cli_rev9_run_creators_reject_caller_run_id_before_side_effects() {
     ] {
         assert!(!absent.exists(), "{} must not be created", absent.display());
     }
+}
+
+// ===========================================================================
+// Rev 9 slice R4 — D3 Rust acceptance truth, D5 immutable acceptance configs,
+// and lows L1–L5
+// ===========================================================================
+
+#[cfg(not(windows))]
+mod rev9_r4 {
+    use super::*;
+    use parapet::cli::control::{
+        control_token_from_reader, control_token_from_source, open_control_token_source,
+        peer_credential_authorized, read_bounded_control_line, read_bounded_control_line_sync,
+        write_private_file, ControlError, ControlLineError, EngineControlPlane,
+        EngineOwnerRecordV0, CONTROL_TOKEN_BYTES, CONTROL_TOKEN_SOURCE, ENGINE_OWNER_SCHEMA,
+        MAX_CONTROL_LINE_BYTES,
+    };
+    use parapet::cli::render::{verification_error_code, verification_reason_code};
+    use parapet::receipt::{
+        receipt_projection, Availability, ProjectionVerification, Row, VerificationOutcome,
+        VerificationReason,
+    };
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+
+    const ENFORCED_YAML: &[u8] = include_bytes!("fixtures/cli_v0/accept_enforced_v0.yaml");
+    const SHADOW_YAML: &[u8] = include_bytes!("fixtures/cli_v0/accept_shadow_l3_off_v0.yaml");
+    const ENFORCED_PATH: &str = "parapet/tests/fixtures/cli_v0/accept_enforced_v0.yaml";
+    const SHADOW_PATH: &str = "parapet/tests/fixtures/cli_v0/accept_shadow_l3_off_v0.yaml";
+    const ENFORCED_HASH: &str =
+        "sha256:44628d6064ca4ebc86b79883b7796df84fdcaf11a68c459145d6d1b43bc39d2d";
+    const SHADOW_HASH: &str =
+        "sha256:211c6e9f0501273e39220a478e64154dea277367f1c7c66268b5ce67e7a7feed";
+
+    /// (scenario, needs effect root, exact config bytes, exact config hash).
+    const SCENARIOS: [(&str, bool, &[u8], &str); 4] = [
+        ("allow_no_executor", false, ENFORCED_YAML, ENFORCED_HASH),
+        ("allow_verified_write", true, ENFORCED_YAML, ENFORCED_HASH),
+        ("block_no_effect", true, ENFORCED_YAML, ENFORCED_HASH),
+        ("shadow_parse_error_l3_off", false, SHADOW_YAML, SHADOW_HASH),
+    ];
+
+    fn sha256_prefixed(bytes: &[u8]) -> String {
+        format!("sha256:{:x}", Sha256::digest(bytes))
+    }
+
+    fn write_cfg(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).expect("write config");
+        path
+    }
+
+    fn accept_args<'a>(
+        state: &'a Path,
+        cfg: &'a Path,
+        scenario: &'a str,
+        effect_root: Option<&'a Path>,
+        json: bool,
+    ) -> Vec<&'a str> {
+        let mut args = vec![
+            "accept",
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--config",
+            cfg.to_str().unwrap(),
+            "--scenario",
+            scenario,
+        ];
+        if let Some(er) = effect_root {
+            args.push("--effect-root");
+            args.push(er.to_str().unwrap());
+        }
+        if json {
+            args.push("--json");
+        }
+        args
+    }
+
+    fn installed_cli_version() -> String {
+        let info = run_parapet(&["info", "--json"], None);
+        assert_eq!(info.status.code(), Some(0));
+        let val: Value = serde_json::from_slice(&info.stdout).unwrap();
+        val["cli_version"].as_str().unwrap().to_owned()
+    }
+
+    fn inspect_json(state: &Path, run_id: &str) -> (Option<i32>, Value) {
+        let out = run_parapet(
+            &[
+                "inspect",
+                "--state-dir",
+                state.to_str().unwrap(),
+                "--run-id",
+                run_id,
+                "--json",
+            ],
+            None,
+        );
+        (
+            out.status.code(),
+            serde_json::from_slice(&out.stdout).expect("inspect json"),
+        )
+    }
+
+    pub(super) fn cli_accept_rust_requester_truth_rev9() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let version = installed_cli_version();
+        assert_eq!(version, env!("CARGO_PKG_VERSION"));
+
+        for (scenario, needs_er, cfg_bytes, cfg_hash) in SCENARIOS {
+            let cfg = write_cfg(dir.path(), &format!("{scenario}.yaml"), cfg_bytes);
+
+            // JSON: Rust requester, generated envelope run id, exact contract hash, no `sdk`.
+            let state = dir.path().join(format!("state_{scenario}"));
+            let er = dir.path().join(format!("er_{scenario}"));
+            let out = run_parapet(
+                &accept_args(
+                    &state,
+                    &cfg,
+                    scenario,
+                    needs_er.then_some(er.as_path()),
+                    true,
+                ),
+                None,
+            );
+            assert_eq!(
+                out.status.code(),
+                Some(0),
+                "{scenario}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(out.stderr.is_empty(), "{scenario}");
+            let val: Value = serde_json::from_slice(&out.stdout).unwrap();
+            let obj = val.as_object().unwrap();
+            assert_eq!(val["requester"].as_str(), Some("rust_cli"), "{scenario}");
+            assert_eq!(
+                val["requester_version"].as_str(),
+                Some(version.as_str()),
+                "{scenario}"
+            );
+            assert_eq!(val["config_contract_hash"].as_str(), Some(cfg_hash));
+            assert!(!obj.contains_key("sdk"), "{scenario}: no machine sdk");
+            assert!(
+                !obj.keys().any(|k| k.contains("request_id")),
+                "{scenario}: HTTP request identity is never reported as a run field"
+            );
+            let run_id = val["run_id"].as_str().unwrap().to_owned();
+            assert!(parapet::effect::RunIdV0::parse(&run_id).is_some());
+
+            // The reported run id is the captured envelope run stored in this state dir.
+            let (code, inspected) = inspect_json(&state, &run_id);
+            assert_eq!(code, Some(0), "{scenario}: inspect generated run");
+            assert_eq!(inspected["run_id"].as_str(), Some(run_id.as_str()));
+            // L5: verbatim projection verification reason code.
+            assert_eq!(
+                val["verification_error_code"],
+                inspected["projection"]["verification"]["reason_code"],
+                "{scenario}"
+            );
+
+            // Human: `requester: Rust CLI <version>`, exact hash, and no `sdk:` line.
+            let state_h = dir.path().join(format!("state_{scenario}_h"));
+            let er_h = dir.path().join(format!("er_{scenario}_h"));
+            let out_h = run_parapet(
+                &accept_args(
+                    &state_h,
+                    &cfg,
+                    scenario,
+                    needs_er.then_some(er_h.as_path()),
+                    false,
+                ),
+                None,
+            );
+            assert_eq!(out_h.status.code(), Some(0), "{scenario}");
+            let human = String::from_utf8(out_h.stdout).unwrap();
+            assert!(human.contains(&format!("\nrequester: Rust CLI {version}\n")));
+            assert!(human.contains(&format!("\nconfig_contract_hash: {cfg_hash}\n")));
+            assert!(
+                !human.lines().any(|l| l.starts_with("sdk")),
+                "{scenario}: {human}"
+            );
+            assert!(!human.to_lowercase().contains("python"));
+            assert!(!human.to_lowercase().contains("typescript"));
+        }
+
+        // Obsolete `--sdk` (any value, either spelling) is a Clap usage error, exit 2,
+        // before any state, store, effect root, socket, or child process.
+        let cfg = write_cfg(dir.path(), "enforced.yaml", ENFORCED_YAML);
+        for (i, sdk_args) in [
+            vec!["--sdk", "rust"],
+            vec!["--sdk", "python"],
+            vec!["--sdk", "ts"],
+            vec!["--sdk=python"],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let state = dir.path().join(format!("sdk_state_{i}"));
+            let er = dir.path().join(format!("sdk_er_{i}"));
+            let mut args = accept_args(&state, &cfg, "allow_verified_write", Some(&er), true);
+            args.extend(sdk_args);
+            let out = run_parapet(&args, None);
+            assert_eq!(out.status.code(), Some(2), "{i}");
+            assert_eq!(
+                String::from_utf8(out.stdout).unwrap(),
+                "{\"schema\":\"parapet-cli-error/v0\",\"command\":\"accept\",\"error_code\":\"invalid_accept_combination\",\"exit_code\":2}\n"
+            );
+            assert!(String::from_utf8_lossy(&out.stderr).starts_with("parapet accept: error: "));
+            assert!(!state.exists(), "{i}: no state");
+            assert!(!er.exists(), "{i}: no effect root");
+        }
+
+        let help = run_parapet(&["accept", "--help"], None);
+        assert_eq!(help.status.code(), Some(0));
+        let help = String::from_utf8(help.stdout).unwrap().to_lowercase();
+        assert!(!help.contains("--sdk") && !help.contains("python"));
+
+        // Source witness: no SDK selector, fallback, or caller config mutation in the CLI.
+        let cli_source = include_str!("../src/cli/mod.rs");
+        for forbidden in [
+            "sdk",
+            "python",
+            "\"ts\"",
+            "mut cfg",
+            "cfg.policy.tools.insert",
+        ] {
+            assert!(
+                !cli_source.to_lowercase().contains(forbidden),
+                "cli/mod.rs contains {forbidden}"
+            );
+        }
+    }
+
+    pub(super) fn cli_accept_requires_exact_immutable_scenario_config_rev9() {
+        let golden = golden_outputs();
+        let dir = tempfile::tempdir().expect("create tempdir");
+
+        // The public fixtures are the exact durable bytes.
+        assert_eq!(ENFORCED_YAML.len(), 412);
+        assert_eq!(SHADOW_YAML.len(), 131);
+        assert_eq!(sha256_prefixed(ENFORCED_YAML), ENFORCED_HASH);
+        assert_eq!(sha256_prefixed(SHADOW_YAML), SHADOW_HASH);
+
+        let enforced = write_cfg(dir.path(), "enforced.yaml", ENFORCED_YAML);
+        let shadow = write_cfg(dir.path(), "shadow.yaml", SHADOW_YAML);
+        let minimal = write_cfg(dir.path(), "minimal.yaml", b"parapet: v1\n");
+        let mut renormalized = ENFORCED_YAML.to_vec();
+        renormalized.extend_from_slice(b"\n");
+        let renormalized = write_cfg(dir.path(), "renormalized.yaml", &renormalized);
+        let minimal_hash = sha256_prefixed(b"parapet: v1\n");
+
+        // An existing private state dir must remain byte-for-byte empty on mismatch.
+        let empty_state = dir.path().join("empty_state");
+        std::fs::create_dir(&empty_state).unwrap();
+        std::fs::set_permissions(&empty_state, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        for (i, (scenario, needs_er, cfg_bytes, cfg_hash)) in SCENARIOS.into_iter().enumerate() {
+            let (exact, wrong, wrong_hash, required_path, minimal_key) = if cfg_hash == SHADOW_HASH
+            {
+                (
+                    &shadow,
+                    &enforced,
+                    ENFORCED_HASH,
+                    SHADOW_PATH,
+                    "accept_config_mismatch_shadow_minimal",
+                )
+            } else {
+                (
+                    &enforced,
+                    &shadow,
+                    SHADOW_HASH,
+                    ENFORCED_PATH,
+                    "accept_config_mismatch_enforced_minimal",
+                )
+            };
+
+            // Exact fixture succeeds and reports the accepted hash; caller bytes untouched.
+            let state = dir.path().join(format!("ok_state_{i}"));
+            let er = dir.path().join(format!("ok_er_{i}"));
+            let out = run_parapet(
+                &accept_args(
+                    &state,
+                    exact,
+                    scenario,
+                    needs_er.then_some(er.as_path()),
+                    true,
+                ),
+                None,
+            );
+            assert_eq!(out.status.code(), Some(0), "{scenario}");
+            let val: Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert_eq!(val["config_contract_hash"].as_str(), Some(cfg_hash));
+            assert_eq!(
+                std::fs::read(exact).unwrap(),
+                cfg_bytes,
+                "config not mutated"
+            );
+
+            // Minimal config, wrong fixture class, and a renormalized copy all mismatch.
+            let mismatches: [(&str, &Path, String); 3] = [
+                ("minimal", &minimal, minimal_hash.clone()),
+                ("wrong_class", wrong, wrong_hash.to_owned()),
+                (
+                    "renormalized",
+                    &renormalized,
+                    sha256_prefixed(&std::fs::read(&renormalized).unwrap()),
+                ),
+            ];
+            for (case, cfg, observed) in mismatches {
+                for json in [true, false] {
+                    for state in [
+                        dir.path().join(format!("bad_state_{i}_{case}")),
+                        empty_state.clone(),
+                    ] {
+                        let er = dir.path().join(format!("bad_er_{i}_{case}"));
+                        let out = run_parapet(
+                            &accept_args(
+                                &state,
+                                cfg,
+                                scenario,
+                                needs_er.then_some(er.as_path()),
+                                json,
+                            ),
+                            None,
+                        );
+                        assert_eq!(out.status.code(), Some(3), "{scenario}/{case}");
+                        let stdout = String::from_utf8(out.stdout).unwrap();
+                        let stderr = String::from_utf8(out.stderr).unwrap();
+                        let expected_json = format!(
+                            "{{\"schema\":\"parapet-cli-error/v0\",\"command\":\"accept\",\"error_code\":\"accept_config_mismatch\",\"exit_code\":3,\"required_config\":\"{required_path}\",\"required_config_contract_hash\":\"{cfg_hash}\",\"observed_config_contract_hash\":\"{observed}\"}}\n"
+                        );
+                        let expected_stderr = format!(
+                            "parapet accept: error: config contract hash {observed} does not match required scenario config {required_path} ({cfg_hash})\n"
+                        );
+                        assert_eq!(stdout, if json { expected_json.as_str() } else { "" });
+                        assert_eq!(stderr, expected_stderr);
+                        if case == "minimal" {
+                            let g = &golden["errors"][minimal_key];
+                            assert_eq!(g["exit_code"].as_i64(), Some(3));
+                            assert_eq!(g["stderr"].as_str(), Some(stderr.as_str()));
+                            if json {
+                                assert_eq!(g["json_stdout"].as_str(), Some(stdout.as_str()));
+                            }
+                        }
+                        // Never a private absolute path.
+                        let tmp = dir.path().to_str().unwrap();
+                        assert!(!stdout.contains(tmp) && !stderr.contains(tmp));
+                        assert!(!stdout.contains("/Users/") && !stderr.contains("/Users/"));
+                        assert!(!stdout.contains("research-findings"));
+                        // Zero side effects.
+                        if state != empty_state {
+                            assert!(!state.exists(), "{scenario}/{case}: no state");
+                        }
+                        assert!(!er.exists(), "{scenario}/{case}: no effect root");
+                        assert_eq!(
+                            std::fs::read_dir(&empty_state).unwrap().count(),
+                            0,
+                            "{scenario}/{case}: no control, store, socket, or token"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    pub(super) fn cli_accept_verification_error_code_mapping_rev9() {
+        // Every reason code is emitted verbatim as its serialized form.
+        for reason in [
+            VerificationReason::AttemptAmbiguous,
+            VerificationReason::ObservationMissing,
+            VerificationReason::AttemptErrored,
+            VerificationReason::OutsideRoot,
+            VerificationReason::TargetMissing,
+            VerificationReason::LengthMismatch,
+            VerificationReason::DigestMismatch,
+            VerificationReason::BeforeStateMissing,
+            VerificationReason::NoDeltaObserved,
+        ] {
+            assert_eq!(
+                Value::from(verification_reason_code(reason)),
+                serde_json::to_value(reason).unwrap()
+            );
+        }
+
+        // (a) present verification with `attempt_errored`, derived from a real receipt row.
+        let cases: Value =
+            serde_json::from_str(include_str!("fixtures/receipt_v0/a2_function_cases.json"))
+                .unwrap();
+        let mut row_val = cases["summaries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["row"].clone())
+            .find(|r| r["stages"]["verification"]["availability"] == "present")
+            .expect("present verification row");
+        row_val["stages"]["verification"]["record"]["outcome"] = json!("failed");
+        row_val["stages"]["verification"]["record"]["reason_code"] = json!("attempt_errored");
+        let row: Row = serde_json::from_value(row_val).unwrap();
+        let errored = receipt_projection(&row).verification;
+        assert_eq!(
+            errored.reason_code,
+            Some(VerificationReason::AttemptErrored)
+        );
+        assert_eq!(verification_error_code(&errored), Some("attempt_errored"));
+        let constructed = ProjectionVerification {
+            availability: Availability::Present,
+            outcome: Some(VerificationOutcome::Failed),
+            reason_code: Some(VerificationReason::AttemptErrored),
+            delta: None,
+        };
+        assert_eq!(
+            verification_error_code(&constructed),
+            Some("attempt_errored")
+        );
+
+        // (b) `absent_by_contract` emits null.
+        let absent = ProjectionVerification {
+            availability: Availability::AbsentByContract,
+            outcome: None,
+            reason_code: None,
+            delta: None,
+        };
+        assert_eq!(verification_error_code(&absent), None);
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let cfg = write_cfg(dir.path(), "enforced.yaml", ENFORCED_YAML);
+        let state_a = dir.path().join("absent_state");
+        let out = run_parapet(
+            &accept_args(&state_a, &cfg, "allow_no_executor", None, true),
+            None,
+        );
+        assert_eq!(out.status.code(), Some(0));
+        let val: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(
+            val["verification_availability"].as_str(),
+            Some("absent_by_contract")
+        );
+        assert!(val["verification_error_code"].is_null());
+
+        // (c) a released projection (`projection_code == object_released`) leaves the
+        //     verification field unchanged: it is never sourced from reader/projection codes.
+        let state_r = dir.path().join("released_state");
+        let er = dir.path().join("released_er");
+        let out = run_parapet(
+            &accept_args(&state_r, &cfg, "allow_verified_write", Some(&er), true),
+            None,
+        );
+        assert_eq!(out.status.code(), Some(0));
+        let val: Value = serde_json::from_slice(&out.stdout).unwrap();
+        let run_id = val["run_id"].as_str().unwrap().to_owned();
+        let (_, before) = inspect_json(&state_r, &run_id);
+        assert_eq!(
+            val["verification_error_code"],
+            before["projection"]["verification"]["reason_code"]
+        );
+        let release = run_parapet(
+            &[
+                "evidence",
+                "release",
+                "--state-dir",
+                state_r.to_str().unwrap(),
+                "--run-id",
+                &run_id,
+                "--json",
+            ],
+            None,
+        );
+        assert_eq!(release.status.code(), Some(0));
+        let (code, after) = inspect_json(&state_r, &run_id);
+        assert_eq!(code, Some(4));
+        assert_eq!(after["projection_code"].as_str(), Some("object_released"));
+        assert!(after["reader_code"].is_null());
+        assert!(val["verification_error_code"].is_null());
+        assert_ne!(val["verification_error_code"], json!("object_released"));
+        assert_eq!(
+            verification_error_code(&receipt_projection(&row).verification),
+            Some("attempt_errored"),
+            "the mapping takes only the projection verification"
+        );
+    }
+
+    struct CountingReader {
+        next: u8,
+        delivered: usize,
+        limit: usize,
+    }
+
+    impl std::io::Read for CountingReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = buf.len().min(self.limit - self.delivered);
+            for b in &mut buf[..n] {
+                *b = self.next;
+                self.next = self.next.wrapping_add(0x11);
+            }
+            self.delivered += n;
+            Ok(n)
+        }
+    }
+
+    pub(super) fn control_token_source_rev9() {
+        // Deterministic injected reader: exactly 32 bytes consumed, 64 lowercase hex.
+        let mut reader = CountingReader {
+            next: 0xa0,
+            delivered: 0,
+            limit: usize::MAX,
+        };
+        let token = control_token_from_reader(&mut reader).unwrap();
+        assert_eq!(CONTROL_TOKEN_BYTES, 32);
+        assert_eq!(reader.delivered, 32);
+        let expected: String = (0..32u8)
+            .map(|i| format!("{:02x}", 0xa0u8.wrapping_add(i.wrapping_mul(0x11))))
+            .collect();
+        assert_eq!(token, expected);
+        assert_eq!(token.len(), 64);
+        assert!(token
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
+
+        // A short source is an error, never a shorter token.
+        let mut short = CountingReader {
+            next: 0,
+            delivered: 0,
+            limit: 31,
+        };
+        assert_eq!(
+            control_token_from_reader(&mut short),
+            Err(ControlError::IoFailed)
+        );
+
+        // Production factory is `/dev/urandom`.
+        assert_eq!(CONTROL_TOKEN_SOURCE, "/dev/urandom");
+        let a = control_token_from_source(open_control_token_source).unwrap();
+        let b = control_token_from_source(open_control_token_source).unwrap();
+        assert_eq!(a.len(), 64);
+        assert_ne!(a, b);
+
+        // Production-source error: no token, and bind creates no control artifact.
+        let failing = || -> std::io::Result<std::fs::File> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "token source unavailable",
+            ))
+        };
+        assert_eq!(
+            control_token_from_source(failing),
+            Err(ControlError::IoFailed)
+        );
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let state = dir.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let res =
+                EngineControlPlane::bind_with_token_source(&state, 0, ENFORCED_HASH, None, failing);
+            assert!(matches!(res, Err(ControlError::IoFailed)));
+        });
+        assert_eq!(std::fs::read_dir(&state).unwrap().count(), 0);
+
+        // Source witness: no UUID composition in the token.
+        let control_source = include_str!("../src/cli/control.rs");
+        assert!(!control_source.contains("as_u128"));
+    }
+
+    pub(super) fn control_peer_credential_and_line_bound_rev9() {
+        // Peer-credential lookup failure denies; only the owner uid is authorized.
+        let owner = 501;
+        assert!(!peer_credential_authorized(
+            Err(std::io::Error::other("peer_cred failed")),
+            owner
+        ));
+        assert!(!peer_credential_authorized(Ok(owner + 1), owner));
+        assert!(peer_credential_authorized(Ok(owner), owner));
+
+        assert_eq!(MAX_CONTROL_LINE_BYTES, 4096);
+        let line_of = |len: usize| {
+            let mut v = vec![b' '; len - 1];
+            v.push(b'\n');
+            v
+        };
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        // 4,096 accepted; 4,097 overflow; at most 4,097 bytes are acquired.
+        let ok = line_of(4096);
+        let over = line_of(4097);
+        let big = vec![b'x'; 10_000];
+        rt.block_on(async {
+            assert_eq!(
+                read_bounded_control_line(&ok[..]).await.unwrap().len(),
+                4096
+            );
+            assert_eq!(
+                read_bounded_control_line(&over[..]).await,
+                Err(ControlLineError::Overflow)
+            );
+            let mut src: &[u8] = &big;
+            assert_eq!(
+                read_bounded_control_line(&mut src).await,
+                Err(ControlLineError::Overflow)
+            );
+            assert_eq!(src.len(), 10_000 - 4097);
+            assert_eq!(
+                read_bounded_control_line(&b""[..]).await,
+                Err(ControlLineError::Empty)
+            );
+        });
+        assert_eq!(read_bounded_control_line_sync(&ok[..]).unwrap().len(), 4096);
+        assert_eq!(
+            read_bounded_control_line_sync(&over[..]),
+            Err(ControlLineError::Overflow)
+        );
+        let mut src: &[u8] = &big;
+        assert_eq!(
+            read_bounded_control_line_sync(&mut src),
+            Err(ControlLineError::Overflow)
+        );
+        assert_eq!(src.len(), 10_000 - 4097);
+
+        // Live listener: a 4,096-byte line is answered; 4,097 bytes get no response.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let state = dir.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        rt.block_on(async {
+            let (plane, listener, _rx) =
+                EngineControlPlane::bind(&state, 0, ENFORCED_HASH, None).expect("bind");
+            plane.spawn_listener(listener);
+            let sock = state.join("control.sock");
+            let (answered, dropped) = tokio::task::spawn_blocking(move || {
+                use std::io::Read;
+                let exchange = |payload: &[u8]| {
+                    let mut s = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+                    s.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                        .unwrap();
+                    s.write_all(payload).unwrap();
+                    let mut resp = Vec::new();
+                    let _ = s.read_to_end(&mut resp);
+                    resp
+                };
+                (exchange(&line_of(4096)), exchange(&line_of(4097)))
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                String::from_utf8(answered).unwrap(),
+                "{\"schema\":\"parapet-control/v0\",\"ok\":false,\"error_code\":\"invalid_request\"}\n"
+            );
+            assert!(dropped.is_empty(), "overflow line is never processed");
+        });
+    }
+
+    pub(super) fn lib_module_order_restores_base_rev9() {
+        let modules: Vec<&str> = include_str!("../src/lib.rs")
+            .lines()
+            .filter(|l| !l.starts_with("//") && !l.trim().is_empty())
+            .collect();
+        assert_eq!(
+            modules,
+            [
+                "pub mod cli;",
+                "pub mod config;",
+                "pub mod constraint;",
+                "pub mod defang;",
+                "pub mod effect;",
+                "pub mod engine;",
+                "#[cfg(feature = \"eval\")]",
+                "pub mod eval;",
+                "pub mod layers;",
+                "pub mod message;",
+                "pub mod model_fetch;",
+                "pub mod model_path;",
+                "pub mod normalize;",
+                "pub mod provider;",
+                "pub mod proxy;",
+                "pub mod routing;",
+                "pub mod sensor;",
+                "pub mod session;",
+                "pub mod signal;",
+                "pub(crate) mod stream;",
+                "pub mod trust;",
+                "pub mod receipt;",
+            ]
+        );
+    }
+
+    struct SleepGuard(std::process::Child);
+    impl Drop for SleepGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    pub(super) fn cli_disable_timeout_preserves_live_controls_rev9() {
+        // A live owner approves `disable` but never exits: the bounded wait times out,
+        // nothing is reported as stopped, and every owned control is preserved.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let state = dir.path().join("state");
+        let init = run_parapet(&["init", "--state-dir", state.to_str().unwrap()], None);
+        assert_eq!(init.status.code(), Some(0));
+
+        let mut live = SleepGuard(
+            Command::new("/bin/sleep")
+                .arg("60")
+                .spawn()
+                .expect("spawn live owner"),
+        );
+        let owner = EngineOwnerRecordV0 {
+            schema: ENGINE_OWNER_SCHEMA.to_owned(),
+            pid: live.0.id(),
+            port: 0,
+            config_hash: ENFORCED_HASH.trim_start_matches("sha256:").to_owned(),
+            file_capability_active: false,
+            run_id: None,
+            owned: None,
+        };
+        write_private_file(
+            &state,
+            "engine.owner.json",
+            &serde_json::to_vec(&owner).unwrap(),
+        )
+        .unwrap();
+        write_private_file(&state, "control.token", "ab".repeat(32).as_bytes()).unwrap();
+        let sock_path = state.join("control.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock_path).expect("bind sock");
+        std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let server = std::thread::spawn(move || {
+            use std::io::BufRead;
+            let (stream, _) = listener.accept().expect("accept");
+            let mut line = String::new();
+            std::io::BufReader::new(&stream)
+                .read_line(&mut line)
+                .unwrap();
+            assert!(line.contains("\"action\":\"disable\""));
+            (&stream)
+                .write_all(b"{\"schema\":\"parapet-control/v0\",\"ok\":true,\"stop_approved\":true,\"file_cleanup\":\"not_applicable\",\"evidence_retained\":true}\n")
+                .unwrap();
+            listener
+        });
+
+        let before = std::time::Instant::now();
+        let out = run_parapet(
+            &["disable", "--state-dir", state.to_str().unwrap(), "--json"],
+            None,
+        );
+        let elapsed = before.elapsed();
+        let _listener = server.join().unwrap();
+        assert_eq!(out.status.code(), Some(4));
+        assert!(elapsed >= std::time::Duration::from_millis(5000));
+        assert!(elapsed < std::time::Duration::from_secs(30), "bounded wait");
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap(),
+            "{\"schema\":\"parapet-cli-disable/v0\",\"status\":\"refused\",\"refusal_code\":\"stop_unconfirmed\",\"file_cleanup\":\"not_applicable\",\"file_cleanup_label\":\"file cleanup: not applicable\",\"ownership_label\":\"engine ownership: owned\",\"owned_control_removed\":false,\"evidence_retained\":true}\n"
+        );
+        assert!(live.0.try_wait().unwrap().is_none(), "owner still live");
+        for name in [
+            "control.sock",
+            "control.token",
+            "engine.owner.json",
+            "control.json",
+        ] {
+            assert!(state.join(name).exists(), "{name} preserved after timeout");
+        }
+    }
+}
+
+#[cfg(not(windows))]
+#[test]
+fn cli_accept_rust_requester_truth_rev9() {
+    rev9_r4::cli_accept_rust_requester_truth_rev9();
+}
+
+#[cfg(not(windows))]
+#[test]
+fn cli_accept_requires_exact_immutable_scenario_config_rev9() {
+    rev9_r4::cli_accept_requires_exact_immutable_scenario_config_rev9();
+}
+
+#[cfg(not(windows))]
+#[test]
+fn cli_accept_verification_error_code_mapping_rev9() {
+    rev9_r4::cli_accept_verification_error_code_mapping_rev9();
+}
+
+#[cfg(not(windows))]
+#[test]
+fn control_token_source_rev9() {
+    rev9_r4::control_token_source_rev9();
+}
+
+#[cfg(not(windows))]
+#[test]
+fn control_peer_credential_and_line_bound_rev9() {
+    rev9_r4::control_peer_credential_and_line_bound_rev9();
+}
+
+#[cfg(not(windows))]
+#[test]
+fn lib_module_order_restores_base_rev9() {
+    rev9_r4::lib_module_order_restores_base_rev9();
+}
+
+#[cfg(not(windows))]
+#[test]
+fn cli_disable_timeout_preserves_live_controls_rev9() {
+    rev9_r4::cli_disable_timeout_preserves_live_controls_rev9();
 }

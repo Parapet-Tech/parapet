@@ -28,7 +28,7 @@ use crate::cli::render::{
     availability_code, enforcement_code, enforcement_label, evidence_cleanup_result_label,
     file_cleanup_lifecycle_label, projection_verification_label, render_inspect_human,
     splice_inspect_json, store_failure_code, store_failure_label, summary_code, summary_label,
-    verification_outcome_code,
+    verification_error_code, verification_outcome_code,
 };
 #[cfg(not(windows))]
 use crate::effect::store::{
@@ -71,7 +71,7 @@ enum Commands {
     Init(InitArgs),
     /// Run the local Parapet proxy engine inside an initialized state directory
     Run(RunArgs),
-    /// Run a deterministic offline acceptance scenario across the full pipeline
+    /// Run a deterministic offline Rust CLI acceptance scenario across the full pipeline
     Accept(AcceptArgs),
     /// Inspect a run's redacted receipt projection and authority status
     Inspect(InspectArgs),
@@ -161,17 +161,13 @@ struct AcceptArgs {
     #[arg(long)]
     state_dir: Option<PathBuf>,
 
-    /// Path to parapet.yaml configuration file
+    /// Exact scenario config (parapet/tests/fixtures/cli_v0/accept_*_v0.yaml bytes)
     #[arg(long)]
     config: Option<PathBuf>,
 
     /// Acceptance scenario (allow_no_executor | allow_verified_write | block_no_effect | shadow_parse_error_l3_off)
     #[arg(long)]
     scenario: Option<String>,
-
-    /// Required SDK selector (rust | python | ts)
-    #[arg(long)]
-    sdk: Option<String>,
 
     /// New effect root path (required for allow_verified_write and block_no_effect; forbidden otherwise)
     #[arg(long)]
@@ -292,8 +288,10 @@ struct CliRunJsonV0 {
 struct CliAcceptJsonV0<'a> {
     schema: &'static str,
     scenario: &'a str,
-    sdk: &'a str,
+    requester: &'static str,
+    requester_version: &'static str,
     run_id: &'a str,
+    config_contract_hash: &'a str,
     real_model_contacted: bool,
     upstream_label: &'static str,
     http_status: u16,
@@ -303,12 +301,41 @@ struct CliAcceptJsonV0<'a> {
     enforcement_label: &'static str,
     verification_availability: &'static str,
     verification_outcome: Option<&'static str>,
-    verification_error_code: Option<&'a str>,
+    verification_error_code: Option<&'static str>,
     verification_label: &'a str,
     replay_verdict: Option<&'static str>,
     replay_reason: Option<&'static str>,
     replay_label: Option<&'static str>,
 }
+
+#[cfg(not(windows))]
+#[derive(serde::Serialize)]
+struct CliAcceptConfigMismatchJsonV0<'a> {
+    schema: &'static str,
+    command: &'static str,
+    error_code: &'static str,
+    exit_code: i32,
+    required_config: &'static str,
+    required_config_contract_hash: &'static str,
+    observed_config_contract_hash: &'a str,
+}
+
+/// Machine requester identity of `parapet accept`: the installed Rust CLI.
+#[cfg(not(windows))]
+const ACCEPT_REQUESTER: &str = "rust_cli";
+
+/// Immutable acceptance scenario configs (Rev 9 D5): repository-relative public
+/// fixture path and exact `Config.contract_hash`.
+#[cfg(not(windows))]
+const ACCEPT_ENFORCED_CONFIG: (&str, &str) = (
+    "parapet/tests/fixtures/cli_v0/accept_enforced_v0.yaml",
+    "sha256:44628d6064ca4ebc86b79883b7796df84fdcaf11a68c459145d6d1b43bc39d2d",
+);
+#[cfg(not(windows))]
+const ACCEPT_SHADOW_L3_OFF_CONFIG: (&str, &str) = (
+    "parapet/tests/fixtures/cli_v0/accept_shadow_l3_off_v0.yaml",
+    "sha256:211c6e9f0501273e39220a478e64154dea277367f1c7c66268b5ce67e7a7feed",
+);
 
 #[cfg(not(windows))]
 #[derive(serde::Serialize)]
@@ -1106,14 +1133,14 @@ fn run_accept(_args: AcceptArgs, json_mode: bool) -> i32 {
 fn run_accept(args: AcceptArgs, json_mode: bool) -> i32 {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
-    let (Some(state_dir), Some(config_path), Some(scenario), Some(sdk)) =
-        (args.state_dir, args.config, args.scenario, args.sdk)
+    let (Some(state_dir), Some(config_path), Some(scenario)) =
+        (args.state_dir, args.config, args.scenario)
     else {
         return emit_cli_error(
             "accept",
             "invalid_accept_combination",
             2,
-            "missing required --state-dir, --config, --scenario, or --sdk",
+            "missing required --state-dir, --config, or --scenario",
             json_mode,
         );
     };
@@ -1134,21 +1161,23 @@ fn run_accept(args: AcceptArgs, json_mode: bool) -> i32 {
         );
     }
 
-    if !matches!(sdk.as_str(), "rust" | "python" | "ts") {
-        return emit_cli_error(
-            "accept",
-            "invalid_accept_combination",
-            2,
-            "--sdk must be rust, python, or ts",
-            json_mode,
-        );
-    }
-
-    let fixture = match scenario.as_str() {
-        "allow_no_executor" => OfflineUpstreamFixtureV0::AllowNoExecutor,
-        "allow_verified_write" => OfflineUpstreamFixtureV0::AllowVerifiedWrite,
-        "block_no_effect" => OfflineUpstreamFixtureV0::BlockNoEffect,
-        "shadow_parse_error_l3_off" => OfflineUpstreamFixtureV0::ShadowParseErrorL3Off,
+    let (fixture, (required_config, required_hash)) = match scenario.as_str() {
+        "allow_no_executor" => (
+            OfflineUpstreamFixtureV0::AllowNoExecutor,
+            ACCEPT_ENFORCED_CONFIG,
+        ),
+        "allow_verified_write" => (
+            OfflineUpstreamFixtureV0::AllowVerifiedWrite,
+            ACCEPT_ENFORCED_CONFIG,
+        ),
+        "block_no_effect" => (
+            OfflineUpstreamFixtureV0::BlockNoEffect,
+            ACCEPT_ENFORCED_CONFIG,
+        ),
+        "shadow_parse_error_l3_off" => (
+            OfflineUpstreamFixtureV0::ShadowParseErrorL3Off,
+            ACCEPT_SHADOW_L3_OFF_CONFIG,
+        ),
         _ => {
             return emit_cli_error(
                 "accept",
@@ -1195,7 +1224,8 @@ fn run_accept(args: AcceptArgs, json_mode: bool) -> i32 {
         _ => {}
     }
 
-    let Ok(mut cfg) = config::load_config(&config::FileSource { path: config_path }) else {
+    // The caller bytes are loaded once and the loaded `Config` is never mutated.
+    let Ok(cfg) = config::load_config(&config::FileSource { path: config_path }) else {
         return emit_cli_error(
             "accept",
             "invalid_config",
@@ -1205,80 +1235,35 @@ fn run_accept(args: AcceptArgs, json_mode: bool) -> i32 {
         );
     };
 
-    let mut max_content_len_bytes = 4096u64;
-    if scenario == "shadow_parse_error_l3_off" {
-        if cfg
-            .policy
-            .layers
-            .l3_outbound
-            .as_ref()
-            .is_some_and(|l| l.mode == "block")
-        {
-            cfg.policy.layers.l3_outbound = None;
+    // Rev 9 D5: the exact immutable scenario config is required before any
+    // state, effect, store, socket, or listener side effect.
+    if cfg.contract_hash != required_hash {
+        eprintln!(
+            "parapet accept: error: config contract hash {} does not match required scenario config {required_config} ({required_hash})",
+            cfg.contract_hash
+        );
+        if json_mode {
+            emit_json_line(&CliAcceptConfigMismatchJsonV0 {
+                schema: "parapet-cli-error/v0",
+                command: "accept",
+                error_code: "accept_config_mismatch",
+                exit_code: 3,
+                required_config,
+                required_config_contract_hash: required_hash,
+                observed_config_contract_hash: &cfg.contract_hash,
+            });
         }
-    } else {
-        if cfg.policy.tools.is_empty() {
-            cfg.policy.tools.insert(
-                "_default".to_owned(),
-                config::ToolConfig {
-                    allowed: false,
-                    trust: None,
-                    constraints: std::collections::HashMap::new(),
-                    result_policy: None,
-                },
-            );
-            let mut constraints = std::collections::HashMap::new();
-            constraints.insert(
-                "content".to_owned(),
-                config::ArgumentConstraints {
-                    type_check: Some("string".to_owned()),
-                    max_length: Some(4096),
-                    ..Default::default()
-                },
-            );
-            if let Ok(pat) = config::CompiledPattern::compile(crate::effect::BASENAME_PATTERN) {
-                constraints.insert(
-                    "path".to_owned(),
-                    config::ArgumentConstraints {
-                        type_check: Some("string".to_owned()),
-                        matches: Some(pat),
-                        max_length: Some(crate::effect::BASENAME_MAX_LEN as usize),
-                        ..Default::default()
-                    },
-                );
-            }
-            cfg.policy.tools.insert(
-                "write_file".to_owned(),
-                config::ToolConfig {
-                    allowed: true,
-                    trust: None,
-                    constraints,
-                    result_policy: None,
-                },
-            );
-            if !cfg
-                .policy
-                .layers
-                .l3_outbound
-                .as_ref()
-                .is_some_and(|l| l.mode == "block")
-            {
-                cfg.policy.layers.l3_outbound = Some(config::LayerConfig {
-                    mode: "block".to_owned(),
-                    block_action: Some("rewrite".to_owned()),
-                    window_chars: None,
-                });
-            }
-        } else if let Some(len) = cfg
-            .policy
-            .tools
-            .get("write_file")
-            .and_then(|t| t.constraints.get("content"))
-            .and_then(|c| c.max_length)
-        {
-            max_content_len_bytes = len as u64;
-        }
+        return 3;
     }
+
+    let max_content_len_bytes = cfg
+        .policy
+        .tools
+        .get("write_file")
+        .and_then(|t| t.constraints.get("content"))
+        .and_then(|c| c.max_length)
+        .map_or(4096u64, |len| len as u64);
+    let config_contract_hash = cfg.contract_hash.clone();
     let config = std::sync::Arc::new(cfg);
 
     if !state_dir.exists() {
@@ -1391,7 +1376,7 @@ fn run_accept(args: AcceptArgs, json_mode: bool) -> i32 {
             "messages": [
                 {
                     "role": "user",
-                    "content": format!("parapet accept scenario {scenario} via {sdk}")
+                    "content": format!("parapet accept scenario {scenario}")
                 }
             ]
         });
@@ -1448,16 +1433,19 @@ fn run_accept(args: AcceptArgs, json_mode: bool) -> i32 {
 
         let ver_avail = availability_code(proj.verification.availability);
         let ver_outcome = proj.verification.outcome.map(verification_outcome_code);
-        let ver_err: Option<&str> = None;
+        let ver_err = verification_error_code(&proj.verification);
         let ver_lbl = projection_verification_label(&proj.verification);
         let upstream_lbl = "upstream: deterministic offline fixture (no real model contacted)";
+        let requester_version = env!("CARGO_PKG_VERSION");
 
         if json_mode {
             let out = CliAcceptJsonV0 {
                 schema: "parapet-cli-accept/v0",
                 scenario: &scenario,
-                sdk: &sdk,
+                requester: ACCEPT_REQUESTER,
+                requester_version,
                 run_id: first_run.run_id.as_str(),
+                config_contract_hash: &config_contract_hash,
                 real_model_contacted: false,
                 upstream_label: upstream_lbl,
                 http_status,
@@ -1476,8 +1464,9 @@ fn run_accept(args: AcceptArgs, json_mode: bool) -> i32 {
             emit_json_line(&out);
         } else {
             println!("scenario: {scenario}");
-            println!("sdk: {sdk}");
+            println!("requester: Rust CLI {requester_version}");
             println!("run_id: {}", first_run.run_id.as_str());
+            println!("config_contract_hash: {config_contract_hash}");
             println!("real_model_contacted: false");
             println!("{upstream_lbl}");
             println!("http_status: {http_status}");
@@ -1875,7 +1864,34 @@ fn run_disable(args: DisableArgs, json_mode: bool) -> i32 {
                 .unwrap_or("file cleanup: not run (restore required)");
 
             if stop_approved {
-                let _ = wait_for_owned_shutdown(&args.state_dir, owner.pid, CONTROL_TIMEOUT);
+                // Rev 9 L4: `stopped` and control removal only after confirmed exit;
+                // a bounded wait that times out preserves every owned control.
+                if !wait_for_owned_shutdown(&args.state_dir, owner.pid, CONTROL_TIMEOUT) {
+                    let stop_lbl =
+                        "engine stop: exit not confirmed within 5000 ms; owned controls preserved";
+                    if json_mode {
+                        let out = CliDisableJsonV0 {
+                            schema: "parapet-cli-disable/v0",
+                            status: "refused",
+                            refusal_code: Some("stop_unconfirmed"),
+                            file_cleanup: Some(file_cleanup),
+                            file_cleanup_label: Some(cleanup_lbl),
+                            ownership_label: ownership_lbl,
+                            owned_control_removed: false,
+                            evidence_retained: true,
+                        };
+                        emit_json_line(&out);
+                    } else {
+                        println!("status: refused");
+                        println!("{ownership_lbl}");
+                        println!("{cleanup_lbl}");
+                        println!("{stop_lbl}");
+                        println!(
+                            "protected evidence: retained (use 'parapet evidence release' to release store objects)"
+                        );
+                    }
+                    return 4;
+                }
                 remove_owned_transient_files(&args.state_dir);
                 if json_mode {
                     let out = CliDisableJsonV0 {

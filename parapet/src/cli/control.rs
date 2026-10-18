@@ -9,7 +9,7 @@
 use crate::effect::{FileCleanupResultV0, FileEffectCleanupV0, RootCapabilityV0};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
@@ -143,12 +143,91 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-fn generate_token_hex() -> String {
-    format!(
-        "{:032x}{:032x}",
-        uuid::Uuid::new_v4().as_u128(),
-        uuid::Uuid::new_v4().as_u128()
-    )
+/// Number of random bytes in a control token.
+pub const CONTROL_TOKEN_BYTES: usize = 32;
+/// Production control-token entropy source.
+pub const CONTROL_TOKEN_SOURCE: &str = "/dev/urandom";
+
+/// Production token-source factory: opens [`CONTROL_TOKEN_SOURCE`].
+pub fn open_control_token_source() -> std::io::Result<std::fs::File> {
+    std::fs::File::open(CONTROL_TOKEN_SOURCE)
+}
+
+/// Read exactly [`CONTROL_TOKEN_BYTES`] from `reader` and encode them as 64
+/// lowercase hex characters. A short or failed read is an error.
+pub fn control_token_from_reader<R: Read>(reader: &mut R) -> Result<String, ControlError> {
+    let mut bytes = [0u8; CONTROL_TOKEN_BYTES];
+    reader
+        .read_exact(&mut bytes)
+        .map_err(|_| ControlError::IoFailed)?;
+    let mut hex = String::with_capacity(CONTROL_TOKEN_BYTES * 2);
+    for b in bytes {
+        hex.push_str(&format!("{b:02x}"));
+    }
+    Ok(hex)
+}
+
+/// Open a token source through `factory` and read one token from it.
+pub fn control_token_from_source<F, R>(factory: F) -> Result<String, ControlError>
+where
+    F: FnOnce() -> std::io::Result<R>,
+    R: Read,
+{
+    let mut reader = factory().map_err(|_| ControlError::IoFailed)?;
+    control_token_from_reader(&mut reader)
+}
+
+/// Peer-credential gate: a failed lookup or a different uid denies the request.
+pub fn peer_credential_authorized(peer_uid: std::io::Result<u32>, owner_uid: u32) -> bool {
+    matches!(peer_uid, Ok(uid) if uid == owner_uid)
+}
+
+/// Closed failure of a bounded control-line read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlLineError {
+    /// No bytes before end of input.
+    Empty,
+    /// More than [`MAX_CONTROL_LINE_BYTES`] bytes before the newline.
+    Overflow,
+    /// Read failure or non-UTF-8 bytes.
+    Invalid,
+}
+
+fn finish_control_line(buf: Vec<u8>) -> Result<String, ControlLineError> {
+    if buf.is_empty() {
+        return Err(ControlLineError::Empty);
+    }
+    if buf.len() > MAX_CONTROL_LINE_BYTES {
+        return Err(ControlLineError::Overflow);
+    }
+    String::from_utf8(buf).map_err(|_| ControlLineError::Invalid)
+}
+
+/// Read one control line, acquiring at most `MAX_CONTROL_LINE_BYTES` plus one
+/// overflow sentinel byte. A line of exactly `MAX_CONTROL_LINE_BYTES` bytes
+/// (including its newline) is accepted; one more byte is an overflow.
+pub async fn read_bounded_control_line<R>(reader: R) -> Result<String, ControlLineError>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+    let mut limited = reader.take(MAX_CONTROL_LINE_BYTES as u64 + 1);
+    let mut buf = Vec::new();
+    limited
+        .read_until(b'\n', &mut buf)
+        .await
+        .map_err(|_| ControlLineError::Invalid)?;
+    finish_control_line(buf)
+}
+
+/// Blocking counterpart of [`read_bounded_control_line`].
+pub fn read_bounded_control_line_sync<R: BufRead>(reader: R) -> Result<String, ControlLineError> {
+    let mut limited = reader.take(MAX_CONTROL_LINE_BYTES as u64 + 1);
+    let mut buf = Vec::new();
+    limited
+        .read_until(b'\n', &mut buf)
+        .map_err(|_| ControlLineError::Invalid)?;
+    finish_control_line(buf)
 }
 
 /// Verify `<state_dir>` exists, is a non-symlink directory, has mode `0700`,
@@ -247,8 +326,37 @@ impl EngineControlPlane {
         ),
         ControlError,
     > {
+        Self::bind_with_token_source(
+            state_dir,
+            port,
+            config_hash,
+            capability,
+            open_control_token_source,
+        )
+    }
+
+    /// [`Self::bind`] with an injected token-source factory. The token is read
+    /// before any control file or socket is created.
+    pub fn bind_with_token_source<F, R>(
+        state_dir: &Path,
+        port: u16,
+        config_hash: &str,
+        capability: Option<Arc<RootCapabilityV0>>,
+        token_source: F,
+    ) -> Result<
+        (
+            Arc<Self>,
+            tokio::net::UnixListener,
+            tokio::sync::watch::Receiver<bool>,
+        ),
+        ControlError,
+    >
+    where
+        F: FnOnce() -> std::io::Result<R>,
+        R: Read,
+    {
         let expected_uid = verify_private_state_dir(state_dir)?;
-        let token = generate_token_hex();
+        let token = control_token_from_source(token_source)?;
         write_private_file(state_dir, "control.token", token.as_bytes())?;
 
         let sock_path = state_dir.join("control.sock");
@@ -436,30 +544,27 @@ impl EngineControlPlane {
     pub fn spawn_listener(self: &Arc<Self>, listener: tokio::net::UnixListener) {
         let plane = self.clone();
         tokio::spawn(async move {
-            use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+            use tokio::io::AsyncWriteExt;
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     break;
                 };
                 let plane_conn = plane.clone();
                 tokio::spawn(async move {
-                    if let Ok(cred) = stream.peer_cred() {
-                        if cred.uid() != plane_conn.owner_uid {
-                            return;
-                        }
+                    let peer_uid = stream.peer_cred().map(|cred| cred.uid());
+                    if !peer_credential_authorized(peer_uid, plane_conn.owner_uid) {
+                        return;
                     }
                     let (reader, mut writer) = stream.split();
-                    let mut buf_reader = tokio::io::BufReader::new(reader);
-                    let mut line = String::new();
-                    let read_res =
-                        tokio::time::timeout(CONTROL_TIMEOUT, buf_reader.read_line(&mut line))
-                            .await;
-                    let Ok(Ok(n)) = read_res else {
+                    let buf_reader = tokio::io::BufReader::new(reader);
+                    let read_res = tokio::time::timeout(
+                        CONTROL_TIMEOUT,
+                        read_bounded_control_line(buf_reader),
+                    )
+                    .await;
+                    let Ok(Ok(line)) = read_res else {
                         return;
                     };
-                    if n == 0 || line.len() > MAX_CONTROL_LINE_BYTES {
-                        return;
-                    }
                     let (resp, approve_shutdown) = plane_conn.handle_request_line(&line);
                     let _ = writer.write_all(&resp).await;
                     let _ = writer.flush().await;
@@ -669,14 +774,8 @@ pub fn send_control_request(state_dir: &Path, action: &str) -> Result<Value, Con
         .flush()
         .map_err(|_| ControlError::EngineUnavailable)?;
 
-    let mut reader = BufReader::new(stream);
-    let mut resp_line = String::new();
-    let read_bytes = reader
-        .read_line(&mut resp_line)
+    let resp_line = read_bounded_control_line_sync(BufReader::new(stream))
         .map_err(|_| ControlError::EngineUnavailable)?;
-    if read_bytes == 0 || resp_line.len() > MAX_CONTROL_LINE_BYTES {
-        return Err(ControlError::EngineUnavailable);
-    }
     let val: Value =
         serde_json::from_str(resp_line.trim()).map_err(|_| ControlError::ProtocolError)?;
     if val.get("schema").and_then(Value::as_str) != Some(CONTROL_SCHEMA) {

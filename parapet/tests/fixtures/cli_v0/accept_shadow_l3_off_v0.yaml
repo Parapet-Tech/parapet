@@ -1,0 +1,6 @@
+parapet: v1
+layers:
+  L0: { mode: sanitize }
+  L3_inbound: { mode: block }
+  L3_outbound: { mode: shadow }
+  L5a: { mode: redact }
