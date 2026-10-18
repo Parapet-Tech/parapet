@@ -274,9 +274,10 @@ struct CliInitJsonV0 {
 
 #[cfg(not(windows))]
 #[derive(serde::Serialize)]
-struct CliRunJsonV0 {
+struct CliRunJsonV0<'a> {
     schema: &'static str,
     port: u16,
+    run_id: Option<&'a str>,
     file_capability: &'static str,
     file_cleanup: &'static str,
     file_cleanup_label: &'static str,
@@ -1018,6 +1019,8 @@ fn run_engine_cmd(args: RunArgs, json_mode: bool) -> i32 {
                 }
             };
         let has_cap = root_cap.is_some();
+        // Capture the engine-generated identity before the capability moves into the control plane.
+        let run_id = root_cap.as_ref().map(|cap| cap.run_id().clone());
         let upstream: std::sync::Arc<dyn crate::proxy::UpstreamClient> =
             std::sync::Arc::new(client);
         let app = crate::proxy::build_router(upstream);
@@ -1088,6 +1091,7 @@ fn run_engine_cmd(args: RunArgs, json_mode: bool) -> i32 {
             let out = CliRunJsonV0 {
                 schema: "parapet-cli-run/v0",
                 port: bound_port,
+                run_id: run_id.as_ref().map(RunIdV0::as_str),
                 file_capability: cap_str,
                 file_cleanup: cleanup_str,
                 file_cleanup_label: cleanup_lbl,
@@ -1096,6 +1100,10 @@ fn run_engine_cmd(args: RunArgs, json_mode: bool) -> i32 {
             emit_json_line(&out);
         } else {
             println!("port: {bound_port}");
+            println!(
+                "run_id: {}",
+                run_id.as_ref().map_or("not_applicable", RunIdV0::as_str)
+            );
             println!("file_capability: {cap_str}");
             println!("{cleanup_lbl}");
             println!(

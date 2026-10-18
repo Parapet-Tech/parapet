@@ -3062,6 +3062,7 @@ mod story3_r2a {
         let run_val: Value = serde_json::from_str(&run_stdout).expect("parse run json");
         assert_eq!(run_val["schema"].as_str(), Some("parapet-cli-run/v0"));
         assert_eq!(run_val["port"].as_u64(), Some(u64::from(port)));
+        assert_eq!(run_val["run_id"].as_str(), Some(run_id_hex));
         assert_eq!(run_val["file_capability"].as_str(), Some("created"));
         assert_eq!(run_val["file_cleanup"].as_str(), Some("clear"));
         assert_eq!(
@@ -3071,7 +3072,7 @@ mod story3_r2a {
         assert_eq!(run_val["evidence_retained"].as_bool(), Some(true));
         // Verify exact key order of `parapet-cli-run/v0`
         assert!(run_stdout.starts_with(&format!(
-            "{{\"schema\":\"parapet-cli-run/v0\",\"port\":{port},\"file_capability\":\"created\",\"file_cleanup\":\"clear\",\"file_cleanup_label\":\"file cleanup: clear\",\"evidence_retained\":true}}\n"
+            "{{\"schema\":\"parapet-cli-run/v0\",\"port\":{port},\"run_id\":\"{run_id_hex}\",\"file_capability\":\"created\",\"file_cleanup\":\"clear\",\"file_cleanup_label\":\"file cleanup: clear\",\"evidence_retained\":true}}\n"
         )));
 
         // Inspect the run recorded in `state_dir`
@@ -3895,6 +3896,7 @@ layers:
             .expect("wait child_b");
         assert_eq!(wait_b.status.code(), Some(0));
         let val_b: Value = serde_json::from_slice(&wait_b.stdout).expect("parse run B json");
+        assert!(val_b["run_id"].is_null());
         assert_eq!(val_b["file_capability"].as_str(), Some("not_applicable"));
         assert_eq!(val_b["file_cleanup"].as_str(), Some("not_applicable"));
         assert_eq!(val_b["evidence_retained"].as_bool(), Some(true));
@@ -4027,6 +4029,146 @@ layers:
         assert!(!state_a.join("control.sock").exists());
         assert!(!state_a.join("control.token").exists());
         assert!(!state_a.join("engine.owner.json").exists());
+    }
+
+    fn spawn_run_output(
+        state_dir: &Path,
+        cfg_path: &Path,
+        effect_root: Option<&Path>,
+        json_mode: bool,
+    ) -> (String, u16, Option<String>) {
+        assert_eq!(
+            run_parapet(&["init", "--state-dir", state_dir.to_str().unwrap()], None)
+                .status
+                .code(),
+            Some(0)
+        );
+        let mut args: Vec<String> = [
+            "run",
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--config",
+            cfg_path.to_str().unwrap(),
+            "--port",
+            "0",
+            "--offline-fixture",
+            "v0",
+            "--ready-file",
+            "ready.port",
+        ]
+        .iter()
+        .map(|a| (*a).to_owned())
+        .collect();
+        if let Some(er) = effect_root {
+            args.extend(
+                [
+                    "--effect-root",
+                    er.to_str().unwrap(),
+                    "--file-effect-profile",
+                    "v0",
+                    "--max-content-bytes",
+                    "4096",
+                ]
+                .iter()
+                .map(|a| (*a).to_owned()),
+            );
+        }
+        if json_mode {
+            args.push("--json".to_owned());
+        }
+        let mut child = ChildGuard(Some(
+            Command::new(parapet_bin())
+                .args(&args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn parapet run"),
+        ));
+        let port = wait_for_ready_port(&state_dir.join("ready.port"));
+        let owner_run_id = if effect_root.is_some() {
+            let owner: Value = serde_json::from_slice(
+                &std::fs::read(state_dir.join("engine.owner.json")).expect("read owner json"),
+            )
+            .expect("parse owner json");
+            let owner_run_id = owner["run_id"].as_str().expect("owner run_id").to_owned();
+            for cmd in ["restore", "disable"] {
+                assert_eq!(
+                    run_parapet(
+                        &[cmd, "--state-dir", state_dir.to_str().unwrap(), "--json"],
+                        None
+                    )
+                    .status
+                    .code(),
+                    Some(0),
+                    "{cmd} must succeed"
+                );
+            }
+            Some(owner_run_id)
+        } else {
+            send_signal(child.0.as_ref().unwrap().id(), "-TERM");
+            None
+        };
+        let out = child
+            .0
+            .take()
+            .unwrap()
+            .wait_with_output()
+            .expect("wait parapet run");
+        assert_eq!(out.status.code(), Some(0));
+        (
+            String::from_utf8(out.stdout).expect("utf8 run stdout"),
+            port,
+            owner_run_id,
+        )
+    }
+
+    pub(super) fn cli_run_reports_exact_engine_run_id_json_and_human() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let cfg_path = dir.path().join("parapet.yaml");
+        std::fs::write(&cfg_path, mandatory_profile_yaml()).expect("write parapet.yaml");
+
+        // No effect root: JSON `run_id: null`, human closed not-applicable convention.
+        let (stdout, port, _) =
+            spawn_run_output(&dir.path().join("state_none_json"), &cfg_path, None, true);
+        assert_eq!(
+            stdout,
+            format!(
+                "{{\"schema\":\"parapet-cli-run/v0\",\"port\":{port},\"run_id\":null,\"file_capability\":\"not_applicable\",\"file_cleanup\":\"not_applicable\",\"file_cleanup_label\":\"file cleanup: not applicable\",\"evidence_retained\":true}}\n"
+            )
+        );
+        let (stdout, port, _) =
+            spawn_run_output(&dir.path().join("state_none_human"), &cfg_path, None, false);
+        assert_eq!(
+            stdout,
+            format!(
+                "port: {port}\nrun_id: not_applicable\nfile_capability: not_applicable\nfile cleanup: not applicable\nprotected evidence: retained (use 'parapet evidence release' to release store objects)\n"
+            )
+        );
+
+        // Effect root: the reported run ID is the engine-generated identity witnessed by
+        // the owner record and the effect-root sentinel.
+        for (name, json_mode) in [("json", true), ("human", false)] {
+            let er = dir.path().join(format!("er_{name}"));
+            let (stdout, port, owner_run_id) = spawn_run_output(
+                &dir.path().join(format!("state_er_{name}")),
+                &cfg_path,
+                Some(&er),
+                json_mode,
+            );
+            let run_id = owner_run_id.expect("owner run_id");
+            assert!(RunIdV0::parse(&run_id).is_some());
+            assert!(er.join(format!(".parapet-run-{run_id}.sentinel")).exists());
+            let expected = if json_mode {
+                format!(
+                    "{{\"schema\":\"parapet-cli-run/v0\",\"port\":{port},\"run_id\":\"{run_id}\",\"file_capability\":\"created\",\"file_cleanup\":\"clear\",\"file_cleanup_label\":\"file cleanup: clear\",\"evidence_retained\":true}}\n"
+                )
+            } else {
+                format!(
+                    "port: {port}\nrun_id: {run_id}\nfile_capability: created\nfile cleanup: clear\nprotected evidence: retained (use 'parapet evidence release' to release store objects)\n"
+                )
+            };
+            assert_eq!(stdout, expected);
+        }
     }
 
     pub(super) fn cli_inspect_before_after_restore_disable_and_evidence_release() {
@@ -5071,6 +5213,12 @@ fn cli_cross_process_restore_and_no_capability_reopen() {
 #[test]
 fn cli_and_sdk_shutdown_gate_negative_and_positive_witnesses() {
     story4_r2b::cli_and_sdk_shutdown_gate_negative_and_positive_witnesses();
+}
+
+#[cfg(not(windows))]
+#[test]
+fn cli_run_reports_exact_engine_run_id_json_and_human() {
+    story4_r2b::cli_run_reports_exact_engine_run_id_json_and_human();
 }
 
 #[cfg(not(windows))]

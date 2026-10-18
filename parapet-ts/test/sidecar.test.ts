@@ -1468,6 +1468,53 @@ describe("EngineManager", () => {
         vi.useRealTimers();
       }
     });
+
+    it("gated child already exited by signal is a confirmed exit: no grace wait, no SIGKILL", async () => {
+      const { deps, fs, spawnedProcesses } = createMockDeps({
+        requestControlDisable: async () => APPROVED_CLEAR,
+      });
+      setupConfigFile(fs);
+      const stateDir = "/var/tmp/parapet-signal-exited";
+      const mgr = new EngineManager({
+        configPath: CONFIG_PATH,
+        stateDir,
+        engineArgs: ["--effect-root", "/var/tmp/parapet-effect"],
+        deps,
+      });
+      await mgr.start();
+      fs.files.set(join(stateDir, "control.sock"), "");
+      fs.files.set(join(stateDir, "control.token"), "b".repeat(64));
+      fs.files.set(
+        join(stateDir, "engine.owner.json"),
+        JSON.stringify({ schema: "parapet-engine-owner/v0", pid: 12345 }),
+      );
+
+      // The child was already reaped by a signal: exitCode stays null, and a
+      // dead child never emits another "exit" event.
+      const proc = spawnedProcesses[0];
+      proc.stubborn = true;
+      Object.defineProperty(proc, "signalCode", { value: "SIGTERM" });
+
+      vi.useFakeTimers();
+      try {
+        let settled = false;
+        const stopping = mgr.stop().then(() => {
+          settled = true;
+        });
+        await vi.advanceTimersByTimeAsync(1);
+        expect(settled).toBe(true);
+        await stopping;
+      } finally {
+        vi.useRealTimers();
+      }
+
+      expect(proc.killSignals).toEqual([]);
+      expect(proc.killSignals).not.toContain("SIGKILL");
+      expect(mgr.isInitialized).toBe(false);
+      for (const f of ["engine.pid", "engine.meta", "control.sock", "control.token", "engine.owner.json"]) {
+        expect(fs.files.has(join(stateDir, f))).toBe(false);
+      }
+    });
   });
 
   // -----------------------------------------------------------------------
@@ -1868,6 +1915,75 @@ describe("EngineManager", () => {
         expect(fs.files.has(f)).toBe(true);
       }
     });
+
+    it("stale PID alone is cleaned and startup proceeds even with a newly requested effect root", async () => {
+      let fetchCalls = 0;
+      const { deps, fs, spawnedProcesses } = createMockDeps({
+        // The stale-PID heartbeat finds the port free; the new child is ready.
+        fetch: async () => {
+          fetchCalls++;
+          if (fetchCalls === 1) throw new Error("connection refused");
+          return { ok: true, status: 200 } as Response;
+        },
+      });
+      setupConfigFile(fs);
+      fs.files.set(PID, "4242");
+
+      const mgr = new EngineManager({
+        configPath: CONFIG_PATH,
+        port: 9800,
+        stateDir: STATE_DIR,
+        engineArgs: ["--effect-root", "/var/tmp/parapet-rev9-effect"],
+        deps,
+      });
+      const err = await startAndCollect(mgr);
+
+      expect(err).toBeNull();
+      expect(spawnedProcesses).toHaveLength(1);
+      expect(fs.files.get(PID)).toBe(String(spawnedProcesses[0].pid));
+      expect(mgr.isInitialized).toBe(true);
+      expect(killSpy).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["control.sock", SOCK, ""],
+      ["control.token", TOKEN, "9".repeat(64)],
+      ["engine.owner.json", OWNER, JSON.stringify({ pid: 4242 })],
+    ] as const)(
+      "stale PID plus %s with a newly requested effect root remains fail closed",
+      async (_label, artifact, content) => {
+        const { deps, fs, spawnedProcesses } = createMockDeps({
+          fetch: async () => {
+            throw new Error("connection refused");
+          },
+        });
+        const unlinks: string[] = [];
+        deps.unlink = (p) => {
+          unlinks.push(p);
+          fs.files.delete(p);
+        };
+        setupConfigFile(fs);
+        fs.files.set(PID, "4242");
+        fs.files.set(artifact, content);
+
+        const mgr = new EngineManager({
+          configPath: CONFIG_PATH,
+          port: 9800,
+          stateDir: STATE_DIR,
+          engineArgs: ["--effect-root", "/var/tmp/parapet-rev9-effect"],
+          deps,
+        });
+        const err = await startAndCollect(mgr);
+
+        expect(err).toBeInstanceOf(EngineRecoveryError);
+        expect((err as EngineRecoveryError).reason).toBe("stale_control_state");
+        expect(spawnedProcesses).toHaveLength(0);
+        expect(unlinks).toEqual([]);
+        expect(killSpy).not.toHaveBeenCalled();
+        expect(fs.files.has(PID)).toBe(true);
+        expect(fs.files.has(artifact)).toBe(true);
+      },
+    );
   });
 
   // -----------------------------------------------------------------------

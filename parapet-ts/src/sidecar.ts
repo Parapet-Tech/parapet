@@ -560,9 +560,11 @@ export class EngineManager {
         );
       }
 
-      // Stale or mismatched and port is free — clean up files, unless they
-      // may belong to a gated engine whose evidence must be recovered first.
-      if (this.requiresControlGate()) {
+      // Stale or mismatched and port is free — clean up files, unless an
+      // actual control artifact shows a gated engine whose evidence must be
+      // recovered first. A newly requested effect root alone does not make a
+      // legacy stale PID gated.
+      if (this.hasControlArtifacts()) {
         throw new EngineRecoveryError("stale_control_state", this.parapetDir);
       }
       this.cleanupFiles();
@@ -775,9 +777,12 @@ export class EngineManager {
   // -----------------------------------------------------------------------
 
   private requiresControlGate(): boolean {
-    if (hasFlag(this._engineArgs, "--effect-root")) {
-      return true;
-    }
+    return (
+      hasFlag(this._engineArgs, "--effect-root") || this.hasControlArtifacts()
+    );
+  }
+
+  private hasControlArtifacts(): boolean {
     return (
       this.deps.exists(this.controlSockPath) ||
       this.deps.exists(this.controlTokenPath) ||
@@ -999,7 +1004,7 @@ export class EngineManager {
     proc: ChildProcess,
     allowSigkill = true,
   ): Promise<boolean> {
-    if (proc.exitCode !== null) {
+    if (hasExited(proc)) {
       return true;
     }
     return new Promise<boolean>((resolve) => {
