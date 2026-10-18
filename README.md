@@ -101,31 +101,57 @@ Run the protected lifecycle in this exact order (`init` -> `run` -> `inspect` ->
 ```bash
 # Terminal 1: initialize disposable state and start the long-lived engine
 parapet init --state-dir <state-dir> --effect-root <new-effect-root> --json
-parapet run --state-dir <state-dir> --config <config> --effect-root <new-effect-root> --file-effect-profile v0 --run-id 00000000000000000000000000000001 --max-content-bytes 4096 --json
+parapet run --state-dir <state-dir> --config <config> --effect-root <new-effect-root> --file-effect-profile v0 --max-content-bytes 4096 --json
 
 # Terminal 2: inspect -> restore -> disable -> post-disable inspect -> optional evidence release -> post-release inspect
-parapet inspect --state-dir <state-dir> --run-id 00000000000000000000000000000001 --json
+parapet inspect --state-dir <state-dir> --run-id <run-id> --json
 parapet restore --state-dir <state-dir> --json
 parapet disable --state-dir <state-dir> --json
 # protected evidence: retained (use 'parapet evidence release' to release store objects)
-parapet inspect --state-dir <state-dir> --run-id 00000000000000000000000000000001 --json
-parapet evidence release --state-dir <state-dir> --run-id 00000000000000000000000000000001 --json
-parapet inspect --state-dir <state-dir> --run-id 00000000000000000000000000000001 --json
+parapet inspect --state-dir <state-dir> --run-id <run-id> --json
+parapet evidence release --state-dir <state-dir> --run-id <run-id> --json
+parapet inspect --state-dir <state-dir> --run-id <run-id> --json
 ```
+
+Run-creating commands (`parapet run`, `parapet accept`, and `parapet-engine`) never accept a caller-supplied run ID. The engine generates the only run identity; `<run-id>` above is that generated 32-character lowercase hex value, named by the `<new-effect-root>/.parapet-run-<run-id>.sentinel` file that the effect-enabled engine creates at startup.
 
 `parapet disable` never performs `restore` itself: it is an observational shutdown gate that refuses to stop an owned effect-enabled engine until file cleanup is already `clear` (after `parapet restore`) or `not_applicable`. Stopping the engine always retains protected receipt evidence (`protected evidence: retained (use 'parapet evidence release' to release store objects)`) so post-restore and post-disable `parapet inspect` continue to succeed until you optionally run explicit `parapet evidence release`, after which `parapet inspect` reports `reader: object_released`.
 
-#### Disposable offline acceptance example
+#### Rust CLI acceptance (disposable offline fixture)
 
-To run a self-contained local acceptance pass against the fixed offline upstream fixture, supply a disposable `<state-dir>` and a disposable `<new-effect-root>` that does not exist beforehand:
+This is **Rust CLI acceptance**: the installed Rust `parapet` CLI is the only requester, sending one request through a loopback engine/proxy to the deterministic offline fixture. It **does not exercise Python or TypeScript**; the Python and TypeScript SDKs are verified separately by the installed SDK commands below. Supply a disposable `<state-dir>` and a disposable `<new-effect-root>` that does not exist beforehand:
 
 ```bash
-parapet accept --state-dir <state-dir> --config <config> --scenario allow_verified_write --run-id 00000000000000000000000000000001 --sdk python --effect-root <new-effect-root> --json
+parapet accept --state-dir <state-dir> --config <config> --scenario allow_verified_write --effect-root <new-effect-root> --json
 ```
 
 `upstream: deterministic offline fixture (no real model contacted)`
 
-Both `<state-dir>` and `<new-effect-root>` are disposable local directories, `<new-effect-root>` must not exist beforehand, and the command contacts only the deterministic local fixture (`"real_model_contacted": false`).
+Both `<state-dir>` and `<new-effect-root>` are disposable local directories, `<new-effect-root>` must not exist beforehand, and the command contacts only the deterministic local fixture (`"real_model_contacted": false`). `<config>` must be the exact bytes of `parapet/tests/fixtures/cli_v0/accept_enforced_v0.yaml` (`shadow_parse_error_l3_off` uses `parapet/tests/fixtures/cli_v0/accept_shadow_l3_off_v0.yaml`); any other config exits 3 with `accept_config_mismatch` before creating state. The JSON output reports `"requester": "rust_cli"`, the installed CLI `requester_version`, the engine-generated `run_id`, and the accepted `config_contract_hash`; human output prints `requester: Rust CLI <version>`.
+
+#### Installed Python SDK verification
+
+This runs the Python SDK from the locally built wheel installed in `<ROLE>/python-installed-venv` (the role's disposable installed venv), from the role's neutral working directory `<ROLE>/neutral-cwd` outside the checkout `<LANE>`, with `PYTHONPATH` unset and the installed `parapet-engine` and `parapet` binaries bound explicitly:
+
+```bash
+cd <ROLE>/neutral-cwd
+env -u PYTHONPATH PARAPET_NO_REAL_MODEL=1 PARAPET_EXPECTED_ENV_ROOT=<ROLE>/python-installed-venv PARAPET_ENGINE_BIN=<ROLE>/python-installed-venv/bin/parapet-engine PARAPET_CLI_BIN=<ROLE>/python-installed-venv/bin/parapet PYTHONDONTWRITEBYTECODE=1 <ROLE>/python-installed-venv/bin/python -m pytest -q --import-mode=importlib -p no:cacheprovider <LANE>/parapet-py/tests/test_e2e.py -k installed_python_sdk_is_actual_loopback_requester_rev9
+```
+
+The test requires the real `Path.cwd()` to equal `<ROLE>/neutral-cwd`, records the installed `parapet` distribution version and `parapet.__file__`, and requires the module below the installed venv's `site-packages` and outside `<LANE>`; no checkout Python package is imported. It starts the installed engine on a bound loopback endpoint, records that endpoint and the engine owner PID, and makes an actual request through the installed SDK transport. Its substitution witness is an in-process recorder under the installed SDK's base HTTP transport: the request must be recorded exactly once, from the installed `parapet/transport.py`, with the SDK's `x-parapet-original-host` header, and the caller must receive that recorded response. A request made by Rust `reqwest` or by the TypeScript SDK never reaches the recorder and fails the test. Every non-loopback destination is refused, and the retained `PARAPET_PY_INSTALLED_REQUESTER_RECORD` reports `"real_model_contacted": false`.
+
+#### Installed TypeScript SDK verification
+
+The TypeScript SDK is a separate npm package (`@parapet-tech/parapet`) in its own Node environment; it is not a Python-wheel payload. After building, packing, and installing that package into the disposable consumer `<ROLE>/ts-install/consumer`, run from the same neutral working directory against the wheel-installed engine (`<NODE>` is the Node binary; Vitest comes from the role's dev-dependency copy):
+
+```bash
+cd <ROLE>/neutral-cwd
+E2E=1 PARAPET_NO_REAL_MODEL=1 PARAPET_ENGINE_PATH=<ROLE>/python-installed-venv/bin/parapet-engine PARAPET_CLI_BIN=<ROLE>/python-installed-venv/bin/parapet PARAPET_TS_INSTALLED_ENTRY=<ROLE>/ts-install/consumer/node_modules/@parapet-tech/parapet/dist/index.js PARAPET_TS_CHECKOUT_ROOT=<LANE>/parapet-ts PARAPET_TS_NEUTRAL_CWD=<ROLE>/neutral-cwd <NODE> <ROLE>/tool-cache/ts-seed/node_modules/vitest/vitest.mjs run --root <LANE>/parapet-ts --config <LANE>/parapet-ts/vitest.config.ts test/e2e.test.ts -t "installed TypeScript SDK is actual loopback requester Rev9"
+```
+
+The test requires `process.cwd()` to equal `<ROLE>/neutral-cwd`, records the installed package name, version, and resolved entry (inside the consumer and outside `<LANE>/parapet-ts`), records the bound loopback engine endpoint and the actual request/response, and retains the `PARAPET_TS_INSTALLED_REQUESTER_RECORD` substitution witness proving the installed entry, not Rust `reqwest` or Python, made the request with `"real_model_contacted": false`. The same command with `PARAPET_TS_INSTALLED_ENTRY=<LANE>/parapet-ts/src/index.ts` must exit nonzero with `installed_entry_inside_checkout` before starting the engine.
+
+A missing runtime, package, binary, or other installed input is a hard error in every SDK verification command; there is no client fallback to Rust, the other SDK, or a checkout source tree.
 
 ### 2. Write a policy
 

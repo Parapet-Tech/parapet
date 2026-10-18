@@ -15,6 +15,7 @@ Requires the engine binary to be built:
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -382,14 +383,10 @@ def test_installed_wheel_python_sdk_offline_e2e(monkeypatch) -> None:
 
     monkeypatch.setattr(socket.socket, "connect", _guarded_connect)
 
-    run_id = "000000000000000000000000000000e2"
-    accept_run_id = "000000000000000000000000000000e3"
-
     with tempfile.TemporaryDirectory(dir="/tmp", prefix="p1d_py_") as tmp:
         tmp_dir = Path(tmp)
         state_dir = tmp_dir / "state"
         effect_root = tmp_dir / "effect"
-        accept_state_dir = tmp_dir / "accept_state"
         config_path = tmp_dir / "parapet.yaml"
         config_path.write_text(_OFFLINE_E2E_CONFIG, encoding="utf-8")
 
@@ -406,8 +403,6 @@ def test_installed_wheel_python_sdk_offline_e2e(monkeypatch) -> None:
                     str(effect_root),
                     "--file-effect-profile",
                     "v0",
-                    "--run-id",
-                    run_id,
                     "--max-content-bytes",
                     "4096",
                     "--offline-fixture",
@@ -451,6 +446,19 @@ def test_installed_wheel_python_sdk_offline_e2e(monkeypatch) -> None:
             assert tool_call["function"]["name"] == "write_file"
             assert (effect_root / "note.txt").read_text(encoding="utf-8") == "hello parapet\n"
 
+            # The engine generates the only run identity; its effect-root
+            # sentinel names it. No caller-supplied run id exists.
+            sentinels = [
+                m
+                for m in (
+                    re.fullmatch(r"\.parapet-run-([0-9a-f]{32})\.sentinel", p.name)
+                    for p in effect_root.iterdir()
+                )
+                if m is not None
+            ]
+            assert len(sentinels) == 1, f"Expected one run sentinel, got {sentinels}"
+            run_id = sentinels[0].group(1)
+
             # Verify receipt evidence recorded in state_dir via installed parapet inspect.
             inspect_proc = subprocess.run(
                 [
@@ -471,36 +479,6 @@ def test_installed_wheel_python_sdk_offline_e2e(monkeypatch) -> None:
             assert inspect_json["schema"] == "parapet-cli-inspect/v0"
             assert inspect_json["outcome"] == "complete"
             assert inspect_json["projection"]["summary"] == "allowed_effect_verified"
-
-            # Also verify installed parapet accept --sdk python reports real_model_contacted == false.
-            accept_proc = subprocess.run(
-                [
-                    cli_bin,
-                    "accept",
-                    "--state-dir",
-                    str(accept_state_dir),
-                    "--config",
-                    str(config_path),
-                    "--scenario",
-                    "allow_no_executor",
-                    "--run-id",
-                    accept_run_id,
-                    "--sdk",
-                    "python",
-                    "--json",
-                ],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            assert accept_proc.returncode == 0, accept_proc.stderr
-            accept_json = json.loads(accept_proc.stdout)
-            assert accept_json["schema"] == "parapet-cli-accept/v0"
-            assert accept_json["real_model_contacted"] is False
-            assert (
-                accept_json["upstream_label"]
-                == "upstream: deterministic offline fixture (no real model contacted)"
-            )
 
             # 5. Exercise installed SDK shutdown against the authenticated cleanup gate:
             #    Before restore, shutdown() must be refused and leave engine + control files intact.
@@ -566,3 +544,292 @@ def test_installed_wheel_python_sdk_offline_e2e(monkeypatch) -> None:
         "loopback_only=true "
         "home_parapet_unchanged=true"
     )
+
+
+# ---------------------------------------------------------------------------
+# Installed Python SDK native requester witness (1D Rev 9)
+# ---------------------------------------------------------------------------
+
+def _required_installed_input(name: str) -> str:
+    """Return a required installed-witness environment input; never fall back."""
+    value = os.environ.get(name)
+    if not value:
+        pytest.fail(f"installed_input_missing: {name}", pytrace=False)
+    return value
+
+
+def _required_existing_path(path: Path, code: str) -> Path:
+    if not path.exists():
+        pytest.fail(f"{code}: {path}", pytrace=False)
+    return path.resolve()
+
+
+def test_installed_python_sdk_is_actual_loopback_requester_rev9(
+    monkeypatch, capsys
+) -> None:
+    """The installed Python SDK, not Rust reqwest or TypeScript, makes the request."""
+    import hashlib
+    import importlib.metadata
+    import json
+    import socket
+    import sysconfig
+    import traceback
+
+    assert os.environ.get("PARAPET_NO_REAL_MODEL") == "1", (
+        "PARAPET_NO_REAL_MODEL=1 is required for the installed requester witness"
+    )
+    assert not os.environ.get("PYTHONPATH"), "PYTHONPATH must be unset"
+
+    # Role inputs are explicit; a missing installed input is a hard failure.
+    env_root = _required_existing_path(
+        Path(_required_installed_input("PARAPET_EXPECTED_ENV_ROOT")),
+        "installed_env_root_missing",
+    )
+    engine_bin = _required_existing_path(
+        Path(_required_installed_input("PARAPET_ENGINE_BIN")),
+        "installed_engine_missing",
+    )
+    cli_bin = _required_existing_path(
+        Path(_required_installed_input("PARAPET_CLI_BIN")),
+        "installed_cli_missing",
+    )
+    role_root = env_root.parent
+    neutral_cwd = _required_existing_path(
+        role_root / "neutral-cwd", "installed_neutral_cwd_missing"
+    )
+    role_tmp = _required_existing_path(
+        role_root / "tool-cache" / "tmp", "installed_role_tmp_missing"
+    )
+    checkout_root = _REPO_ROOT.resolve()
+
+    # Neutral cwd and interpreter identity.
+    cwd = Path.cwd().resolve()
+    assert cwd == neutral_cwd, f"cwd {cwd} != role neutral cwd {neutral_cwd}"
+    assert not cwd.is_relative_to(checkout_root)
+    assert Path(sys.prefix).resolve() == env_root, (
+        f"interpreter prefix {sys.prefix} is not the installed venv {env_root}"
+    )
+
+    # The installed distribution and module, below the venv site-packages only.
+    site_packages = Path(sysconfig.get_paths()["purelib"]).resolve()
+    assert site_packages.is_relative_to(env_root)
+    assert site_packages.name == "site-packages"
+    assert not site_packages.is_relative_to(checkout_root)
+
+    import parapet
+    from parapet import _engine_state
+
+    parapet_file = Path(parapet.__file__).resolve()
+    assert parapet_file.is_relative_to(site_packages), (
+        f"parapet must import from {site_packages}, got {parapet_file}"
+    )
+    assert not parapet_file.is_relative_to(checkout_root)
+    distribution = importlib.metadata.distribution("parapet")
+    package_version = distribution.version
+    assert (
+        Path(str(distribution.locate_file("parapet/__init__.py"))).resolve()
+        == parapet_file
+    )
+    assert Path(httpx.__file__).resolve().is_relative_to(site_packages)
+    installed_transport = (parapet_file.parent / "transport.py").resolve()
+    assert Path(sys.modules["parapet.transport"].__file__).resolve() == installed_transport
+
+    # No checkout Python package is importable or imported.
+    this_test = Path(__file__).resolve()
+    test_pkg_init = (this_test.parent / "__init__.py").resolve()
+    checkout_paths = [
+        p for p in sys.path if p and Path(p).resolve().is_relative_to(checkout_root)
+    ]
+    assert not checkout_paths, f"checkout on sys.path: {checkout_paths}"
+    checkout_modules = sorted(
+        name
+        for name, mod in list(sys.modules.items())
+        if getattr(mod, "__file__", None)
+        and Path(mod.__file__).resolve().is_relative_to(checkout_root)
+        and Path(mod.__file__).resolve() not in (this_test, test_pkg_init)
+    )
+    assert not checkout_modules, f"checkout modules imported: {checkout_modules}"
+
+    # The engine and CLI are the exact installed venv binaries.
+    for binary in (engine_bin, cli_bin):
+        assert binary.parent == (env_root / "bin").resolve(), binary
+        assert not binary.is_relative_to(checkout_root)
+    engine_sha256 = hashlib.sha256(engine_bin.read_bytes()).hexdigest()
+    info_proc = subprocess.run(
+        [str(cli_bin), "info", "--json"], capture_output=True, text=True, check=False
+    )
+    assert info_proc.returncode == 0, info_proc.stderr
+    cli_info = json.loads(info_proc.stdout)
+    assert cli_info["schema"] == "parapet-cli-info/v0"
+
+    before_home = _snapshot_home_parapet()
+    port = _pick_free_loopback_port()
+    endpoint = f"http://127.0.0.1:{port}"
+
+    # Substitution witness: the base httpx transport under the installed SDK is
+    # this in-process recorder. Rust reqwest or a TypeScript client would
+    # bypass it entirely, leaving zero recorded completions. Every non-loopback
+    # destination is refused with a non-httpx error, so no failopen retry can
+    # reach a real provider.
+    recorded: list[dict[str, Any]] = []
+    refused: list[str] = []
+    real_handle_request = httpx.HTTPTransport.handle_request
+
+    def _recording_handle_request(self, request: httpx.Request) -> httpx.Response:
+        stack = traceback.extract_stack()
+        url = str(request.url)
+        if not url.startswith(f"{endpoint}/"):
+            refused.append(url)
+            raise RuntimeError(f"non-loopback request refused in test: {url}")
+        response = real_handle_request(self, request)
+        if request.url.path == "/v1/chat/completions":
+            recorded.append(
+                {
+                    "url": url,
+                    "method": request.method,
+                    "headers": dict(request.headers),
+                    "stack": stack,
+                    "response": response,
+                }
+            )
+        return response
+
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", _recording_handle_request)
+
+    # Violations are also recorded because the SDK heartbeat thread swallows
+    # connection errors.
+    inet_endpoints: list[str] = []
+    non_loopback_connects: list[str] = []
+    real_connect = socket.socket.connect
+
+    def _guarded_connect(self, address):
+        if self.family in (socket.AF_INET, socket.AF_INET6):
+            host = address[0] if isinstance(address, tuple) else str(address)
+            if host not in ("127.0.0.1", "::1", "localhost"):
+                non_loopback_connects.append(repr(address))
+                raise AssertionError(
+                    f"Non-loopback socket connection forbidden: {address!r}"
+                )
+            inet_endpoints.append(f"{host}:{address[1]}")
+        return real_connect(self, address)
+
+    monkeypatch.setattr(socket.socket, "connect", _guarded_connect)
+
+    with tempfile.TemporaryDirectory(dir=role_tmp, prefix="p1d_py_req_") as tmp:
+        tmp_dir = Path(tmp)
+        state_dir = tmp_dir / "state"
+        config_path = tmp_dir / "parapet.yaml"
+        config_path.write_text(_OFFLINE_E2E_CONFIG, encoding="utf-8")
+        try:
+            parapet.init(
+                str(config_path),
+                port=port,
+                engine_bin=str(engine_bin),
+                state_dir=state_dir,
+                engine_args=["--offline-fixture", "v0", "--ready-file", "ready.port"],
+            )
+            ready_file = state_dir / "ready.port"
+            owner_file = state_dir / "engine.owner.json"
+            deadline = time.monotonic() + _STARTUP_TIMEOUT_S
+            while time.monotonic() < deadline and not (
+                ready_file.exists() and owner_file.exists()
+            ):
+                time.sleep(0.05)
+            assert int(ready_file.read_text(encoding="utf-8").strip()) == port
+            owner_pid = json.loads(owner_file.read_text(encoding="utf-8"))["pid"]
+            assert _engine_state.process is not None
+            assert owner_pid == _engine_state.process.pid
+            assert owner_pid == int((state_dir / "engine.pid").read_text().strip())
+
+            with parapet.session(user_id="py_installed_requester", role="developer"):
+                prompt = parapet.untrusted(
+                    "hello installed py requester", source="unit_test"
+                )
+                # trust_env=False: an ambient proxy mount would bypass the SDK
+                # transport and is never a valid requester path here.
+                with httpx.Client(timeout=10.0, trust_env=False) as http_client:
+                    resp = http_client.post(
+                        "https://api.openai.com/v1/chat/completions",
+                        headers={
+                            "Authorization": "Bearer sk-offline-fixture",
+                            "x-parapet-offline-scenario": "allow_no_executor",
+                        },
+                        json={
+                            "model": "gpt-4o-mini",
+                            "messages": [{"role": "user", "content": prompt}],
+                        },
+                    )
+
+            # Exactly one loopback completion, issued by the installed SDK
+            # transport in this interpreter; the caller got that very response.
+            assert refused == []
+            assert len(recorded) == 1, recorded
+            req = recorded[0]
+            assert req["url"] == f"{endpoint}/v1/chat/completions"
+            assert req["method"] == "POST"
+            assert req["headers"]["x-parapet-original-host"] == "api.openai.com"
+            assert req["headers"].get("x-guard-trust")
+            assert "user_id=py_installed_requester" in req["headers"]["baggage"]
+            assert resp is req["response"]
+            stack_files = [Path(frame.filename).resolve() for frame in req["stack"]]
+            assert installed_transport in stack_files, stack_files
+            checkout_sdk = checkout_root / "parapet-py" / "parapet"
+            assert not any(f.is_relative_to(checkout_sdk) for f in stack_files)
+
+            assert resp.status_code == 200, resp.text
+            payload = resp.json()
+            assert payload["id"] == "chatcmpl-offline-v0"
+
+            record = {
+                "schema": "parapet-py-installed-requester/rev9",
+                "cwd": str(cwd),
+                "package": {
+                    "name": "parapet",
+                    "version": package_version,
+                    "module_file": str(parapet_file),
+                    "site_packages": str(site_packages),
+                    "transport_file": str(installed_transport),
+                },
+                "interpreter": {"executable": sys.executable, "prefix": sys.prefix},
+                "checkout_excluded": True,
+                "checkout_root": str(checkout_root),
+                "engine": {
+                    "binary": str(engine_bin),
+                    "sha256": engine_sha256,
+                    "endpoint": endpoint,
+                    "owner_pid": owner_pid,
+                },
+                "cli": {"binary": str(cli_bin), "version": cli_info["cli_version"]},
+                "request": {
+                    "url": req["url"],
+                    "method": req["method"],
+                    "original_host": "api.openai.com",
+                },
+                "response": {"status": resp.status_code, "id": payload["id"]},
+                "requester": "installed_python_sdk",
+                "non_loopback_attempts": len(refused),
+                "real_model_contacted": False,
+            }
+            with capsys.disabled():
+                print(f"PARAPET_PY_INSTALLED_REQUESTER_RECORD {json.dumps(record)}")
+
+            # Without an effect root the control gate approves not_applicable.
+            assert parapet.shutdown() is True
+            assert not (state_dir / "engine.pid").exists()
+            assert not owner_file.exists()
+        finally:
+            if _engine_state.process is not None and _engine_state.process.poll() is None:
+                _engine_state.process.terminate()
+                try:
+                    _engine_state.process.wait(timeout=5)
+                except Exception:
+                    _engine_state.process.kill()
+            _engine_state.process = None
+            _engine_state.initialized = False
+            _engine_state.owns_process = False
+            _engine_state.state_dir = None
+            _engine_state.engine_args = []
+
+    assert _snapshot_home_parapet() == before_home, "~/.parapet must remain untouched"
+    assert non_loopback_connects == [], non_loopback_connects
+    assert f"127.0.0.1:{port}" in inet_endpoints, inet_endpoints
