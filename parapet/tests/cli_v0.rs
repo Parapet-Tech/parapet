@@ -4091,6 +4091,13 @@ layers:
             )
             .expect("parse owner json");
             let owner_run_id = owner["run_id"].as_str().expect("owner run_id").to_owned();
+            let effect_root = effect_root.expect("effect root");
+            assert!(
+                effect_root
+                    .join(format!(".parapet-run-{owner_run_id}.sentinel"))
+                    .exists(),
+                "live sentinel must witness the owner-record run id before restore"
+            );
             for cmd in ["restore", "disable"] {
                 assert_eq!(
                     run_parapet(
@@ -4157,7 +4164,6 @@ layers:
             );
             let run_id = owner_run_id.expect("owner run_id");
             assert!(RunIdV0::parse(&run_id).is_some());
-            assert!(er.join(format!(".parapet-run-{run_id}.sentinel")).exists());
             let expected = if json_mode {
                 format!(
                     "{{\"schema\":\"parapet-cli-run/v0\",\"port\":{port},\"run_id\":\"{run_id}\",\"file_capability\":\"created\",\"file_cleanup\":\"clear\",\"file_cleanup_label\":\"file cleanup: clear\",\"evidence_retained\":true}}\n"
