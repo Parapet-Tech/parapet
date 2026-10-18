@@ -12,6 +12,11 @@
  *
  * Requires the engine binary to be built:
  *   cd parapet && cargo build --release
+ *
+ * SDK selection (1D Rev 9): exactly one SDK module is imported dynamically.
+ * Without PARAPET_TS_INSTALLED_ENTRY the source SDK is used. With it, only that
+ * installed package entry is imported, after proving it resolves inside the
+ * role consumer install and outside PARAPET_TS_CHECKOUT_ROOT.
  */
 
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
@@ -23,22 +28,153 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { createConnection, createServer as createNetServer } from "node:net";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join, relative, resolve } from "node:path";
-import {
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+
+// ---------------------------------------------------------------------------
+// SDK module selection (exactly one module; no fallback)
+// ---------------------------------------------------------------------------
+
+type SdkModule = typeof import("../src/index.js");
+
+const INSTALLED_PACKAGE_NAME = "@parapet-tech/parapet";
+
+interface InstalledProvenance {
+  checkoutRoot: string;
+  neutralCwd: string;
+  roleRoot: string;
+  packageRoot: string;
+  packageName: string;
+  packageVersion: string;
+}
+
+interface SelectedSdk {
+  mode: "source" | "installed";
+  /** Real path of the single imported module file. */
+  entry: string;
+  module: SdkModule;
+  installed: InstalledProvenance | null;
+}
+
+/** Stable, machine-checkable installed-selection failure. */
+class InstalledEntryError extends Error {
+  constructor(
+    readonly code: string,
+    detail: string,
+  ) {
+    super(`${code}: ${detail}`);
+    this.name = "InstalledEntryError";
+  }
+}
+
+function isStrictlyWithin(child: string, parent: string): boolean {
+  const rel = relative(parent, child);
+  return rel !== "" && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+}
+
+function realpathOrFail(path: string, code: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    throw new InstalledEntryError(code, path);
+  }
+}
+
+function requiredEnv(name: string, code: string): string {
+  const value = process.env[name];
+  if (!value) {
+    throw new InstalledEntryError(code, `${name} is required in installed mode`);
+  }
+  return value;
+}
+
+async function selectSdk(): Promise<SelectedSdk> {
+  const rawEntry = process.env.PARAPET_TS_INSTALLED_ENTRY;
+  if (!rawEntry) {
+    const entry = realpathSync(fileURLToPath(new URL("../src/index.ts", import.meta.url)));
+    return {
+      mode: "source",
+      entry,
+      module: (await import("../src/index.js")) as SdkModule,
+      installed: null,
+    };
+  }
+
+  // Every check below runs before any engine, socket, or request exists.
+  const rawCheckout = requiredEnv("PARAPET_TS_CHECKOUT_ROOT", "installed_checkout_root_missing");
+  if (!isAbsolute(rawEntry)) {
+    throw new InstalledEntryError("installed_entry_not_absolute", rawEntry);
+  }
+  const entry = realpathOrFail(rawEntry, "installed_entry_unresolvable");
+  const checkoutRoot = realpathOrFail(rawCheckout, "installed_checkout_root_unresolvable");
+  if (entry === checkoutRoot || isStrictlyWithin(entry, checkoutRoot)) {
+    throw new InstalledEntryError(
+      "installed_entry_inside_checkout",
+      `${entry} is inside ${checkoutRoot}`,
+    );
+  }
+
+  const neutralCwd = realpathOrFail(
+    requiredEnv("PARAPET_TS_NEUTRAL_CWD", "installed_neutral_cwd_missing"),
+    "installed_neutral_cwd_unresolvable",
+  );
+  const roleRoot = dirname(neutralCwd);
+  const packageRoot = realpathOrFail(
+    join(roleRoot, "ts-install", "consumer", "node_modules", "@parapet-tech", "parapet"),
+    "installed_package_root_unresolvable",
+  );
+  if (!isStrictlyWithin(entry, packageRoot)) {
+    throw new InstalledEntryError(
+      "installed_entry_outside_consumer",
+      `${entry} is not below ${packageRoot}`,
+    );
+  }
+  if (packageRoot === checkoutRoot || isStrictlyWithin(packageRoot, checkoutRoot)) {
+    throw new InstalledEntryError("installed_package_inside_checkout", packageRoot);
+  }
+  const pkg = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf-8")) as {
+    name?: unknown;
+    version?: unknown;
+  };
+  if (pkg.name !== INSTALLED_PACKAGE_NAME || typeof pkg.version !== "string") {
+    throw new InstalledEntryError(
+      "installed_package_identity_mismatch",
+      `${String(pkg.name)}@${String(pkg.version)}`,
+    );
+  }
+
+  return {
+    mode: "installed",
+    entry,
+    module: (await import(pathToFileURL(entry).href)) as SdkModule,
+    installed: {
+      checkoutRoot,
+      neutralCwd,
+      roleRoot,
+      packageRoot,
+      packageName: pkg.name,
+      packageVersion: pkg.version,
+    },
+  };
+}
+
+const SDK = await selectSdk();
+const {
   init,
   session,
   untrusted,
   getParapetFetch,
   shutdown,
   _resetForTesting,
-} from "../src/index.js";
-import { createParapetFetch } from "../src/transport.js";
+  createParapetFetch,
+} = SDK.module;
 
 // ---------------------------------------------------------------------------
 // Paths
@@ -388,12 +524,8 @@ describe("Installed-engine offline TypeScript SDK E2E", () => {
     const tmpRoot = mkdtempSync("/tmp/p1d_ts_e2e_");
     const stateDir = join(tmpRoot, "state");
     const effectRoot = join(tmpRoot, "effect");
-    const acceptStateDir = join(tmpRoot, "accept_state");
     const configPath = join(tmpRoot, "parapet.yaml");
     writeFileSync(configPath, OFFLINE_E2E_CONFIG, "utf-8");
-
-    const runId = "000000000000000000000000000000f1";
-    const acceptRunId = "000000000000000000000000000000f2";
 
     try {
       await init({
@@ -406,8 +538,6 @@ describe("Installed-engine offline TypeScript SDK E2E", () => {
           effectRoot,
           "--file-effect-profile",
           "v0",
-          "--run-id",
-          runId,
           "--max-content-bytes",
           "4096",
           "--offline-fixture",
@@ -476,6 +606,14 @@ describe("Installed-engine offline TypeScript SDK E2E", () => {
         "hello parapet\n",
       );
 
+      // The engine generates the only run identity; its effect-root sentinel
+      // names it. No caller-supplied run id exists.
+      const sentinels = readdirSync(effectRoot)
+        .map((name) => /^\.parapet-run-([0-9a-f]{64})\.sentinel$/.exec(name))
+        .filter((m): m is RegExpExecArray => m !== null);
+      expect(sentinels).toHaveLength(1);
+      const runId = sentinels[0][1];
+
       if (hasCliBin) {
         const inspectRes = spawnSync(
           cliCandidate,
@@ -491,36 +629,6 @@ describe("Installed-engine offline TypeScript SDK E2E", () => {
         expect(inspectJson.schema).toBe("parapet-cli-inspect/v0");
         expect(inspectJson.outcome).toBe("complete");
         expect(inspectJson.projection.summary).toBe("allowed_effect_verified");
-
-        const acceptRes = spawnSync(
-          cliCandidate,
-          [
-            "accept",
-            "--state-dir",
-            acceptStateDir,
-            "--config",
-            configPath,
-            "--scenario",
-            "allow_no_executor",
-            "--run-id",
-            acceptRunId,
-            "--sdk",
-            "ts",
-            "--json",
-          ],
-          { encoding: "utf-8" },
-        );
-        expect(acceptRes.status).toBe(0);
-        const acceptJson = JSON.parse(acceptRes.stdout) as {
-          schema: string;
-          real_model_contacted: boolean;
-          upstream_label: string;
-        };
-        expect(acceptJson.schema).toBe("parapet-cli-accept/v0");
-        expect(acceptJson.real_model_contacted).toBe(false);
-        expect(acceptJson.upstream_label).toBe(
-          "upstream: deterministic offline fixture (no real model contacted)",
-        );
       }
 
       // 1. Before restore, shutdown() must be refused by the cleanup gate.
@@ -573,4 +681,199 @@ describe("Installed-engine offline TypeScript SDK E2E", () => {
     const afterHome = snapshotHomeParapet();
     expect(afterHome).toEqual(beforeHome);
   });
+});
+
+// ---------------------------------------------------------------------------
+// Installed TypeScript SDK native requester witness (1D Rev 9)
+// ---------------------------------------------------------------------------
+
+interface RecordedRequest {
+  url: string;
+  method: string;
+  headers: Record<string, string>;
+  stack: string;
+  response: Response;
+}
+
+describe("Installed TypeScript SDK native requester (1D Rev 9)", () => {
+  it.skipIf(SDK.mode !== "installed")(
+    "installed TypeScript SDK is actual loopback requester Rev9",
+    async () => {
+      const prov = SDK.installed!;
+      expect(process.env.PARAPET_NO_REAL_MODEL).toBe("1");
+
+      // Neutral cwd, package identity, consumer containment, checkout exclusion.
+      const cwd = realpathSync(process.cwd());
+      expect(cwd).toBe(prov.neutralCwd);
+      expect(isStrictlyWithin(cwd, prov.checkoutRoot)).toBe(false);
+      expect(prov.packageName).toBe(INSTALLED_PACKAGE_NAME);
+      expect(isStrictlyWithin(SDK.entry, prov.packageRoot)).toBe(true);
+      expect(isStrictlyWithin(SDK.entry, prov.checkoutRoot)).toBe(false);
+      const entrySha256 = createHash("sha256").update(readFileSync(SDK.entry)).digest("hex");
+
+      // The engine is the role-installed binary only; no source/target fallback.
+      const engineBin = requiredEnv("PARAPET_ENGINE_PATH", "installed_engine_missing");
+      expect(isAbsolute(engineBin)).toBe(true);
+      expect(existsSync(engineBin)).toBe(true);
+      expect(isStrictlyWithin(realpathSync(engineBin), prov.checkoutRoot)).toBe(false);
+
+      const roleTmp = realpathOrFail(
+        join(prov.roleRoot, "tool-cache", "tmp"),
+        "installed_role_tmp_missing",
+      );
+      const tmpRoot = mkdtempSync(join(roleTmp, "p1d_ts_req_"));
+      const stateDir = join(tmpRoot, "state");
+      const configPath = join(tmpRoot, "parapet.yaml");
+      writeFileSync(configPath, OFFLINE_E2E_CONFIG, "utf-8");
+      const port = await pickFreeLoopbackPort();
+      const endpoint = `http://127.0.0.1:${port}`;
+
+      // Substitution witness: the only network path is this recorder, which the
+      // installed SDK captures as its base fetch at init(). It refuses every
+      // non-loopback destination, so a failopen retry cannot reach a provider.
+      const realFetch = globalThis.fetch;
+      const recorded: RecordedRequest[] = [];
+      const refused: string[] = [];
+      const recorder = async (
+        input: string | URL | Request,
+        reqInit?: RequestInit,
+      ): Promise<Response> => {
+        // Captured synchronously so the calling SDK frame is on the stack.
+        const stack = new Error("requester").stack ?? "";
+        const url =
+          input instanceof Request ? input.url : input instanceof URL ? input.href : input;
+        if (!url.startsWith(`${endpoint}/`)) {
+          refused.push(url);
+          throw new Error(`non-loopback request refused in test: ${url}`);
+        }
+        const response = await realFetch(input, reqInit);
+        if (new URL(url).pathname === "/v1/chat/completions") {
+          const headers: Record<string, string> = {};
+          new Headers(
+            reqInit?.headers ?? (input instanceof Request ? input.headers : undefined),
+          ).forEach((v, k) => {
+            headers[k] = v;
+          });
+          recorded.push({
+            url,
+            method: reqInit?.method ?? (input instanceof Request ? input.method : "GET"),
+            headers,
+            stack,
+            response,
+          });
+        }
+        return response;
+      };
+
+      _resetForTesting();
+      globalThis.fetch = recorder as typeof globalThis.fetch;
+      try {
+        await init({
+          configPath,
+          port,
+          stateDir,
+          engineBinary: engineBin,
+          engineArgs: ["--offline-fixture", "v0", "--ready-file", "ready.port"],
+        });
+        const ownerFile = join(stateDir, "engine.owner.json");
+        const readyFile = join(stateDir, "ready.port");
+        const deadline = Date.now() + STARTUP_TIMEOUT_MS;
+        while (Date.now() < deadline && !(existsSync(readyFile) && existsSync(ownerFile))) {
+          await sleep(50);
+        }
+        expect(parseInt(readFileSync(readyFile, "utf-8").trim(), 10)).toBe(port);
+        const owner = JSON.parse(readFileSync(ownerFile, "utf-8")) as { pid: number };
+        expect(owner.pid).toBe(
+          parseInt(readFileSync(join(stateDir, "engine.pid"), "utf-8").trim(), 10),
+        );
+
+        const pf = getParapetFetch();
+        const resp = await session(
+          { userId: "ts_installed_requester", role: "developer" },
+          async () =>
+            pf("https://api.openai.com/v1/chat/completions", {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                Authorization: "Bearer sk-offline-fixture",
+                "x-parapet-offline-scenario": "allow_no_executor",
+              },
+              body: JSON.stringify({
+                model: "gpt-4o-mini",
+                messages: [
+                  {
+                    role: "user",
+                    content: untrusted("hello installed ts requester", "unit_test"),
+                  },
+                ],
+              }),
+            }),
+        );
+
+        // Exactly one loopback request, made through the installed entry's
+        // transport, and the caller received that very response object.
+        expect(refused).toEqual([]);
+        expect(recorded).toHaveLength(1);
+        const req = recorded[0];
+        expect(req.url).toBe(`${endpoint}/v1/chat/completions`);
+        expect(req.method).toBe("POST");
+        expect(req.headers["x-parapet-original-host"]).toBe("api.openai.com");
+        expect(req.headers["x-guard-trust"]).toBeTruthy();
+        expect(resp).toBe(req.response);
+        const packageUrl = pathToFileURL(prov.packageRoot).href;
+        expect(req.stack.includes(packageUrl) || req.stack.includes(prov.packageRoot)).toBe(
+          true,
+        );
+        const checkoutSrc = join(prov.checkoutRoot, "src");
+        expect(req.stack.includes(checkoutSrc)).toBe(false);
+        expect(req.stack.includes(pathToFileURL(checkoutSrc).href)).toBe(false);
+
+        expect(resp.status).toBe(200);
+        const payload = (await resp.json()) as { id: string; model: string };
+        expect(payload.id).toBe("chatcmpl-offline-v0");
+
+        const record = {
+          schema: "parapet-ts-installed-requester/rev9",
+          cwd,
+          package: {
+            name: prov.packageName,
+            version: prov.packageVersion,
+            resolved_entry: SDK.entry,
+            entry_sha256: entrySha256,
+            package_root: prov.packageRoot,
+          },
+          consumer_contained: true,
+          checkout_excluded: true,
+          checkout_root: prov.checkoutRoot,
+          engine: { binary: engineBin, endpoint, owner_pid: owner.pid },
+          request: { url: req.url, method: req.method, original_host: "api.openai.com" },
+          response: { status: resp.status, id: payload.id },
+          requester: "installed_typescript_sdk",
+          non_loopback_attempts: refused.length,
+          real_model_contacted: false,
+        };
+        console.log(`PARAPET_TS_INSTALLED_REQUESTER_RECORD ${JSON.stringify(record)}`);
+        expect(record.real_model_contacted).toBe(false);
+
+        // Without an effect root the control gate approves not_applicable.
+        await shutdown();
+        expect(existsSync(join(stateDir, "engine.pid"))).toBe(false);
+        expect(existsSync(ownerFile)).toBe(false);
+      } finally {
+        globalThis.fetch = realFetch;
+        _resetForTesting();
+        // Test teardown only: never leak an engine if an assertion failed.
+        const pidFile = join(stateDir, "engine.pid");
+        if (existsSync(pidFile)) {
+          try {
+            process.kill(parseInt(readFileSync(pidFile, "utf-8").trim(), 10), "SIGTERM");
+          } catch {
+            // Already gone.
+          }
+        }
+        rmSync(tmpRoot, { recursive: true, force: true });
+      }
+    },
+    STARTUP_TIMEOUT_MS + 15_000,
+  );
 });

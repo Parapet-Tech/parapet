@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach, type MockInstance } from "vitest";
 import type { ChildProcess } from "node:child_process";
 import { spawn as spawnChild } from "node:child_process";
 import { EventEmitter } from "node:events";
@@ -13,10 +13,19 @@ import { createServer } from "node:net";
 import { join } from "node:path";
 import {
   EngineManager,
+  EngineRecoveryError,
   defaultRequestControlDisable,
   defaultRequestControlDisableSync,
+  type ControlGateResult,
   type SidecarDeps,
 } from "../src/sidecar.js";
+
+const APPROVED_CLEAR: ControlGateResult = { kind: "approved", fileCleanup: "clear" };
+const APPROVED_NOT_APPLICABLE: ControlGateResult = {
+  kind: "approved",
+  fileCleanup: "not_applicable",
+};
+const REFUSED: ControlGateResult = { kind: "refused" };
 
 // ---------------------------------------------------------------------------
 // Mock ChildProcess
@@ -267,7 +276,7 @@ describe("EngineManager", () => {
 
     it("uses the SDK source hash when engine.owner.json carries a different contract hash", async () => {
       const { deps, fs, spawnedProcesses } = createMockDeps({
-        requestControlDisable: async () => true,
+        requestControlDisable: async () => APPROVED_CLEAR,
       });
       setupConfigFile(fs);
 
@@ -1031,11 +1040,11 @@ describe("EngineManager", () => {
         } = createMockDeps({
           requestControlDisable: async () => {
             asyncGateCalls++;
-            return true;
+            return APPROVED_CLEAR;
           },
           requestControlDisableSync: () => {
             syncGateCalls++;
-            return true;
+            return APPROVED_CLEAR;
           },
         });
         setupConfigFile(fs);
@@ -1172,7 +1181,7 @@ describe("EngineManager", () => {
 
   describe("authenticated cleanup gate across all six shutdown paths", () => {
     it.each(["stop", "SIGINT", "SIGTERM", "beforeExit"] as const)(
-      "async path %s refuses to kill or unlink when gate returns false, then stops cleanly after restore approves",
+      "async path %s refuses to kill or unlink when gate refuses, then stops cleanly after restore approves",
       async (pathName) => {
         let gateApproved = false;
         const gateDirs: string[] = [];
@@ -1185,7 +1194,7 @@ describe("EngineManager", () => {
         } = createMockDeps({
           requestControlDisable: async (dir) => {
             gateDirs.push(dir);
-            return gateApproved;
+            return gateApproved ? APPROVED_CLEAR : REFUSED;
           },
         });
         setupConfigFile(fs);
@@ -1246,7 +1255,7 @@ describe("EngineManager", () => {
             }
           };
 
-          // 1. Gate returns false (file cleanup not_run / fail / indeterminate).
+          // 1. Gate refuses (file cleanup not_run / fail / indeterminate).
           await invokePath();
 
           expect(gateDirs).toEqual([stateDir]);
@@ -1282,14 +1291,14 @@ describe("EngineManager", () => {
     );
 
     it.each(["stopSync", "exit"] as const)(
-      "sync path %s refuses to SIGKILL or unlink when gate returns false or has no handshake, then cleans up when approved",
+      "sync path %s refuses to signal or unlink when gate refuses, and approval permits SIGTERM only without unlink",
       async (pathName) => {
         let syncApproved = false;
         const syncDirs: string[] = [];
         const { deps, fs, spawnedProcesses, exitHandlers } = createMockDeps({
           requestControlDisableSync: (dir) => {
             syncDirs.push(dir);
-            return syncApproved;
+            return syncApproved ? APPROVED_CLEAR : REFUSED;
           },
         });
         setupConfigFile(fs);
@@ -1353,19 +1362,21 @@ describe("EngineManager", () => {
           expect(fs.files.has(tokenFile)).toBe(true);
           expect(fs.files.has(ownerFile)).toBe(true);
 
-          // 2. Approved synchronous gate after restore -> clear.
+          // 2. Approved synchronous gate after restore -> clear: SIGTERM only,
+          // and no unlink because exit cannot be confirmed synchronously.
           syncApproved = true;
           invokeSync();
 
           expect(syncDirs).toEqual([stateDir, stateDir]);
           expect(killSpy).toHaveBeenCalledOnce();
-          expect(killSpy).toHaveBeenCalledWith(proc.pid, "SIGKILL");
-          expect(mgr.isInitialized).toBe(false);
-          expect(fs.files.has(pidFile)).toBe(false);
-          expect(fs.files.has(metaFile)).toBe(false);
-          expect(fs.files.has(sockFile)).toBe(false);
-          expect(fs.files.has(tokenFile)).toBe(false);
-          expect(fs.files.has(ownerFile)).toBe(false);
+          expect(killSpy).toHaveBeenCalledWith(proc.pid, "SIGTERM");
+          expect(proc.killSignals).toEqual([]);
+          expect(mgr.isInitialized).toBe(true);
+          expect(fs.files.has(pidFile)).toBe(true);
+          expect(fs.files.has(metaFile)).toBe(true);
+          expect(fs.files.has(sockFile)).toBe(true);
+          expect(fs.files.has(tokenFile)).toBe(true);
+          expect(fs.files.has(ownerFile)).toBe(true);
           expect(fs.files.has(controlJsonFile)).toBe(true);
         } finally {
           killSpy.mockRestore();
@@ -1419,7 +1430,7 @@ describe("EngineManager", () => {
       vi.useFakeTimers({ shouldAdvanceTime: true });
       try {
         const { deps, fs, spawnedProcesses } = createMockDeps({
-          requestControlDisable: async () => true,
+          requestControlDisable: async () => APPROVED_CLEAR,
         });
         setupConfigFile(fs);
         const stateDir = "/var/tmp/parapet-approved-timeout";
@@ -1432,7 +1443,10 @@ describe("EngineManager", () => {
         await mgr.start();
         fs.files.set(join(stateDir, "control.sock"), "");
         fs.files.set(join(stateDir, "control.token"), "a".repeat(64));
-        fs.files.set(join(stateDir, "engine.owner.json"), "{}");
+        fs.files.set(
+          join(stateDir, "engine.owner.json"),
+          JSON.stringify({ schema: "parapet-engine-owner/v0", pid: 12345 }),
+        );
 
         const proc = spawnedProcesses[0];
         proc.stubborn = true;
@@ -1457,21 +1471,426 @@ describe("EngineManager", () => {
   });
 
   // -----------------------------------------------------------------------
+  // Startup rollback cannot bypass the cleanup gate (1D Rev 9 D4)
+  // -----------------------------------------------------------------------
+
+  describe("readiness rollback obeys effect cleanup gate Rev9", () => {
+    const STATE_DIR = "/var/tmp/parapet-rev9-rollback";
+    const PID = join(STATE_DIR, "engine.pid");
+    const META = join(STATE_DIR, "engine.meta");
+    const SOCK = join(STATE_DIR, "control.sock");
+    const TOKEN = join(STATE_DIR, "control.token");
+    const OWNER = join(STATE_DIR, "engine.owner.json");
+    const CONTROL_JSON = join(STATE_DIR, "control.json");
+    const GATED_FILES = [PID, META, SOCK, TOKEN, OWNER, CONTROL_JSON];
+
+    /** Readiness timeout, child exit after readiness, or both. */
+    type Failure = "readiness" | "exited" | "exited_unready";
+
+    interface Harness {
+      mgr: EngineManager;
+      fs: MockFs;
+      proc: () => MockProcess;
+      events: string[];
+      unlinks: string[];
+      asyncGateCalls: () => number;
+      killSpy: MockInstance<typeof process.kill>;
+    }
+
+    let killSpy: MockInstance<typeof process.kill>;
+
+    beforeEach(() => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+    });
+    afterEach(() => {
+      killSpy.mockRestore();
+      vi.useRealTimers();
+    });
+
+    function harness(opts: {
+      gate?: SidecarDeps["requestControlDisable"];
+      failure: Failure;
+      effectRoot?: boolean;
+      artifacts?: boolean;
+      ownerPid?: number | "unparseable";
+      stubborn?: boolean;
+    }): Harness {
+      const events: string[] = [];
+      const unlinks: string[] = [];
+      let gateCalls = 0;
+      let spawned: MockProcess | null = null;
+      const { deps, fs } = createMockDeps({
+        requestControlDisable:
+          opts.gate === undefined
+            ? undefined
+            : async (dir) => {
+                gateCalls++;
+                events.push("gate");
+                return opts.gate!(dir);
+              },
+        fetch: async () => {
+          if (opts.failure !== "exited") throw new Error("not ready");
+          return { ok: true, status: 200 } as Response;
+        },
+        spawnProcess: () => {
+          const proc = new MockProcess();
+          proc.stubborn = opts.stubborn ?? false;
+          if (opts.failure !== "readiness") {
+            Object.defineProperty(proc, "exitCode", { value: 1 });
+          }
+          proc.on("exit", () => events.push("exit"));
+          spawned = proc;
+          // The engine writes its control artifacts once it is running.
+          if (opts.artifacts ?? true) {
+            fs.files.set(SOCK, "");
+            fs.files.set(TOKEN, "7".repeat(64));
+            fs.files.set(
+              OWNER,
+              opts.ownerPid === "unparseable"
+                ? "{not json"
+                : JSON.stringify({
+                    schema: "parapet-engine-owner/v0",
+                    pid: opts.ownerPid ?? proc.pid,
+                  }),
+            );
+            fs.files.set(CONTROL_JSON, "{}");
+          }
+          return proc as unknown as ChildProcess;
+        },
+      });
+      const baseUnlink = deps.unlink;
+      deps.unlink = (p) => {
+        unlinks.push(p);
+        events.push(`unlink:${p}`);
+        baseUnlink(p);
+      };
+      setupConfigFile(fs);
+      const mgr = new EngineManager({
+        configPath: CONFIG_PATH,
+        port: 9800,
+        stateDir: STATE_DIR,
+        engineArgs:
+          opts.effectRoot ?? true
+            ? ["--effect-root", "/var/tmp/parapet-rev9-effect"]
+            : [],
+        deps,
+      });
+      return {
+        mgr,
+        fs,
+        proc: () => spawned!,
+        events,
+        unlinks,
+        asyncGateCalls: () => gateCalls,
+        killSpy,
+      };
+    }
+
+    async function startAndCollect(mgr: EngineManager): Promise<unknown> {
+      const outcome = mgr.start().then(
+        () => null,
+        (err: unknown) => err,
+      );
+      await vi.advanceTimersByTimeAsync(30_000);
+      return outcome;
+    }
+
+    function expectZeroKillZeroUnlink(h: Harness): void {
+      expect(h.proc().killSignals).toEqual([]);
+      expect(h.proc().killed).toBe(false);
+      expect(h.killSpy).not.toHaveBeenCalled();
+      expect(h.unlinks).toEqual([]);
+    }
+
+    function expectFilesPreserved(h: Harness, files = GATED_FILES): void {
+      for (const f of files) {
+        expect(h.fs.files.has(f)).toBe(true);
+      }
+    }
+
+    it.each([
+      ["clear", APPROVED_CLEAR],
+      ["not_applicable", APPROVED_NOT_APPLICABLE],
+    ] as const)(
+      "async approved %s permits SIGTERM only and removes controls only after confirmed exit",
+      async (_label, gate) => {
+        const h = harness({ gate: async () => gate, failure: "readiness" });
+        const err = await startAndCollect(h.mgr);
+
+        expect(err).toBeInstanceOf(Error);
+        expect(err).not.toBeInstanceOf(EngineRecoveryError);
+        expect((err as Error).message).toMatch(/did not become ready/);
+        expect(h.asyncGateCalls()).toBe(1);
+        expect(h.proc().killSignals).toEqual(["SIGTERM"]);
+        expect(h.killSpy).not.toHaveBeenCalled();
+
+        const exitAt = h.events.indexOf("exit");
+        const firstUnlink = h.events.findIndex((e) => e.startsWith("unlink:"));
+        expect(h.events.indexOf("gate")).toBeLessThan(exitAt);
+        expect(exitAt).toBeGreaterThanOrEqual(0);
+        expect(firstUnlink).toBeGreaterThan(exitAt);
+
+        for (const f of [PID, META, SOCK, TOKEN, OWNER]) {
+          expect(h.fs.files.has(f)).toBe(false);
+        }
+        expect(h.fs.files.has(CONTROL_JSON)).toBe(true);
+        expect(h.mgr.isInitialized).toBe(false);
+      },
+    );
+
+    it("async approved without confirmed exit sends no SIGKILL and unlinks nothing", async () => {
+      const h = harness({
+        gate: async () => APPROVED_CLEAR,
+        failure: "readiness",
+        stubborn: true,
+      });
+      const err = await startAndCollect(h.mgr);
+
+      expect(err).toBeInstanceOf(EngineRecoveryError);
+      expect((err as EngineRecoveryError).reason).toBe("exit_unconfirmed");
+      expect(h.proc().killSignals).toEqual(["SIGTERM"]);
+      expect(h.killSpy).not.toHaveBeenCalled();
+      expect(h.unlinks).toEqual([]);
+      expectFilesPreserved(h);
+    });
+
+    it.each([
+      ["refused", async () => ({ kind: "refused" }) as ControlGateResult, "refused"],
+      ["unavailable", async () => ({ kind: "unavailable" }) as ControlGateResult, "unavailable"],
+      ["timeout", async () => ({ kind: "timeout" }) as ControlGateResult, "timeout"],
+      ["malformed", async () => ({ kind: "malformed" }) as ControlGateResult, "malformed"],
+      ["bare boolean true", async () => true as unknown as ControlGateResult, "malformed"],
+      [
+        "approved without fileCleanup",
+        async () => ({ kind: "approved" }) as unknown as ControlGateResult,
+        "malformed",
+      ],
+      [
+        "approved with fail cleanup",
+        async () => ({ kind: "approved", fileCleanup: "fail" }) as unknown as ControlGateResult,
+        "malformed",
+      ],
+      [
+        "approved with extra field",
+        async () =>
+          ({ kind: "approved", fileCleanup: "clear", force: true }) as unknown as ControlGateResult,
+        "malformed",
+      ],
+      [
+        "throwing client",
+        async (): Promise<ControlGateResult> => {
+          throw new Error("socket exploded");
+        },
+        "unavailable",
+      ],
+    ] as const)(
+      "gate %s performs zero kill and zero unlink and returns a recovery error",
+      async (_label, gate, reason) => {
+        const h = harness({ gate, failure: "readiness" });
+        const err = await startAndCollect(h.mgr);
+
+        expect(err).toBeInstanceOf(EngineRecoveryError);
+        expect((err as EngineRecoveryError).reason).toBe(reason);
+        expect((err as EngineRecoveryError).stateDir).toBe(STATE_DIR);
+        expect((err as EngineRecoveryError).startupError?.message).toMatch(
+          /did not become ready/,
+        );
+        expect(h.asyncGateCalls()).toBe(1);
+        expectZeroKillZeroUnlink(h);
+        expectFilesPreserved(h);
+        expect(h.mgr.isInitialized).toBe(false);
+      },
+    );
+
+    it("missing async control client is unavailable: zero kill, zero unlink", async () => {
+      const h = harness({ gate: undefined, failure: "readiness" });
+      const err = await startAndCollect(h.mgr);
+
+      expect(err).toBeInstanceOf(EngineRecoveryError);
+      expect((err as EngineRecoveryError).reason).toBe("unavailable");
+      expectZeroKillZeroUnlink(h);
+      expectFilesPreserved(h);
+    });
+
+    it("effect root alone gates rollback even before any control artifact exists", async () => {
+      const h = harness({
+        gate: async () => REFUSED,
+        failure: "readiness",
+        artifacts: false,
+      });
+      const err = await startAndCollect(h.mgr);
+
+      expect(err).toBeInstanceOf(EngineRecoveryError);
+      expect((err as EngineRecoveryError).reason).toBe("refused");
+      expectZeroKillZeroUnlink(h);
+      expectFilesPreserved(h, [PID, META]);
+    });
+
+    it("control artifacts alone gate rollback without an effect root", async () => {
+      const h = harness({
+        gate: async () => REFUSED,
+        failure: "readiness",
+        effectRoot: false,
+      });
+      const err = await startAndCollect(h.mgr);
+
+      expect(err).toBeInstanceOf(EngineRecoveryError);
+      expect((err as EngineRecoveryError).reason).toBe("refused");
+      expectZeroKillZeroUnlink(h);
+      expectFilesPreserved(h);
+    });
+
+    it.each([
+      ["owner pid mismatch", 99999],
+      ["unparseable owner record", "unparseable"],
+    ] as const)(
+      "ownership unknown (%s) skips the gate and performs zero kill and zero unlink",
+      async (_label, ownerPid) => {
+        const h = harness({
+          gate: async () => APPROVED_CLEAR,
+          failure: "readiness",
+          ownerPid,
+        });
+        const err = await startAndCollect(h.mgr);
+
+        expect(err).toBeInstanceOf(EngineRecoveryError);
+        expect((err as EngineRecoveryError).reason).toBe("ownership_unknown");
+        expect(h.asyncGateCalls()).toBe(0);
+        expectZeroKillZeroUnlink(h);
+        expectFilesPreserved(h);
+      },
+    );
+
+    it.each(["exited", "exited_unready"] as const)(
+      "child exited before handshake (%s) skips the gate and preserves evidence/control state",
+      async (failure) => {
+        const h = harness({ gate: async () => APPROVED_CLEAR, failure });
+        const err = await startAndCollect(h.mgr);
+
+        expect(err).toBeInstanceOf(EngineRecoveryError);
+        expect((err as EngineRecoveryError).reason).toBe("exited_before_handshake");
+        expect(h.asyncGateCalls()).toBe(0);
+        expectZeroKillZeroUnlink(h);
+        expectFilesPreserved(h);
+      },
+    );
+
+    it("sync approved permits at most SIGTERM and never unlinks", async () => {
+      let syncCalls = 0;
+      const { deps, fs, spawnedProcesses } = createMockDeps({
+        requestControlDisableSync: () => {
+          syncCalls++;
+          return APPROVED_NOT_APPLICABLE;
+        },
+      });
+      const unlinks: string[] = [];
+      const baseUnlink = deps.unlink;
+      deps.unlink = (p) => {
+        unlinks.push(p);
+        baseUnlink(p);
+      };
+      setupConfigFile(fs);
+      const mgr = new EngineManager({
+        configPath: CONFIG_PATH,
+        port: 9800,
+        stateDir: STATE_DIR,
+        engineArgs: ["--effect-root", "/var/tmp/parapet-rev9-effect"],
+        deps,
+      });
+      await mgr.start();
+      fs.files.set(SOCK, "");
+      fs.files.set(TOKEN, "8".repeat(64));
+      fs.files.set(OWNER, JSON.stringify({ pid: spawnedProcesses[0].pid }));
+
+      mgr.stopSync();
+
+      expect(syncCalls).toBe(1);
+      expect(killSpy).toHaveBeenCalledOnce();
+      expect(killSpy).toHaveBeenCalledWith(spawnedProcesses[0].pid, "SIGTERM");
+      expect(killSpy).not.toHaveBeenCalledWith(expect.anything(), "SIGKILL");
+      expect(spawnedProcesses[0].killSignals).toEqual([]);
+      expect(unlinks).toEqual([]);
+      for (const f of [PID, META, SOCK, TOKEN, OWNER]) {
+        expect(fs.files.has(f)).toBe(true);
+      }
+      expect(mgr.isInitialized).toBe(true);
+    });
+
+    it("legacy ungated rollback applies only without effect root and without control artifacts", async () => {
+      const h = harness({
+        gate: async () => REFUSED,
+        failure: "readiness",
+        effectRoot: false,
+        artifacts: false,
+      });
+      const err = await startAndCollect(h.mgr);
+
+      expect(err).not.toBeInstanceOf(EngineRecoveryError);
+      expect((err as Error).message).toMatch(/did not become ready/);
+      expect(h.asyncGateCalls()).toBe(0);
+      expect(h.proc().killSignals).toContain("SIGTERM");
+      expect(h.fs.files.has(PID)).toBe(false);
+      expect(h.fs.files.has(META)).toBe(false);
+    });
+
+    it("stale gated control state is never unlinked ungated on restart", async () => {
+      const { deps, fs, spawnedProcesses } = createMockDeps({
+        fetch: async () => {
+          throw new Error("connection refused");
+        },
+      });
+      const unlinks: string[] = [];
+      deps.unlink = (p) => {
+        unlinks.push(p);
+        fs.files.delete(p);
+      };
+      setupConfigFile(fs);
+      fs.files.set(PID, "4242");
+      fs.files.set(SOCK, "");
+      fs.files.set(TOKEN, "9".repeat(64));
+      fs.files.set(OWNER, JSON.stringify({ pid: 4242 }));
+
+      const mgr = new EngineManager({
+        configPath: CONFIG_PATH,
+        port: 9800,
+        stateDir: STATE_DIR,
+        deps,
+      });
+      const err = await startAndCollect(mgr);
+
+      expect(err).toBeInstanceOf(EngineRecoveryError);
+      expect((err as EngineRecoveryError).reason).toBe("stale_control_state");
+      expect(spawnedProcesses).toHaveLength(0);
+      expect(unlinks).toEqual([]);
+      expect(killSpy).not.toHaveBeenCalled();
+      for (const f of [PID, SOCK, TOKEN, OWNER]) {
+        expect(fs.files.has(f)).toBe(true);
+      }
+    });
+  });
+
+  // -----------------------------------------------------------------------
   // Default Unix domain socket control-gate helpers (parapet-control/v0)
   // -----------------------------------------------------------------------
 
   describe("defaultRequestControlDisable and defaultRequestControlDisableSync", () => {
-    it("returns false when control.sock or control.token is missing or empty", async () => {
+    it("returns unavailable when control.sock or control.token is missing, empty, or not listening", async () => {
       const tmpDir = mkdtempSync("/tmp/p1d_ts_ctrl_missing_");
       chmodSync(tmpDir, 0o700);
       try {
-        expect(await defaultRequestControlDisable(tmpDir)).toBe(false);
-        expect(defaultRequestControlDisableSync(tmpDir)).toBe(false);
+        expect(await defaultRequestControlDisable(tmpDir)).toEqual({ kind: "unavailable" });
+        expect(defaultRequestControlDisableSync(tmpDir)).toEqual({ kind: "unavailable" });
 
         writeFileSync(join(tmpDir, "control.token"), "   \n", { mode: 0o600 });
         writeFileSync(join(tmpDir, "control.sock"), "", { mode: 0o600 });
-        expect(await defaultRequestControlDisable(tmpDir)).toBe(false);
-        expect(defaultRequestControlDisableSync(tmpDir)).toBe(false);
+        expect(await defaultRequestControlDisable(tmpDir)).toEqual({ kind: "unavailable" });
+        expect(defaultRequestControlDisableSync(tmpDir)).toEqual({ kind: "unavailable" });
+
+        // Token present but control.sock is a plain file, not a listener.
+        writeFileSync(join(tmpDir, "control.token"), "a".repeat(64), { mode: 0o600 });
+        expect(await defaultRequestControlDisable(tmpDir)).toEqual({ kind: "unavailable" });
+        expect(defaultRequestControlDisableSync(tmpDir)).toEqual({ kind: "unavailable" });
       } finally {
         rmSync(tmpDir, { recursive: true, force: true });
       }
@@ -1485,7 +1904,7 @@ describe("EngineManager", () => {
       const expectedToken = "f".repeat(64);
       writeFileSync(tokenPath, expectedToken, { mode: 0o600 });
 
-      let nextResponse: Record<string, unknown> = {
+      let nextResponse: Record<string, unknown> | string = {
         schema: "parapet-control/v0",
         ok: false,
         stop_approved: false,
@@ -1501,7 +1920,11 @@ describe("EngineManager", () => {
           if (buf.includes("\n")) {
             const line = buf.split("\n", 1)[0].trim();
             receivedRequests.push(JSON.parse(line));
-            conn.end(JSON.stringify(nextResponse) + "\n");
+            conn.end(
+              (typeof nextResponse === "string"
+                ? nextResponse
+                : JSON.stringify(nextResponse)) + "\n",
+            );
           }
         });
       });
@@ -1510,8 +1933,8 @@ describe("EngineManager", () => {
       chmodSync(sockPath, 0o600);
 
       try {
-        // 1. Refused (not_run) -> false.
-        expect(await defaultRequestControlDisable(tmpDir)).toBe(false);
+        // 1. Refused (not_run).
+        expect(await defaultRequestControlDisable(tmpDir)).toEqual({ kind: "refused" });
         expect(receivedRequests).toHaveLength(1);
         expect(receivedRequests[0]).toEqual({
           schema: "parapet-control/v0",
@@ -1519,7 +1942,7 @@ describe("EngineManager", () => {
           action: "disable",
         });
 
-        // 2. Approved (clear) -> true.
+        // 2. Approved (clear).
         nextResponse = {
           schema: "parapet-control/v0",
           ok: true,
@@ -1527,8 +1950,40 @@ describe("EngineManager", () => {
           file_cleanup: "clear",
           evidence_retained: true,
         };
-        expect(await defaultRequestControlDisable(tmpDir)).toBe(true);
+        expect(await defaultRequestControlDisable(tmpDir)).toEqual(APPROVED_CLEAR);
         expect(receivedRequests).toHaveLength(2);
+
+        // 3. Approved (not_applicable).
+        nextResponse = { ...nextResponse, file_cleanup: "not_applicable" };
+        expect(await defaultRequestControlDisable(tmpDir)).toEqual(
+          APPROVED_NOT_APPLICABLE,
+        );
+
+        // 4. Stop approved but file cleanup failed -> refused.
+        nextResponse = { ...nextResponse, file_cleanup: "fail" };
+        expect(await defaultRequestControlDisable(tmpDir)).toEqual({ kind: "refused" });
+
+        // 5. Non-JSON, wrong schema, and untyped fields -> malformed.
+        nextResponse = "not json";
+        expect(await defaultRequestControlDisable(tmpDir)).toEqual({ kind: "malformed" });
+        nextResponse = {
+          schema: "parapet-control/v1",
+          ok: true,
+          stop_approved: true,
+          file_cleanup: "clear",
+        };
+        expect(await defaultRequestControlDisable(tmpDir)).toEqual({ kind: "malformed" });
+        nextResponse = {
+          schema: "parapet-control/v0",
+          ok: "true",
+          stop_approved: true,
+          file_cleanup: "clear",
+        };
+        expect(await defaultRequestControlDisable(tmpDir)).toEqual({ kind: "malformed" });
+
+        // 6. Oversized response line -> malformed.
+        nextResponse = "x".repeat(5000);
+        expect(await defaultRequestControlDisable(tmpDir)).toEqual({ kind: "malformed" });
       } finally {
         await new Promise<void>((resolve) => server.close(() => resolve()));
         rmSync(tmpDir, { recursive: true, force: true });
@@ -1583,7 +2038,7 @@ describe("EngineManager", () => {
         });
         chmodSync(sockPath, 0o600);
 
-        expect(defaultRequestControlDisableSync(tmpDir)).toBe(true);
+        expect(defaultRequestControlDisableSync(tmpDir)).toEqual(APPROVED_CLEAR);
         await exited;
         expect(JSON.parse(readFileSync(requestPath, "utf-8"))).toEqual({
           schema: "parapet-control/v0",

@@ -45,53 +45,135 @@ export interface SidecarDeps {
   removeBeforeExitHandler(handler: () => void): void;
   onExit(handler: () => void): void;
   removeExitHandler(handler: () => void): void;
-  requestControlDisable?(stateDir: string): Promise<boolean>;
-  requestControlDisableSync?(stateDir: string): boolean;
+  requestControlDisable?(stateDir: string): Promise<ControlGateResult>;
+  requestControlDisableSync?(stateDir: string): ControlGateResult;
+}
+
+/**
+ * Closed result of one authenticated control-socket disable handshake.
+ *
+ * Only `approved` permits a signal; every other kind leaves the engine and
+ * all control state untouched.
+ */
+export type ControlGateResult =
+  | { kind: "approved"; fileCleanup: "clear" | "not_applicable" }
+  | { kind: "refused" }
+  | { kind: "unavailable" }
+  | { kind: "timeout" }
+  | { kind: "malformed" };
+
+/** Raised when startup rollback cannot prove it may stop and clean up. */
+export class EngineRecoveryError extends Error {
+  constructor(
+    readonly reason:
+      | ControlGateResult["kind"]
+      | "ownership_unknown"
+      | "exited_before_handshake"
+      | "exit_unconfirmed"
+      | "stale_control_state",
+    readonly stateDir: string,
+    readonly startupError?: Error,
+  ) {
+    super(
+      `Parapet engine recovery required (${reason}): engine and control ` +
+        `state were preserved in ${stateDir}.` +
+        (startupError ? ` Startup failure: ${startupError.message}` : ""),
+    );
+    this.name = "EngineRecoveryError";
+  }
 }
 
 const CONTROL_SCHEMA = "parapet-control/v0";
 const CONTROL_TIMEOUT_MS = 5_000;
 const MAX_CONTROL_LINE_BYTES = 4096;
 
-interface ControlDisableResponse {
-  schema?: unknown;
-  ok?: unknown;
-  stop_approved?: unknown;
-  file_cleanup?: unknown;
+const UNAVAILABLE: ControlGateResult = { kind: "unavailable" };
+const TIMEOUT: ControlGateResult = { kind: "timeout" };
+const MALFORMED: ControlGateResult = { kind: "malformed" };
+const REFUSED: ControlGateResult = { kind: "refused" };
+
+/** Classify one raw `parapet-control/v0` disable response line. */
+function classifyControlDisableLine(rawLine: string): ControlGateResult {
+  let resp: unknown;
+  try {
+    resp = JSON.parse(rawLine);
+  } catch {
+    return MALFORMED;
+  }
+  if (resp === null || typeof resp !== "object" || Array.isArray(resp)) {
+    return MALFORMED;
+  }
+  const obj = resp as Record<string, unknown>;
+  if (
+    obj.schema !== CONTROL_SCHEMA ||
+    typeof obj.ok !== "boolean" ||
+    typeof obj.stop_approved !== "boolean"
+  ) {
+    return MALFORMED;
+  }
+  if (
+    obj.ok &&
+    obj.stop_approved &&
+    (obj.file_cleanup === "clear" || obj.file_cleanup === "not_applicable")
+  ) {
+    return { kind: "approved", fileCleanup: obj.file_cleanup };
+  }
+  return REFUSED;
 }
 
-function isApprovedControlDisable(resp: unknown): boolean {
-  if (resp === null || typeof resp !== "object") return false;
-  const obj = resp as ControlDisableResponse;
-  return (
-    obj.schema === CONTROL_SCHEMA &&
-    obj.ok === true &&
-    obj.stop_approved === true &&
-    (obj.file_cleanup === "clear" || obj.file_cleanup === "not_applicable")
-  );
+/**
+ * Accept only an exact `ControlGateResult` from an injected client; any other
+ * value (including a bare boolean) is `malformed`.
+ */
+function normalizeControlGateResult(value: unknown): ControlGateResult {
+  if (value === null || typeof value !== "object") return MALFORMED;
+  const obj = value as Record<string, unknown>;
+  const keys = Object.keys(obj).sort().join(",");
+  switch (obj.kind) {
+    case "approved":
+      if (
+        keys === "fileCleanup,kind" &&
+        (obj.fileCleanup === "clear" || obj.fileCleanup === "not_applicable")
+      ) {
+        return { kind: "approved", fileCleanup: obj.fileCleanup };
+      }
+      return MALFORMED;
+    case "refused":
+    case "unavailable":
+    case "timeout":
+    case "malformed":
+      return keys === "kind" ? { kind: obj.kind } : MALFORMED;
+    default:
+      return MALFORMED;
+  }
+}
+
+function readControlToken(stateDir: string): string | null {
+  const sockPath = join(stateDir, "control.sock");
+  const tokenPath = join(stateDir, "control.token");
+  try {
+    if (!existsSync(sockPath) || !existsSync(tokenPath)) {
+      return null;
+    }
+    const token = readFileSync(tokenPath, "utf-8").trim();
+    return token ? token : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Default async authenticated control-socket disable handshake. */
 export function defaultRequestControlDisable(
   stateDir: string,
-): Promise<boolean> {
+): Promise<ControlGateResult> {
   if (process.platform === "win32") {
-    return Promise.resolve(false);
+    return Promise.resolve(UNAVAILABLE);
+  }
+  const token = readControlToken(stateDir);
+  if (token === null) {
+    return Promise.resolve(UNAVAILABLE);
   }
   const sockPath = join(stateDir, "control.sock");
-  const tokenPath = join(stateDir, "control.token");
-  let token: string;
-  try {
-    if (!existsSync(sockPath) || !existsSync(tokenPath)) {
-      return Promise.resolve(false);
-    }
-    token = readFileSync(tokenPath, "utf-8").trim();
-    if (!token) {
-      return Promise.resolve(false);
-    }
-  } catch {
-    return Promise.resolve(false);
-  }
 
   const payload =
     JSON.stringify({
@@ -100,9 +182,9 @@ export function defaultRequestControlDisable(
       action: "disable",
     }) + "\n";
 
-  return new Promise<boolean>((resolve) => {
+  return new Promise<ControlGateResult>((resolve) => {
     let settled = false;
-    const finish = (result: boolean): void => {
+    const finish = (result: ControlGateResult): void => {
       if (settled) return;
       settled = true;
       resolve(result);
@@ -112,9 +194,12 @@ export function defaultRequestControlDisable(
     const chunks: Buffer[] = [];
     let received = 0;
 
+    const firstLine = (): string =>
+      Buffer.concat(chunks).toString("utf-8").split("\n", 1)[0].trim();
+
     const timer = setTimeout(() => {
       sock.destroy();
-      finish(false);
+      finish(TIMEOUT);
     }, CONTROL_TIMEOUT_MS);
 
     sock.on("connect", () => {
@@ -127,100 +212,96 @@ export function defaultRequestControlDisable(
       if (received > MAX_CONTROL_LINE_BYTES) {
         clearTimeout(timer);
         sock.destroy();
-        finish(false);
+        finish(MALFORMED);
         return;
       }
       if (chunk.includes(0x0a)) {
         clearTimeout(timer);
         sock.end();
-        const rawLine = Buffer.concat(chunks)
-          .toString("utf-8")
-          .split("\n", 1)[0]
-          .trim();
-        try {
-          finish(isApprovedControlDisable(JSON.parse(rawLine)));
-        } catch {
-          finish(false);
-        }
+        finish(classifyControlDisableLine(firstLine()));
       }
     });
 
     sock.on("end", () => {
       clearTimeout(timer);
-      if (chunks.length === 0 || received > MAX_CONTROL_LINE_BYTES) {
-        finish(false);
-        return;
-      }
-      const rawLine = Buffer.concat(chunks)
-        .toString("utf-8")
-        .split("\n", 1)[0]
-        .trim();
-      try {
-        finish(isApprovedControlDisable(JSON.parse(rawLine)));
-      } catch {
-        finish(false);
-      }
+      finish(chunks.length === 0 ? UNAVAILABLE : classifyControlDisableLine(firstLine()));
     });
 
     sock.on("error", () => {
       clearTimeout(timer);
-      finish(false);
+      finish(UNAVAILABLE);
     });
   });
 }
 
+// Exit codes of the synchronous handshake helper process. On success the
+// helper prints the raw response line, which the parent classifies.
+const SYNC_EXIT_LINE = 0;
+const SYNC_EXIT_UNAVAILABLE = 30;
+const SYNC_EXIT_TIMEOUT = 40;
+const SYNC_EXIT_MALFORMED = 50;
+
 /** Default synchronous authenticated control-socket disable handshake. */
-export function defaultRequestControlDisableSync(stateDir: string): boolean {
+export function defaultRequestControlDisableSync(
+  stateDir: string,
+): ControlGateResult {
   if (process.platform === "win32") {
-    return false;
+    return UNAVAILABLE;
+  }
+  const token = readControlToken(stateDir);
+  if (token === null) {
+    return UNAVAILABLE;
   }
   const sockPath = join(stateDir, "control.sock");
-  const tokenPath = join(stateDir, "control.token");
-  let token: string;
-  try {
-    if (!existsSync(sockPath) || !existsSync(tokenPath)) {
-      return false;
-    }
-    token = readFileSync(tokenPath, "utf-8").trim();
-    if (!token) {
-      return false;
-    }
-  } catch {
-    return false;
-  }
 
   const script = [
     'const net = require("node:net");',
     "const [sockPath, token] = process.argv.slice(1);",
     'const req = JSON.stringify({ schema: "parapet-control/v0", token, action: "disable" }) + "\\n";',
     "const s = net.createConnection(sockPath);",
-    'let buf = "";',
-    "const t = setTimeout(() => { s.destroy(); process.exit(1); }, 5000);",
+    "const chunks = [];",
+    "let received = 0;",
+    "let finished = false;",
+    `const done = (code, line) => { if (finished) return; finished = true; clearTimeout(t); s.destroy(); if (line !== undefined) process.stdout.write(line + "\\n"); process.exitCode = code; };`,
+    `const t = setTimeout(() => done(${SYNC_EXIT_TIMEOUT}), ${CONTROL_TIMEOUT_MS});`,
     's.on("connect", () => s.write(req));',
     's.on("data", (d) => {',
-    '  buf += d.toString("utf-8");',
-    "  if (buf.length > 4096) { clearTimeout(t); s.destroy(); process.exit(1); }",
-    '  if (buf.includes("\\n")) {',
-    "    clearTimeout(t);",
-    "    s.end();",
-    "    try {",
-    '      const r = JSON.parse(buf.split("\\n", 1)[0].trim());',
-    '      const ok = r && r.schema === "parapet-control/v0" && r.ok === true && r.stop_approved === true && (r.file_cleanup === "clear" || r.file_cleanup === "not_applicable");',
-    "      process.exit(ok ? 0 : 1);",
-    "    } catch { process.exit(1); }",
+    "  chunks.push(d);",
+    "  received += d.length;",
+    `  if (received > ${MAX_CONTROL_LINE_BYTES}) return done(${SYNC_EXIT_MALFORMED});`,
+    "  const buf = Buffer.concat(chunks);",
+    "  if (buf.includes(0x0a)) {",
+    `    done(${SYNC_EXIT_LINE}, buf.toString("utf-8").split("\\n", 1)[0].trim());`,
     "  }",
     "});",
-    's.on("error", () => { clearTimeout(t); process.exit(1); });',
+    `s.on("end", () => { if (chunks.length === 0) return done(${SYNC_EXIT_UNAVAILABLE}); done(${SYNC_EXIT_LINE}, Buffer.concat(chunks).toString("utf-8").split("\\n", 1)[0].trim()); });`,
+    `s.on("error", () => done(${SYNC_EXIT_UNAVAILABLE}));`,
   ].join("\n");
 
   try {
     const res = spawnSync(process.execPath, ["-e", script, sockPath, token], {
-      timeout: CONTROL_TIMEOUT_MS,
-      stdio: "ignore",
+      timeout: CONTROL_TIMEOUT_MS + 1_000,
+      stdio: ["ignore", "pipe", "ignore"],
+      maxBuffer: MAX_CONTROL_LINE_BYTES * 2,
+      encoding: "utf-8",
     });
-    return res.status === 0;
+    if (res.error) {
+      return (res.error as NodeJS.ErrnoException).code === "ETIMEDOUT"
+        ? TIMEOUT
+        : UNAVAILABLE;
+    }
+    switch (res.status) {
+      case SYNC_EXIT_LINE:
+        return classifyControlDisableLine(String(res.stdout).split("\n", 1)[0]);
+      case SYNC_EXIT_UNAVAILABLE:
+        return UNAVAILABLE;
+      case SYNC_EXIT_TIMEOUT:
+        return TIMEOUT;
+      default:
+        return MALFORMED;
+    }
   } catch {
-    return false;
+    return UNAVAILABLE;
   }
 }
 
@@ -322,8 +403,6 @@ export class EngineManager {
   private initialized = false;
   /** True when we spawned the process; false when reusing from PID/owner file. */
   private ownsProcess = false;
-  /** True during startup readiness rollback before control gate is active. */
-  private rollingBackStartup = false;
   /** Canonical config path resolved via realpath, set during start(). */
   private _canonicalConfigPath: string | null = null;
   /** SHA-256 of config contents, set during start(). */
@@ -481,7 +560,11 @@ export class EngineManager {
         );
       }
 
-      // Stale or mismatched and port is free — clean up files.
+      // Stale or mismatched and port is free — clean up files, unless they
+      // may belong to a gated engine whose evidence must be recovered first.
+      if (this.requiresControlGate()) {
+        throw new EngineRecoveryError("stale_control_state", this.parapetDir);
+      }
       this.cleanupFiles();
     } else if (this._stateDir !== null && this.deps.exists(this.ownerPath)) {
       const owner = this.readOwnerRecord();
@@ -546,28 +629,20 @@ export class EngineManager {
     try {
       await this.waitForReady();
     } catch (err) {
-      this.rollingBackStartup = true;
-      try {
-        await this.stop();
-      } finally {
-        this.rollingBackStartup = false;
-      }
-      throw err;
+      throw await this.rollbackStartup(
+        err instanceof Error ? err : new Error(String(err)),
+      );
     }
 
     // Verify our child process is still alive — if it exited immediately,
     // the readiness heartbeat may have hit a stale listener on the port.
     const exitCode = this.process.exitCode;
     if (exitCode !== null) {
-      this.rollingBackStartup = true;
-      try {
-        await this.stop();
-      } finally {
-        this.rollingBackStartup = false;
-      }
-      throw new Error(
-        `Engine process exited immediately with code ${exitCode}. ` +
-          `Check ${this.logPath} for details.`,
+      throw await this.rollbackStartup(
+        new Error(
+          `Engine process exited immediately with code ${exitCode}. ` +
+            `Check ${this.logPath} for details.`,
+        ),
       );
     }
 
@@ -607,10 +682,14 @@ export class EngineManager {
         return;
       }
 
-      const gated = !this.rollingBackStartup && this.requiresControlGate();
+      const gated = this.requiresControlGate();
       if (gated) {
-        const approved = await this.checkControlGateAsync();
-        if (!approved) {
+        if (!this.ownershipConfirmed()) {
+          // Cannot prove the gated engine is ours: leave everything intact.
+          return;
+        }
+        const gate = await this.checkControlGateAsync();
+        if (gate.kind !== "approved") {
           // Refused by cleanup gate: leave child process and control files intact.
           return;
         }
@@ -652,28 +731,26 @@ export class EngineManager {
     }
 
     if (this.requiresControlGate()) {
-      const approved = this.checkControlGateSync();
-      if (!approved) {
-        // Refused or unable to complete synchronous handshake: leave engine
-        // and all control state intact and never send SIGKILL or unlink files.
+      if (!this.ownershipConfirmed()) {
         return;
       }
-      if (this.process?.pid && this.process.exitCode === null) {
+      const gate = this.checkControlGateSync();
+      if (gate.kind !== "approved") {
+        // Refused or unable to complete synchronous handshake: leave engine
+        // and all control state intact and never signal or unlink files.
+        return;
+      }
+      // Approved synchronously: request a graceful stop at most. Exit cannot
+      // be confirmed synchronously, so every control file and the manager's
+      // live state are preserved for recovery.
+      const proc = this.process;
+      if (proc?.pid && !hasExited(proc)) {
         try {
-          process.kill(this.process.pid, "SIGKILL");
+          process.kill(proc.pid, "SIGTERM");
         } catch {
-          // Without proof that the process stopped, preserve its reachable
-          // state instead of claiming successful synchronous shutdown.
-          return;
+          // Preserve state either way.
         }
       }
-      this.stopHeartbeat();
-      this.removeShutdownHandlers();
-      this.closeLogFd();
-      this.cleanupFiles();
-      this.process = null;
-      this.initialized = false;
-      this.ownsProcess = false;
       return;
     }
 
@@ -708,25 +785,85 @@ export class EngineManager {
     );
   }
 
-  private async checkControlGateAsync(): Promise<boolean> {
-    if (!this.deps.requestControlDisable) {
+  /**
+   * True only when this manager spawned the live child it holds and any
+   * engine owner record names that same pid.
+   */
+  private ownershipConfirmed(): boolean {
+    const pid = this.process?.pid;
+    if (!this.ownsProcess || typeof pid !== "number") {
       return false;
     }
+    if (!this.deps.exists(this.ownerPath)) {
+      return true;
+    }
+    return this.readOwnerRecord()?.pid === pid;
+  }
+
+  /**
+   * Roll back a spawned engine whose startup failed; returns the error the
+   * caller throws.
+   *
+   * Without an effect root or any control/token/owner artifact this is the
+   * legacy ungated stop. Otherwise only an async approved gate permits
+   * SIGTERM, and controls are removed only after confirmed exit. Every other
+   * state sends no signal, unlinks nothing, and yields a recovery error.
+   */
+  private async rollbackStartup(startupError: Error): Promise<Error> {
+    if (!this.requiresControlGate()) {
+      await this.stop();
+      return startupError;
+    }
+    const recovery = (reason: EngineRecoveryError["reason"]): Error =>
+      new EngineRecoveryError(reason, this.parapetDir, startupError);
+
+    const proc = this.process;
+    if (proc === null || !this.ownershipConfirmed()) {
+      return recovery("ownership_unknown");
+    }
+    if (hasExited(proc)) {
+      return recovery("exited_before_handshake");
+    }
+    const gate = await this.checkControlGateAsync();
+    if (gate.kind !== "approved") {
+      return recovery(gate.kind);
+    }
+    if (!(await this.terminateProcess(proc, false))) {
+      return recovery("exit_unconfirmed");
+    }
+    this.process = null;
+    this.stopHeartbeat();
+    this.removeShutdownHandlers();
+    this.closeLogFd();
+    this.cleanupFiles();
+    this.initialized = false;
+    this.ownsProcess = false;
+    return startupError;
+  }
+
+  private async checkControlGateAsync(): Promise<ControlGateResult> {
+    if (!this.deps.requestControlDisable) {
+      return UNAVAILABLE;
+    }
     try {
-      return await this.deps.requestControlDisable(this.parapetDir);
+      return normalizeControlGateResult(
+        await this.deps.requestControlDisable(this.parapetDir),
+      );
     } catch {
-      return false;
+      return UNAVAILABLE;
     }
   }
 
-  private checkControlGateSync(): boolean {
+  private checkControlGateSync(): ControlGateResult {
     if (!this.deps.requestControlDisableSync) {
-      return false;
+      return UNAVAILABLE;
     }
     try {
-      return this.deps.requestControlDisableSync(this.parapetDir);
+      return normalizeControlGateResult(
+        this.deps.requestControlDisableSync(this.parapetDir),
+      );
     } catch {
-      return false;
+      return UNAVAILABLE;
     }
   }
 
@@ -889,10 +1026,11 @@ export class EngineManager {
       try {
         proc.kill("SIGTERM");
       } catch {
-        // Already dead.
+        // Ungated stop treats a failed signal as already dead; a gated stop
+        // requires observed exit before controls may be removed.
         clearTimeout(timeout);
         proc.removeListener("exit", onExit);
-        resolve(true);
+        resolve(allowSigkill || hasExited(proc));
       }
     });
   }
@@ -950,6 +1088,10 @@ export class EngineManager {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+function hasExited(proc: ChildProcess): boolean {
+  return proc.exitCode !== null || (proc.signalCode ?? null) !== null;
+}
 
 function hasFlag(args: readonly string[], flag: string): boolean {
   return args.some((a) => a === flag || a.startsWith(`${flag}=`));
