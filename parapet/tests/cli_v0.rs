@@ -1125,7 +1125,7 @@ mod story2_r1b {
             let stdout_str = String::from_utf8(inspect_out.stdout.clone()).expect("utf8 stdout");
             assert!(
                 stdout_str.starts_with(&format!(
-                    "{{\"schema\":\"parapet-cli-inspect/v0\",\"run_id\":\"{run_id_hex}\",\"outcome\":\"complete\",\"cleanup\":\"not_started\",\"banner\":null,\"reader_code\":null,\"labels\":{{\"summary\":"
+                    "{{\"schema\":\"parapet-cli-inspect/v0\",\"run_id\":\"{run_id_hex}\",\"outcome\":\"complete\",\"cleanup\":\"not_started\",\"banner\":null,\"reader_code\":null,\"projection_code\":null,\"labels\":{{\"summary\":"
                 )),
                 "unexpected inspect --json prefix: {stdout_str}"
             );
@@ -2025,6 +2025,7 @@ mod story2_r1b {
             Some(CleanupStateV0::NotStarted),
             Some(STORAGE_FAILURE_BANNER),
             Some(ReaderErrorV0::StorageIncomplete),
+            None,
             Some(&expected_proj_bytes),
             false,
         );
@@ -2035,6 +2036,7 @@ mod story2_r1b {
             Some(CleanupStateV0::NotStarted),
             Some(STORAGE_FAILURE_BANNER),
             Some(ReaderErrorV0::StorageIncomplete),
+            None,
             Some(&expected_proj_bytes),
         );
         assert_eq!(spliced, inc_json.stdout);
@@ -2074,7 +2076,302 @@ mod story2_r1b {
             mismatch_val["labels"]["reader"].as_str(),
             Some("reader: terminal_status_mismatch")
         );
+        assert!(mismatch_val["projection_code"].is_null());
         assert!(mismatch_val["projection"].is_null());
+    }
+
+    /// Run `inspect` in JSON and human mode; return (exit, json stdout, human stdout).
+    fn inspect_both(
+        state_dir: &Path,
+        run_id_hex: &str,
+        claimed: Option<&str>,
+    ) -> (i32, Vec<u8>, String) {
+        let mut args = vec![
+            "inspect",
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--run-id",
+            run_id_hex,
+        ];
+        if let Some(c) = claimed {
+            args.extend(["--claimed-outcome", c]);
+        }
+        let human = run_parapet(&args, None);
+        args.push("--json");
+        let json = run_parapet(&args, None);
+        assert!(json.stderr.is_empty() && human.stderr.is_empty());
+        assert_eq!(json.status.code(), human.status.code());
+        (
+            json.status.code().unwrap(),
+            json.stdout,
+            String::from_utf8(human.stdout).expect("utf8 human"),
+        )
+    }
+
+    /// Exact CLI output rendered from the redacted view alone.
+    fn rendered_from_view(
+        state_dir: &Path,
+        run_id_hex: &str,
+        claimed: Option<TerminalOutcomeV0>,
+    ) -> (i32, Vec<u8>, String) {
+        let store = ProtectedEvidenceStoreV0::open(&state_dir.join("receipt-evidence"))
+            .expect("open store");
+        let view = RedactedEvidenceReaderV0::new(&store)
+            .view(&RunIdV0::parse(run_id_hex).unwrap(), claimed);
+        let exit = if view.reader_code.is_none()
+            && view.projection_code.is_none()
+            && view.outcome == Some(TerminalOutcomeV0::Complete)
+        {
+            0
+        } else {
+            4
+        };
+        let json = splice_inspect_json(
+            run_id_hex,
+            view.outcome,
+            view.cleanup,
+            view.banner,
+            view.reader_code,
+            view.projection_code,
+            view.projection_bytes.as_deref(),
+        );
+        let human = render_inspect_human(
+            run_id_hex,
+            view.outcome,
+            view.cleanup,
+            view.banner,
+            view.reader_code,
+            view.projection_code,
+            view.projection_bytes.as_deref(),
+            false,
+        );
+        (exit, json, human)
+    }
+
+    fn release_run(state_dir: &Path, run_id_hex: &str) {
+        let store = ProtectedEvidenceStoreV0::open(&state_dir.join("receipt-evidence"))
+            .expect("open store");
+        assert_eq!(
+            store.cleanup_run(&RunIdV0::parse(run_id_hex).unwrap()),
+            CleanupResultV0::Clear
+        );
+    }
+
+    pub(super) fn cli_inspect_consumes_redacted_projection_code_only() {
+        // Source witness (D2-C3, correction1 C6): the CLI holds no protected reader or layout
+        // path, and `verification_error_code` is never sourced from either reader code.
+        let cli_source = include_str!("../src/cli/mod.rs");
+        for forbidden in [
+            "ProtectedEvidenceReaderV0",
+            "projection/sha256",
+            "projection_path",
+            "object_locked",
+        ] {
+            assert!(
+                !cli_source.contains(forbidden),
+                "cli/mod.rs uses {forbidden}"
+            );
+        }
+        for line in cli_source.lines() {
+            if line.contains("verification_error_code") || line.contains("ver_err") {
+                assert!(
+                    !line.contains("reader_code") && !line.contains("projection_code"),
+                    "verification_error_code sourced from a reader code: {line}"
+                );
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let state_dir = dir.path().join("state");
+        assert_eq!(
+            run_parapet(&["init", "--state-dir", state_dir.to_str().unwrap()], None)
+                .status
+                .code(),
+            Some(0)
+        );
+        let row: Row = serde_json::from_str(include_str!(
+            "fixtures/cli_v0/f71_unresolved_bounded_row.json"
+        ))
+        .unwrap();
+        let complete = "000000000000000000000000000000d1";
+        let released = "000000000000000000000000000000d2";
+        let incomplete = "000000000000000000000000000000d3";
+        let corrupt = "000000000000000000000000000000d4";
+        let missing = "000000000000000000000000000000d5";
+        for run in [complete, released, corrupt] {
+            persist_row_in_store(&state_dir, run, &row, TerminalOutcomeV0::Complete, None);
+        }
+        persist_row_in_store(
+            &state_dir,
+            incomplete,
+            &row,
+            TerminalOutcomeV0::StorageIncomplete,
+            None,
+        );
+        release_run(&state_dir, released);
+        let store = ProtectedEvidenceStoreV0::open(&state_dir.join("receipt-evidence"))
+            .expect("open store");
+        let corrupt_manifest = store
+            .manifest(&RunIdV0::parse(corrupt).unwrap())
+            .expect("manifest");
+        let projection_entry = corrupt_manifest
+            .objects
+            .iter()
+            .find(|e| e.kind == StageKindV0::Projection)
+            .expect("projection entry");
+        let projection_file = state_dir
+            .join("receipt-evidence")
+            .join(&projection_entry.path);
+        drop(store);
+        // Identical rows share one projection object; corrupt it only while inspecting `corrupt`.
+        let mut bytes = std::fs::read(&projection_file).unwrap();
+        let original = bytes.clone();
+        bytes[3] ^= 1;
+
+        #[rustfmt::skip]
+        let cases: [(&str, Option<&str>, Option<TerminalOutcomeV0>, Option<&str>, Option<&str>); 6] = [
+            (complete, None, None, None, None),
+            (released, None, None, None, Some("object_released")),
+            (complete, Some("storage_incomplete"), Some(TerminalOutcomeV0::StorageIncomplete), Some("terminal_status_mismatch"), None),
+            (incomplete, None, None, Some("storage_incomplete"), None),
+            (missing, None, None, Some("run_manifest_missing"), None),
+            (corrupt, None, None, None, Some("object_digest_mismatch")),
+        ];
+        for (run, claimed_arg, claimed, reader_code, projection_code) in cases {
+            if run == corrupt {
+                std::fs::write(&projection_file, &bytes).unwrap();
+            }
+            let observed = inspect_both(&state_dir, run, claimed_arg);
+            let expected = rendered_from_view(&state_dir, run, claimed);
+            if run == corrupt {
+                std::fs::write(&projection_file, &original).unwrap();
+            }
+            assert_eq!(
+                observed, expected,
+                "{run}: CLI output is exactly the redacted view"
+            );
+            let val: Value = serde_json::from_slice(&observed.1).unwrap();
+            let marker = b",\"projection\":";
+            assert_eq!(
+                observed
+                    .1
+                    .windows(marker.len())
+                    .filter(|w| w == marker)
+                    .count(),
+                1,
+                "{run}: the spliced projection key is unique"
+            );
+            assert_eq!(val["reader_code"].as_str(), reader_code, "{run}");
+            assert_eq!(val["projection_code"].as_str(), projection_code, "{run}");
+            assert_eq!(
+                val["labels"]["projection_code"].as_str().map(str::to_owned),
+                projection_code.map(|c| format!("projection: {c}")),
+                "{run}"
+            );
+            assert!(val.get("verification_error_code").is_none());
+            if let Some(code) = projection_code {
+                assert!(
+                    observed.2.contains(&format!("projection: {code}\n")),
+                    "{run}"
+                );
+                assert!(!observed.2.contains(&format!("reader: {code}")), "{run}");
+                assert!(val["projection"].is_null());
+                assert_eq!(observed.0, 4);
+            }
+        }
+    }
+
+    pub(super) fn cli_inspect_complete_released_projection_code_rev9() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let state_dir = dir.path().join("state");
+        assert_eq!(
+            run_parapet(&["init", "--state-dir", state_dir.to_str().unwrap()], None)
+                .status
+                .code(),
+            Some(0)
+        );
+        let row: Row = serde_json::from_str(include_str!(
+            "fixtures/cli_v0/f71_unresolved_bounded_row.json"
+        ))
+        .unwrap();
+        let run = "000000000000000000000000000000e1";
+        persist_row_in_store(&state_dir, run, &row, TerminalOutcomeV0::Complete, None);
+        release_run(&state_dir, run);
+        let (exit, json, human) = inspect_both(&state_dir, run, None);
+        assert_eq!(exit, 4);
+        let val: Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(val["outcome"].as_str(), Some("complete"));
+        assert_eq!(val["cleanup"].as_str(), Some("clear"));
+        assert!(val["banner"].is_null());
+        assert!(val["reader_code"].is_null());
+        assert_eq!(val["projection_code"].as_str(), Some("object_released"));
+        assert!(val["labels"]["reader"].is_null());
+        assert_eq!(
+            val["labels"]["projection_code"].as_str(),
+            Some("projection: object_released")
+        );
+        assert!(val["projection"].is_null());
+        assert_eq!(
+            human,
+            format!(
+                "run_id: {run}\nterminal_outcome: complete\nevidence_cleanup_state: clear\nprojection: object_released\n"
+            )
+        );
+    }
+
+    pub(super) fn cli_inspect_projection_code_layout_independence_rev9() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let state_dir = dir.path().join("state");
+        assert_eq!(
+            run_parapet(&["init", "--state-dir", state_dir.to_str().unwrap()], None)
+                .status
+                .code(),
+            Some(0)
+        );
+        let row: Row = serde_json::from_str(include_str!(
+            "fixtures/cli_v0/f71_unresolved_bounded_row.json"
+        ))
+        .unwrap();
+        let run = "000000000000000000000000000000e2";
+        let run_id = RunIdV0::parse(run).unwrap();
+        persist_row_in_store(&state_dir, run, &row, TerminalOutcomeV0::Complete, None);
+        release_run(&state_dir, run);
+        let evidence_root = state_dir.join("receipt-evidence");
+        let view_of = || {
+            let store = ProtectedEvidenceStoreV0::open(&evidence_root).expect("open store");
+            RedactedEvidenceReaderV0::new(&store).view(&run_id, None)
+        };
+        let before_view = view_of();
+        let before = inspect_both(&state_dir, run, None);
+        assert_eq!(before, rendered_from_view(&state_dir, run, None));
+
+        // Change the protected layout: plant readable bytes at every conventional object path
+        // the released run names, including `projection/sha256/<row>.json`.
+        let store = ProtectedEvidenceStoreV0::open(&evidence_root).expect("open store");
+        let manifest = store.manifest(&run_id).expect("manifest");
+        drop(store);
+        let mut planted = 0;
+        for entry in &manifest.objects {
+            let path = evidence_root.join(&entry.path);
+            if !path.exists() {
+                std::fs::write(&path, b"{\"planted\":true}").unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+                planted += 1;
+            }
+        }
+        assert!(planted > 0, "release unlinked the run's private objects");
+        assert!(manifest
+            .objects
+            .iter()
+            .any(|e| e.kind == StageKindV0::Projection && evidence_root.join(&e.path).exists()));
+
+        assert_eq!(view_of(), before_view, "redacted result held constant");
+        let after = inspect_both(&state_dir, run, None);
+        assert_eq!(
+            after, before,
+            "CLI output is governed only by the redacted result"
+        );
+        assert!(!after.2.contains("planted"));
     }
 }
 
@@ -2094,6 +2391,24 @@ fn cli_redaction_and_target_text_path_preservation() {
 #[test]
 fn cli_inspect_json_preserves_exact_projection_bytes() {
     story2_r1b::cli_inspect_json_preserves_exact_projection_bytes();
+}
+
+#[cfg(not(windows))]
+#[test]
+fn cli_inspect_consumes_redacted_projection_code_only() {
+    story2_r1b::cli_inspect_consumes_redacted_projection_code_only();
+}
+
+#[cfg(not(windows))]
+#[test]
+fn cli_inspect_complete_released_projection_code_rev9() {
+    story2_r1b::cli_inspect_complete_released_projection_code_rev9();
+}
+
+#[cfg(not(windows))]
+#[test]
+fn cli_inspect_projection_code_layout_independence_rev9() {
+    story2_r1b::cli_inspect_projection_code_layout_independence_rev9();
 }
 
 #[cfg(not(windows))]
@@ -3991,7 +4306,8 @@ layers:
                 .unwrap()
         );
 
-        // 7. Inspect AFTER `evidence release` -> `cleanup == "clear"` and `reader_code == "object_released"` (`AC-1D-12`)
+        // 7. Inspect AFTER `evidence release` -> `cleanup == "clear"`, no `reader_code`, and
+        // redacted `projection_code == "object_released"` (`AC-1D-12`, Rev 9 D2)
         let inspect_after_release_json = run_parapet(
             &[
                 "inspect",
@@ -4008,17 +4324,19 @@ layers:
             serde_json::from_slice(&inspect_after_release_json.stdout).unwrap();
         assert_eq!(val_after_release["outcome"].as_str(), Some("complete"));
         assert_eq!(val_after_release["cleanup"].as_str(), Some("clear"));
+        assert!(val_after_release["reader_code"].is_null());
         assert_eq!(
-            val_after_release["reader_code"].as_str(),
+            val_after_release["projection_code"].as_str(),
             Some("object_released")
         );
         assert_eq!(
             val_after_release["labels"]["evidence_cleanup"].as_str(),
             Some("evidence cleanup: clear")
         );
+        assert!(val_after_release["labels"]["reader"].is_null());
         assert_eq!(
-            val_after_release["labels"]["reader"].as_str(),
-            Some("reader: object_released")
+            val_after_release["labels"]["projection_code"].as_str(),
+            Some("projection: object_released")
         );
         assert!(val_after_release["projection"].is_null());
 
@@ -4036,7 +4354,8 @@ layers:
         let human_after_release =
             String::from_utf8(inspect_after_release_human.stdout).expect("utf8 human");
         assert!(human_after_release.contains("evidence_cleanup_state: clear\n"));
-        assert!(human_after_release.contains("reader: object_released\n"));
+        assert!(human_after_release.contains("projection: object_released\n"));
+        assert!(!human_after_release.contains("reader: "));
     }
 
     pub(super) fn cli_evidence_release_live_unsettled_run_n6() {

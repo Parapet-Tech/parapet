@@ -32,8 +32,8 @@ use crate::cli::render::{
 };
 #[cfg(not(windows))]
 use crate::effect::store::{
-    cleanup::CleanupRefusalV0, CleanupResultV0, ProtectedEvidenceReaderV0,
-    ProtectedEvidenceStoreV0, RedactedEvidenceReaderV0, TerminalOutcomeV0,
+    cleanup::CleanupRefusalV0, CleanupResultV0, ProtectedEvidenceStoreV0, RedactedEvidenceReaderV0,
+    TerminalOutcomeV0,
 };
 #[cfg(not(windows))]
 use crate::effect::{EnvelopeResponseResultV0, EnvelopeResultSinkV0, FileEffectProfileV0, RunIdV0};
@@ -1551,25 +1551,8 @@ fn run_inspect(args: InspectArgs, json_mode: bool) -> i32 {
         }
     };
 
-    let reader = RedactedEvidenceReaderV0::new(&store);
-    let mut view = reader.view(&run_id, claimed);
-
-    // When `RedactedEvidenceReaderV0::view` suppresses `projection_bytes` because
-    // the underlying projection object is released/missing/corrupt while authority
-    // is otherwise settled, query `ProtectedEvidenceReaderV0::read` on the projection
-    // path to surface the exact landed `ReaderErrorV0` (such as `ObjectReleased`).
-    if view.reader_code.is_none() && view.projection_bytes.is_none() {
-        if let Ok(manifest) = store.manifest(&run_id) {
-            if let Some(row_digest) = manifest.row_digest() {
-                let proj_path = format!("projection/sha256/{row_digest}.json");
-                if let Err(code) =
-                    ProtectedEvidenceReaderV0::new(&store).read(&run_id, &proj_path, None, claimed)
-                {
-                    view.reader_code = Some(code);
-                }
-            }
-        }
-    }
+    // The redacted view is the sole source of every rendered field and code.
+    let view = RedactedEvidenceReaderV0::new(&store).view(&run_id, claimed);
 
     let inert_fallback = args.inert_fallback;
 
@@ -1580,6 +1563,7 @@ fn run_inspect(args: InspectArgs, json_mode: bool) -> i32 {
             view.cleanup,
             view.banner,
             view.reader_code,
+            view.projection_code,
             view.projection_bytes.as_deref(),
         );
         let _ = std::io::stdout().write_all(&bytes);
@@ -1591,6 +1575,7 @@ fn run_inspect(args: InspectArgs, json_mode: bool) -> i32 {
             view.cleanup,
             view.banner,
             view.reader_code,
+            view.projection_code,
             view.projection_bytes.as_deref(),
             inert_fallback,
         );
@@ -1598,7 +1583,10 @@ fn run_inspect(args: InspectArgs, json_mode: bool) -> i32 {
         let _ = std::io::stdout().flush();
     }
 
-    if view.reader_code.is_some() || view.outcome != Some(TerminalOutcomeV0::Complete) {
+    if view.reader_code.is_some()
+        || view.projection_code.is_some()
+        || view.outcome != Some(TerminalOutcomeV0::Complete)
+    {
         4
     } else {
         0

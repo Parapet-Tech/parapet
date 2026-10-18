@@ -20,7 +20,7 @@ use parapet::effect::store::RuntimeTerminalV0;
 use parapet::effect::store::{
     CleanupResultV0, CleanupStateV0, ExpectedBindingV0, FaultPlanV0, FaultPointV0, ForeignOwnerV0,
     ProtectedEvidenceReaderV0, ProtectedEvidenceStoreV0, ReaderErrorV0, RecoveryOutcomeV0,
-    RedactedEvidenceReaderV0, RunStateV0, TerminalOutcomeV0,
+    RedactedEvidenceReaderV0, RedactedRunViewV0, RunStateV0, TerminalOutcomeV0,
 };
 use parapet::effect::*;
 use parapet::engine::{
@@ -2447,6 +2447,185 @@ fn redacted_wrapper_preserves_projection_bytes() {
         projection_field_not_allowed(&presented),
         ProjectionInstrument::Pass
     );
+}
+
+/// One Sensor `60d9e9ef` section 3 store fixture: (run, claimed, landed projection bytes).
+fn projection_mapping_case(
+    ev: &Evidence,
+    mutation: &str,
+) -> (RunIdV0, Option<TerminalOutcomeV0>, Vec<u8>) {
+    if let Some(cleanup) = mutation.strip_prefix("storage_incomplete") {
+        let (run, _, _) = reader_case(ev, "storage_incomplete_run");
+        let bytes = RedactedEvidenceReaderV0::new(&ev.store)
+            .view(&run, None)
+            .projection_bytes
+            .expect("storage_incomplete retains the projection");
+        if cleanup == "_cleaned" {
+            assert_eq!(ev.store.cleanup_run(&run), CleanupResultV0::Clear);
+        }
+        return (run, None, bytes);
+    }
+    let run = complete_run(ev, "mapping");
+    let bytes = run.projection_bytes.clone();
+    let projection = run.refs.projection.clone().expect("projection ref");
+    assert_eq!(projection, layout::projection_path(&run.row_digest));
+    let edit_projection_entry = |edit: &dyn Fn(&mut RunManifestV0)| {
+        let mut m = read_manifest(&ev.root, &run.run_id);
+        edit(&mut m);
+        write_manifest(&ev.root, &run.run_id, &m);
+    };
+    let mut claimed = None;
+    match mutation {
+        "complete" => {}
+        "complete_claimed" => claimed = Some(TerminalOutcomeV0::Complete),
+        "claimed_mismatch" => claimed = Some(TerminalOutcomeV0::StorageIncomplete),
+        "released" => assert_eq!(ev.store.cleanup_run(&run.run_id), CleanupResultV0::Clear),
+        "cleanup_retained" => {
+            let peer = complete_run(ev, "peer");
+            std::fs::write(manifest_path(&ev.root, &peer.run_id), b"unreadable").unwrap();
+            assert_eq!(
+                ev.store.cleanup_run(&run.run_id),
+                CleanupResultV0::Indeterminate
+            );
+        }
+        "cleanup_released" => {
+            let faulty = ProtectedEvidenceStoreV0::open_with_faults(
+                &ev.root,
+                FaultPlanV0::fail_at(FaultPointV0::CleanupAfterRelease, 0),
+            )
+            .unwrap();
+            assert_eq!(faulty.cleanup_run(&run.run_id), CleanupResultV0::Fail);
+            // The crash precedes the projection release; release it monotonically.
+            edit_projection_entry(&|m| {
+                for e in m.objects.iter_mut().filter(|e| e.path == projection) {
+                    e.state = ObjectStateV0::Released;
+                }
+            });
+        }
+        "projection_missing" => std::fs::remove_file(ev.root.join(&projection)).unwrap(),
+        "projection_digest" => {
+            let path = ev.root.join(&projection);
+            let mut b = std::fs::read(&path).unwrap();
+            b[3] ^= 1;
+            std::fs::write(&path, b).unwrap();
+        }
+        "projection_length" => edit_projection_entry(&|m| {
+            for e in m.objects.iter_mut().filter(|e| e.path == projection) {
+                e.len_bytes = 1;
+            }
+        }),
+        "projection_pending" => edit_projection_entry(&|m| {
+            for e in m.objects.iter_mut().filter(|e| e.path == projection) {
+                e.state = ObjectStateV0::Pending;
+            }
+        }),
+        "projection_unlisted" => {
+            edit_projection_entry(&|m| m.objects.retain(|e| e.path != projection))
+        }
+        "row_object_digest" => {
+            let path = ev.root.join(run.refs.row.as_ref().unwrap());
+            let mut b = std::fs::read(&path).unwrap();
+            b[3] ^= 1;
+            std::fs::write(&path, b).unwrap();
+        }
+        "row_object_missing" => {
+            std::fs::remove_file(ev.root.join(run.refs.row.as_ref().unwrap())).unwrap()
+        }
+        // Authority mutations: no projection is read, so the landed bytes are unused.
+        other => {
+            let (run, _, _) = reader_case(ev, other);
+            return (run, None, bytes);
+        }
+    }
+    (run.run_id, claimed, bytes)
+}
+
+#[test]
+fn redacted_reader_projection_code_mapping_rev9() {
+    use CleanupStateV0 as C;
+    use ReaderErrorV0 as R;
+    use TerminalOutcomeV0 as O;
+    // (fixture, outcome, cleanup, banner, reader_code, landed bytes?, projection_code)
+    type MappingRow = (
+        &'static str,
+        Option<O>,
+        Option<C>,
+        Option<&'static str>,
+        Option<R>,
+        bool,
+        Option<R>,
+    );
+    let banner = Some(STORAGE_FAILURE_BANNER);
+    #[rustfmt::skip]
+    let rows: [MappingRow; 22] = [
+        // complete
+        ("complete", Some(O::Complete), Some(C::NotStarted), None, None, true, None),
+        ("complete_claimed", Some(O::Complete), Some(C::NotStarted), None, None, true, None),
+        // unavailable: no authority
+        ("delete_manifest", None, None, None, Some(R::RunManifestMissing), false, None),
+        ("set_pending_terminal", None, None, None, Some(R::TerminalPending), false, None),
+        ("clear_terminal_pointer", None, None, None, Some(R::TerminalMissing), false, None),
+        // unavailable: cleanup (bytes or code per D2-C1)
+        ("cleanup_retained", Some(O::Complete), Some(C::Indeterminate), None, Some(R::CleanupInProgress), true, None),
+        ("cleanup_released", Some(O::Complete), Some(C::InProgress), None, Some(R::CleanupInProgress), false, Some(R::ObjectReleased)),
+        // errored (bytes or code per D2-C1)
+        ("storage_incomplete", Some(O::StorageIncomplete), Some(C::NotStarted), banner, Some(R::StorageIncomplete), true, None),
+        ("storage_incomplete_cleaned", Some(O::StorageIncomplete), Some(C::Clear), banner, Some(R::StorageIncomplete), false, Some(R::ObjectReleased)),
+        // released
+        ("released", Some(O::Complete), Some(C::Clear), None, None, false, Some(R::ObjectReleased)),
+        // corrupt: run/terminal
+        ("garble_manifest", None, None, None, Some(R::RunManifestCorrupt), false, None),
+        ("garble_terminal", None, None, None, Some(R::TerminalCorrupt), false, None),
+        ("forge_broken_link", None, None, None, Some(R::TerminalBindingMismatch), false, None),
+        ("forge_incomplete_to_complete_chain", None, None, None, Some(R::TerminalBindingMismatch), false, None),
+        // corrupt: projection object
+        ("projection_digest", Some(O::Complete), Some(C::NotStarted), None, None, false, Some(R::ObjectDigestMismatch)),
+        ("projection_length", Some(O::Complete), Some(C::NotStarted), None, None, false, Some(R::ObjectLengthMismatch)),
+        ("projection_missing", Some(O::Complete), Some(C::NotStarted), None, None, false, Some(R::ObjectMissing)),
+        ("projection_pending", Some(O::Complete), Some(C::NotStarted), None, None, false, Some(R::ObjectPending)),
+        ("projection_unlisted", Some(O::Complete), Some(C::NotStarted), None, None, false, Some(R::RefNotListed)),
+        // claimed status mismatch: suppressed, not read
+        ("claimed_mismatch", Some(O::Complete), None, None, Some(R::TerminalStatusMismatch), false, None),
+        // a non-projection object corruption never reaches the projection result
+        ("row_object_digest", Some(O::Complete), Some(C::NotStarted), None, None, true, None),
+        ("row_object_missing", Some(O::Complete), Some(C::NotStarted), None, None, true, None),
+    ];
+    for (name, outcome, cleanup, banner, reader_code, landed, projection_code) in rows {
+        let ev = evidence();
+        let (run, claimed, bytes) = projection_mapping_case(&ev, name);
+        let view = RedactedEvidenceReaderV0::new(&ev.store).view(&run, claimed);
+        let expected = RedactedRunViewV0 {
+            outcome,
+            cleanup,
+            banner,
+            reader_code,
+            projection_bytes: landed.then_some(bytes),
+            projection_code,
+        };
+        assert_eq!(view, expected, "{name}");
+        // D2-C1: authority without a status mismatch sets exactly one of bytes / code.
+        if view.outcome.is_some() && view.reader_code != Some(R::TerminalStatusMismatch) {
+            assert!(
+                view.projection_bytes.is_some() != view.projection_code.is_some(),
+                "{name}"
+            );
+        }
+        // The code is the unmodified `object_locked` error behind any status error.
+        if let Some(code) = view.projection_code {
+            assert_eq!(
+                ProtectedEvidenceReaderV0::new(&ev.store).read(
+                    &run,
+                    &layout::projection_path(
+                        &ev.store.manifest(&run).unwrap().row_digest().unwrap()
+                    ),
+                    None,
+                    claimed,
+                ),
+                Err(view.reader_code.unwrap_or(code)),
+                "{name}"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -260,6 +260,9 @@ pub struct RedactedRunViewV0 {
     pub reader_code: Option<ReaderErrorV0>,
     /// Exact landed projection bytes, when authorized.
     pub projection_bytes: Option<Vec<u8>>,
+    /// Unmodified `object_locked` error when authority exists, no status
+    /// mismatch was claimed, and the projection could not be read.
+    pub projection_code: Option<ReaderErrorV0>,
 }
 
 /// Section 4.2: the only reader a public adapter receives.
@@ -273,7 +276,7 @@ impl<'a> RedactedEvidenceReaderV0<'a> {
         Self { store }
     }
 
-    /// Outer outcome, banner, reader code and unchanged projection bytes.
+    /// Outer outcome, banner, reader code, and unchanged projection bytes or code.
     pub fn view(&self, run: &RunIdV0, claimed: Option<TerminalOutcomeV0>) -> RedactedRunViewV0 {
         let failed = |code| RedactedRunViewV0 {
             outcome: None,
@@ -281,6 +284,7 @@ impl<'a> RedactedEvidenceReaderV0<'a> {
             banner: None,
             reader_code: Some(code),
             projection_bytes: None,
+            projection_code: None,
         };
         let Ok(_lock) = self.store.lock() else {
             return failed(ReaderErrorV0::RunManifestCorrupt);
@@ -301,18 +305,23 @@ impl<'a> RedactedEvidenceReaderV0<'a> {
             Err(code) => Some(code),
         };
         let mismatch = reader_code == Some(ReaderErrorV0::TerminalStatusMismatch);
-        let projection_bytes = (!mismatch)
-            .then(|| {
-                let path = super::layout::projection_path(&authority.terminal.row_digest);
-                self.store.object_locked(&authority.manifest, &path).ok()
-            })
-            .flatten();
+        // Exactly one of bytes / code once authority exists without a status mismatch.
+        let (projection_bytes, projection_code) = if mismatch {
+            (None, None)
+        } else {
+            let path = super::layout::projection_path(&authority.terminal.row_digest);
+            match self.store.object_locked(&authority.manifest, &path) {
+                Ok(bytes) => (Some(bytes), None),
+                Err(code) => (None, Some(code)),
+            }
+        };
         RedactedRunViewV0 {
             outcome: Some(outcome),
             cleanup: if mismatch { None } else { cleanup },
             banner,
             reader_code,
             projection_bytes,
+            projection_code,
         }
     }
 }

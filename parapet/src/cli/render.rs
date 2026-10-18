@@ -325,6 +325,28 @@ pub fn reader_error_label(error: ReaderErrorV0) -> &'static str {
     }
 }
 
+/// Frozen one-to-one human label for a redacted `projection_code` (Rev 9 D2-C4).
+#[cfg(not(windows))]
+pub fn projection_error_label(error: ReaderErrorV0) -> &'static str {
+    match error {
+        ReaderErrorV0::RunManifestMissing => "projection: run_manifest_missing",
+        ReaderErrorV0::RunManifestCorrupt => "projection: run_manifest_corrupt",
+        ReaderErrorV0::RefNotListed => "projection: ref_not_listed",
+        ReaderErrorV0::ObjectPending => "projection: object_pending",
+        ReaderErrorV0::ObjectReleased => "projection: object_released",
+        ReaderErrorV0::ObjectMissing => "projection: object_missing",
+        ReaderErrorV0::ObjectDigestMismatch => "projection: object_digest_mismatch",
+        ReaderErrorV0::ObjectLengthMismatch => "projection: object_length_mismatch",
+        ReaderErrorV0::TerminalPending => "projection: terminal_pending",
+        ReaderErrorV0::TerminalMissing => "projection: terminal_missing",
+        ReaderErrorV0::TerminalCorrupt => "projection: terminal_corrupt",
+        ReaderErrorV0::TerminalBindingMismatch => "projection: terminal_binding_mismatch",
+        ReaderErrorV0::TerminalStatusMismatch => "projection: terminal_status_mismatch",
+        ReaderErrorV0::CleanupInProgress => "projection: cleanup_in_progress",
+        ReaderErrorV0::StorageIncomplete => "projection: storage_incomplete",
+    }
+}
+
 fn is_bidi_or_format_control(c: char) -> bool {
     matches!(
         c as u32,
@@ -428,6 +450,7 @@ pub fn render_inspect_human(
     cleanup: Option<CleanupStateV0>,
     banner: Option<&str>,
     reader_code: Option<ReaderErrorV0>,
+    projection_code: Option<ReaderErrorV0>,
     projection_bytes: Option<&[u8]>,
     inert_fallback: bool,
 ) -> String {
@@ -450,6 +473,11 @@ pub fn render_inspect_human(
     }
     if let Some(code) = reader_code {
         lines.push(reader_error_label(code).to_owned());
+    }
+    if let Some(code) = projection_code {
+        lines.push(projection_error_label(code).to_owned());
+    }
+    if reader_code.is_some() {
         let mut out = lines.join("\n");
         out.push('\n');
         return out;
@@ -471,6 +499,8 @@ struct InspectLabels<'a> {
     verification: Option<String>,
     evidence_cleanup: Option<&'a str>,
     reader: Option<&'a str>,
+    // Not `projection`: that key is reserved for the spliced projection bytes.
+    projection_code: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -481,6 +511,7 @@ struct InspectPrefix<'a> {
     cleanup: Option<&'static str>,
     banner: Option<&'a str>,
     reader_code: Option<&'static str>,
+    projection_code: Option<&'static str>,
     labels: InspectLabels<'a>,
 }
 
@@ -493,6 +524,7 @@ pub fn splice_inspect_json(
     cleanup: Option<CleanupStateV0>,
     banner: Option<&str>,
     reader_code: Option<ReaderErrorV0>,
+    projection_code: Option<ReaderErrorV0>,
     projection_bytes: Option<&[u8]>,
 ) -> Vec<u8> {
     let outcome_str = match outcome {
@@ -512,6 +544,7 @@ pub fn splice_inspect_json(
         .map(|p| projection_verification_label(&p.verification));
     let evidence_cleanup_lbl = cleanup.map(evidence_cleanup_state_label);
     let reader_lbl = reader_code.map(reader_error_label);
+    let projection_lbl = projection_code.map(projection_error_label);
 
     let prefix = InspectPrefix {
         schema: "parapet-cli-inspect/v0",
@@ -520,12 +553,14 @@ pub fn splice_inspect_json(
         cleanup: cleanup_str,
         banner,
         reader_code: reader_code.map(reader_error_code),
+        projection_code: projection_code.map(reader_error_code),
         labels: InspectLabels {
             summary: summary_lbl,
             enforcement: enforcement_lbl,
             verification: verification_lbl,
             evidence_cleanup: evidence_cleanup_lbl,
             reader: reader_lbl,
+            projection_code: projection_lbl,
         },
     };
     let mut out = serde_json::to_vec(&prefix).expect("inspect prefix serializes");
