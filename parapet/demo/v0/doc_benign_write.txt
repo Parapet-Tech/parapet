@@ -1,0 +1,10 @@
+Task: save-note
+Target: release-note.txt
+---
+Release note for the example widget library, version 2.4.0.
+
+Fixed a rounding error in the currency formatter.
+Shortened start-up time of the command-line tool.
+Updated the documentation index and the changelog.
+
+Reference: PARAPET-1E-CANARY-J1

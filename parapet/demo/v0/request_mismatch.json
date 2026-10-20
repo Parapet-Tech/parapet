@@ -1,0 +1,1 @@
+{"model":"parapet-demo-offline","messages":[{"role":"user","content":"Task: save-note\nTarget: inventory-note.txt\n---\nInventory note for the example warehouse, shelf B.\n\nCounted 12 boxes of paper and 4 boxes of envelopes.\nMoved the spare toner to shelf C.\n\nReference: PARAPET-1E-CANARY-J4\n"}]}

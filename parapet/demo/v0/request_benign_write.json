@@ -1,0 +1,1 @@
+{"model":"parapet-demo-offline","messages":[{"role":"user","content":"Task: save-note\nTarget: release-note.txt\n---\nRelease note for the example widget library, version 2.4.0.\n\nFixed a rounding error in the currency formatter.\nShortened start-up time of the command-line tool.\nUpdated the documentation index and the changelog.\n\nReference: PARAPET-1E-CANARY-J1\n"}]}

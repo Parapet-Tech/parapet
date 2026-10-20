@@ -1,0 +1,20 @@
+parapet: v1
+tools:
+  _default:
+    allowed: false
+  write_file:
+    allowed: true
+    constraints:
+      content:
+        type: string
+        max_length: 4096
+      path:
+        type: string
+        matches: "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+        max_length: 128
+layers:
+  L0: { mode: sanitize }
+  L3_inbound: { mode: block }
+  L3_outbound: { mode: block, block_action: rewrite }
+  L5a: { mode: redact }
+  L1: { mode: shadow }

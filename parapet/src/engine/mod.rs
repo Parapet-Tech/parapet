@@ -1747,6 +1747,11 @@ pub fn build_engine_client(config: Arc<Config>) -> Result<EngineUpstreamClient, 
 // POSIX opt-in runtime envelope and deterministic offline upstream (1D)
 // ---------------------------------------------------------------------------
 
+/// Deterministic offline demo workflow (1E): proposer, fixtures, and export.
+#[cfg(not(windows))]
+#[path = "../demo/mod.rs"]
+pub mod demo;
+
 /// Schema identifier for the fixed deterministic offline upstream fixture.
 #[cfg(not(windows))]
 pub const OFFLINE_UPSTREAM_SCHEMA: &str = "parapet-offline-upstream/v0";
@@ -1765,6 +1770,9 @@ pub enum OfflineUpstreamFixtureV0 {
     BlockNoEffect,
     /// `shadow_parse_error_l3_off` scenario.
     ShadowParseErrorL3Off,
+    /// 1E demo journey answered by the document-consuming demo proposer.
+    #[cfg(not(windows))]
+    Demo(demo::DemoJourneyV0),
 }
 
 #[cfg(not(windows))]
@@ -1777,6 +1785,14 @@ impl OfflineUpstreamFixtureV0 {
             "allow_verified_write" => Some(Self::AllowVerifiedWrite),
             "block_no_effect" => Some(Self::BlockNoEffect),
             "shadow_parse_error_l3_off" => Some(Self::ShadowParseErrorL3Off),
+            #[cfg(not(windows))]
+            "demo_benign_write_v0" => Some(Self::Demo(demo::DemoJourneyV0::BenignWrite)),
+            #[cfg(not(windows))]
+            "demo_unauthorized_v0" => Some(Self::Demo(demo::DemoJourneyV0::Unauthorized)),
+            #[cfg(not(windows))]
+            "demo_injection_benign_v0" => Some(Self::Demo(demo::DemoJourneyV0::InjectionBenign)),
+            #[cfg(not(windows))]
+            "demo_mismatch_v0" => Some(Self::Demo(demo::DemoJourneyV0::Mismatch)),
             _ => None,
         }
     }
@@ -1805,6 +1821,13 @@ impl DeterministicOfflineHttpSenderV0 {
             .and_then(|v| v.to_str().ok())
         {
             if let Some(parsed) = OfflineUpstreamFixtureV0::parse(hdr.trim()) {
+                // A demo selector in this header is no match: only the demo sender serves it.
+                #[cfg(not(windows))]
+                let parsed = if matches!(parsed, OfflineUpstreamFixtureV0::Demo(_)) {
+                    OfflineUpstreamFixtureV0::V0
+                } else {
+                    parsed
+                };
                 if parsed != OfflineUpstreamFixtureV0::V0 {
                     return parsed;
                 }
@@ -1830,6 +1853,12 @@ impl DeterministicOfflineHttpSenderV0 {
 #[async_trait]
 impl HttpSender for DeterministicOfflineHttpSenderV0 {
     async fn send(&self, request: HttpRequest) -> Result<HttpResponse, HttpError> {
+        #[cfg(not(windows))]
+        if matches!(self.fixture, OfflineUpstreamFixtureV0::Demo(_)) {
+            return Err(HttpError::Transport(
+                "offline fixture demo journey requires the demo proposer sender".into(),
+            ));
+        }
         if !request.url.starts_with("https://") {
             return Err(HttpError::Transport(
                 "offline fixture requires HTTPS resolved upstream URL".into(),
@@ -1852,6 +1881,12 @@ impl HttpSender for DeterministicOfflineHttpSenderV0 {
                 }),
                 OfflineUpstreamFixtureV0::ShadowParseErrorL3Off => {
                     serde_json::Value::String("{unclosed".to_owned())
+                }
+                #[cfg(not(windows))]
+                OfflineUpstreamFixtureV0::Demo(_) => {
+                    return Err(HttpError::Transport(
+                        "offline fixture demo journey requires the demo proposer sender".into(),
+                    ))
                 }
             };
             serde_json::json!({
@@ -1887,6 +1922,12 @@ impl HttpSender for DeterministicOfflineHttpSenderV0 {
                         r#"{"content":"blocked","path":"../escape.txt"}"#
                     }
                     OfflineUpstreamFixtureV0::ShadowParseErrorL3Off => "{unclosed",
+                    #[cfg(not(windows))]
+                    OfflineUpstreamFixtureV0::Demo(_) => {
+                        return Err(HttpError::Transport(
+                            "offline fixture demo journey requires the demo proposer sender".into(),
+                        ))
+                    }
                 }
             };
             serde_json::json!({
@@ -2121,6 +2162,11 @@ pub fn build_engine_client_with_runtime_v0(
     let envelope = Arc::new(RuntimeEnvelopeV0::new(parts));
 
     let http: Arc<dyn HttpSender> = match options.offline_fixture {
+        #[cfg(not(windows))]
+        Some(OfflineUpstreamFixtureV0::Demo(journey)) => Arc::new(demo::DemoProposerHttpSenderV0::new(
+            journey,
+            demo::ManifestDemoProposerV0::new_default(),
+        )),
         Some(fixture) => Arc::new(DeterministicOfflineHttpSenderV0::new(fixture)),
         None => Arc::new(ReqwestHttpSender::new(reqwest::Client::new())),
     };

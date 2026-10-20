@@ -81,6 +81,8 @@ enum Commands {
     Evidence(EvidenceArgs),
     /// Stop the engine owned by a state directory after file-cleanup verification
     Disable(DisableArgs),
+    /// Deterministic offline demo assets
+    Demo(DemoArgs),
 }
 
 #[derive(Args)]
@@ -228,6 +230,25 @@ struct DisableArgs {
     /// Initialized state directory path
     #[arg(long)]
     state_dir: PathBuf,
+}
+
+#[derive(Args)]
+struct DemoArgs {
+    #[command(subcommand)]
+    command: DemoCommands,
+}
+
+#[derive(Subcommand)]
+enum DemoCommands {
+    /// Write the embedded, hash-verified demo assets into a new directory
+    Export(DemoExportArgs),
+}
+
+#[derive(Args)]
+struct DemoExportArgs {
+    /// New directory to create (must not exist; its parent must exist)
+    #[arg(long)]
+    out: PathBuf,
 }
 
 #[derive(serde::Serialize)]
@@ -489,6 +510,19 @@ pub fn run_from_env() -> i32 {
             EvidenceCommands::Release(args) => run_evidence_release(args, json_mode),
         },
         Commands::Disable(args) => run_disable(args, json_mode),
+        Commands::Demo(demo) => {
+            let DemoCommands::Export(_args) = demo.command;
+            #[cfg(not(windows))]
+            return crate::engine::demo::export::export(&_args.out, json_mode);
+            #[cfg(windows)]
+            return emit_cli_error(
+                "demo export",
+                "unsupported_platform",
+                6,
+                "demo export is only supported on POSIX platforms",
+                json_mode,
+            );
+        }
     }
 }
 
