@@ -2135,9 +2135,37 @@ pub fn build_engine_client_with_runtime_v0(
             .map_err(|e| StartupError::RuntimeInit(format!("profile_error:{e:?}")))?;
         // C2.2: exactly one envelope-allocated id, reserved before the root exists.
         let run_id = RuntimeEnvelopeV0::allocate_run_id();
-        let root =
-            crate::effect::file::RootCapabilityV0::create(effect_root, run_id.clone(), max_bytes)
-                .map_err(|e| StartupError::RuntimeInit(format!("root_error:{e:?}")))?;
+        let root = match options.offline_fixture {
+            #[cfg(not(windows))]
+            Some(OfflineUpstreamFixtureV0::Demo(demo::DemoJourneyV0::Mismatch)) => {
+                use demo::EffectInterferenceV0 as _;
+                let interference =
+                    demo::OverwriteTargetInterferenceV0::new_default(effect_root.clone())
+                        .ok_or_else(|| {
+                            StartupError::RuntimeInit("demo_mismatch_interference_invalid".into())
+                        })?;
+                let hook: crate::effect::file::FileHookV0 = Arc::new(move |phase| {
+                    if phase == crate::effect::file::FilePhaseV0::BeforeObservation {
+                        interference.before_observation();
+                    }
+                });
+                crate::effect::file::RootCapabilityV0::create_with(
+                    effect_root,
+                    run_id.clone(),
+                    max_bytes,
+                    crate::effect::file::FileFixtureV0 {
+                        hook: Some(hook),
+                        ..Default::default()
+                    },
+                )
+            }
+            _ => crate::effect::file::RootCapabilityV0::create(
+                effect_root,
+                run_id.clone(),
+                max_bytes,
+            ),
+        }
+        .map_err(|e| StartupError::RuntimeInit(format!("root_error:{e:?}")))?;
         let exec = crate::effect::file::FileActionExecutorV0::new(root.clone(), &resolved_policy)
             .map_err(|e| StartupError::RuntimeInit(format!("executor_error:{e:?}")))?;
         let obs = crate::effect::file::FilesystemEffectObserverV0::new(root.clone());

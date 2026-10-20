@@ -10,6 +10,7 @@
 
 pub mod export;
 pub mod fixtures;
+pub mod interference;
 pub mod proposer;
 pub mod sender;
 
@@ -17,6 +18,9 @@ pub use fixtures::{
     load_verified_manifest, sha256_hex, CompiledDemoFixturesV0, DemoAuthorshipV0,
     DemoFixtureErrorV0, DemoFixtureSourceV0, DemoJourneyEntryV0, DemoManifestV0,
     DEMO_FIXTURES_SCHEMA, EXPORTED_ASSETS, MANIFEST_NAME,
+};
+pub use interference::{
+    EffectInterferenceV0, OverwriteTargetInterferenceV0, INTERFERENCE_FILL_BYTE,
 };
 pub use proposer::{
     DemoProposerV0, ManifestDemoProposerV0, ProposedCallV0, ProposerErrorV0, ProposerInputV0,

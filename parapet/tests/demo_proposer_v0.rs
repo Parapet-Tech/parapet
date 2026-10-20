@@ -12,7 +12,8 @@ use parapet::engine::demo::export::{export_assets, DemoExportErrorV0, DEMO_EXPOR
 use parapet::engine::demo::{
     load_verified_manifest, sha256_hex, CompiledDemoFixturesV0, DemoFixtureErrorV0,
     DemoFixtureSourceV0, DemoJourneyV0, DemoProposerHttpSenderV0, DemoProposerV0,
-    ManifestDemoProposerV0, ProposerErrorV0, ProposerInputV0, EXPORTED_ASSETS, MANIFEST_NAME,
+    EffectInterferenceV0, ManifestDemoProposerV0, OverwriteTargetInterferenceV0, ProposerErrorV0,
+    ProposerInputV0, EXPORTED_ASSETS, INTERFERENCE_FILL_BYTE, MANIFEST_NAME,
 };
 use parapet::engine::{
     build_engine_client_with_runtime_v0, DeterministicOfflineHttpSenderV0, EngineRuntimeOptionsV0,
@@ -712,6 +713,339 @@ async fn n5_default_sender_never_reaches_demo_code() {
         assert!(!text.contains("release-note.txt"), "{text}");
     }
     assert!(!effect_root.join("release-note.txt").exists());
+}
+
+// --- 1E.2 Mismatch: interference unit, live J4 path, N3, and N4 ---------------
+
+#[test]
+fn interference_overwrites_in_root_target_with_same_length_and_refuses_escape() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let default = OverwriteTargetInterferenceV0::new_default(root.clone()).expect("default j4");
+    assert_eq!(default.basename, "inventory-note.txt");
+    let body = document(DemoJourneyV0::Mismatch)
+        .split_once("---\n")
+        .unwrap()
+        .1;
+    assert_eq!(default.bytes.len(), body.len());
+    assert!(default.bytes.iter().all(|&b| b == INTERFERENCE_FILL_BYTE));
+
+    let target = root.join("inventory-note.txt");
+    std::fs::write(&target, body.as_bytes()).unwrap();
+    default.before_observation();
+    let observed = std::fs::read(&target).unwrap();
+    assert_eq!(observed.len(), body.len());
+    assert_eq!(observed, default.bytes);
+    assert_ne!(sha256_hex(&observed), sha256_hex(body.as_bytes()));
+
+    // Missing file and non-existent root swallow I/O failure without panicking.
+    let missing_root = dir.path().join("no_such_root");
+    OverwriteTargetInterferenceV0::new(
+        missing_root,
+        "inventory-note.txt".into(),
+        vec![INTERFERENCE_FILL_BYTE; 8],
+    )
+    .before_observation();
+
+    // Symlink target is refused by O_NOFOLLOW and outside file stays untouched.
+    let outside = dir.path().join("outside.txt");
+    std::fs::write(&outside, b"outside-original").unwrap();
+    let link = root.join("link.txt");
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+    OverwriteTargetInterferenceV0::new(
+        root.clone(),
+        "link.txt".into(),
+        vec![INTERFERENCE_FILL_BYTE; 16],
+    )
+    .before_observation();
+    assert_eq!(std::fs::read(&outside).unwrap(), b"outside-original");
+
+    // Traversal or non-basename is refused before opening.
+    for bad in ["../outside.txt", "/etc/passwd", "sub/file.txt", ".hidden"] {
+        OverwriteTargetInterferenceV0::new(
+            root.clone(),
+            bad.into(),
+            vec![INTERFERENCE_FILL_BYTE; 16],
+        )
+        .before_observation();
+    }
+    assert_eq!(std::fs::read(&outside).unwrap(), b"outside-original");
+}
+
+#[tokio::test]
+async fn j4_live_mismatch_reaches_failed_digest_mismatch_and_never_verified() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = private_state_dir(dir.path());
+    let effect_root = dir.path().join("root");
+    let config = std::sync::Arc::new(
+        parapet::config::load_config(&parapet::config::FileSource {
+            path: source_dir().join("config_demo_v0.yaml"),
+        })
+        .unwrap(),
+    );
+    let (client, store, root) = build_engine_client_with_runtime_v0(
+        config,
+        EngineRuntimeOptionsV0 {
+            state_dir: state,
+            effect_root: Some(effect_root.clone()),
+            file_effect_profile: Some(parapet::effect::FileEffectProfileV0::select_explicitly()),
+            max_content_len_bytes: Some(4096),
+            build_digest: None,
+            offline_fixture: Some(OfflineUpstreamFixtureV0::Demo(DemoJourneyV0::Mismatch)),
+            result_sink: None,
+        },
+    )
+    .expect("builds mismatch engine");
+    let root = root.expect("effect root created");
+    let run_id = root.run_id().clone();
+
+    let mut headers = HeaderMap::new();
+    headers.insert("content-type", HeaderValue::from_static("application/json"));
+    headers.insert(
+        "x-parapet-original-host",
+        HeaderValue::from_static("api.openai.com"),
+    );
+    let resp = client
+        .forward(
+            Provider::OpenAi,
+            ProxyRequest {
+                method: Method::POST,
+                uri: "/v1/chat/completions".parse().unwrap(),
+                headers,
+                body: Bytes::from_static(embedded("request_mismatch.json")),
+            },
+        )
+        .await
+        .expect("j4 forward succeeds");
+    assert_eq!(resp.status, StatusCode::OK);
+
+    let view = parapet::effect::store::RedactedEvidenceReaderV0::new(&store).view(&run_id, None);
+    assert!(view.reader_code.is_none());
+    assert!(view.projection_code.is_none());
+    let proj: Value =
+        serde_json::from_slice(&view.projection_bytes.expect("projection bytes")).unwrap();
+
+    assert_eq!(proj["policy"]["decision"], "allow");
+    assert_eq!(proj["effect"]["attempt_outcome"], "completed");
+    assert_eq!(proj["effect"]["stage_reached"], "verification");
+    let obs_missing = proj["not_present"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|np| np["field"] == "observation");
+    assert!(!obs_missing, "observation must be present: {proj}");
+
+    assert_eq!(proj["verification"]["availability"], "present");
+    let ver_outcome = proj["verification"]["outcome"].as_str().unwrap();
+    assert!(
+        matches!(ver_outcome, "failed" | "unknown"),
+        "unexpected verification outcome: {ver_outcome}"
+    );
+    assert_ne!(ver_outcome, "verified");
+    assert_eq!(ver_outcome, "failed");
+    assert_eq!(proj["verification"]["reason_code"], "digest_mismatch");
+    assert_eq!(proj["summary"], "allowed_effect_failed");
+    assert_eq!(proj["line"], "allowed; effect verification failed");
+
+    let entry = journey_entry(DemoJourneyV0::Mismatch);
+    let expected_sha = entry["expected_file_sha256"].as_str().unwrap();
+    let target_file = effect_root.join(entry["expected_target_basename"].as_str().unwrap());
+    let disk_bytes = std::fs::read(&target_file).expect("target file exists on disk");
+    let observed_sha = sha256_hex(&disk_bytes);
+    assert_ne!(observed_sha, expected_sha);
+    let body = document(DemoJourneyV0::Mismatch)
+        .split_once("---\n")
+        .unwrap()
+        .1;
+    assert_eq!(disk_bytes.len(), body.len());
+    assert!(disk_bytes.iter().all(|&b| b == INTERFERENCE_FILL_BYTE));
+}
+
+#[tokio::test]
+async fn n3_j4_with_interference_hook_disabled_verifies() {
+    // Run the exact J4 document and proposer with the default FileFixtureV0 (no hook).
+    let dir = tempfile::tempdir().unwrap();
+    let state = private_state_dir(dir.path());
+    let effect_root = dir.path().join("root");
+    let config = std::sync::Arc::new(
+        parapet::config::load_config(&parapet::config::FileSource {
+            path: source_dir().join("config_demo_v0.yaml"),
+        })
+        .unwrap(),
+    );
+    // Construct the engine with BenignWrite so RootCapabilityV0::create (default FileFixtureV0,
+    // no hook) is used, then drive the envelope through the same pipeline with a J4 Mismatch
+    // demo sender, proving the hook is the sole cause of J4's mismatch.
+    let store_root = state.join("receipt-evidence");
+    let store = std::sync::Arc::new(
+        parapet::effect::store::ProtectedEvidenceStoreV0::open(&store_root).unwrap(),
+    );
+    let identity: std::sync::Arc<dyn parapet::effect::BuildIdentityProviderV0> =
+        std::sync::Arc::new(parapet::effect::InjectedBuildIdentityV0::unavailable());
+    use parapet::effect::ResolvedPolicyProviderV0 as _;
+    let resolved_policy = parapet::effect::ConfigPolicyProviderV0::new(config.clone())
+        .resolve()
+        .unwrap();
+    parapet::effect::file::check_mandatory_profile(&resolved_policy.policy, 4096).unwrap();
+    let run_id = parapet::effect::RuntimeEnvelopeV0::allocate_run_id();
+    let root = parapet::effect::file::RootCapabilityV0::create_with(
+        &effect_root,
+        run_id.clone(),
+        4096,
+        parapet::effect::file::FileFixtureV0::default(),
+    )
+    .unwrap();
+    let exec =
+        parapet::effect::file::FileActionExecutorV0::new(root.clone(), &resolved_policy).unwrap();
+    let obs = parapet::effect::file::FilesystemEffectObserverV0::new(root.clone());
+    let action_id =
+        parapet::effect::ActionIdV0::parse(&format!("act-{}", run_id.as_str())).unwrap();
+    let binding = parapet::effect::ExecutorBindingV0::new(
+        parapet::effect::FileEffectProfileV0::select_explicitly(),
+        root.opaque(),
+        action_id,
+        std::sync::Arc::new(exec),
+        std::sync::Arc::new(obs),
+    );
+    let mut parts = parapet::effect::EnvelopePartsV0::new(config.clone(), store.clone(), identity);
+    parts.executor = Some(binding);
+    parts.fixed_run_id = Some(run_id.clone());
+    let envelope = std::sync::Arc::new(parapet::effect::RuntimeEnvelopeV0::new(parts));
+
+    let deps = parapet::engine::EngineDeps {
+        config,
+        http: std::sync::Arc::new(DemoProposerHttpSenderV0::new(
+            DemoJourneyV0::Mismatch,
+            ManifestDemoProposerV0::new_default(),
+        )),
+        resolver: std::sync::Arc::new(parapet::engine::EnvUpstreamResolver::new()),
+        registry: std::sync::Arc::new(parapet::engine::DefaultProviderRegistry),
+        normalizer: std::sync::Arc::new(parapet::normalize::L0Normalizer::new()),
+        trust_assigner: std::sync::Arc::new(parapet::trust::RoleTrustAssigner),
+        l1_scanner: None,
+        l1_model: Some(std::sync::Arc::new(parapet::layers::l1::SvmModel)),
+        l2a_scanner: None,
+        l2a_semaphore: None,
+        inbound_scanner: std::sync::Arc::new(
+            parapet::layers::l3_inbound::DefaultInboundScanner::new(),
+        ),
+        constraint_evaluator: std::sync::Arc::new(
+            parapet::constraint::DslConstraintEvaluator::new(),
+        ),
+        output_scanner: std::sync::Arc::new(parapet::layers::l5a::L5aScanner),
+        session_store: None,
+        multi_turn_scanner: None,
+        orthogonal_sensor_router: std::sync::Arc::new(
+            parapet::routing::NoopOrthogonalSensorRouter::new(),
+        ),
+        signal_extractor: std::sync::Arc::new(
+            parapet::signal::extractor::DefaultSignalExtractor::new(),
+        ),
+        verdict_combiner: std::sync::Arc::new(
+            parapet::signal::combiner::DefaultVerdictCombiner::new(),
+        ),
+        emit_l1_signals: false,
+    };
+    let client = parapet::engine::EngineUpstreamClient::new_with_envelope(deps, envelope);
+
+    let mut headers = HeaderMap::new();
+    headers.insert("content-type", HeaderValue::from_static("application/json"));
+    headers.insert(
+        "x-parapet-original-host",
+        HeaderValue::from_static("api.openai.com"),
+    );
+    let resp = client
+        .forward(
+            Provider::OpenAi,
+            ProxyRequest {
+                method: Method::POST,
+                uri: "/v1/chat/completions".parse().unwrap(),
+                headers,
+                body: Bytes::from_static(embedded("request_mismatch.json")),
+            },
+        )
+        .await
+        .expect("n3 forward succeeds");
+    assert_eq!(resp.status, StatusCode::OK);
+
+    let view = parapet::effect::store::RedactedEvidenceReaderV0::new(&store).view(&run_id, None);
+    let proj: Value =
+        serde_json::from_slice(&view.projection_bytes.expect("projection bytes")).unwrap();
+    assert_eq!(proj["policy"]["decision"], "allow");
+    assert_eq!(proj["effect"]["attempt_outcome"], "completed");
+    assert_eq!(proj["verification"]["outcome"], "verified");
+    assert!(proj["verification"]["reason_code"].is_null());
+
+    let entry = journey_entry(DemoJourneyV0::Mismatch);
+    let expected_sha = entry["expected_file_sha256"].as_str().unwrap();
+    let target_file = effect_root.join(entry["expected_target_basename"].as_str().unwrap());
+    let disk_bytes = std::fs::read(&target_file).unwrap();
+    assert_eq!(sha256_hex(&disk_bytes), expected_sha);
+}
+
+#[test]
+fn n4_mismatch_without_effect_root_errors_before_hook_construction() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let config = source_dir().join("config_demo_v0.yaml");
+
+    let init = std::process::Command::new(env!("CARGO_BIN_EXE_parapet"))
+        .args(["init", "--state-dir"])
+        .arg(&state)
+        .arg("--json")
+        .output()
+        .expect("parapet init");
+    assert!(init.status.success(), "init failed: {:?}", init);
+
+    // 1) Passing --file-effect-profile / --max-content-bytes without --effect-root fails usage (exit 2)
+    // before build_engine_client_with_runtime_v0 or any hook is constructed.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_parapet"))
+        .args(["run", "--state-dir"])
+        .arg(&state)
+        .arg("--config")
+        .arg(&config)
+        .args([
+            "--file-effect-profile",
+            "v0",
+            "--max-content-bytes",
+            "4096",
+            "--offline-fixture",
+            "demo_mismatch_v0",
+            "--json",
+        ])
+        .output()
+        .expect("parapet run without effect-root");
+    assert_eq!(out.status.code(), Some(2));
+    let err_json: Value = serde_json::from_slice(&out.stdout).expect("cli error json");
+    assert_eq!(err_json["schema"], "parapet-cli-error/v0");
+    assert_eq!(err_json["error_code"], "invalid_effect_arguments");
+
+    // 2) At the builder seam, effect_root: None with Demo(Mismatch) returns root_cap == None
+    // so no RootCapabilityV0 or interference hook is ever constructed.
+    let cfg = std::sync::Arc::new(
+        parapet::config::load_config(&parapet::config::FileSource { path: config }).unwrap(),
+    );
+    let (_client, _store, root_cap) = build_engine_client_with_runtime_v0(
+        cfg,
+        EngineRuntimeOptionsV0 {
+            state_dir: state,
+            effect_root: None,
+            file_effect_profile: None,
+            max_content_len_bytes: None,
+            build_digest: None,
+            offline_fixture: Some(OfflineUpstreamFixtureV0::Demo(DemoJourneyV0::Mismatch)),
+            result_sink: None,
+        },
+    )
+    .expect("builds without effect root");
+    assert!(
+        root_cap.is_none(),
+        "no root or hook constructed when effect_root is None"
+    );
 }
 
 // --- N9: export --------------------------------------------------------------
