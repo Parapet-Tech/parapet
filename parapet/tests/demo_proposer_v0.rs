@@ -247,6 +247,95 @@ fn demo_config_contract_hash_matches_manifest() {
     assert_eq!(demo, format!("{accept}  L1: {{ mode: shadow }}\n"));
 }
 
+#[test]
+fn manifest_freezes_measured_1e1_values() {
+    let manifest = manifest_json();
+    assert_eq!(manifest["measurement_status"], "partially_measured");
+    let measured = [
+        (
+            DemoJourneyV0::BenignWrite,
+            serde_json::json!({
+                "decision": "allow",
+                "attempt": "completed",
+                "verification": "verified",
+                "verification_reason_code": null,
+                "verification_delta": "created",
+                "human_label": "allowed; effect verified",
+                "detection": "present",
+                "detection_outcome": "threshold_not_breached",
+            }),
+        ),
+        (
+            DemoJourneyV0::Unauthorized,
+            serde_json::json!({
+                "decision": "block",
+                "failed_argument": "path",
+                "reason_code": "matches",
+                "constraint_names": ["matches"],
+                "attempt": "absent_by_contract",
+                "verification": "absent_by_contract",
+                "human_label": "blocked before execution",
+                "detection": "present",
+                "detection_outcome": "threshold_breached",
+                "injected_path_exists": false,
+            }),
+        ),
+        (
+            DemoJourneyV0::InjectionBenign,
+            serde_json::json!({
+                "decision": "allow",
+                "attempt": "completed",
+                "verification": "verified",
+                "verification_reason_code": null,
+                "verification_delta": "created",
+                "human_label": "allowed; effect verified",
+                "detection": "present",
+                "detection_outcome": "threshold_breached",
+            }),
+        ),
+    ];
+    for (journey, expected) in measured {
+        let entry = journey_entry(journey);
+        assert_eq!(
+            entry["measurement_status"],
+            "measured",
+            "{}",
+            journey.name()
+        );
+        assert_eq!(entry["expected_http_status"], 200, "{}", journey.name());
+        assert_eq!(entry["expected"], expected, "{}", journey.name());
+    }
+    assert_eq!(
+        journey_entry(DemoJourneyV0::BenignWrite)["expected_file_sha256"],
+        "af52e00108572372f970dab87de34e3d257ef44f57671a662898e9bc87868d66"
+    );
+    assert_eq!(
+        journey_entry(DemoJourneyV0::InjectionBenign)["expected_file_sha256"],
+        "dce7575a167e62cc27bba7307727f38b36b79afda3ec53add26d67873cb15e41"
+    );
+    let unauthorized = journey_entry(DemoJourneyV0::Unauthorized);
+    assert!(unauthorized["expected_file_sha256"].is_null());
+    // The blocked argument is `path`; `matches` is the predicate it failed.
+    let args: Value =
+        serde_json::from_str(unauthorized["expected_arguments_json"].as_str().unwrap()).unwrap();
+    assert_eq!(args["path"], unauthorized["injected_path"]);
+    // J4 is measured in 1E.2, not here.
+    assert_eq!(
+        journey_entry(DemoJourneyV0::Mismatch)["measurement_status"],
+        "predeclared_unmeasured"
+    );
+    assert_eq!(
+        manifest["negative_controls"]["unknown_document"],
+        serde_json::json!({
+            "selector": "demo_benign_write_v0",
+            "measurement_status": "measured",
+            "expected_http_status": 502,
+            "expected_body": "upstream request failed",
+            "expected_proposal": null,
+        })
+    );
+}
+
 // --- proposer -----------------------------------------------------------------
 
 #[test]

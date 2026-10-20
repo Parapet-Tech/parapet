@@ -118,6 +118,8 @@ pub struct DemoJourneyEntryV0 {
     pub request_path: String,
     pub request_sha256: String,
     pub request_len_bytes: u64,
+    /// `measured` once a live run froze `expected`, else `predeclared_unmeasured`.
+    pub measurement_status: String,
     pub expected_http_status: u16,
     pub expected_tool_name: String,
     pub expected_arguments_json: String,
