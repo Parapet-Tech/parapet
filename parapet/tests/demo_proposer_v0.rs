@@ -795,7 +795,7 @@ async fn n5_default_sender_never_reaches_demo_code() {
     assert_eq!(sha256_hex(&disk_bytes), sha256_hex(known_bytes.as_bytes()));
 }
 
-// --- 1E.2 Mismatch: interference unit, live J4 path, N3, and N4 ---------------
+// --- 1E.2 Mismatch: interference unit, live J4 path, and N4 (N3 lives in engine::mod) ---
 
 #[test]
 fn interference_overwrites_in_root_target_with_same_length_and_refuses_escape() {
@@ -943,128 +943,6 @@ async fn j4_live_mismatch_reaches_failed_digest_mismatch_and_never_verified() {
         .1;
     assert_eq!(disk_bytes.len(), body.len());
     assert!(disk_bytes.iter().all(|&b| b == INTERFERENCE_FILL_BYTE));
-}
-
-#[tokio::test]
-async fn n3_j4_with_interference_hook_disabled_verifies() {
-    // Run the exact J4 document and proposer with the default FileFixtureV0 (no hook).
-    let dir = tempfile::tempdir().unwrap();
-    let state = private_state_dir(dir.path());
-    let effect_root = dir.path().join("root");
-    let config = std::sync::Arc::new(
-        parapet::config::load_config(&parapet::config::FileSource {
-            path: source_dir().join("config_demo_v0.yaml"),
-        })
-        .unwrap(),
-    );
-    // Construct the engine with BenignWrite so RootCapabilityV0::create (default FileFixtureV0,
-    // no hook) is used, then drive the envelope through the same pipeline with a J4 Mismatch
-    // demo sender, proving the hook is the sole cause of J4's mismatch.
-    let store_root = state.join("receipt-evidence");
-    let store = std::sync::Arc::new(
-        parapet::effect::store::ProtectedEvidenceStoreV0::open(&store_root).unwrap(),
-    );
-    let identity: std::sync::Arc<dyn parapet::effect::BuildIdentityProviderV0> =
-        std::sync::Arc::new(parapet::effect::InjectedBuildIdentityV0::unavailable());
-    use parapet::effect::ResolvedPolicyProviderV0 as _;
-    let resolved_policy = parapet::effect::ConfigPolicyProviderV0::new(config.clone())
-        .resolve()
-        .unwrap();
-    parapet::effect::file::check_mandatory_profile(&resolved_policy.policy, 4096).unwrap();
-    let run_id = parapet::effect::RuntimeEnvelopeV0::allocate_run_id();
-    let root = parapet::effect::file::RootCapabilityV0::create_with(
-        &effect_root,
-        run_id.clone(),
-        4096,
-        parapet::effect::file::FileFixtureV0::default(),
-    )
-    .unwrap();
-    let exec =
-        parapet::effect::file::FileActionExecutorV0::new(root.clone(), &resolved_policy).unwrap();
-    let obs = parapet::effect::file::FilesystemEffectObserverV0::new(root.clone());
-    let action_id =
-        parapet::effect::ActionIdV0::parse(&format!("act-{}", run_id.as_str())).unwrap();
-    let binding = parapet::effect::ExecutorBindingV0::new(
-        parapet::effect::FileEffectProfileV0::select_explicitly(),
-        root.opaque(),
-        action_id,
-        std::sync::Arc::new(exec),
-        std::sync::Arc::new(obs),
-    );
-    let mut parts = parapet::effect::EnvelopePartsV0::new(config.clone(), store.clone(), identity);
-    parts.executor = Some(binding);
-    parts.fixed_run_id = Some(run_id.clone());
-    let envelope = std::sync::Arc::new(parapet::effect::RuntimeEnvelopeV0::new(parts));
-
-    let deps = parapet::engine::EngineDeps {
-        config,
-        http: std::sync::Arc::new(DemoProposerHttpSenderV0::new(
-            DemoJourneyV0::Mismatch,
-            ManifestDemoProposerV0::new_default(),
-        )),
-        resolver: std::sync::Arc::new(parapet::engine::EnvUpstreamResolver::new()),
-        registry: std::sync::Arc::new(parapet::engine::DefaultProviderRegistry),
-        normalizer: std::sync::Arc::new(parapet::normalize::L0Normalizer::new()),
-        trust_assigner: std::sync::Arc::new(parapet::trust::RoleTrustAssigner),
-        l1_scanner: None,
-        l1_model: Some(std::sync::Arc::new(parapet::layers::l1::SvmModel)),
-        l2a_scanner: None,
-        l2a_semaphore: None,
-        inbound_scanner: std::sync::Arc::new(
-            parapet::layers::l3_inbound::DefaultInboundScanner::new(),
-        ),
-        constraint_evaluator: std::sync::Arc::new(
-            parapet::constraint::DslConstraintEvaluator::new(),
-        ),
-        output_scanner: std::sync::Arc::new(parapet::layers::l5a::L5aScanner),
-        session_store: None,
-        multi_turn_scanner: None,
-        orthogonal_sensor_router: std::sync::Arc::new(
-            parapet::routing::NoopOrthogonalSensorRouter::new(),
-        ),
-        signal_extractor: std::sync::Arc::new(
-            parapet::signal::extractor::DefaultSignalExtractor::new(),
-        ),
-        verdict_combiner: std::sync::Arc::new(
-            parapet::signal::combiner::DefaultVerdictCombiner::new(),
-        ),
-        emit_l1_signals: false,
-    };
-    let client = parapet::engine::EngineUpstreamClient::new_with_envelope(deps, envelope);
-
-    let mut headers = HeaderMap::new();
-    headers.insert("content-type", HeaderValue::from_static("application/json"));
-    headers.insert(
-        "x-parapet-original-host",
-        HeaderValue::from_static("api.openai.com"),
-    );
-    let resp = client
-        .forward(
-            Provider::OpenAi,
-            ProxyRequest {
-                method: Method::POST,
-                uri: "/v1/chat/completions".parse().unwrap(),
-                headers,
-                body: Bytes::from_static(embedded("request_mismatch.json")),
-            },
-        )
-        .await
-        .expect("n3 forward succeeds");
-    assert_eq!(resp.status, StatusCode::OK);
-
-    let view = parapet::effect::store::RedactedEvidenceReaderV0::new(&store).view(&run_id, None);
-    let proj: Value =
-        serde_json::from_slice(&view.projection_bytes.expect("projection bytes")).unwrap();
-    assert_eq!(proj["policy"]["decision"], "allow");
-    assert_eq!(proj["effect"]["attempt_outcome"], "completed");
-    assert_eq!(proj["verification"]["outcome"], "verified");
-    assert!(proj["verification"]["reason_code"].is_null());
-
-    let entry = journey_entry(DemoJourneyV0::Mismatch);
-    let expected_sha = entry["expected_file_sha256"].as_str().unwrap();
-    let target_file = effect_root.join(entry["expected_target_basename"].as_str().unwrap());
-    let disk_bytes = std::fs::read(&target_file).unwrap();
-    assert_eq!(sha256_hex(&disk_bytes), expected_sha);
 }
 
 #[test]

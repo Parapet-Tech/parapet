@@ -2023,6 +2023,23 @@ pub fn build_engine_client_with_runtime_v0(
     ),
     StartupError,
 > {
+    build_engine_client_with_runtime_and_file_fixture_v0(config, options, None)
+}
+
+#[cfg(not(windows))]
+#[allow(clippy::type_complexity)]
+fn build_engine_client_with_runtime_and_file_fixture_v0(
+    config: Arc<Config>,
+    options: EngineRuntimeOptionsV0,
+    file_fixture_override: Option<crate::effect::file::FileFixtureV0>,
+) -> Result<
+    (
+        EngineUpstreamClient,
+        Arc<crate::effect::store::ProtectedEvidenceStoreV0>,
+        Option<Arc<crate::effect::file::RootCapabilityV0>>,
+    ),
+    StartupError,
+> {
     let session_store: Option<Arc<dyn crate::session::SessionStore>> = None;
 
     let (l1_model, l1_scanner): (Option<Arc<dyn L1Model>>, Option<Arc<dyn L1Scanner>>) =
@@ -2135,9 +2152,15 @@ pub fn build_engine_client_with_runtime_v0(
             .map_err(|e| StartupError::RuntimeInit(format!("profile_error:{e:?}")))?;
         // C2.2: exactly one envelope-allocated id, reserved before the root exists.
         let run_id = RuntimeEnvelopeV0::allocate_run_id();
-        let root = match options.offline_fixture {
+        let root = match (file_fixture_override, options.offline_fixture) {
+            (Some(fixture), _) => crate::effect::file::RootCapabilityV0::create_with(
+                effect_root,
+                run_id.clone(),
+                max_bytes,
+                fixture,
+            ),
             #[cfg(not(windows))]
-            Some(OfflineUpstreamFixtureV0::Demo(demo::DemoJourneyV0::Mismatch)) => {
+            (None, Some(OfflineUpstreamFixtureV0::Demo(demo::DemoJourneyV0::Mismatch))) => {
                 use demo::EffectInterferenceV0 as _;
                 let interference =
                     demo::OverwriteTargetInterferenceV0::new_default(effect_root.clone())
@@ -2159,7 +2182,7 @@ pub fn build_engine_client_with_runtime_v0(
                     },
                 )
             }
-            _ => crate::effect::file::RootCapabilityV0::create(
+            (None, _) => crate::effect::file::RootCapabilityV0::create(
                 effect_root,
                 run_id.clone(),
                 max_bytes,
@@ -3396,3 +3419,97 @@ fn parse_anthropic_tool_call(value: &serde_json::Value) -> Result<ToolCall, Stri
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, not(windows)))]
+mod n3_same_builder_tests {
+    use super::*;
+    use crate::engine::demo::{
+        load_verified_manifest, sha256_hex, CompiledDemoFixturesV0, DemoFixtureSourceV0,
+        DemoJourneyV0,
+    };
+    use serde_json::Value;
+
+    #[tokio::test]
+    async fn n3_j4_with_interference_hook_disabled_verifies() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let effect_root = dir.path().join("root");
+
+        let config_bytes = CompiledDemoFixturesV0
+            .asset("config_demo_v0.yaml")
+            .expect("embedded demo config");
+        let config_path = dir.path().join("config_demo_v0.yaml");
+        std::fs::write(&config_path, config_bytes).unwrap();
+        let config = Arc::new(
+            crate::config::load_config(&crate::config::FileSource { path: config_path }).unwrap(),
+        );
+
+        let (client, store, root) = build_engine_client_with_runtime_and_file_fixture_v0(
+            config,
+            EngineRuntimeOptionsV0 {
+                state_dir: state,
+                effect_root: Some(effect_root.clone()),
+                file_effect_profile: Some(crate::effect::FileEffectProfileV0::select_explicitly()),
+                max_content_len_bytes: Some(4096),
+                build_digest: None,
+                offline_fixture: Some(OfflineUpstreamFixtureV0::Demo(DemoJourneyV0::Mismatch)),
+                result_sink: None,
+            },
+            Some(crate::effect::file::FileFixtureV0::default()),
+        )
+        .expect("builds mismatch engine with default FileFixtureV0");
+        let root = root.expect("effect root created");
+        let run_id = root.run_id().clone();
+
+        let request_bytes = CompiledDemoFixturesV0
+            .asset("request_mismatch.json")
+            .expect("embedded mismatch request");
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        headers.insert(
+            "x-parapet-original-host",
+            HeaderValue::from_static("api.openai.com"),
+        );
+        let resp = client
+            .forward(
+                Provider::OpenAi,
+                ProxyRequest {
+                    method: Method::POST,
+                    uri: "/v1/chat/completions".parse().unwrap(),
+                    headers,
+                    body: Bytes::from_static(request_bytes),
+                },
+            )
+            .await
+            .expect("n3 forward succeeds");
+        assert_eq!(resp.status, StatusCode::OK);
+
+        let view = crate::effect::store::RedactedEvidenceReaderV0::new(&store).view(&run_id, None);
+        assert!(view.reader_code.is_none());
+        assert!(view.projection_code.is_none());
+        let proj: Value =
+            serde_json::from_slice(&view.projection_bytes.expect("projection bytes")).unwrap();
+        assert_eq!(proj["policy"]["decision"], "allow");
+        assert_eq!(proj["effect"]["attempt_outcome"], "completed");
+        assert_eq!(proj["verification"]["outcome"], "verified");
+        assert!(proj["verification"]["reason_code"].is_null());
+
+        let manifest = load_verified_manifest(&CompiledDemoFixturesV0).expect("manifest verifies");
+        let entry = manifest
+            .journeys
+            .iter()
+            .find(|j| j.journey == DemoJourneyV0::Mismatch.name())
+            .expect("mismatch journey");
+        let expected_sha = entry
+            .expected_file_sha256
+            .as_deref()
+            .expect("expected file sha256");
+        let target_file = effect_root.join(&entry.expected_target_basename);
+        let disk_bytes = std::fs::read(&target_file).expect("target file written");
+        assert_eq!(sha256_hex(&disk_bytes), expected_sha);
+    }
+}
