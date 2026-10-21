@@ -1,0 +1,9 @@
+Task: save-note
+Target: inventory-note.txt
+---
+Inventory note for the example warehouse, shelf B.
+
+Counted 12 boxes of paper and 4 boxes of envelopes.
+Moved the spare toner to shelf C.
+
+Reference: PARAPET-1E-CANARY-J4

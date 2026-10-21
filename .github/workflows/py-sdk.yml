@@ -61,3 +61,9 @@ jobs:
           test ! -e /tmp/parapet-ci-venv/bin/parapet-eval
           /tmp/parapet-ci-venv/bin/parapet info --json
           printf 'hello parapet' | /tmp/parapet-ci-venv/bin/parapet scan --stdin --json
+      - name: Verify installed CLI deterministic demo guide from neutral cwd
+        run: |
+          mkdir -p /tmp/parapet-demo-neutral
+          awk '/^```sh$/{f=1;next} /^```$/{f=0} f' "$GITHUB_WORKSPACE/parapet/demo/v0/README.md" > /tmp/parapet-demo-guide.sh
+          cd /tmp/parapet-demo-neutral
+          PATH="/tmp/parapet-ci-venv/bin:$PATH" sh -x /tmp/parapet-demo-guide.sh
