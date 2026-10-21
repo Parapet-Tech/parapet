@@ -602,6 +602,19 @@ pub enum StoreError {
     /// Contract e7b70be3, section 16.3: `store_not_configured`.
     #[serde(rename = "store_not_configured")]
     StoreNotConfigured,
+    /// Contract 34e79d9e, section 16.3: attempt-scoped failure to establish
+    /// and verify a usable persisted content reference with a configured store.
+    /// This does not claim that the store holds no copy.
+    #[serde(rename = "not_persisted")]
+    NotPersisted,
+}
+
+/// Contract 34e79d9e, section 16.3: detection payload storage availability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DetectionPayloadError {
+    /// Contract 34e79d9e, section 16.3: `store_not_configured`.
+    #[serde(rename = "store_not_configured")]
+    StoreNotConfigured,
 }
 
 /// Contract e7b70be3, section 16.3.
@@ -837,7 +850,7 @@ pub struct ProposalContext {
     /// Contract e7b70be3, section 7: `arguments_payload`.
     pub arguments_payload: PresentUnavailable<PayloadRef, ArgumentsPayloadError>,
     /// Contract e7b70be3, section 7: `detection_payload`.
-    pub detection_payload: PresentUnavailableAbsent<PayloadRef, StoreError>,
+    pub detection_payload: PresentUnavailableAbsent<PayloadRef, DetectionPayloadError>,
 }
 
 /// Contract e7b70be3, section 9.1.
