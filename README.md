@@ -131,6 +131,8 @@ parapet accept --state-dir <state-dir> --config <config> --scenario allow_verifi
 
 Both `<state-dir>` and `<new-effect-root>` are disposable local directories, `<new-effect-root>` must not exist beforehand, and the command contacts only the deterministic local fixture (`"real_model_contacted": false`). `<config>` must be the exact bytes of `parapet/tests/fixtures/cli_v0/accept_enforced_v0.yaml` (`shadow_parse_error_l3_off` uses `parapet/tests/fixtures/cli_v0/accept_shadow_l3_off_v0.yaml`); any other config exits 3 with `accept_config_mismatch` before creating state. The JSON output reports `"requester": "rust_cli"`, the installed CLI `requester_version`, the engine-generated `run_id`, and the accepted `config_contract_hash`; human output prints `requester: Rust CLI <version>`.
 
+For the full multi-journey deterministic offline workflow (`parapet demo export` and `parapet init`/`run`/`inspect`/`restore`/`disable`/`evidence release` across benign write, unauthorized block, injection-looking benign allow, verification mismatch, and undeclared residue recovery from a neutral working directory), see the [Deterministic Offline Demo Guide](parapet/demo/v0/README.md).
+
 #### Installed Python SDK verification
 
 This runs the Python SDK from the locally built wheel installed in `<ROLE>/python-installed-venv` (the role's disposable installed venv), from the role's neutral working directory `<ROLE>/neutral-cwd` outside the checkout `<LANE>`, with `PYTHONPATH` unset and the installed `parapet-engine` and `parapet` binaries bound explicitly:
