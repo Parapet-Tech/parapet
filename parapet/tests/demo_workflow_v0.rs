@@ -27,6 +27,11 @@ use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 const BASE_COMMIT_SHA: &str = "67f3f13b5df428fe6d22ca49e72364973a5e2210";
+/// `git ls-files -s` digests used by N8 when `BASE_COMMIT_SHA` is absent (shallow checkout).
+const N8_FROZEN_INDEX_SHA256: &str =
+    "f7b61081fa9d5f6cf443be08566a78e618c46d5093d9807d49bba96520f8d2db";
+const N8_CARVEOUT_INDEX_SHA256: &str =
+    "e4050c874b549b87324bb68baa46c576cda9cbdf353bb565c875c7ca8ff0304e";
 const J2_UNAUTHORIZED_SHA256: &str =
     "60a65e916c21c05659f80665dc484358fd10fedb84fa60c462f25bacf908e75b";
 const J3_INJECTION_BENIGN_SHA256: &str =
@@ -2440,6 +2445,45 @@ fn n7_canary_scanner_detects_planted_controls_and_finds_zero_on_redacted_surface
     .expect("write canary_scan_report.json");
 }
 
+/// Returns whether `BASE_COMMIT_SHA` is present; panics on any git failure other than absence.
+fn n8_base_commit_present(repo_root: &Path) -> bool {
+    let commit = format!("{BASE_COMMIT_SHA}^{{commit}}");
+    let out = Command::new("git")
+        .current_dir(repo_root)
+        .args(["cat-file", "-e", &commit])
+        .output()
+        .expect("run git cat-file -e on N8 base commit");
+    if out.status.success() {
+        return true;
+    }
+    let shallow = Command::new("git")
+        .current_dir(repo_root)
+        .args(["rev-parse", "--is-shallow-repository"])
+        .output()
+        .expect("run git rev-parse --is-shallow-repository");
+    assert!(
+        shallow.status.success() && shallow.stdout == b"true\n",
+        "N8: git cat-file -e {commit} failed in a non-shallow checkout: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    false
+}
+
+fn n8_ls_files_digest(repo_root: &Path, paths: &[&str]) -> String {
+    let out = Command::new("git")
+        .current_dir(repo_root)
+        .args(["ls-files", "-s", "--"])
+        .args(paths)
+        .output()
+        .expect("run git ls-files -s");
+    assert!(
+        out.status.success(),
+        "N8: git ls-files -s failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    sha256_hex(&out.stdout)
+}
+
 #[test]
 fn n8_1d_preservation_and_neutral_cwd_cli_regression() {
     let repo_root = checkout_repo_root();
@@ -2474,42 +2518,56 @@ fn n8_1d_preservation_and_neutral_cwd_cli_regression() {
         ".github/workflows/repro-contract.yml",
         ".github/workflows/ts-sdk.yml",
     ];
-    let diff_out = Command::new("git")
-        .current_dir(&repo_root)
-        .args(["diff", "--exit-code", BASE_COMMIT_SHA, "HEAD", "--"])
-        .args(prohibited_paths)
-        .output()
-        .expect("run git diff on frozen 1D paths");
-    assert!(
-        diff_out.status.success(),
-        "N8 violation: frozen 1D paths modified since {BASE_COMMIT_SHA}:\n{}",
-        String::from_utf8_lossy(&diff_out.stdout)
-    );
+    let carveout_paths = ["parapet/src/cli/mod.rs", ".github/workflows/py-sdk.yml"];
 
-    // 2. Verify the two additive-only carve-outs have zero removed lines versus `67f3f13`.
-    let carveout_diff = Command::new("git")
-        .current_dir(&repo_root)
-        .args([
-            "diff",
-            "-U0",
-            BASE_COMMIT_SHA,
-            "HEAD",
-            "--",
-            "parapet/src/cli/mod.rs",
-            ".github/workflows/py-sdk.yml",
-        ])
-        .output()
-        .expect("run git diff -U0 on additive carve-outs");
-    assert!(carveout_diff.status.success());
-    let carveout_text = String::from_utf8(carveout_diff.stdout).expect("utf8 diff");
-    let removed_lines: Vec<&str> = carveout_text
-        .lines()
-        .filter(|l| l.starts_with('-') && !l.starts_with("---"))
-        .collect();
-    assert!(
-        removed_lines.is_empty(),
-        "N8 violation: non-additive removal in carve-out files: {removed_lines:?}"
-    );
+    if n8_base_commit_present(&repo_root) {
+        let diff_out = Command::new("git")
+            .current_dir(&repo_root)
+            .args(["diff", "--exit-code", BASE_COMMIT_SHA, "HEAD", "--"])
+            .args(prohibited_paths)
+            .output()
+            .expect("run git diff on frozen 1D paths");
+        assert!(
+            diff_out.status.success(),
+            "N8 violation: frozen 1D paths modified since {BASE_COMMIT_SHA}:\n{}{}",
+            String::from_utf8_lossy(&diff_out.stdout),
+            String::from_utf8_lossy(&diff_out.stderr)
+        );
+
+        // 2. Verify the two additive-only carve-outs have zero removed lines versus `67f3f13`.
+        let carveout_diff = Command::new("git")
+            .current_dir(&repo_root)
+            .args(["diff", "-U0", BASE_COMMIT_SHA, "HEAD", "--"])
+            .args(carveout_paths)
+            .output()
+            .expect("run git diff -U0 on additive carve-outs");
+        assert!(
+            carveout_diff.status.success(),
+            "N8 git diff -U0 on carve-outs failed: {}",
+            String::from_utf8_lossy(&carveout_diff.stderr)
+        );
+        let carveout_text = String::from_utf8(carveout_diff.stdout).expect("utf8 diff");
+        let removed_lines: Vec<&str> = carveout_text
+            .lines()
+            .filter(|l| l.starts_with('-') && !l.starts_with("---"))
+            .collect();
+        assert!(
+            removed_lines.is_empty(),
+            "N8 violation: non-additive removal in carve-out files: {removed_lines:?}"
+        );
+    } else {
+        // Shallow checkout without `67f3f13`: bind the exact checkout index entries instead.
+        let frozen_digest = n8_ls_files_digest(&repo_root, &prohibited_paths);
+        assert_eq!(
+            frozen_digest, N8_FROZEN_INDEX_SHA256,
+            "N8 violation: frozen 1D path index digest mismatch (base {BASE_COMMIT_SHA} absent); observed {frozen_digest}"
+        );
+        let carveout_digest = n8_ls_files_digest(&repo_root, &carveout_paths);
+        assert_eq!(
+            carveout_digest, N8_CARVEOUT_INDEX_SHA256,
+            "N8 violation: carve-out index digest mismatch (base {BASE_COMMIT_SHA} absent); observed {carveout_digest}"
+        );
+    }
 
     // 3. Verify Section 3.3 pinned 1D fixture hashes and frozen human fixture intake hashes.
     let cli_fixtures = checkout_manifest_dir().join("tests/fixtures/cli_v0");
