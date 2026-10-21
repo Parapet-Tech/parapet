@@ -685,8 +685,8 @@ async fn n5_default_sender_never_reaches_demo_code() {
         })
         .unwrap(),
     );
-    let (client, _store, root) = build_engine_client_with_runtime_v0(
-        config,
+    let (client, store, root) = build_engine_client_with_runtime_v0(
+        config.clone(),
         EngineRuntimeOptionsV0 {
             state_dir: state,
             effect_root: Some(effect_root.clone()),
@@ -698,7 +698,7 @@ async fn n5_default_sender_never_reaches_demo_code() {
         },
     )
     .expect("builds without offline fixture");
-    assert!(root.is_some());
+    let root = root.expect("effect root created");
     let mut headers = HeaderMap::new();
     headers.insert("content-type", HeaderValue::from_static("application/json"));
     headers.insert(
@@ -723,6 +723,76 @@ async fn n5_default_sender_never_reaches_demo_code() {
         assert!(!text.contains("release-note.txt"), "{text}");
     }
     assert!(!effect_root.join("release-note.txt").exists());
+
+    // Behavioral hook guard: exercise the exact returned root capability from
+    // `offline_fixture: None` on `inventory-note.txt` with known bytes so any
+    // leaked demo interference hook fires at `BeforeObservation` and fails
+    // verification / corrupts disk bytes.
+    let known_bytes = "operator inventory text\n";
+    use parapet::effect::ResolvedPolicyProviderV0 as _;
+    let resolved_policy = parapet::effect::ConfigPolicyProviderV0::new(config.clone())
+        .resolve()
+        .unwrap();
+    let exec =
+        parapet::effect::file::FileActionExecutorV0::new(root.clone(), &resolved_policy).unwrap();
+    let obs = parapet::effect::file::FilesystemEffectObserverV0::new(root.clone());
+    let run_id = root.run_id().clone();
+    let action_id =
+        parapet::effect::ActionIdV0::parse(&format!("act-{}", run_id.as_str())).unwrap();
+    let binding = parapet::effect::ExecutorBindingV0::new(
+        parapet::effect::FileEffectProfileV0::select_explicitly(),
+        root.opaque(),
+        action_id,
+        std::sync::Arc::new(exec),
+        std::sync::Arc::new(obs),
+    );
+    let identity: std::sync::Arc<dyn parapet::effect::BuildIdentityProviderV0> =
+        std::sync::Arc::new(parapet::effect::InjectedBuildIdentityV0::unavailable());
+    let mut parts = parapet::effect::EnvelopePartsV0::new(config, store.clone(), identity);
+    parts.executor = Some(binding);
+    parts.fixed_run_id = Some(run_id.clone());
+    let envelope = parapet::effect::RuntimeEnvelopeV0::new(parts);
+    let mut user_msg = parapet::message::Message::new(
+        parapet::message::Role::User,
+        "write the operator inventory note",
+    );
+    user_msg.trust = parapet::message::TrustLevel::Untrusted;
+    let capture = envelope.capture(&[user_msg], None, "n5-hook-probe", "parapet-n5");
+    let candidate = parapet::effect::ProposalCandidateV0 {
+        ordinal: 0,
+        provider: parapet::receipt::Provider::Openai,
+        transport: parapet::effect::TransportV0::Buffered,
+        coordinate: Ok(parapet::effect::CandidateRefV0 {
+            provider: parapet::receipt::Provider::Openai,
+            choice_index: 0,
+            index: 0,
+        }),
+        tool_call_id: Some("call_n5_0".to_owned()),
+        tool_name: Some("write_file".to_owned()),
+        arguments: parapet::effect::RawArgumentsV0::String(
+            serde_json::json!({
+                "path": "inventory-note.txt",
+                "content": known_bytes,
+            })
+            .to_string(),
+        ),
+        failure: None,
+        malformed: false,
+        location: (0, 0),
+    };
+    let (batch, _, _) = envelope.process_candidates(&capture, vec![candidate]);
+    assert_eq!(batch.runs.len(), 1);
+    let view = parapet::effect::store::RedactedEvidenceReaderV0::new(&store).view(&run_id, None);
+    let proj: Value =
+        serde_json::from_slice(&view.projection_bytes.expect("projection bytes")).unwrap();
+    assert_eq!(proj["policy"]["decision"], "allow");
+    assert_eq!(proj["effect"]["attempt_outcome"], "completed");
+    assert_eq!(proj["verification"]["outcome"], "verified");
+    assert!(proj["verification"]["reason_code"].is_null());
+    let disk_bytes =
+        std::fs::read(effect_root.join("inventory-note.txt")).expect("inventory-note.txt written");
+    assert_eq!(disk_bytes, known_bytes.as_bytes());
+    assert_eq!(sha256_hex(&disk_bytes), sha256_hex(known_bytes.as_bytes()));
 }
 
 // --- 1E.2 Mismatch: interference unit, live J4 path, N3, and N4 ---------------
