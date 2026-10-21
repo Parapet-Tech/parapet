@@ -2,7 +2,7 @@
   "schema": "parapet-demo-fixtures/v0",
   "packet": "1E-ROUTING-DETERMINISTIC-DEMO",
   "upstream_label": "parapet-offline-upstream/v0",
-  "measurement_status": "partially_measured",
+  "measurement_status": "measured",
   "config": {
     "path": "config_demo_v0.yaml",
     "sha256": "1b954d7eb2a49a0b3f8100b260685fadc55d752de83dc791759b59c619907450",
@@ -134,7 +134,7 @@
       "request_path": "request_mismatch.json",
       "request_sha256": "1864d10031029adada29395b64205eaa8cb06bef0e02f9f8c43c6c3532c32741",
       "request_len_bytes": 301,
-      "measurement_status": "predeclared_unmeasured",
+      "measurement_status": "measured",
       "expected_http_status": 200,
       "expected_tool_name": "write_file",
       "expected_arguments_json": "{\"content\":\"Inventory note for the example warehouse, shelf B.\\n\\nCounted 12 boxes of paper and 4 boxes of envelopes.\\nMoved the spare toner to shelf C.\\n\\nReference: PARAPET-1E-CANARY-J4\\n\",\"path\":\"inventory-note.txt\"}",

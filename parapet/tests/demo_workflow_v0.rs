@@ -436,6 +436,52 @@ impl CanaryAndBodyScanner {
             if let Some((_, body)) = doc_text.split_once("\n---\n") {
                 assert!(!body.is_empty(), "empty document body for {j_name}");
                 needles.push((format!("document_body:{j_name}"), body.to_owned()));
+
+                let escaped_body_json =
+                    serde_json::to_string(body).expect("json-escape document body");
+                let escaped_body = escaped_body_json
+                    .strip_prefix('"')
+                    .and_then(|s| s.strip_suffix('"'))
+                    .expect("quoted json string");
+                assert!(
+                    !escaped_body.is_empty(),
+                    "empty json-escaped document body for {j_name}"
+                );
+                needles.push((
+                    format!("document_body_json_escaped:{j_name}"),
+                    escaped_body.to_owned(),
+                ));
+
+                let mut frag_count = 0usize;
+                for (line_idx, raw_line) in body.lines().enumerate() {
+                    let trimmed = raw_line.trim();
+                    if trimmed.len() >= 16 && !trimmed.contains(canary) {
+                        frag_count += 1;
+                        needles.push((
+                            format!("document_body_fragment:{j_name}:line_{}", line_idx + 1),
+                            trimmed.to_owned(),
+                        ));
+                        let esc_line_json =
+                            serde_json::to_string(trimmed).expect("json-escape body fragment");
+                        let esc_line = esc_line_json
+                            .strip_prefix('"')
+                            .and_then(|s| s.strip_suffix('"'))
+                            .expect("quoted json fragment");
+                        if esc_line != trimmed {
+                            needles.push((
+                                format!(
+                                    "document_body_fragment_json_escaped:{j_name}:line_{}",
+                                    line_idx + 1
+                                ),
+                                esc_line.to_owned(),
+                            ));
+                        }
+                    }
+                }
+                assert!(
+                    frag_count >= 2,
+                    "expected at least 2 partial non-canary body fragments for {j_name}, got {frag_count}"
+                );
             }
 
             let args_raw = entry["expected_arguments_json"]
@@ -458,12 +504,13 @@ impl CanaryAndBodyScanner {
         hits
     }
 
-    /// N7 requirement: plant every canary and document body in a control string and verify
+    /// N7 requirement: plant every canary, full document/body, JSON-escaped body, and
+    /// partial non-canary document-body fragment in a control string and verify
     /// the scanner detects each one before scanning redacted surfaces.
     fn verify_planted_controls(&self) {
         assert!(
-            self.needles.len() >= 16,
-            "expected at least 4 canaries + 4 docs + 4 bodies + 4 tool contents"
+            self.needles.len() >= 28,
+            "expected at least 4 canaries + 4 docs + 4 bodies + 4 json-escaped bodies + 8 partial fragments + 4 tool contents"
         );
         for (label, needle) in &self.needles {
             let control = format!("redacted-surface-prefix [{needle}] redacted-surface-suffix");
@@ -2226,8 +2273,43 @@ fn n7_canary_scanner_detects_planted_controls_and_finds_zero_on_redacted_surface
     let (assets_dir, manifest, export_json_cmd) = harness.export_and_verify_assets();
 
     let scanner = CanaryAndBodyScanner::from_manifest_and_assets(&manifest, &assets_dir);
-    // 1. Prove the scanner detects every planted canary, document, document body, and tool content.
+    // 1. Prove the scanner detects every planted canary, document, document body, JSON-escaped
+    //    document body, partial non-canary document-body fragment, and tool content.
     scanner.verify_planted_controls();
+
+    for j_name in [
+        "benign_write",
+        "unauthorized",
+        "injection_benign",
+        "mismatch",
+    ] {
+        assert!(
+            scanner
+                .needles
+                .iter()
+                .any(|(label, _)| label == &format!("document_body_json_escaped:{j_name}")),
+            "missing JSON-escaped body needle for {j_name}"
+        );
+        let frag_needles: Vec<&(String, String)> = scanner
+            .needles
+            .iter()
+            .filter(|(label, _)| {
+                label.starts_with(&format!("document_body_fragment:{j_name}:line_"))
+            })
+            .collect();
+        assert!(
+            frag_needles.len() >= 2,
+            "expected at least 2 partial non-canary body fragments for {j_name}"
+        );
+        for (label, frag) in frag_needles {
+            let planted_json = format!("{{\"preview\":{}}}", serde_json::to_string(frag).unwrap());
+            let hits = scanner.scan(&planted_json);
+            assert!(
+                !hits.is_empty(),
+                "scanner must catch JSON-escaped partial fragment {label}"
+            );
+        }
+    }
 
     // 2. Also exercise human `demo export`, `init`, and `info` redacted surfaces and verify zero hits.
     let human_assets = harness.work_dir.path().join("assets_human");
@@ -2294,6 +2376,33 @@ fn n7_canary_scanner_detects_planted_controls_and_finds_zero_on_redacted_surface
     );
     assert_eq!(inspect_err_json.exit_code, 4);
 
+    let inspect_err_human = harness.run_parapet(
+        "n7_inspect_missing_human",
+        &[
+            "inspect",
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--run-id",
+            dummy_run_id,
+        ],
+        &[&state_dir],
+    );
+    assert_eq!(inspect_err_human.exit_code, 4);
+
+    let inspect_err_inert = harness.run_parapet(
+        "n7_inspect_missing_inert",
+        &[
+            "inspect",
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--run-id",
+            dummy_run_id,
+            "--inert-fallback",
+        ],
+        &[&state_dir],
+    );
+    assert_eq!(inspect_err_inert.exit_code, 4);
+
     for rec in [
         &export_json_cmd,
         &export_human_cmd,
@@ -2302,6 +2411,8 @@ fn n7_canary_scanner_detects_planted_controls_and_finds_zero_on_redacted_surface
         &scan_unauth_cmd,
         &scan_inj_cmd,
         &inspect_err_json,
+        &inspect_err_human,
+        &inspect_err_inert,
     ] {
         assert!(
             scanner.scan(&rec.stdout).is_empty(),
@@ -2318,7 +2429,7 @@ fn n7_canary_scanner_detects_planted_controls_and_finds_zero_on_redacted_surface
     let report = json!({
         "schema": "parapet-1e3-n7-canary-scan-report/v0",
         "planted_controls_verified": true,
-        "planted_patterns_tested": 6,
+        "planted_patterns_tested": scanner.needles.len(),
         "redacted_cli_surfaces_scanned": harness.commands.len(),
         "redacted_surface_hits": 0,
     });

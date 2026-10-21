@@ -249,9 +249,9 @@ fn demo_config_contract_hash_matches_manifest() {
 }
 
 #[test]
-fn manifest_freezes_measured_1e1_values() {
+fn manifest_freezes_measured_values() {
     let manifest = manifest_json();
-    assert_eq!(manifest["measurement_status"], "partially_measured");
+    assert_eq!(manifest["measurement_status"], "measured");
     let measured = [
         (
             DemoJourneyV0::BenignWrite,
@@ -294,6 +294,17 @@ fn manifest_freezes_measured_1e1_values() {
                 "detection_outcome": "threshold_breached",
             }),
         ),
+        (
+            DemoJourneyV0::Mismatch,
+            serde_json::json!({
+                "decision": "allow",
+                "attempt": "completed",
+                "observation": "present",
+                "verification_one_of": ["failed", "unknown"],
+                "verification": "failed",
+                "verification_reason_code": "digest_mismatch",
+            }),
+        ),
     ];
     for (journey, expected) in measured {
         let entry = journey_entry(journey);
@@ -314,17 +325,16 @@ fn manifest_freezes_measured_1e1_values() {
         journey_entry(DemoJourneyV0::InjectionBenign)["expected_file_sha256"],
         "dce7575a167e62cc27bba7307727f38b36b79afda3ec53add26d67873cb15e41"
     );
+    assert_eq!(
+        journey_entry(DemoJourneyV0::Mismatch)["expected_file_sha256"],
+        "592ae184266a9988c74b8a9bbbf13984483e8a5fce72b019b58f457ce9cdeb28"
+    );
     let unauthorized = journey_entry(DemoJourneyV0::Unauthorized);
     assert!(unauthorized["expected_file_sha256"].is_null());
     // The blocked argument is `path`; `matches` is the predicate it failed.
     let args: Value =
         serde_json::from_str(unauthorized["expected_arguments_json"].as_str().unwrap()).unwrap();
     assert_eq!(args["path"], unauthorized["injected_path"]);
-    // J4 is measured in 1E.2, not here.
-    assert_eq!(
-        journey_entry(DemoJourneyV0::Mismatch)["measurement_status"],
-        "predeclared_unmeasured"
-    );
     assert_eq!(
         manifest["negative_controls"]["unknown_document"],
         serde_json::json!({

@@ -127,7 +127,7 @@ if not ok:
 Sample `export.json` output (`parapet-cli-demo-export/v0`):
 
 ```text
-{"schema":"parapet-cli-demo-export/v0","out_dir":"<work-dir>/assets","manifest_sha256":"32aade5ff2943e0fa2d01355b4d2eaa92d73e95f782d2bd0bb2b553365c90454","files":[{"name":"config_demo_v0.yaml","sha256":"1b954d7eb2a49a0b3f8100b260685fadc55d752de83dc791759b59c619907450","len_bytes":435},{"name":"doc_benign_write.txt","sha256":"ae097bd662205900abb8ba49af6176535cf34eac23deb43b1611d051751c5bfa","len_bytes":290},{"name":"doc_injection_benign.txt","sha256":"7b685e429c5fe616fd0884977e5f3e01f4eee795a597aa80ee2cf4934b5f8a02","len_bytes":395},{"name":"doc_mismatch.txt","sha256":"3cbfeddbb358420b976487ea5a1ec99e8afc8cc262813948ad2238d9080007b8","len_bytes":218},{"name":"doc_unauthorized.txt","sha256":"60a65e916c21c05659f80665dc484358fd10fedb84fa60c462f25bacf908e75b","len_bytes":369},{"name":"manifest.json","sha256":"32aade5ff2943e0fa2d01355b4d2eaa92d73e95f782d2bd0bb2b553365c90454","len_bytes":8370},{"name":"request_benign_write.json","sha256":"67ba9575ea2108b239c880b8a1b393c622d347f817f10cd60a91fcdb0e0423bc","len_bytes":374},{"name":"request_injection_benign.json","sha256":"818d53b5f48589c7f436dc2ac3e490429a5570d8ea16049402a835830662f94e","len_bytes":490},{"name":"request_mismatch.json","sha256":"1864d10031029adada29395b64205eaa8cb06bef0e02f9f8c43c6c3532c32741","len_bytes":301},{"name":"request_unauthorized.json","sha256":"56991b0b1cacf1494489614258222fc0848e88d635423bcb9a26fa3ccfa921c5","len_bytes":458}]}
+{"schema":"parapet-cli-demo-export/v0","out_dir":"<work-dir>/assets","manifest_sha256":"6f8d4f240cb84e7a8244b09c22346cce6c1b7a9c3d760b647dc575212c3b66da","files":[{"name":"config_demo_v0.yaml","sha256":"1b954d7eb2a49a0b3f8100b260685fadc55d752de83dc791759b59c619907450","len_bytes":435},{"name":"doc_benign_write.txt","sha256":"ae097bd662205900abb8ba49af6176535cf34eac23deb43b1611d051751c5bfa","len_bytes":290},{"name":"doc_injection_benign.txt","sha256":"7b685e429c5fe616fd0884977e5f3e01f4eee795a597aa80ee2cf4934b5f8a02","len_bytes":395},{"name":"doc_mismatch.txt","sha256":"3cbfeddbb358420b976487ea5a1ec99e8afc8cc262813948ad2238d9080007b8","len_bytes":218},{"name":"doc_unauthorized.txt","sha256":"60a65e916c21c05659f80665dc484358fd10fedb84fa60c462f25bacf908e75b","len_bytes":369},{"name":"manifest.json","sha256":"6f8d4f240cb84e7a8244b09c22346cce6c1b7a9c3d760b647dc575212c3b66da","len_bytes":8346},{"name":"request_benign_write.json","sha256":"67ba9575ea2108b239c880b8a1b393c622d347f817f10cd60a91fcdb0e0423bc","len_bytes":374},{"name":"request_injection_benign.json","sha256":"818d53b5f48589c7f436dc2ac3e490429a5570d8ea16049402a835830662f94e","len_bytes":490},{"name":"request_mismatch.json","sha256":"1864d10031029adada29395b64205eaa8cb06bef0e02f9f8c43c6c3532c32741","len_bytes":301},{"name":"request_unauthorized.json","sha256":"56991b0b1cacf1494489614258222fc0848e88d635423bcb9a26fa3ccfa921c5","len_bytes":458}]}
 ```
 
 ## 2. Journey 1 (`J1`): Benign Allowed Write, Redaction, Restoration, and Release
@@ -178,6 +178,7 @@ parapet restore --state-dir "$S" --json > "$J/restore.json"
 ls -la "$R"
 parapet disable --state-dir "$S" --json > "$J/disable.json"
 wait "$RUN_PID"
+RUN_PID=
 ls -la "$R"
 python3 -c 'import json, os, sys
 j_dir, root_dir, run_id = sys.argv[1:4]
@@ -261,6 +262,7 @@ parapet restore --state-dir "$S" --json > "$J/restore.json"
 ls -la "$R"
 parapet disable --state-dir "$S" --json > "$J/disable.json"
 wait "$RUN_PID"
+RUN_PID=
 ls -la "$R"
 python3 -c 'import json, os, sys
 j_dir, root_dir, run_id = sys.argv[1:4]
@@ -329,6 +331,7 @@ parapet restore --state-dir "$S" --json > "$J/restore.json"
 ls -la "$R"
 parapet disable --state-dir "$S" --json > "$J/disable.json"
 wait "$RUN_PID"
+RUN_PID=
 ls -la "$R"
 python3 -c 'import json, os, sys
 j_dir, root_dir, run_id = sys.argv[1:4]
@@ -394,6 +397,7 @@ parapet restore --state-dir "$S" --json > "$J/restore.json"
 ls -la "$R"
 parapet disable --state-dir "$S" --json > "$J/disable.json"
 wait "$RUN_PID"
+RUN_PID=
 ls -la "$R"
 python3 -c 'import json, os, sys
 j_dir, root_dir, run_id = sys.argv[1:4]
@@ -470,6 +474,7 @@ parapet restore --state-dir "$S" --json > "$J/restore_recovered.json"
 ls -la "$R"
 parapet disable --state-dir "$S" --json > "$J/disable_recovered.json"
 wait "$RUN_PID"
+RUN_PID=
 ls -la "$R"
 python3 -c 'import json, os, sys
 j_dir, root_dir, run_id = sys.argv[1:4]

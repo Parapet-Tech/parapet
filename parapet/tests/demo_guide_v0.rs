@@ -196,6 +196,33 @@ fn check_evidence_release_witness_ordering(script: &str) -> Result<usize, String
     Ok(release_count)
 }
 
+/// Verifies that every `wait "$RUN_PID"` line in `script` is immediately followed
+/// by `RUN_PID=` so the EXIT trap cannot later signal a reused PID.
+fn check_wait_run_pid_cleared_ordering(script: &str) -> Result<usize, String> {
+    let lines: Vec<&str> = script.lines().collect();
+    let mut wait_count = 0usize;
+    for (idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed == "wait \"$RUN_PID\"" || trimmed.starts_with("wait \"$RUN_PID\" ") {
+            wait_count += 1;
+            let next = lines
+                .get(idx + 1)
+                .map(|s| s.trim())
+                .unwrap_or("<end of script>");
+            if next != "RUN_PID=" {
+                return Err(format!(
+                    "line {}: `wait \"$RUN_PID\"` not immediately followed by `RUN_PID=` (found `{next}`)",
+                    idx + 1
+                ));
+            }
+        }
+    }
+    if wait_count == 0 {
+        return Err("no `wait \"$RUN_PID\"` command found in script".to_owned());
+    }
+    Ok(wait_count)
+}
+
 // ---------------------------------------------------------------------------
 // N13(c): Public-asset boundary scanner (Section 5.4, Section 13.1 prelude)
 // ---------------------------------------------------------------------------
@@ -869,6 +896,23 @@ fn n12_post_release_reader_witness_extracted_from_guide_and_ordering_enforced() 
     assert_eq!(
         count, 5,
         "expected 5 `parapet evidence release` calls (J1-J4 and J7)"
+    );
+
+    // Process cleanup check: all 5 `wait "$RUN_PID"` calls in the extracted guide
+    // must be immediately followed by `RUN_PID=`.
+    let wait_count =
+        check_wait_run_pid_cleared_ordering(&script).expect("guide wait RUN_PID clear valid");
+    assert_eq!(
+        wait_count, 5,
+        "expected 5 `wait \"$RUN_PID\"` calls followed by `RUN_PID=` (J1-J4 and J7)"
+    );
+    assert!(
+        check_wait_run_pid_cleared_ordering("wait \"$RUN_PID\"\nls -la \"$R\"\n").is_err(),
+        "missing RUN_PID= after wait must fail"
+    );
+    assert!(
+        check_wait_run_pid_cleared_ordering("wait \"$RUN_PID\"\n").is_err(),
+        "wait at end of script without RUN_PID= must fail"
     );
 
     // Negative controls on the ordering checker itself.
