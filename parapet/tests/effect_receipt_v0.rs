@@ -5454,3 +5454,67 @@ fn replay_fix2_arguments_raw_before_length_o1() {
         0,
     );
 }
+
+// Contract 34e79d9e, section 16.3 and F78.
+
+#[test]
+fn f78_before_errored_not_persisted() {
+    let bytes = include_bytes!("fixtures/receipt_v0/F78_before_errored_row.json");
+    assert_eq!(s2_validate(bytes), ValidationResult::Valid);
+}
+
+#[test]
+fn f78_before_present_not_persisted() {
+    let bytes = include_bytes!("fixtures/receipt_v0/F78_before_present_row.json");
+    assert_eq!(s2_validate(bytes), ValidationResult::Valid);
+}
+
+#[test]
+fn f78_store_not_configured() {
+    let bytes = include_bytes!("fixtures/receipt_v0/F78_store_not_configured_row.json");
+    assert_eq!(s2_validate(bytes), ValidationResult::Valid);
+}
+
+#[test]
+fn f78_detection_not_persisted_rejected() {
+    let bytes = include_bytes!("fixtures/receipt_v0/F78_detection_not_persisted_row.json");
+    assert_eq!(s2_validate(bytes), ValidationResult::Rejected(RejectionCode::ErrorCodeNotInClosedList));
+}
+
+#[test]
+fn f78_arguments_not_persisted_rejected() {
+    let bytes = include_bytes!("fixtures/receipt_v0/F78_arguments_not_persisted_row.json");
+    assert_eq!(s2_validate(bytes), ValidationResult::Rejected(RejectionCode::ErrorCodeNotInClosedList));
+}
+
+#[test]
+fn f78_rejected_not_persisted_shape() {
+    let bytes = include_bytes!("fixtures/receipt_v0/F78_rejected_not_persisted_row.json");
+    assert_eq!(s2_validate(bytes), ValidationResult::Rejected(RejectionCode::RejectedAttemptShapeInvalid));
+}
+
+#[test]
+fn f78_not_persisted_projection_reason() {
+    let bytes = include_bytes!("fixtures/receipt_v0/F78_before_errored_row.json");
+    assert_eq!(s2_validate(bytes), ValidationResult::Valid);
+    let row: Row = serde_json::from_slice(bytes).unwrap();
+    let projection = receipt_projection(&row);
+    let entry = projection.not_present.iter().find(|entry| entry.field == "attempt.content_payload").unwrap();
+    assert_eq!(entry.availability, Availability::Unavailable);
+    assert_eq!(entry.reason_code.as_deref(), Some("not_persisted"));
+}
+
+#[test]
+fn f78_payload_error_serde_round_trip() {
+    for (value, wire) in [
+        (StoreError::StoreNotConfigured, "\"store_not_configured\""),
+        (StoreError::NotPersisted, "\"not_persisted\""),
+    ] {
+        assert_eq!(serde_json::to_string(&value).unwrap(), wire);
+        assert_eq!(serde_json::from_str::<StoreError>(wire).unwrap(), value);
+    }
+    let detection = DetectionPayloadError::StoreNotConfigured;
+    assert_eq!(serde_json::to_string(&detection).unwrap(), "\"store_not_configured\"");
+    assert_eq!(serde_json::from_str::<DetectionPayloadError>("\"store_not_configured\"").unwrap(), detection);
+    assert!(serde_json::from_str::<DetectionPayloadError>("\"not_persisted\"").is_err());
+}
