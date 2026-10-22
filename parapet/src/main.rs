@@ -176,8 +176,8 @@ async fn main() {
             let (client, _store, root_cap) =
                 match engine::build_engine_client_with_runtime_v0(config, options) {
                     Ok(parts) => parts,
-                    Err(_) => {
-                        tracing::error!("engine runtime initialization failed");
+                    Err(e) => {
+                        tracing::error!(%e, "engine runtime initialization failed");
                         std::process::exit(1);
                     }
                 };
