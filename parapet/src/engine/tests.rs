@@ -470,7 +470,7 @@ fn env_upstream_resolver_base_url_for_host_with_env_override() {
 // -------------------------------------------------------------------
 
 #[test]
-fn disallowed_host_header_falls_back_to_provider_resolver() {
+fn disallowed_host_header_is_refused_without_fallback() {
     // Stage 0: evil.com is not in KNOWN_LLM_HOSTS — header must be refused, never rerouted.
     let req = proxy_request_with_header(
         "/v1/chat/completions",
@@ -3656,12 +3656,20 @@ fn t16_log_redaction_across_t4_t7_t8_at_trace_level() {
         .env(CHILD_ENV, "1")
         .output()
         .expect("spawn isolated T16 child process");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             output.status.success(),
             "isolated T16 child failed with {}\nstdout:\n{}\nstderr:\n{}",
             output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
+            stdout,
+            stderr,
+        );
+        assert!(
+            stdout.contains("running 1 test") && stdout.contains("1 passed; 0 failed"),
+            "isolated T16 child did not execute exactly 1 passing test\nstdout:\n{}\nstderr:\n{}",
+            stdout,
+            stderr,
         );
         return;
     }

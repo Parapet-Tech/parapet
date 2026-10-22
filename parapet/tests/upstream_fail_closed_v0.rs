@@ -1098,6 +1098,94 @@ fn r8_offline_fixture_with_invalid_env_refuses_startup_with_zero_leak() {
     }
 }
 
+#[test]
+fn r8_non_utf8_upstream_env_refuses_startup_with_zero_leak() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let s = SentinelSet::generate();
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg_path = write_test_config(tmp.path());
+    let mut non_utf8_value = s.c2.as_bytes().to_vec();
+    non_utf8_value.extend_from_slice(b"http://evil.example/\xff\xfe");
+    let expected_len = non_utf8_value.len();
+    let os_value = OsStr::from_bytes(&non_utf8_value);
+
+    for (tag, env_key, expected_prefix) in [
+        (
+            "provider_url",
+            "PARAPET_OPENAI_BASE_URL",
+            "PARAPET_OPENAI_BASE_URL: unparseable",
+        ),
+        (
+            "fallback_url",
+            "OPENAI_BASE_URL",
+            "OPENAI_BASE_URL: unparseable",
+        ),
+        (
+            "per_host_url",
+            "PARAPET_API_OPENAI_COM_BASE_URL",
+            "PARAPET_API_OPENAI_COM_BASE_URL: unparseable",
+        ),
+        (
+            "extra_hosts",
+            "PARAPET_EXTRA_HOSTS",
+            "PARAPET_EXTRA_HOSTS entry #1: extra_host_invalid",
+        ),
+    ] {
+        let state_dir = write_private_state_dir(tmp.path(), &format!("state-r8-nonutf8-{tag}"));
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_parapet"));
+        clear_all_upstream_env(&mut cmd);
+        let out = cmd
+            .env(env_key, os_value)
+            .args([
+                "run",
+                "--json",
+                "--config",
+                cfg_path.to_str().unwrap(),
+                "--state-dir",
+                state_dir.to_str().unwrap(),
+                "--offline-fixture",
+                "v0",
+            ])
+            .output()
+            .expect("run parapet run --offline-fixture v0 with non-UTF-8 env");
+
+        assert_eq!(out.status.code(), Some(4), "case={tag}");
+        s.assert_clean(&format!("R8:nonutf8:{tag}:stdout"), &out.stdout);
+        s.assert_clean(&format!("R8:nonutf8:{tag}:stderr"), &out.stderr);
+        s.assert_state_dir_clean(&format!("R8:nonutf8:{tag}:state_dir"), &state_dir);
+
+        for surface in [&out.stdout, &out.stderr] {
+            assert!(
+                !surface.contains(&0xff) && !surface.contains(&0xfe),
+                "raw non-UTF-8 bytes leaked on {tag}"
+            );
+            let lossy = String::from_utf8_lossy(surface);
+            assert!(
+                !lossy.contains("evil.example") && !lossy.contains("http://evil"),
+                "leaked URL substring on {tag}: {lossy}"
+            );
+        }
+
+        let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(json["error_code"], "upstream_config_invalid");
+        let mut json_strings = Vec::new();
+        walk_json_strings(&json, &mut json_strings);
+        for field in &json_strings {
+            s.assert_clean(&format!("R8:nonutf8:{tag}:json_field"), field.as_bytes());
+            assert!(!field.contains("evil.example"));
+        }
+
+        let expected_diag = format!("{expected_prefix} (value withheld, {expected_len} bytes)");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(&expected_diag),
+            "case={tag} expected '{expected_diag}' in stderr={stderr}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn r9_config_sentinel_sweep_across_all_real_binaries_and_surfaces() {
     let recorder = LoopbackRecorder::spawn_silent().await;

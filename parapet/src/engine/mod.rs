@@ -2177,6 +2177,26 @@ pub struct UpstreamTable {
     host_overrides: std::collections::HashMap<String, String>,
 }
 
+fn read_process_env_for_upstream_validation(key: &str) -> Option<String> {
+    match std::env::var(key) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(value)) => {
+            #[cfg(unix)]
+            let value_len = {
+                use std::os::unix::ffi::OsStrExt as _;
+                value.as_os_str().as_bytes().len()
+            };
+            #[cfg(not(unix))]
+            let value_len = value.as_os_str().as_encoded_bytes().len();
+
+            // Preserve only the byte length so the ordinary validation path emits
+            // the correct key/rule without retaining or formatting attacker bytes.
+            Some(" ".repeat(value_len.max(1)))
+        }
+    }
+}
+
 impl UpstreamTable {
     pub fn from_env_fn(get: &dyn Fn(&str) -> Option<String>) -> Result<Self, UpstreamConfigError> {
         let mut extra_hosts: Vec<String> = Vec::new();
@@ -2331,7 +2351,7 @@ impl UpstreamTable {
     }
 
     pub fn from_process_env() -> Result<Self, UpstreamConfigError> {
-        let table = Self::from_env_fn(&|k| std::env::var(k).ok())?;
+        let table = Self::from_env_fn(&read_process_env_for_upstream_validation)?;
         let mut unrelated_count = 0usize;
         for (os_key, _) in std::env::vars_os() {
             let Some(key) = os_key.to_str() else {
@@ -2420,7 +2440,7 @@ impl std::fmt::Debug for EnvUpstreamResolver {
 
 impl EnvUpstreamResolver {
     pub fn new() -> Self {
-        Self::from_env_fn(&|k| std::env::var(k).ok())
+        Self::from_env_fn(&read_process_env_for_upstream_validation)
     }
 
     pub fn from_table(table: UpstreamTable) -> Self {

@@ -169,6 +169,7 @@ fn is_non_canonical_path(path: &str) -> bool {
     if !path.starts_with('/')
         || path.contains('\\')
         || path.contains("//")
+        || path.contains('%')
         || contains_ascii_case_insensitive(path, "%2f")
         || contains_ascii_case_insensitive(path, "%5c")
     {
@@ -953,6 +954,9 @@ mod tests {
             "/v1/chat/completions/%2e./embeddings",
             "/v1/chat/completions/%2e",
             "/v1/chat/completions%5c..",
+            "/v1/messages/count%5Ftokens",
+            "/v1/messages/%63ount_tokens",
+            "/v1/messages/b%61tches",
         ] {
             assert_eq!(
                 classify_path(path),
@@ -1045,30 +1049,47 @@ mod tests {
         assert!(msg_501.contains("Parapet does not inspect /v1/responses."));
         assert!(!msg_501.contains("secret_query"));
 
-        let resp_400 = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/chat/completions/../../embeddings")
-                    .body(Body::from("not even json"))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp_400.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(
-            resp_400
-                .headers()
-                .get("x-parapet-error")
-                .and_then(|v| v.to_str().ok()),
-            Some("path_not_canonical")
-        );
-        let body_400 = axum::body::to_bytes(resp_400.into_body(), 1024 * 1024)
-            .await
-            .unwrap();
-        let json_400: serde_json::Value = serde_json::from_slice(&body_400).unwrap();
-        assert_eq!(json_400["error"]["type"], "parapet_path_not_canonical");
-        assert_eq!(json_400["error"]["code"], "path_not_canonical");
+        for non_canonical_path in [
+            "/v1/chat/completions/../../embeddings",
+            "/v1/messages/count%5Ftokens",
+            "/v1/messages/%63ount_tokens",
+            "/v1/messages/b%61tches",
+        ] {
+            let resp_400 = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("{non_canonical_path}?secret_query=should_not_echo"))
+                        .header("authorization", "Bearer secret-token-should-not-echo")
+                        .body(Body::from(r#"{"secret_body":"should_not_echo"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp_400.status(),
+                StatusCode::BAD_REQUEST,
+                "path={non_canonical_path}"
+            );
+            assert_eq!(
+                resp_400
+                    .headers()
+                    .get("x-parapet-error")
+                    .and_then(|v| v.to_str().ok()),
+                Some("path_not_canonical")
+            );
+            let body_400 = axum::body::to_bytes(resp_400.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let json_400: serde_json::Value = serde_json::from_slice(&body_400).unwrap();
+            assert_eq!(json_400["error"]["type"], "parapet_path_not_canonical");
+            assert_eq!(json_400["error"]["code"], "path_not_canonical");
+            let msg_400 = json_400["error"]["message"].as_str().unwrap();
+            assert!(!msg_400.contains("secret_query"));
+            assert!(!msg_400.contains("secret-token-should-not-echo"));
+            assert!(!msg_400.contains("should_not_echo"));
+        }
 
         assert!(client.captured_provider.lock().await.is_none());
     }
