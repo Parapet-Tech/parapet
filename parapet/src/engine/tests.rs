@@ -407,14 +407,14 @@ fn build_upstream_url_with_header_uses_host() {
         "/v1/chat/completions",
         Some("api.cerebras.ai"),
     );
-    let url = build_upstream_url(&NoopResolver, Provider::OpenAi, &req);
+    let url = build_upstream_url(&NoopResolver, Provider::OpenAi, &req).unwrap();
     assert_eq!(url, "https://api.cerebras.ai/v1/chat/completions");
 }
 
 #[test]
 fn build_upstream_url_without_header_falls_back_to_resolver() {
     let req = proxy_request_with_header("/v1/chat/completions", None);
-    let url = build_upstream_url(&NoopResolver, Provider::OpenAi, &req);
+    let url = build_upstream_url(&NoopResolver, Provider::OpenAi, &req).unwrap();
     assert_eq!(url, "https://example.com/v1/chat/completions");
 }
 
@@ -439,13 +439,14 @@ fn build_upstream_url_with_header_uses_resolver_base_url_for_host() {
         "/v1/chat/completions",
         Some("api.cerebras.ai"),
     );
-    let url = build_upstream_url(&StagingResolver, Provider::OpenAi, &req);
+    let url = build_upstream_url(&StagingResolver, Provider::OpenAi, &req).unwrap();
     assert_eq!(url, "https://staging.cerebras.internal/v1/chat/completions");
 }
 
 #[test]
 fn env_upstream_resolver_base_url_for_host_default() {
-    let resolver = EnvUpstreamResolver::new();
+    let table = UpstreamTable::from_env_fn(&|_| None).unwrap();
+    let resolver = EnvUpstreamResolver::from_table(table);
     // Without env var set, defaults to https://{host}
     let url = resolver.base_url_for_host("api.groq.com");
     assert_eq!(url, "https://api.groq.com");
@@ -453,12 +454,14 @@ fn env_upstream_resolver_base_url_for_host_default() {
 
 #[test]
 fn env_upstream_resolver_base_url_for_host_with_env_override() {
-    let resolver = EnvUpstreamResolver::new();
-    // Use a distinct host from env_upstream_resolver_base_url_for_host_default
-    // to avoid env var race between parallel tests.
-    std::env::set_var("PARAPET_API_MISTRAL_AI_BASE_URL", "https://mistral.staging.internal");
+    let table = UpstreamTable::from_env_fn(&|key| match key {
+        "PARAPET_EXTRA_HOSTS" => Some("api.mistral.ai".to_string()),
+        "PARAPET_API_MISTRAL_AI_BASE_URL" => Some("https://mistral.staging.internal".to_string()),
+        _ => None,
+    })
+    .unwrap();
+    let resolver = EnvUpstreamResolver::from_table(table);
     let url = resolver.base_url_for_host("api.mistral.ai");
-    std::env::remove_var("PARAPET_API_MISTRAL_AI_BASE_URL");
     assert_eq!(url, "https://mistral.staging.internal");
 }
 
@@ -468,14 +471,13 @@ fn env_upstream_resolver_base_url_for_host_with_env_override() {
 
 #[test]
 fn disallowed_host_header_falls_back_to_provider_resolver() {
-    // evil.com is not in KNOWN_LLM_HOSTS — header must be rejected.
+    // Stage 0: evil.com is not in KNOWN_LLM_HOSTS — header must be refused, never rerouted.
     let req = proxy_request_with_header(
         "/v1/chat/completions",
         Some("evil.com"),
     );
-    let url = build_upstream_url(&NoopResolver, Provider::OpenAi, &req);
-    // Falls back to NoopResolver.base_url() → "https://example.com"
-    assert_eq!(url, "https://example.com/v1/chat/completions");
+    let res = build_upstream_url(&NoopResolver, Provider::OpenAi, &req);
+    assert_eq!(res, Err(UpstreamRefusal::HostNotAllowed));
 }
 
 #[test]
@@ -484,23 +486,28 @@ fn allowed_host_header_is_accepted() {
         "/v1/chat/completions",
         Some("api.groq.com"),
     );
-    let url = build_upstream_url(&NoopResolver, Provider::OpenAi, &req);
+    let url = build_upstream_url(&NoopResolver, Provider::OpenAi, &req).unwrap();
     assert_eq!(url, "https://api.groq.com/v1/chat/completions");
 }
 
 #[test]
 fn env_extra_hosts_extends_allowlist() {
-    let resolver = EnvUpstreamResolver::new();
-    assert!(!resolver.is_allowed_host("api.fireworks.ai"));
+    let default_table = UpstreamTable::from_env_fn(&|_| None).unwrap();
+    let default_resolver = EnvUpstreamResolver::from_table(default_table);
+    assert!(!default_resolver.is_allowed_host("api.fireworks.ai"));
 
-    std::env::set_var("PARAPET_EXTRA_HOSTS", "api.fireworks.ai,api.custom.dev");
+    let table = UpstreamTable::from_env_fn(&|key| match key {
+        "PARAPET_EXTRA_HOSTS" => Some("api.fireworks.ai,api.custom.dev".to_string()),
+        _ => None,
+    })
+    .unwrap();
+    let resolver = EnvUpstreamResolver::from_table(table);
     assert!(resolver.is_allowed_host("api.fireworks.ai"));
     assert!(resolver.is_allowed_host("api.custom.dev"));
     // Known hosts still allowed
     assert!(resolver.is_allowed_host("api.openai.com"));
     // Random host still blocked
     assert!(!resolver.is_allowed_host("evil.com"));
-    std::env::remove_var("PARAPET_EXTRA_HOSTS");
 }
 
 #[test]
@@ -2841,4 +2848,1135 @@ async fn l5a_panic_on_failure_open_skips_redaction() {
     let resp = engine.forward(Provider::OpenAi, openai_request()).await.unwrap();
     // on_failure: open — skip L5a, return upstream response as-is.
     assert_eq!(resp.status, StatusCode::OK);
+}
+
+// ===================================================================
+// Stage 0: Fail-Closed Upstream + Zero-Leak Diagnostics (T1–T9, T13–T18)
+// ===================================================================
+
+#[derive(Clone)]
+struct SentinelToken {
+    full: String,
+    suffix: String,
+}
+
+struct Stage0SentinelRun {
+    tokens: Vec<SentinelToken>,
+    c1: String,
+    c2: String,
+    c3: String,
+    c4: String,
+    c5: String,
+    c6: String,
+    c7: String,
+    c8: String,
+    c9: String,
+    c10: String,
+    h1: Vec<u8>,
+    h2: Vec<u8>,
+    h3: Vec<u8>,
+    h4_second: Vec<u8>,
+    h5: Vec<u8>,
+}
+
+impl Stage0SentinelRun {
+    fn generate() -> Self {
+        let seed_base = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x5a17_c0de)
+            ^ (std::process::id() as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let mut tokens = Vec::new();
+        let mut next_token = |prefix: &str, tag: &str, idx: u64| -> String {
+            let mixed = seed_base
+                .wrapping_add(idx.wrapping_mul(0xbf58_476d_1ce4_e5b9))
+                .rotate_left(17)
+                ^ 0x94d0_49bb_1331_11eb;
+            let digits = [b'1', b'2', b'3', b'4', b'6', b'7', b'8', b'9'];
+            let letters = [b'a', b'b', b'c', b'd', b'e', b'f'];
+            let mut suffix = String::with_capacity(6);
+            for pos in 0..3 {
+                let d = digits[((mixed >> (pos * 8)) as usize) % digits.len()] as char;
+                let l = letters[((mixed >> (pos * 8 + 4)) as usize) % letters.len()] as char;
+                suffix.push(d);
+                suffix.push(l);
+            }
+            let full = format!("{prefix}-{tag}-{suffix}");
+            tokens.push(SentinelToken {
+                full: full.clone(),
+                suffix,
+            });
+            full
+        };
+
+        let c1_u = next_token("SNTLu", "c1u", 1);
+        let c1_p = next_token("SNTLp", "c1p", 2);
+        let c1_path = next_token("SNTLpath", "c1path", 3);
+        let c1 = format!("https://{c1_u}:{c1_p}@gw.example/{c1_path}");
+
+        let c2_raw = next_token("SNTLraw", "c2", 4);
+        let c2 = format!("{c2_raw} ::/ not a url");
+
+        let c3_host = next_token("SNTLhost", "c3h", 5);
+        let c3_path = next_token("SNTLpath", "c3p", 6);
+        let c3 = format!("http://{c3_host}.example:4000/{c3_path}");
+
+        let c4_q = next_token("SNTLq", "c4q", 7);
+        let c4_qv = next_token("SNTLqv", "c4v", 8);
+        let c4 = format!("https://gw.example/?{c4_q}={c4_qv}");
+
+        let c5_frag = next_token("SNTLfrag", "c5f", 9);
+        let c5 = format!("https://gw.example/#{c5_frag}");
+
+        let c6_scheme = next_token("SNTLscheme", "c6s", 10);
+        let c6 = format!("{c6_scheme}://gw.example");
+
+        let c7_long = next_token("SNTLlong", "c7l", 11);
+        let repeat_count = (4096 / c7_long.len()) + 4;
+        let c7 = format!("https://[{}", c7_long.repeat(repeat_count));
+
+        let c8_self = next_token("SNTLself", "c8s", 12);
+        let c8 = format!("http://{c8_self}.local:9800");
+
+        let c9_xh = next_token("SNTLxh", "c9x", 13);
+        let c9 = format!("api.ok.dev,{c9_xh}@evil.dev");
+
+        let c10_xs = next_token("SNTLxs", "c10x", 14);
+        let c10 = format!("https://{c10_xs}.dev");
+
+        let h1_tok = next_token("SNTLh", "h1", 15);
+        let h1 = format!("{h1_tok}.evil.com").into_bytes();
+
+        let h2_tok = next_token("SNTLh", "h2", 16);
+        let h2 = format!("api.openai.com.{h2_tok}").into_bytes();
+
+        let h3_tok = next_token("SNTLh", "h3", 17);
+        let mut h3 = h3_tok.into_bytes();
+        h3.extend_from_slice(&[0xFF, 0xFE]);
+
+        let h4_tok = next_token("SNTLh", "h4", 18);
+        let h4_second = h4_tok.into_bytes();
+
+        let h5_tok = next_token("SNTLh", "h5", 19);
+        let h5 = format!("{h5_tok}\tevil.com").into_bytes();
+
+        Self {
+            tokens,
+            c1,
+            c2,
+            c3,
+            c4,
+            c5,
+            c6,
+            c7,
+            c8,
+            c9,
+            c10,
+            h1,
+            h2,
+            h3,
+            h4_second,
+            h5,
+        }
+    }
+
+    fn percent_encode_all(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() * 3);
+        for b in s.as_bytes() {
+            out.push_str(&format!("%{b:02x}"));
+        }
+        out
+    }
+
+    /// Returns `Some(reason)` if the surface contains any sentinel form (§7.3 matcher).
+    fn scan_bytes(&self, surface: &[u8]) -> Option<String> {
+        let lower: Vec<u8> = surface.iter().map(|b| b.to_ascii_lowercase()).collect();
+        if lower.windows(4).any(|w| w == b"sntl") {
+            return Some("matched literal prefix SNTL".to_string());
+        }
+        for tok in &self.tokens {
+            let full_lower = tok.full.to_ascii_lowercase();
+            let pct_lower = Self::percent_encode_all(&tok.full).to_ascii_lowercase();
+            let idna_lower = url::Host::parse(&tok.full)
+                .ok()
+                .map(|h| h.to_string().to_ascii_lowercase())
+                .unwrap_or_else(|| full_lower.clone());
+            let suffix_lower = tok.suffix.to_ascii_lowercase();
+            for (kind, needle) in [
+                ("raw", full_lower.as_bytes()),
+                ("percent_encoded", pct_lower.as_bytes()),
+                ("idna_lowered", idna_lower.as_bytes()),
+                ("hex_suffix", suffix_lower.as_bytes()),
+            ] {
+                if !needle.is_empty()
+                    && lower.len() >= needle.len()
+                    && lower.windows(needle.len()).any(|w| w == needle)
+                {
+                    return Some(format!("matched {kind} for {}", tok.full));
+                }
+            }
+        }
+        None
+    }
+
+    fn assert_clean(&self, surface_name: &str, surface: &[u8]) {
+        if let Some(reason) = self.scan_bytes(surface) {
+            panic!("sentinel leak on surface {surface_name}: {reason}");
+        }
+    }
+}
+
+#[test]
+fn stage0_sentinel_matcher_positive_control() {
+    let run = Stage0SentinelRun::generate();
+    assert!(run
+        .scan_bytes(b"completely benign diagnostic output")
+        .is_none());
+    // Positive control: buffer containing raw, percent-encoded, IDNA-lowered, suffix, or SNTL prefix must fail.
+    let raw_leak = format!("diagnostic leaked {}", run.tokens[0].full);
+    assert!(run.scan_bytes(raw_leak.as_bytes()).is_some());
+    let pct_leak = format!(
+        "diagnostic leaked {}",
+        Stage0SentinelRun::percent_encode_all(&run.tokens[0].full)
+    );
+    assert!(run.scan_bytes(pct_leak.as_bytes()).is_some());
+    let idna_leak = format!(
+        "diagnostic leaked {}",
+        url::Host::parse(&run.tokens[0].full)
+            .unwrap()
+            .to_string()
+            .to_ascii_lowercase()
+    );
+    assert!(run.scan_bytes(idna_leak.as_bytes()).is_some());
+    let suffix_leak = format!("diagnostic leaked {}", run.tokens[0].suffix);
+    assert!(run.scan_bytes(suffix_leak.as_bytes()).is_some());
+    let prefix_leak = b"truncated sNtL-leak";
+    assert!(run.scan_bytes(prefix_leak).is_some());
+}
+
+#[test]
+fn t1_upstream_table_env_empty_defaults() {
+    let table = UpstreamTable::from_env_fn(&|_| None).expect("empty env valid");
+    let resolver = EnvUpstreamResolver::from_table(table);
+    assert_eq!(
+        resolver.resolve(Provider::OpenAi, OriginalHost::Absent),
+        Ok("https://api.openai.com".to_string())
+    );
+    assert_eq!(
+        resolver.resolve(Provider::Anthropic, OriginalHost::Absent),
+        Ok("https://api.anthropic.com".to_string())
+    );
+    for &host in KNOWN_LLM_HOSTS {
+        assert_eq!(
+            resolver.resolve(Provider::OpenAi, OriginalHost::Present(host)),
+            Ok(format!("https://{host}"))
+        );
+    }
+}
+
+#[test]
+fn t2_upstream_table_valid_https_override_with_path() {
+    let table = UpstreamTable::from_env_fn(&|k| match k {
+        "PARAPET_OPENAI_BASE_URL" => Some("https://gw.example/openai".to_string()),
+        _ => None,
+    })
+    .expect("valid https override");
+    let resolver = EnvUpstreamResolver::from_table(table);
+    let req = proxy_request_with_header("/v1/chat/completions", None);
+    let url = build_upstream_url(&resolver, Provider::OpenAi, &req).expect("build url");
+    assert_eq!(url, "https://gw.example/openai/v1/chat/completions");
+}
+
+#[test]
+fn t3_upstream_table_refuses_all_http_variants_without_leaking_host_or_port() {
+    let bad_urls = [
+        ("http://127.0.0.1:8080", HostClass::LoopbackLiteral, true),
+        ("http://localhost:4000", HostClass::LocalhostName, true),
+        ("http://[::1]:8080", HostClass::LoopbackLiteral, true),
+        (
+            "http://[::ffff:127.0.0.1]",
+            HostClass::LoopbackLiteral,
+            false,
+        ),
+        ("http://127.0.0.1.nip.io", HostClass::DnsName, false),
+        ("http://localhost.evil.com", HostClass::DnsName, false),
+        ("http://192.168.1.5", HostClass::IpLiteral, false),
+        ("HTTP://api.openai.com", HostClass::DnsName, false),
+    ];
+    let target_keys = [
+        "PARAPET_OPENAI_BASE_URL",
+        "OPENAI_BASE_URL",
+        "PARAPET_ANTHROPIC_BASE_URL",
+        "ANTHROPIC_BASE_URL",
+        "PARAPET_API_OPENAI_COM_BASE_URL",
+    ];
+    for &(bad_url, expected_host_class, expected_port) in &bad_urls {
+        for &target_key in &target_keys {
+            let err = UpstreamTable::from_env_fn(&|k| {
+                if k == target_key {
+                    Some(bad_url.to_string())
+                } else {
+                    None
+                }
+            })
+            .expect_err("http URL must be refused");
+            assert_eq!(err.rule, "non_https_upstream");
+            assert_eq!(err.value_len, bad_url.len());
+            assert_eq!(
+                err.shape,
+                Some(ParsedShape {
+                    scheme_class: SchemeClass::Http,
+                    host_class: expected_host_class,
+                    has_userinfo: false,
+                    has_query: false,
+                    has_fragment: false,
+                    has_port: expected_port,
+                })
+            );
+            let display = err.to_string();
+            let debug = format!("{err:?}");
+            assert!(
+                display.contains(target_key),
+                "display must name {target_key}: {display}"
+            );
+            for forbidden in [
+                "nip.io",
+                "evil.com",
+                "192.168",
+                "4000",
+                "8080",
+                "HTTP://",
+                "127.0.0.1",
+            ] {
+                assert!(
+                    !display.contains(forbidden),
+                    "Display leaked {forbidden} for {bad_url}: {display}"
+                );
+                assert!(
+                    !debug.contains(forbidden),
+                    "Debug leaked {forbidden} for {bad_url}: {debug}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn t4_upstream_table_refuses_malformed_and_sentinel_set_c_with_zero_leak() {
+    let s = Stage0SentinelRun::generate();
+    let cases: Vec<(&str, &'static str, Option<ParsedShape>)> = vec![
+        (
+            "https://user:pw@gw.example",
+            "userinfo_forbidden",
+            Some(ParsedShape {
+                scheme_class: SchemeClass::Https,
+                host_class: HostClass::DnsName,
+                has_userinfo: true,
+                has_query: false,
+                has_fragment: false,
+                has_port: false,
+            }),
+        ),
+        (
+            "https://gw.example?x=1",
+            "query_forbidden",
+            Some(ParsedShape {
+                scheme_class: SchemeClass::Https,
+                host_class: HostClass::DnsName,
+                has_userinfo: false,
+                has_query: true,
+                has_fragment: false,
+                has_port: false,
+            }),
+        ),
+        (
+            "https://gw.example#f",
+            "fragment_forbidden",
+            Some(ParsedShape {
+                scheme_class: SchemeClass::Https,
+                host_class: HostClass::DnsName,
+                has_userinfo: false,
+                has_query: false,
+                has_fragment: true,
+                has_port: false,
+            }),
+        ),
+        (
+            "ftp://x",
+            "unsupported_scheme",
+            Some(ParsedShape {
+                scheme_class: SchemeClass::Other,
+                host_class: HostClass::DnsName,
+                has_userinfo: false,
+                has_query: false,
+                has_fragment: false,
+                has_port: false,
+            }),
+        ),
+        ("not a url", "unparseable", None),
+        ("", "empty", None),
+        ("https://", "unparseable", None),
+        (
+            &s.c1,
+            "userinfo_forbidden",
+            Some(ParsedShape {
+                scheme_class: SchemeClass::Https,
+                host_class: HostClass::DnsName,
+                has_userinfo: true,
+                has_query: false,
+                has_fragment: false,
+                has_port: false,
+            }),
+        ),
+        (&s.c2, "unparseable", None),
+        (
+            &s.c3,
+            "non_https_upstream",
+            Some(ParsedShape {
+                scheme_class: SchemeClass::Http,
+                host_class: HostClass::DnsName,
+                has_userinfo: false,
+                has_query: false,
+                has_fragment: false,
+                has_port: true,
+            }),
+        ),
+        (
+            &s.c4,
+            "query_forbidden",
+            Some(ParsedShape {
+                scheme_class: SchemeClass::Https,
+                host_class: HostClass::DnsName,
+                has_userinfo: false,
+                has_query: true,
+                has_fragment: false,
+                has_port: false,
+            }),
+        ),
+        (
+            &s.c5,
+            "fragment_forbidden",
+            Some(ParsedShape {
+                scheme_class: SchemeClass::Https,
+                host_class: HostClass::DnsName,
+                has_userinfo: false,
+                has_query: false,
+                has_fragment: true,
+                has_port: false,
+            }),
+        ),
+        (
+            &s.c6,
+            "unsupported_scheme",
+            Some(ParsedShape {
+                scheme_class: SchemeClass::Other,
+                host_class: HostClass::DnsName,
+                has_userinfo: false,
+                has_query: false,
+                has_fragment: false,
+                has_port: false,
+            }),
+        ),
+        (&s.c7, "unparseable", None),
+        (
+            &s.c8,
+            "non_https_upstream",
+            Some(ParsedShape {
+                scheme_class: SchemeClass::Http,
+                host_class: HostClass::DnsName,
+                has_userinfo: false,
+                has_query: false,
+                has_fragment: false,
+                has_port: true,
+            }),
+        ),
+    ];
+
+    let keys = [
+        "PARAPET_OPENAI_BASE_URL",
+        "OPENAI_BASE_URL",
+        "PARAPET_ANTHROPIC_BASE_URL",
+        "ANTHROPIC_BASE_URL",
+        "PARAPET_API_OPENAI_COM_BASE_URL",
+    ];
+
+    for (val, expected_rule, expected_shape) in cases {
+        for &target_key in &keys {
+            let err = UpstreamTable::from_env_fn(&|k| {
+                if k == target_key {
+                    Some(val.to_string())
+                } else {
+                    None
+                }
+            })
+            .expect_err("must refuse invalid config value");
+            assert_eq!(err.rule, expected_rule, "key={target_key} val={val}");
+            assert_eq!(err.value_len, val.len());
+            assert_eq!(err.shape, expected_shape);
+
+            let display = err.to_string();
+            let debug = format!("{err:?}");
+            let key_str = err.key.to_string();
+            for surface in [
+                display.as_bytes(),
+                debug.as_bytes(),
+                key_str.as_bytes(),
+                err.rule.as_bytes(),
+                err.fix.as_bytes(),
+            ] {
+                s.assert_clean("UpstreamConfigError", surface);
+                let text = std::str::from_utf8(surface).unwrap();
+                for literal in ["pw", "user:", "x=1", "gw.example", "#f"] {
+                    assert!(
+                        !text.contains(literal),
+                        "surface leaked literal {literal}: {text}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn t5_openai_base_url_self_loop_control_names_both_keys() {
+    let err = UpstreamTable::from_env_fn(&|k| match k {
+        "OPENAI_BASE_URL" => Some("http://127.0.0.1:9800".to_string()),
+        _ => None,
+    })
+    .expect_err("unshadowed fallback must refuse");
+    assert_eq!(err.key, UpstreamKey::Static("OPENAI_BASE_URL"));
+    assert_eq!(err.rule, "non_https_upstream");
+    let display = err.to_string();
+    assert!(display.contains("OPENAI_BASE_URL"));
+    assert!(display.contains("PARAPET_OPENAI_BASE_URL"));
+    assert!(!display.contains("9800"));
+    assert!(!display.contains("127.0.0.1"));
+}
+
+#[test]
+fn t6_shadowed_openai_base_url_is_accepted() {
+    let table = UpstreamTable::from_env_fn(&|k| match k {
+        "PARAPET_OPENAI_BASE_URL" => Some("https://api.openai.com".to_string()),
+        "OPENAI_BASE_URL" => Some("http://127.0.0.1:9800".to_string()),
+        _ => None,
+    })
+    .expect("shadowed fallback must be ignored");
+    assert_eq!(table.base_url(Provider::OpenAi), "https://api.openai.com");
+}
+
+#[test]
+fn t7_extra_hosts_validation_and_sentinels_c9_c10() {
+    let table = UpstreamTable::from_env_fn(&|k| match k {
+        "PARAPET_EXTRA_HOSTS" => Some("api.x.dev, api.y.dev ".to_string()),
+        _ => None,
+    })
+    .expect("trimmed bare lowercase DNS names accepted");
+    assert!(table.is_allowed_host("api.x.dev"));
+    assert!(table.is_allowed_host("api.y.dev"));
+
+    for bad_entry in [
+        "",
+        "https://a.dev",
+        "a.dev/p",
+        "u@a.dev",
+        "a.dev:443",
+        "127.0.0.1",
+        "A.DEV",
+    ] {
+        let err = UpstreamTable::from_env_fn(&|k| match k {
+            "PARAPET_EXTRA_HOSTS" => Some(bad_entry.to_string()),
+            _ => None,
+        })
+        .expect_err("invalid extra host must be refused");
+        assert_eq!(err.rule, "extra_host_invalid");
+        assert_eq!(err.entry_index, Some(1));
+        assert_eq!(err.value_len, bad_entry.len());
+        assert_eq!(err.shape, None);
+    }
+
+    let s = Stage0SentinelRun::generate();
+    let err_c9 = UpstreamTable::from_env_fn(&|k| match k {
+        "PARAPET_EXTRA_HOSTS" => Some(s.c9.clone()),
+        _ => None,
+    })
+    .expect_err("C9 must fail");
+    assert_eq!(err_c9.rule, "extra_host_invalid");
+    assert_eq!(err_c9.entry_index, Some(2));
+    assert!(err_c9.to_string().contains("PARAPET_EXTRA_HOSTS entry #2"));
+    s.assert_clean("C9 Display", err_c9.to_string().as_bytes());
+    s.assert_clean("C9 Debug", format!("{err_c9:?}").as_bytes());
+
+    let err_c10 = UpstreamTable::from_env_fn(&|k| match k {
+        "PARAPET_EXTRA_HOSTS" => Some(s.c10.clone()),
+        _ => None,
+    })
+    .expect_err("C10 must fail");
+    assert_eq!(err_c10.rule, "extra_host_invalid");
+    assert_eq!(err_c10.entry_index, Some(1));
+    assert!(err_c10.to_string().contains("PARAPET_EXTRA_HOSTS entry #1"));
+    s.assert_clean("C10 Display", err_c10.to_string().as_bytes());
+    s.assert_clean("C10 Debug", format!("{err_c10:?}").as_bytes());
+
+    // Host key collision control (api-openai.com collides with api.openai.com)
+    let err_coll = UpstreamTable::from_env_fn(&|k| match k {
+        "PARAPET_EXTRA_HOSTS" => Some("api-openai.com".to_string()),
+        _ => None,
+    })
+    .expect_err("collision with known host must fail");
+    assert_eq!(err_coll.rule, "host_key_collision");
+    let coll_disp = err_coll.to_string();
+    assert!(coll_disp.contains("api.openai.com"));
+    assert!(coll_disp.contains("entry #1"));
+    assert!(!coll_disp.contains("api-openai.com"));
+}
+
+#[test]
+fn t8_original_host_header_refusals_and_sentinels_h1_h5() {
+    let s = Stage0SentinelRun::generate();
+    let table = UpstreamTable::from_env_fn(&|_| None).unwrap();
+    let resolver = EnvUpstreamResolver::from_table(table);
+
+    let single_cases: Vec<Vec<u8>> = vec![
+        b"evil.com".to_vec(),
+        b"api.openai.com.evil.com".to_vec(),
+        b"API.OPENAI.COM".to_vec(),
+        b"api.openai.com:443".to_vec(),
+        b"".to_vec(),
+        vec![0xFF, 0xFE],
+        s.h1.clone(),
+        s.h2.clone(),
+        s.h3.clone(),
+        s.h5.clone(),
+    ];
+
+    for raw_bytes in single_cases {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-parapet-original-host",
+            HeaderValue::from_bytes(&raw_bytes).expect("valid HeaderValue bytes"),
+        );
+        let req = ProxyRequest {
+            method: Method::POST,
+            uri: "/v1/chat/completions".parse().unwrap(),
+            headers,
+            body: Bytes::from_static(b"{}"),
+        };
+        let err = build_upstream_url(&resolver, Provider::OpenAi, &req)
+            .expect_err("disallowed or malformed header must be refused");
+        assert_eq!(err, UpstreamRefusal::HostNotAllowed);
+        s.assert_clean("T8 Display", err.to_string().as_bytes());
+        s.assert_clean("T8 Debug", format!("{err:?}").as_bytes());
+    }
+
+    // Duplicate header values (including H4)
+    let mut dup_headers = HeaderMap::new();
+    dup_headers.append(
+        "x-parapet-original-host",
+        HeaderValue::from_static("api.openai.com"),
+    );
+    dup_headers.append(
+        "x-parapet-original-host",
+        HeaderValue::from_bytes(&s.h4_second).unwrap(),
+    );
+    let dup_req = ProxyRequest {
+        method: Method::POST,
+        uri: "/v1/chat/completions".parse().unwrap(),
+        headers: dup_headers,
+        body: Bytes::from_static(b"{}"),
+    };
+    let err = build_upstream_url(&resolver, Provider::OpenAi, &dup_req)
+        .expect_err("duplicate header must be refused");
+    assert_eq!(err, UpstreamRefusal::HostNotAllowed);
+    s.assert_clean("T8 H4 Display", err.to_string().as_bytes());
+    s.assert_clean("T8 H4 Debug", format!("{err:?}").as_bytes());
+}
+
+#[test]
+fn t9_allowed_host_with_per_host_https_override() {
+    let table = UpstreamTable::from_env_fn(&|k| match k {
+        "PARAPET_API_GROQ_COM_BASE_URL" => Some("https://groq-gw.internal/proxy/".to_string()),
+        _ => None,
+    })
+    .unwrap();
+    let resolver = EnvUpstreamResolver::from_table(table);
+    let req = proxy_request_with_header("/v1/chat/completions", Some("api.groq.com"));
+    let url = build_upstream_url(&resolver, Provider::OpenAi, &req).unwrap();
+    assert_eq!(url, "https://groq-gw.internal/proxy/v1/chat/completions");
+}
+
+#[test]
+fn t13_destination_binding_post_check_refuses_origin_change() {
+    // Resolver whose base has a trailing '?' so joining "/v1/chat/completions"
+    // would turn the path into a query string or change the resolved origin.
+    struct QueryInjectingResolver;
+    impl UpstreamResolver for QueryInjectingResolver {
+        fn base_url(&self, _provider: Provider) -> String {
+            "https://api.openai.com?".to_string()
+        }
+    }
+
+    // Resolver whose `resolve` returns a different host from its table entry `base_url`.
+    struct OriginShiftingResolver;
+    impl UpstreamResolver for OriginShiftingResolver {
+        fn base_url(&self, _provider: Provider) -> String {
+            "https://api.openai.com".to_string()
+        }
+        fn resolve(
+            &self,
+            _provider: Provider,
+            _original_host: OriginalHost<'_>,
+        ) -> Result<String, UpstreamRefusal> {
+            Ok("https://evil.example.com".to_string())
+        }
+    }
+
+    let req = proxy_request_with_header("/v1/chat/completions", None);
+    assert_eq!(
+        build_upstream_url(&QueryInjectingResolver, Provider::OpenAi, &req),
+        Err(UpstreamRefusal::DestinationMismatch)
+    );
+    assert_eq!(
+        build_upstream_url(&OriginShiftingResolver, Provider::OpenAi, &req),
+        Err(UpstreamRefusal::DestinationMismatch)
+    );
+}
+
+#[test]
+fn t14_sdk_default_host_sets_are_subsets_of_known_llm_hosts() {
+    let ts_src = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../parapet-ts/src/transport.ts"
+    ));
+    let py_src = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../parapet-py/parapet/transport.py"
+    ));
+
+    fn parse_quoted_hosts(block: &str) -> Vec<&str> {
+        let mut hosts = Vec::new();
+        for line in block.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('#') || trimmed.starts_with("//") {
+                continue;
+            }
+            if let Some(first) = trimmed.find('"') {
+                if let Some(rest) = trimmed.get(first + 1..) {
+                    if let Some(second) = rest.find('"') {
+                        hosts.push(&rest[..second]);
+                    }
+                }
+            }
+        }
+        hosts
+    }
+
+    let ts_block = ts_src
+        .split("DEFAULT_INTERCEPTED_HOSTS")
+        .nth(1)
+        .and_then(|s| s.split("];").next())
+        .expect("locate TS DEFAULT_INTERCEPTED_HOSTS");
+    let ts_hosts = parse_quoted_hosts(ts_block);
+    assert!(!ts_hosts.is_empty());
+    for host in ts_hosts {
+        assert!(
+            KNOWN_LLM_HOSTS.contains(&host),
+            "TS host {host} missing from KNOWN_LLM_HOSTS"
+        );
+    }
+
+    let py_block = py_src
+        .split("DEFAULT_LLM_HOSTS:")
+        .nth(1)
+        .and_then(|s| s.split(")").next())
+        .expect("locate Python DEFAULT_LLM_HOSTS");
+    let py_hosts = parse_quoted_hosts(py_block);
+    assert!(!py_hosts.is_empty());
+    for host in py_hosts {
+        assert!(
+            KNOWN_LLM_HOSTS.contains(&host),
+            "Python host {host} missing from KNOWN_LLM_HOSTS"
+        );
+    }
+}
+
+#[test]
+fn t15_env_upstream_resolver_with_invalid_table_refuses_resolve_and_keeps_legacy_value() {
+    let resolver = EnvUpstreamResolver::from_env_fn(&|k| match k {
+        "PARAPET_OPENAI_BASE_URL" => Some("http://127.0.0.1:4000".to_string()),
+        _ => None,
+    });
+    assert_eq!(
+        resolver.resolve(Provider::OpenAi, OriginalHost::Absent),
+        Err(UpstreamRefusal::ConfigInvalid)
+    );
+    assert_eq!(
+        resolver.base_url(Provider::OpenAi),
+        "http://127.0.0.1:4000".to_string()
+    );
+}
+
+#[derive(Clone, Default)]
+struct SharedLogBuffer {
+    buf: Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+struct SharedLogGuard {
+    buf: Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+impl std::io::Write for SharedLogGuard {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.buf.lock().unwrap().extend_from_slice(data);
+        Ok(data.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedLogBuffer {
+    type Writer = SharedLogGuard;
+    fn make_writer(&'a self) -> Self::Writer {
+        SharedLogGuard {
+            buf: self.buf.clone(),
+        }
+    }
+}
+
+#[test]
+fn t16_log_redaction_across_t4_t7_t8_at_trace_level() {
+    const CHILD_ENV: &str = "PARAPET_STAGE0_T16_TRACE_CHILD";
+    if std::env::var_os(CHILD_ENV).is_none() {
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("locate current Rust test executable"),
+        )
+        .arg("--exact")
+        .arg("engine::tests::t16_log_redaction_across_t4_t7_t8_at_trace_level")
+        .arg("--nocapture")
+        .env(CHILD_ENV, "1")
+        .output()
+        .expect("spawn isolated T16 child process");
+        assert!(
+            output.status.success(),
+            "isolated T16 child failed with {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+
+    let s = Stage0SentinelRun::generate();
+    let writer = SharedLogBuffer::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
+        .with_writer(writer.clone())
+        .with_ansi(false)
+        .without_time()
+        .finish();
+
+    tracing::subscriber::with_default(subscriber, || {
+        // Run T4 cases
+        for val in [
+            "https://user:pw@gw.example",
+            "https://gw.example?x=1",
+            "https://gw.example#f",
+            "ftp://x",
+            "not a url",
+            "",
+            "https://",
+            s.c1.as_str(),
+            s.c2.as_str(),
+            s.c3.as_str(),
+            s.c4.as_str(),
+            s.c5.as_str(),
+            s.c6.as_str(),
+            s.c7.as_str(),
+        ] {
+            let _ = UpstreamTable::from_env_fn(&|k| {
+                if k == "PARAPET_OPENAI_BASE_URL" {
+                    Some(val.to_string())
+                } else {
+                    None
+                }
+            });
+        }
+        let _ = UpstreamTable::from_env_fn(&|k| {
+            if k == "OPENAI_BASE_URL" {
+                Some(s.c8.clone())
+            } else {
+                None
+            }
+        });
+
+        // Run T7 cases
+        for extra in [s.c9.as_str(), s.c10.as_str()] {
+            let _ = UpstreamTable::from_env_fn(&|k| {
+                if k == "PARAPET_EXTRA_HOSTS" {
+                    Some(extra.to_string())
+                } else {
+                    None
+                }
+            });
+        }
+
+        // Run T8 cases (H1–H5)
+        let valid_table = UpstreamTable::from_env_fn(&|_| None).unwrap();
+        let resolver = EnvUpstreamResolver::from_table(valid_table);
+        let adapter = DefaultProviderRegistry.adapter_for(Provider::OpenAi);
+
+        for raw_bytes in [&s.h1, &s.h2, &s.h3, &s.h5] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-parapet-original-host",
+                HeaderValue::from_bytes(raw_bytes).unwrap(),
+            );
+            let req = ProxyRequest {
+                method: Method::POST,
+                uri: "/v1/chat/completions".parse().unwrap(),
+                headers,
+                body: Bytes::from_static(b"{}"),
+            };
+            let refusal = build_upstream_url(&resolver, Provider::OpenAi, &req).unwrap_err();
+            let _resp = upstream_refusal_response(adapter.as_ref(), &resolver, refusal);
+        }
+
+        // H4 duplicate headers
+        let mut dup_headers = HeaderMap::new();
+        dup_headers.append(
+            "x-parapet-original-host",
+            HeaderValue::from_static("api.openai.com"),
+        );
+        dup_headers.append(
+            "x-parapet-original-host",
+            HeaderValue::from_bytes(&s.h4_second).unwrap(),
+        );
+        let dup_req = ProxyRequest {
+            method: Method::POST,
+            uri: "/v1/chat/completions".parse().unwrap(),
+            headers: dup_headers,
+            body: Bytes::from_static(b"{}"),
+        };
+        let refusal = build_upstream_url(&resolver, Provider::OpenAi, &dup_req).unwrap_err();
+        let _resp = upstream_refusal_response(adapter.as_ref(), &resolver, refusal);
+    });
+
+    let bytes = writer.buf.lock().unwrap().clone();
+    s.assert_clean("T16 tracing buffer", &bytes);
+    let log_text = String::from_utf8(bytes).expect("utf8 log");
+    for forbidden in ["pw", "user:", "x=1", "gw.example", "#f"] {
+        assert!(
+            !log_text.contains(forbidden),
+            "log leaked {forbidden}: {log_text}"
+        );
+    }
+    for required_rule in [
+        "userinfo_forbidden",
+        "unparseable",
+        "non_https_upstream",
+        "query_forbidden",
+        "fragment_forbidden",
+        "unsupported_scheme",
+        "empty",
+        "extra_host_invalid",
+        "header_not_allowlisted",
+        "header_not_visible_ascii",
+        "header_duplicated",
+    ] {
+        assert!(
+            log_text.contains(required_rule),
+            "log missing expected rule token {required_rule}: {log_text}"
+        );
+    }
+    assert!(
+        log_text.contains(&format!("value_lens=[{}]", s.h1.len())),
+        "log missing H1 length: {log_text}"
+    );
+    assert!(
+        log_text.contains(&format!("value_lens=[14, {}]", s.h4_second.len())),
+        "log missing H4 duplicate lengths: {log_text}"
+    );
+}
+
+#[tokio::test]
+async fn t17_response_surface_check_for_invalid_headers_h1_h5() {
+    use tower::ServiceExt;
+
+    struct ZeroCallSender {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl HttpSender for ZeroCallSender {
+        async fn send(&self, _request: HttpRequest) -> Result<HttpResponse, HttpError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            panic!("stub sender must never be called on refused header");
+        }
+    }
+
+    let s = Stage0SentinelRun::generate();
+    let sender = Arc::new(ZeroCallSender {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let table = UpstreamTable::from_env_fn(&|_| None).unwrap();
+    let deps = EngineDeps {
+        config: Arc::new(base_config_with_canary("dummy")),
+        http: sender.clone(),
+        resolver: Arc::new(EnvUpstreamResolver::from_table(table)),
+        registry: Arc::new(DefaultProviderRegistry),
+        normalizer: Arc::new(NoopNormalizer),
+        trust_assigner: Arc::new(NoopTrustAssigner),
+        l1_scanner: None,
+        l1_model: None,
+        l2a_scanner: None,
+        l2a_semaphore: None,
+        inbound_scanner: Arc::new(NoopInboundScanner),
+        constraint_evaluator: Arc::new(DslConstraintEvaluator::new()),
+        output_scanner: Arc::new(L5aScanner),
+        session_store: None,
+        multi_turn_scanner: None,
+        orthogonal_sensor_router: Arc::new(NoopOrthogonalSensorRouter::new()),
+        signal_extractor: Arc::new(DefaultSignalExtractor::new()),
+        verdict_combiner: Arc::new(DefaultVerdictCombiner::new()),
+        emit_l1_signals: false,
+    };
+    let app = crate::proxy::build_router(Arc::new(EngineUpstreamClient::new_with(deps)));
+
+    for raw_bytes in [&s.h1, &s.h2, &s.h3, &s.h5] {
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header(
+                "x-parapet-original-host",
+                HeaderValue::from_bytes(raw_bytes).unwrap(),
+            )
+            .body(Body::from(
+                r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#,
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            resp.headers()
+                .get("x-parapet-error")
+                .and_then(|v| v.to_str().ok()),
+            Some("parapet_upstream_host_not_allowed")
+        );
+        for (name, val) in resp.headers() {
+            s.assert_clean(name.as_str(), val.as_bytes());
+        }
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        s.assert_clean("T17 response body", &body);
+    }
+
+    // H4 duplicate headers
+    let req_h4 = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("x-parapet-original-host", "api.openai.com")
+        .header(
+            "x-parapet-original-host",
+            HeaderValue::from_bytes(&s.h4_second).unwrap(),
+        )
+        .body(Body::from(
+            r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#,
+        ))
+        .unwrap();
+    let resp_h4 = app.oneshot(req_h4).await.unwrap();
+    assert_eq!(resp_h4.status(), StatusCode::BAD_REQUEST);
+    for (name, val) in resp_h4.headers() {
+        s.assert_clean(name.as_str(), val.as_bytes());
+    }
+    let body_h4 = axum::body::to_bytes(resp_h4.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    s.assert_clean("T17 H4 response body", &body_h4);
+
+    assert_eq!(sender.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn t18_l1_block_verdict_takes_precedence_over_disallowed_original_host() {
+    struct CountingSender {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl HttpSender for CountingSender {
+        async fn send(&self, _request: HttpRequest) -> Result<HttpResponse, HttpError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            panic!("sender must not be called when L1 blocks");
+        }
+    }
+
+    struct AlwaysBlockL1Model;
+    impl L1Model for AlwaysBlockL1Model {
+        fn score(&self, _text: &str) -> f64 {
+            10.0
+        }
+        fn calibration(&self) -> crate::layers::l1_harness::CalibrationParams {
+            SvmModel.calibration()
+        }
+    }
+
+    let mut cfg = base_config_with_canary("dummy");
+    cfg.policy.layers.l1 = Some(crate::config::L1Config {
+        mode: crate::config::L1Mode::Block,
+        threshold: 0.5,
+        specialists: HashMap::new(),
+        min_agree: 1,
+        generalist_solo_threshold: Some(0.99),
+    });
+
+    let sender = Arc::new(CountingSender {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let table = UpstreamTable::from_env_fn(&|_| None).unwrap();
+    let deps = EngineDeps {
+        config: Arc::new(cfg),
+        http: sender.clone(),
+        resolver: Arc::new(EnvUpstreamResolver::from_table(table)),
+        registry: Arc::new(DefaultProviderRegistry),
+        normalizer: Arc::new(NoopNormalizer),
+        trust_assigner: Arc::new(RoleTrustAssigner),
+        l1_scanner: None,
+        l1_model: Some(Arc::new(AlwaysBlockL1Model)),
+        l2a_scanner: None,
+        l2a_semaphore: None,
+        inbound_scanner: Arc::new(NoopInboundScanner),
+        constraint_evaluator: Arc::new(DslConstraintEvaluator::new()),
+        output_scanner: Arc::new(L5aScanner),
+        session_store: None,
+        multi_turn_scanner: None,
+        orthogonal_sensor_router: Arc::new(NoopOrthogonalSensorRouter::new()),
+        signal_extractor: Arc::new(DefaultSignalExtractor::new()),
+        verdict_combiner: Arc::new(DefaultVerdictCombiner::new()),
+        emit_l1_signals: false,
+    };
+    let engine = EngineUpstreamClient::new_with(deps);
+
+    let mut req = openai_request();
+    req.headers.insert(
+        "x-parapet-original-host",
+        HeaderValue::from_static("evil.example.com"),
+    );
+
+    let resp = engine.forward(Provider::OpenAi, req).await.unwrap();
+    assert_eq!(resp.status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        resp.headers
+            .get("x-parapet-blocked-by")
+            .and_then(|v| v.to_str().ok()),
+        Some("L1")
+    );
+    assert_ne!(
+        resp.headers
+            .get("x-parapet-error")
+            .and_then(|v| v.to_str().ok()),
+        Some("parapet_upstream_host_not_allowed")
+    );
+    assert_eq!(sender.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
 }

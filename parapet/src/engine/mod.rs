@@ -79,7 +79,7 @@ struct RequestContext {
 /// but the engine must not blindly trust headers from arbitrary clients (curl,
 /// other SDKs). An unrecognized host would cause the engine to forward the
 /// request — including auth headers — to an attacker-controlled server.
-const KNOWN_LLM_HOSTS: &[&str] = &[
+pub const KNOWN_LLM_HOSTS: &[&str] = &[
     "api.openai.com",
     "api.anthropic.com",
     "api.cerebras.ai",
@@ -87,6 +87,102 @@ const KNOWN_LLM_HOSTS: &[&str] = &[
     "generativelanguage.googleapis.com",
     "api.together.xyz",
 ];
+
+/// Validated or classified `X-Parapet-Original-Host` header state.
+///
+/// Manual `Debug` withholds the raw header value to satisfy Z3/Z5.
+#[derive(Clone, PartialEq, Eq)]
+pub enum OriginalHost<'a> {
+    Absent,
+    Present(&'a str),
+    InvalidHeader {
+        rule: &'static str,
+        value_count: usize,
+        value_lens: Vec<usize>,
+    },
+}
+
+impl std::fmt::Debug for OriginalHost<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OriginalHost::Absent => write!(f, "OriginalHost::Absent"),
+            OriginalHost::Present(s) => {
+                write!(f, "OriginalHost::Present(<withheld {} bytes>)", s.len())
+            }
+            OriginalHost::InvalidHeader {
+                rule,
+                value_count,
+                value_lens,
+            } => f
+                .debug_struct("OriginalHost::InvalidHeader")
+                .field("rule", rule)
+                .field("value_count", value_count)
+                .field("value_lens", value_lens)
+                .finish(),
+        }
+    }
+}
+
+impl<'a> OriginalHost<'a> {
+    pub fn from_headers(headers: &'a HeaderMap) -> Self {
+        let values: Vec<&HeaderValue> = headers.get_all("x-parapet-original-host").iter().collect();
+        match values.as_slice() {
+            [] => OriginalHost::Absent,
+            [single] => {
+                let bytes = single.as_bytes();
+                if bytes.is_empty() {
+                    OriginalHost::InvalidHeader {
+                        rule: "header_empty",
+                        value_count: 1,
+                        value_lens: vec![0],
+                    }
+                } else if !bytes.iter().all(|&b| (0x21..=0x7e).contains(&b)) {
+                    OriginalHost::InvalidHeader {
+                        rule: "header_not_visible_ascii",
+                        value_count: 1,
+                        value_lens: vec![bytes.len()],
+                    }
+                } else {
+                    match std::str::from_utf8(bytes) {
+                        Ok(s) => OriginalHost::Present(s),
+                        Err(_) => OriginalHost::InvalidHeader {
+                            rule: "header_not_visible_ascii",
+                            value_count: 1,
+                            value_lens: vec![bytes.len()],
+                        },
+                    }
+                }
+            }
+            many => OriginalHost::InvalidHeader {
+                rule: "header_duplicated",
+                value_count: many.len(),
+                value_lens: many.iter().map(|v| v.as_bytes().len()).collect(),
+            },
+        }
+    }
+}
+
+/// Request-time upstream resolution or destination-binding refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpstreamRefusal {
+    HostNotAllowed,
+    ConfigInvalid,
+    DestinationMismatch,
+}
+
+impl std::fmt::Display for UpstreamRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UpstreamRefusal::HostNotAllowed => write!(f, "parapet_upstream_host_not_allowed"),
+            UpstreamRefusal::ConfigInvalid => write!(f, "parapet_upstream_config_invalid"),
+            UpstreamRefusal::DestinationMismatch => {
+                write!(f, "parapet_upstream_destination_mismatch")
+            }
+        }
+    }
+}
+
+impl std::error::Error for UpstreamRefusal {}
 
 /// Resolves the upstream base URL for a provider.
 ///
@@ -115,6 +211,51 @@ pub trait UpstreamResolver: Send + Sync {
 
     /// Fallback: resolve base URL from provider enum (zero-SDK mode, no header).
     fn base_url(&self, provider: Provider) -> String;
+
+    /// Fail-closed resolution used by `build_upstream_url`.
+    ///
+    /// Disallowed, malformed, or duplicated `X-Parapet-Original-Host` headers
+    /// return `Err(UpstreamRefusal::HostNotAllowed)` instead of falling back.
+    fn resolve(
+        &self,
+        provider: Provider,
+        original_host: OriginalHost<'_>,
+    ) -> Result<String, UpstreamRefusal> {
+        match original_host {
+            OriginalHost::Absent => Ok(self.base_url(provider)),
+            OriginalHost::Present(host) => {
+                if self.is_allowed_host(host) {
+                    Ok(self.base_url_for_host(host))
+                } else {
+                    tracing::warn!(
+                        rule = "header_not_allowlisted",
+                        value_count = 1usize,
+                        value_lens = ?[host.len()],
+                        "x-parapet-original-host refused"
+                    );
+                    Err(UpstreamRefusal::HostNotAllowed)
+                }
+            }
+            OriginalHost::InvalidHeader {
+                rule,
+                value_count,
+                value_lens,
+            } => {
+                tracing::warn!(
+                    rule = rule,
+                    value_count = value_count,
+                    value_lens = ?value_lens,
+                    "x-parapet-original-host refused"
+                );
+                Err(UpstreamRefusal::HostNotAllowed)
+            }
+        }
+    }
+
+    /// Optional startup configuration diagnostic when a resolver was built from an invalid env.
+    fn config_error(&self) -> Option<&UpstreamConfigError> {
+        None
+    }
 }
 
 /// Sends HTTP requests to upstream providers.
@@ -168,6 +309,8 @@ pub enum HttpError {
 /// Error returned when `build_engine_client` cannot construct the engine.
 #[derive(Debug)]
 pub enum StartupError {
+    /// Upstream override environment configuration is invalid or unsupported.
+    UpstreamConfig(UpstreamConfigError),
     /// L2a configured in YAML but binary built without `--features l2a`.
     FeatureDisabled(String),
     /// L2a configured but model files missing or invalid.
@@ -180,6 +323,7 @@ pub enum StartupError {
 impl std::fmt::Display for StartupError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            StartupError::UpstreamConfig(err) => write!(f, "{err}"),
             StartupError::FeatureDisabled(msg) => write!(f, "{msg}"),
             StartupError::ModelMissing(msg) => write!(f, "{msg}"),
             #[cfg(not(windows))]
@@ -939,7 +1083,16 @@ impl UpstreamClient for EngineUpstreamClient {
 
         // 6) Forward to upstream
         let stream = is_streaming_request(&request.headers, &request.body);
-        let url = build_upstream_url(self.deps.resolver.as_ref(), provider, &request);
+        let url = match build_upstream_url(self.deps.resolver.as_ref(), provider, &request) {
+            Ok(u) => u,
+            Err(refusal) => {
+                return Ok(upstream_refusal_response(
+                    adapter.as_ref(),
+                    self.deps.resolver.as_ref(),
+                    refusal,
+                ));
+            }
+        };
 
         // Reverse proxy header hygiene:
         // - x-parapet-original-host: internal routing header, not for upstream.
@@ -971,6 +1124,15 @@ impl UpstreamClient for EngineUpstreamClient {
                 HttpError::Timeout(msg) => ProxyError::UpstreamTimeout(msg),
                 HttpError::Transport(msg) => ProxyError::UpstreamFailure(msg),
             })?;
+
+        if upstream.status.is_redirection() {
+            return Ok(upstream_redirect_refused_response(
+                adapter.as_ref(),
+                &ctx.request_id,
+                upstream.status,
+                &upstream.headers,
+            ));
+        }
 
         if stream {
             let mut resp = self.handle_streaming_response_with(provider, upstream, &ctx, capture);
@@ -1501,14 +1663,814 @@ impl ProviderRegistry for DefaultProviderRegistry {
 }
 
 // ---------------------------------------------------------------------------
-// Env-based upstream resolver
+// Startup-validated upstream table & env-based upstream resolver
 // ---------------------------------------------------------------------------
 
-pub struct EnvUpstreamResolver;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemeClass {
+    Https,
+    Http,
+    Other,
+}
+
+impl SchemeClass {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            SchemeClass::Https => "https",
+            SchemeClass::Http => "http",
+            SchemeClass::Other => "other",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostClass {
+    Absent,
+    LoopbackLiteral,
+    LocalhostName,
+    IpLiteral,
+    DnsName,
+}
+
+impl HostClass {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            HostClass::Absent => "absent",
+            HostClass::LoopbackLiteral => "loopback_literal",
+            HostClass::LocalhostName => "localhost_name",
+            HostClass::IpLiteral => "ip_literal",
+            HostClass::DnsName => "dns_name",
+        }
+    }
+}
+
+/// Closed-vocabulary Z2 tokens for a parseable-but-refused upstream URL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParsedShape {
+    pub scheme_class: SchemeClass,
+    pub host_class: HostClass,
+    pub has_userinfo: bool,
+    pub has_query: bool,
+    pub has_fragment: bool,
+    pub has_port: bool,
+}
+
+impl std::fmt::Display for ParsedShape {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "scheme_class={} host_class={}",
+            self.scheme_class.as_str(),
+            self.host_class.as_str()
+        )?;
+        if self.has_userinfo {
+            write!(f, " has_userinfo=true")?;
+        }
+        if self.has_query {
+            write!(f, " has_query=true")?;
+        }
+        if self.has_fragment {
+            write!(f, " has_fragment=true")?;
+        }
+        if self.has_port {
+            write!(f, " has_port=true")?;
+        }
+        Ok(())
+    }
+}
+
+/// Z4 key identifier for `UpstreamConfigError`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpstreamKey {
+    Static(&'static str),
+    ValidatedHostKey(String),
+    ExtraHostsEntry(usize),
+    HostKeyCollision {
+        known_host: Option<&'static str>,
+        extra_indices: Vec<usize>,
+    },
+}
+
+impl UpstreamKey {
+    /// Key name emitted in 502 `parapet_upstream_config_invalid` client responses (Z4).
+    pub fn client_key_name(&self) -> &str {
+        match self {
+            UpstreamKey::Static(k) => k,
+            UpstreamKey::ValidatedHostKey(k) => k.as_str(),
+            UpstreamKey::ExtraHostsEntry(_) | UpstreamKey::HostKeyCollision { .. } => {
+                "PARAPET_EXTRA_HOSTS"
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for UpstreamKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UpstreamKey::Static(k) => write!(f, "{k}"),
+            UpstreamKey::ValidatedHostKey(k) => write!(f, "{k}"),
+            UpstreamKey::ExtraHostsEntry(idx) => write!(f, "PARAPET_EXTRA_HOSTS entry #{idx}"),
+            UpstreamKey::HostKeyCollision {
+                known_host: Some(kh),
+                extra_indices,
+            } => {
+                let idx = extra_indices.first().copied().unwrap_or(1);
+                write!(
+                    f,
+                    "PARAPET_EXTRA_HOSTS entry #{idx} (collides with known host {kh})"
+                )
+            }
+            UpstreamKey::HostKeyCollision {
+                known_host: None,
+                extra_indices,
+            } => {
+                let first = extra_indices.first().copied().unwrap_or(1);
+                let second = extra_indices.get(1).copied().unwrap_or(first);
+                write!(f, "PARAPET_EXTRA_HOSTS entries #{first}, #{second}")
+            }
+        }
+    }
+}
+
+/// Startup validation error for upstream overrides.
+///
+/// (Rev3) No field holds or borrows the refused value, or any substring copied
+/// or transformed from it. Only `value_len` and `shape` (Z2 classifications)
+/// are derived from the value.
+#[derive(Clone, PartialEq, Eq)]
+pub struct UpstreamConfigError {
+    pub key: UpstreamKey,
+    pub rule: &'static str,
+    pub fix: &'static str,
+    pub value_len: usize,
+    pub shape: Option<ParsedShape>,
+    pub entry_index: Option<usize>,
+}
+
+impl std::fmt::Display for UpstreamConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "upstream configuration refused: {}: {} (value withheld, {} bytes",
+            self.key, self.rule, self.value_len
+        )?;
+        if let Some(shape) = &self.shape {
+            write!(f, "; {shape}")?;
+        }
+        write!(f, "). Fix: {}", self.fix)
+    }
+}
+
+impl std::fmt::Debug for UpstreamConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpstreamConfigError")
+            .field("key", &self.key)
+            .field("rule", &self.rule)
+            .field("fix", &self.fix)
+            .field("value_len", &self.value_len)
+            .field("shape", &self.shape)
+            .field("entry_index", &self.entry_index)
+            .finish()
+    }
+}
+
+impl std::error::Error for UpstreamConfigError {}
+
+const FIX_NON_HTTPS_UPSTREAM: &str =
+    "plain-HTTP upstreams are not supported in this release; use an https:// URL (loopback HTTP support is planned behind an explicit flag)";
+const FIX_NON_HTTPS_OPENAI_FALLBACK: &str =
+    "plain-HTTP upstreams are not supported in this release; use an https:// URL (loopback HTTP support is planned behind an explicit flag); set PARAPET_OPENAI_BASE_URL=https://api.openai.com to keep the hosted default, or remove OPENAI_BASE_URL from the engine's environment";
+const FIX_NON_HTTPS_ANTHROPIC_FALLBACK: &str =
+    "plain-HTTP upstreams are not supported in this release; use an https:// URL (loopback HTTP support is planned behind an explicit flag); set PARAPET_ANTHROPIC_BASE_URL=https://api.anthropic.com to keep the hosted default, or remove ANTHROPIC_BASE_URL from the engine's environment";
+const FIX_EMPTY_URL: &str =
+    "unset the environment variable to keep the default https:// upstream, or set it to a valid https:// URL";
+const FIX_EMPTY_OPENAI_FALLBACK: &str =
+    "unset OPENAI_BASE_URL, or set PARAPET_OPENAI_BASE_URL=https://api.openai.com to keep the hosted default";
+const FIX_EMPTY_ANTHROPIC_FALLBACK: &str =
+    "unset ANTHROPIC_BASE_URL, or set PARAPET_ANTHROPIC_BASE_URL=https://api.anthropic.com to keep the hosted default";
+const FIX_UNPARSEABLE_URL: &str =
+    "provide a valid https:// URL with a host and without userinfo, query, or fragment";
+const FIX_UNPARSEABLE_OPENAI_FALLBACK: &str =
+    "set PARAPET_OPENAI_BASE_URL=https://api.openai.com to keep the hosted default, or remove OPENAI_BASE_URL from the engine's environment";
+const FIX_UNPARSEABLE_ANTHROPIC_FALLBACK: &str =
+    "set PARAPET_ANTHROPIC_BASE_URL=https://api.anthropic.com to keep the hosted default, or remove ANTHROPIC_BASE_URL from the engine's environment";
+const FIX_UNSUPPORTED_SCHEME: &str =
+    "only https:// upstream URLs are supported; provide an https:// URL";
+const FIX_USERINFO_FORBIDDEN: &str =
+    "remove credentials/userinfo from the upstream URL; pass authentication via request headers instead";
+const FIX_QUERY_FORBIDDEN: &str = "remove the query string from the upstream base URL";
+const FIX_FRAGMENT_FORBIDDEN: &str = "remove the URL fragment (#...) from the upstream base URL";
+const FIX_EXTRA_HOST_INVALID: &str =
+    "set PARAPET_EXTRA_HOSTS to a comma-separated list of bare lowercase DNS hostnames (no empty entries, scheme, port, path, userinfo, uppercase, or IP literals)";
+const FIX_HOST_KEY_COLLISION: &str =
+    "remove colliding entries in PARAPET_EXTRA_HOSTS that map to the same PARAPET_<HOST>_BASE_URL environment variable key";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FallbackKeyKind {
+    None,
+    OpenAi,
+    Anthropic,
+}
+
+fn known_host_static_env_key(host: &str) -> Option<&'static str> {
+    match host {
+        "api.openai.com" => Some("PARAPET_API_OPENAI_COM_BASE_URL"),
+        "api.anthropic.com" => Some("PARAPET_API_ANTHROPIC_COM_BASE_URL"),
+        "api.cerebras.ai" => Some("PARAPET_API_CEREBRAS_AI_BASE_URL"),
+        "api.groq.com" => Some("PARAPET_API_GROQ_COM_BASE_URL"),
+        "generativelanguage.googleapis.com" => {
+            Some("PARAPET_GENERATIVELANGUAGE_GOOGLEAPIS_COM_BASE_URL")
+        }
+        "api.together.xyz" => Some("PARAPET_API_TOGETHER_XYZ_BASE_URL"),
+        _ => None,
+    }
+}
+
+fn derive_host_env_key(host: &str) -> String {
+    format!(
+        "PARAPET_{}_BASE_URL",
+        host.to_ascii_uppercase().replace(['.', '-'], "_")
+    )
+}
+
+fn is_valid_extra_host(trimmed: &str) -> bool {
+    if trimmed.is_empty()
+        || trimmed.starts_with('.')
+        || trimmed.ends_with('.')
+        || trimmed.starts_with('-')
+        || trimmed.ends_with('-')
+        || trimmed.contains("..")
+    {
+        return false;
+    }
+    if !trimmed
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-')
+    {
+        return false;
+    }
+    if !trimmed.contains('.') {
+        return false;
+    }
+    let labels: Vec<&str> = trimmed.split('.').collect();
+    if labels
+        .iter()
+        .any(|l| l.is_empty() || l.starts_with('-') || l.ends_with('-'))
+    {
+        return false;
+    }
+    // Reject IP literals: DNS TLDs begin with an ASCII lowercase letter.
+    let Some(last_label) = labels.last() else {
+        return false;
+    };
+    if !last_label
+        .bytes()
+        .next()
+        .is_some_and(|b| b.is_ascii_lowercase())
+    {
+        return false;
+    }
+    if trimmed.parse::<std::net::IpAddr>().is_ok() {
+        return false;
+    }
+    if matches!(
+        url::Host::parse(trimmed),
+        Ok(url::Host::Ipv4(_) | url::Host::Ipv6(_))
+    ) {
+        return false;
+    }
+    true
+}
+
+fn authority_slice(raw: &str) -> Option<&str> {
+    let (_, after_scheme) = raw.split_once("://")?;
+    let end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    Some(&after_scheme[..end])
+}
+
+fn authority_has_at_sign(raw: &str) -> bool {
+    authority_slice(raw).is_some_and(|auth| auth.contains('@'))
+}
+
+fn authority_has_explicit_port(raw: &str) -> bool {
+    let Some(auth) = authority_slice(raw) else {
+        return false;
+    };
+    let host_port = auth.rsplit_once('@').map(|(_, hp)| hp).unwrap_or(auth);
+    if let Some((_, after_bracket)) = host_port.rsplit_once(']') {
+        after_bracket.starts_with(':')
+    } else {
+        host_port.contains(':')
+    }
+}
+
+fn classify_parsed_url(url: &url::Url, raw: &str) -> ParsedShape {
+    let scheme_class = if url.scheme().eq_ignore_ascii_case("https") {
+        SchemeClass::Https
+    } else if url.scheme().eq_ignore_ascii_case("http") {
+        SchemeClass::Http
+    } else {
+        SchemeClass::Other
+    };
+    let host_class = match url.host() {
+        None | Some(url::Host::Domain("")) => HostClass::Absent,
+        Some(url::Host::Ipv4(v4)) => {
+            if v4.is_loopback() {
+                HostClass::LoopbackLiteral
+            } else {
+                HostClass::IpLiteral
+            }
+        }
+        Some(url::Host::Ipv6(v6)) => {
+            if v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()) {
+                HostClass::LoopbackLiteral
+            } else {
+                HostClass::IpLiteral
+            }
+        }
+        Some(url::Host::Domain(d)) => {
+            if d.eq_ignore_ascii_case("localhost") {
+                HostClass::LocalhostName
+            } else if let Ok(ip) = d.parse::<std::net::IpAddr>() {
+                if ip.is_loopback() {
+                    HostClass::LoopbackLiteral
+                } else {
+                    HostClass::IpLiteral
+                }
+            } else {
+                HostClass::DnsName
+            }
+        }
+    };
+    let has_userinfo =
+        !url.username().is_empty() || url.password().is_some() || authority_has_at_sign(raw);
+    let has_query = url.query().is_some() || raw.contains('?');
+    let has_fragment = url.fragment().is_some() || raw.contains('#');
+    let has_port = url.port().is_some() || authority_has_explicit_port(raw);
+
+    ParsedShape {
+        scheme_class,
+        host_class,
+        has_userinfo,
+        has_query,
+        has_fragment,
+        has_port,
+    }
+}
+
+fn fix_for_rule(rule: &'static str, fallback: FallbackKeyKind) -> &'static str {
+    match (rule, fallback) {
+        ("non_https_upstream", FallbackKeyKind::OpenAi) => FIX_NON_HTTPS_OPENAI_FALLBACK,
+        ("non_https_upstream", FallbackKeyKind::Anthropic) => FIX_NON_HTTPS_ANTHROPIC_FALLBACK,
+        ("non_https_upstream", FallbackKeyKind::None) => FIX_NON_HTTPS_UPSTREAM,
+        ("empty", FallbackKeyKind::OpenAi) => FIX_EMPTY_OPENAI_FALLBACK,
+        ("empty", FallbackKeyKind::Anthropic) => FIX_EMPTY_ANTHROPIC_FALLBACK,
+        ("empty", FallbackKeyKind::None) => FIX_EMPTY_URL,
+        ("unparseable", FallbackKeyKind::OpenAi) => FIX_UNPARSEABLE_OPENAI_FALLBACK,
+        ("unparseable", FallbackKeyKind::Anthropic) => FIX_UNPARSEABLE_ANTHROPIC_FALLBACK,
+        ("unparseable", FallbackKeyKind::None) => FIX_UNPARSEABLE_URL,
+        ("unsupported_scheme", _) => FIX_UNSUPPORTED_SCHEME,
+        ("userinfo_forbidden", _) => FIX_USERINFO_FORBIDDEN,
+        ("query_forbidden", _) => FIX_QUERY_FORBIDDEN,
+        ("fragment_forbidden", _) => FIX_FRAGMENT_FORBIDDEN,
+        _ => FIX_UNPARSEABLE_URL,
+    }
+}
+
+fn emit_config_refusal_warn(err: &UpstreamConfigError) {
+    tracing::warn!(
+        rule = err.rule,
+        value_len = err.value_len,
+        entry_index = ?err.entry_index,
+        diagnostic = %err,
+        "upstream configuration refused"
+    );
+}
+
+fn validate_upstream_url(
+    raw: &str,
+    key: UpstreamKey,
+    fallback: FallbackKeyKind,
+) -> Result<String, UpstreamConfigError> {
+    let value_len = raw.len();
+    if raw.is_empty() {
+        let err = UpstreamConfigError {
+            key,
+            rule: "empty",
+            fix: fix_for_rule("empty", fallback),
+            value_len: 0,
+            shape: None,
+            entry_index: None,
+        };
+        emit_config_refusal_warn(&err);
+        return Err(err);
+    }
+    if raw != raw.trim() || raw.bytes().any(|b| b <= 0x20 || b == 0x7f || b == b'\\') {
+        let err = UpstreamConfigError {
+            key,
+            rule: "unparseable",
+            fix: fix_for_rule("unparseable", fallback),
+            value_len,
+            shape: None,
+            entry_index: None,
+        };
+        emit_config_refusal_warn(&err);
+        return Err(err);
+    }
+    let Ok(url) = url::Url::parse(raw) else {
+        let err = UpstreamConfigError {
+            key,
+            rule: "unparseable",
+            fix: fix_for_rule("unparseable", fallback),
+            value_len,
+            shape: None,
+            entry_index: None,
+        };
+        emit_config_refusal_warn(&err);
+        return Err(err);
+    };
+    let shape = classify_parsed_url(&url, raw);
+    if shape.scheme_class == SchemeClass::Http {
+        let err = UpstreamConfigError {
+            key,
+            rule: "non_https_upstream",
+            fix: fix_for_rule("non_https_upstream", fallback),
+            value_len,
+            shape: Some(shape),
+            entry_index: None,
+        };
+        emit_config_refusal_warn(&err);
+        return Err(err);
+    }
+    if shape.scheme_class == SchemeClass::Other {
+        let err = UpstreamConfigError {
+            key,
+            rule: "unsupported_scheme",
+            fix: fix_for_rule("unsupported_scheme", fallback),
+            value_len,
+            shape: Some(shape),
+            entry_index: None,
+        };
+        emit_config_refusal_warn(&err);
+        return Err(err);
+    }
+    if shape.host_class == HostClass::Absent || url.cannot_be_a_base() {
+        let err = UpstreamConfigError {
+            key,
+            rule: "unparseable",
+            fix: fix_for_rule("unparseable", fallback),
+            value_len,
+            shape: None,
+            entry_index: None,
+        };
+        emit_config_refusal_warn(&err);
+        return Err(err);
+    }
+    if shape.has_userinfo {
+        let err = UpstreamConfigError {
+            key,
+            rule: "userinfo_forbidden",
+            fix: fix_for_rule("userinfo_forbidden", fallback),
+            value_len,
+            shape: Some(shape),
+            entry_index: None,
+        };
+        emit_config_refusal_warn(&err);
+        return Err(err);
+    }
+    if shape.has_query {
+        let err = UpstreamConfigError {
+            key,
+            rule: "query_forbidden",
+            fix: fix_for_rule("query_forbidden", fallback),
+            value_len,
+            shape: Some(shape),
+            entry_index: None,
+        };
+        emit_config_refusal_warn(&err);
+        return Err(err);
+    }
+    if shape.has_fragment {
+        let err = UpstreamConfigError {
+            key,
+            rule: "fragment_forbidden",
+            fix: fix_for_rule("fragment_forbidden", fallback),
+            value_len,
+            shape: Some(shape),
+            entry_index: None,
+        };
+        emit_config_refusal_warn(&err);
+        return Err(err);
+    }
+
+    Ok(url.as_str().trim_end_matches('/').to_string())
+}
+
+/// Startup-validated, immutable upstream routing table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamTable {
+    openai_base_url: String,
+    anthropic_base_url: String,
+    extra_hosts: Vec<String>,
+    host_overrides: std::collections::HashMap<String, String>,
+}
+
+impl UpstreamTable {
+    pub fn from_env_fn(get: &dyn Fn(&str) -> Option<String>) -> Result<Self, UpstreamConfigError> {
+        let mut extra_hosts: Vec<String> = Vec::new();
+        let mut extra_host_keys: Vec<(usize, String)> = Vec::new();
+
+        if let Some(raw_extra) = get("PARAPET_EXTRA_HOSTS") {
+            for (idx0, raw_entry) in raw_extra.split(',').enumerate() {
+                let entry_index = idx0 + 1;
+                let trimmed = raw_entry.trim();
+                if !is_valid_extra_host(trimmed) {
+                    let err = UpstreamConfigError {
+                        key: UpstreamKey::ExtraHostsEntry(entry_index),
+                        rule: "extra_host_invalid",
+                        fix: FIX_EXTRA_HOST_INVALID,
+                        value_len: raw_entry.len(),
+                        shape: None,
+                        entry_index: Some(entry_index),
+                    };
+                    emit_config_refusal_warn(&err);
+                    return Err(err);
+                }
+                let derived_key = derive_host_env_key(trimmed);
+                if let Some(&known) = KNOWN_LLM_HOSTS
+                    .iter()
+                    .find(|&&kh| derive_host_env_key(kh) == derived_key)
+                {
+                    let err = UpstreamConfigError {
+                        key: UpstreamKey::HostKeyCollision {
+                            known_host: Some(known),
+                            extra_indices: vec![entry_index],
+                        },
+                        rule: "host_key_collision",
+                        fix: FIX_HOST_KEY_COLLISION,
+                        value_len: raw_entry.len(),
+                        shape: None,
+                        entry_index: Some(entry_index),
+                    };
+                    emit_config_refusal_warn(&err);
+                    return Err(err);
+                }
+                if let Some((prev_idx, _)) =
+                    extra_host_keys.iter().find(|(_, pk)| *pk == derived_key)
+                {
+                    let err = UpstreamConfigError {
+                        key: UpstreamKey::HostKeyCollision {
+                            known_host: None,
+                            extra_indices: vec![*prev_idx, entry_index],
+                        },
+                        rule: "host_key_collision",
+                        fix: FIX_HOST_KEY_COLLISION,
+                        value_len: raw_entry.len(),
+                        shape: None,
+                        entry_index: Some(entry_index),
+                    };
+                    emit_config_refusal_warn(&err);
+                    return Err(err);
+                }
+                extra_host_keys.push((entry_index, derived_key));
+                extra_hosts.push(trimmed.to_string());
+            }
+        }
+
+        let openai_base_url = if let Some(primary) = get("PARAPET_OPENAI_BASE_URL") {
+            let valid = validate_upstream_url(
+                &primary,
+                UpstreamKey::Static("PARAPET_OPENAI_BASE_URL"),
+                FallbackKeyKind::None,
+            )?;
+            if get("OPENAI_BASE_URL").is_some() {
+                tracing::info!(
+                    primary_key = "PARAPET_OPENAI_BASE_URL",
+                    shadowed_key = "OPENAI_BASE_URL",
+                    "fallback upstream base URL environment variable is shadowed by primary"
+                );
+            }
+            valid
+        } else if let Some(fallback) = get("OPENAI_BASE_URL") {
+            let valid = validate_upstream_url(
+                &fallback,
+                UpstreamKey::Static("OPENAI_BASE_URL"),
+                FallbackKeyKind::OpenAi,
+            )?;
+            tracing::warn!(
+                key = "OPENAI_BASE_URL",
+                "using fallback upstream base URL environment variable; prefer PARAPET_OPENAI_BASE_URL"
+            );
+            valid
+        } else {
+            "https://api.openai.com".to_string()
+        };
+
+        let anthropic_base_url = if let Some(primary) = get("PARAPET_ANTHROPIC_BASE_URL") {
+            let valid = validate_upstream_url(
+                &primary,
+                UpstreamKey::Static("PARAPET_ANTHROPIC_BASE_URL"),
+                FallbackKeyKind::None,
+            )?;
+            if get("ANTHROPIC_BASE_URL").is_some() {
+                tracing::info!(
+                    primary_key = "PARAPET_ANTHROPIC_BASE_URL",
+                    shadowed_key = "ANTHROPIC_BASE_URL",
+                    "fallback upstream base URL environment variable is shadowed by primary"
+                );
+            }
+            valid
+        } else if let Some(fallback) = get("ANTHROPIC_BASE_URL") {
+            let valid = validate_upstream_url(
+                &fallback,
+                UpstreamKey::Static("ANTHROPIC_BASE_URL"),
+                FallbackKeyKind::Anthropic,
+            )?;
+            tracing::warn!(
+                key = "ANTHROPIC_BASE_URL",
+                "using fallback upstream base URL environment variable; prefer PARAPET_ANTHROPIC_BASE_URL"
+            );
+            valid
+        } else {
+            "https://api.anthropic.com".to_string()
+        };
+
+        let mut host_overrides = std::collections::HashMap::new();
+        for &known_host in KNOWN_LLM_HOSTS {
+            let env_key = known_host_static_env_key(known_host)
+                .expect("every KNOWN_LLM_HOSTS entry has a static env key");
+            if let Some(raw) = get(env_key) {
+                let valid = validate_upstream_url(
+                    &raw,
+                    UpstreamKey::Static(env_key),
+                    FallbackKeyKind::None,
+                )?;
+                host_overrides.insert(known_host.to_string(), valid);
+            }
+        }
+        for host in &extra_hosts {
+            let env_key = derive_host_env_key(host);
+            if let Some(raw) = get(&env_key) {
+                let valid = validate_upstream_url(
+                    &raw,
+                    UpstreamKey::ValidatedHostKey(env_key),
+                    FallbackKeyKind::None,
+                )?;
+                host_overrides.insert(host.clone(), valid);
+            }
+        }
+
+        Ok(Self {
+            openai_base_url,
+            anthropic_base_url,
+            extra_hosts,
+            host_overrides,
+        })
+    }
+
+    pub fn from_process_env() -> Result<Self, UpstreamConfigError> {
+        let table = Self::from_env_fn(&|k| std::env::var(k).ok())?;
+        let mut unrelated_count = 0usize;
+        for (os_key, _) in std::env::vars_os() {
+            let Some(key) = os_key.to_str() else {
+                continue;
+            };
+            if !key.starts_with("PARAPET_") || !key.ends_with("_BASE_URL") {
+                continue;
+            }
+            if key == "PARAPET_OPENAI_BASE_URL" || key == "PARAPET_ANTHROPIC_BASE_URL" {
+                continue;
+            }
+            let is_known = KNOWN_LLM_HOSTS
+                .iter()
+                .any(|&h| known_host_static_env_key(h) == Some(key));
+            let is_extra = table
+                .extra_hosts
+                .iter()
+                .any(|h| derive_host_env_key(h) == key);
+            if !is_known && !is_extra {
+                unrelated_count += 1;
+            }
+        }
+        if unrelated_count > 0 {
+            tracing::warn!(
+                ignored_key_count = unrelated_count,
+                "ignoring PARAPET_*_BASE_URL environment variable(s) for non-allowlisted host(s)"
+            );
+        }
+        Ok(table)
+    }
+
+    pub fn is_allowed_host(&self, host: &str) -> bool {
+        KNOWN_LLM_HOSTS.contains(&host) || self.extra_hosts.iter().any(|h| h == host)
+    }
+
+    pub fn base_url_for_host(&self, host: &str) -> String {
+        self.host_overrides
+            .get(host)
+            .cloned()
+            .unwrap_or_else(|| format!("https://{host}"))
+    }
+
+    pub fn base_url(&self, provider: Provider) -> &str {
+        match provider {
+            Provider::OpenAi => &self.openai_base_url,
+            Provider::Anthropic => &self.anthropic_base_url,
+        }
+    }
+}
+
+struct InvalidEnvSnapshot {
+    error: UpstreamConfigError,
+    openai_legacy: String,
+    anthropic_legacy: String,
+    extra_hosts: Vec<String>,
+    host_overrides: std::collections::HashMap<String, String>,
+}
+
+impl std::fmt::Debug for InvalidEnvSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InvalidEnvSnapshot")
+            .field("error", &self.error)
+            .field(
+                "openai_legacy",
+                &format!("<withheld {} bytes>", self.openai_legacy.len()),
+            )
+            .field(
+                "anthropic_legacy",
+                &format!("<withheld {} bytes>", self.anthropic_legacy.len()),
+            )
+            .finish()
+    }
+}
+
+pub struct EnvUpstreamResolver {
+    state: Result<UpstreamTable, InvalidEnvSnapshot>,
+}
+
+impl std::fmt::Debug for EnvUpstreamResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EnvUpstreamResolver")
+            .field("state", &self.state)
+            .finish()
+    }
+}
 
 impl EnvUpstreamResolver {
     pub fn new() -> Self {
-        Self
+        Self::from_env_fn(&|k| std::env::var(k).ok())
+    }
+
+    pub fn from_table(table: UpstreamTable) -> Self {
+        Self { state: Ok(table) }
+    }
+
+    pub fn from_env_fn(get: &dyn Fn(&str) -> Option<String>) -> Self {
+        match UpstreamTable::from_env_fn(get) {
+            Ok(table) => Self { state: Ok(table) },
+            Err(error) => {
+                let openai_legacy = get("PARAPET_OPENAI_BASE_URL")
+                    .or_else(|| get("OPENAI_BASE_URL"))
+                    .unwrap_or_else(|| "https://api.openai.com".to_string());
+                let anthropic_legacy = get("PARAPET_ANTHROPIC_BASE_URL")
+                    .or_else(|| get("ANTHROPIC_BASE_URL"))
+                    .unwrap_or_else(|| "https://api.anthropic.com".to_string());
+                let extra_hosts: Vec<String> = get("PARAPET_EXTRA_HOSTS")
+                    .map(|raw| {
+                        raw.split(',')
+                            .map(str::trim)
+                            .filter(|s| is_valid_extra_host(s))
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let mut host_overrides = std::collections::HashMap::new();
+                for &known_host in KNOWN_LLM_HOSTS {
+                    if let Some(env_key) = known_host_static_env_key(known_host) {
+                        if let Some(val) = get(env_key) {
+                            host_overrides.insert(known_host.to_string(), val);
+                        }
+                    }
+                }
+                for host in &extra_hosts {
+                    let env_key = derive_host_env_key(host);
+                    if let Some(val) = get(&env_key) {
+                        host_overrides.insert(host.clone(), val);
+                    }
+                }
+                Self {
+                    state: Err(InvalidEnvSnapshot {
+                        error,
+                        openai_legacy,
+                        anthropic_legacy,
+                        extra_hosts,
+                        host_overrides,
+                    }),
+                }
+            }
+        }
     }
 }
 
@@ -1520,68 +2482,79 @@ impl Default for EnvUpstreamResolver {
 
 impl UpstreamResolver for EnvUpstreamResolver {
     fn is_allowed_host(&self, host: &str) -> bool {
-        if KNOWN_LLM_HOSTS.contains(&host) {
-            return true;
+        match &self.state {
+            Ok(table) => table.is_allowed_host(host),
+            Err(inv) => {
+                KNOWN_LLM_HOSTS.contains(&host) || inv.extra_hosts.iter().any(|h| h == host)
+            }
         }
-        // PARAPET_EXTRA_HOSTS=api.together.xyz,api.fireworks.ai
-        if let Ok(extra) = std::env::var("PARAPET_EXTRA_HOSTS") {
-            return extra.split(',').any(|h| h.trim() == host);
-        }
-        false
     }
 
     fn base_url_for_host(&self, host: &str) -> String {
-        // Check PARAPET_{HOST_UPPER}_BASE_URL, e.g. PARAPET_API_CEREBRAS_AI_BASE_URL
-        let env_key = format!(
-            "PARAPET_{}_BASE_URL",
-            host.to_uppercase().replace(['.', '-'], "_")
-        );
-        match std::env::var(&env_key) {
-            Ok(url) if url.starts_with("https://") => url,
-            Ok(url) => {
-                tracing::warn!(
-                    env_key = %env_key,
-                    url = %url,
-                    "ignoring non-HTTPS base URL override, falling back to https://{}",
-                    host,
-                );
-                format!("https://{host}")
-            }
-            Err(_) => format!("https://{host}"),
+        match &self.state {
+            Ok(table) => table.base_url_for_host(host),
+            Err(inv) => inv
+                .host_overrides
+                .get(host)
+                .cloned()
+                .unwrap_or_else(|| format!("https://{host}")),
         }
     }
 
     fn base_url(&self, provider: Provider) -> String {
-        let (primary_key, fallback_key, default_url) = match provider {
-            Provider::OpenAi => (
-                "PARAPET_OPENAI_BASE_URL",
-                Some("OPENAI_BASE_URL"),
-                "https://api.openai.com",
-            ),
-            Provider::Anthropic => (
-                "PARAPET_ANTHROPIC_BASE_URL",
-                Some("ANTHROPIC_BASE_URL"),
-                "https://api.anthropic.com",
-            ),
+        match &self.state {
+            Ok(table) => table.base_url(provider).to_owned(),
+            Err(inv) => match provider {
+                Provider::OpenAi => inv.openai_legacy.clone(),
+                Provider::Anthropic => inv.anthropic_legacy.clone(),
+            },
+        }
+    }
+
+    fn resolve(
+        &self,
+        provider: Provider,
+        original_host: OriginalHost<'_>,
+    ) -> Result<String, UpstreamRefusal> {
+        let table = match &self.state {
+            Ok(table) => table,
+            Err(_) => return Err(UpstreamRefusal::ConfigInvalid),
         };
+        match original_host {
+            OriginalHost::Absent => Ok(table.base_url(provider).to_owned()),
+            OriginalHost::Present(host) => {
+                if table.is_allowed_host(host) {
+                    Ok(table.base_url_for_host(host))
+                } else {
+                    tracing::warn!(
+                        rule = "header_not_allowlisted",
+                        value_count = 1usize,
+                        value_lens = ?[host.len()],
+                        "x-parapet-original-host refused"
+                    );
+                    Err(UpstreamRefusal::HostNotAllowed)
+                }
+            }
+            OriginalHost::InvalidHeader {
+                rule,
+                value_count,
+                value_lens,
+            } => {
+                tracing::warn!(
+                    rule = rule,
+                    value_count = value_count,
+                    value_lens = ?value_lens,
+                    "x-parapet-original-host refused"
+                );
+                Err(UpstreamRefusal::HostNotAllowed)
+            }
+        }
+    }
 
-        let url = std::env::var(primary_key)
-            .or_else(|_| {
-                fallback_key
-                    .map(std::env::var)
-                    .unwrap_or(Err(std::env::VarError::NotPresent))
-            })
-            .unwrap_or_else(|_| default_url.to_string());
-
-        if url.starts_with("https://") {
-            url
-        } else {
-            tracing::warn!(
-                url = %url,
-                "ignoring non-HTTPS base URL override for {:?}, using default",
-                provider,
-            );
-            default_url.to_string()
+    fn config_error(&self) -> Option<&UpstreamConfigError> {
+        match &self.state {
+            Ok(_) => None,
+            Err(inv) => Some(&inv.error),
         }
     }
 }
@@ -1593,6 +2566,14 @@ pub type DefaultUpstreamResolver = EnvUpstreamResolver;
 // ---------------------------------------------------------------------------
 // Reqwest HTTP sender
 // ---------------------------------------------------------------------------
+
+/// Build the production `reqwest::Client` with redirect following disabled.
+pub fn production_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("build production reqwest client")
+}
 
 pub struct ReqwestHttpSender {
     client: reqwest::Client,
@@ -1657,6 +2638,7 @@ impl HttpSender for ReqwestHttpSender {
 // ---------------------------------------------------------------------------
 
 pub fn build_engine_client(config: Arc<Config>) -> Result<EngineUpstreamClient, StartupError> {
+    let upstream_table = UpstreamTable::from_process_env().map_err(StartupError::UpstreamConfig)?;
     let session_store: Option<Arc<dyn crate::session::SessionStore>> = None; // Sprint 2
 
     // L1: harness path for generalist, legacy scanner for ensemble.
@@ -1720,8 +2702,8 @@ pub fn build_engine_client(config: Arc<Config>) -> Result<EngineUpstreamClient, 
 
     let deps = EngineDeps {
         config,
-        http: Arc::new(ReqwestHttpSender::new(reqwest::Client::new())),
-        resolver: Arc::new(EnvUpstreamResolver::new()),
+        http: Arc::new(ReqwestHttpSender::new(production_http_client())),
+        resolver: Arc::new(EnvUpstreamResolver::from_table(upstream_table)),
         registry: Arc::new(DefaultProviderRegistry),
         normalizer: Arc::new(L0Normalizer::new()),
         trust_assigner: Arc::new(RoleTrustAssigner),
@@ -2040,6 +3022,7 @@ fn build_engine_client_with_runtime_and_file_fixture_v0(
     ),
     StartupError,
 > {
+    let upstream_table = UpstreamTable::from_process_env().map_err(StartupError::UpstreamConfig)?;
     let session_store: Option<Arc<dyn crate::session::SessionStore>> = None;
 
     let (l1_model, l1_scanner): (Option<Arc<dyn L1Model>>, Option<Arc<dyn L1Scanner>>) =
@@ -2219,13 +3202,13 @@ fn build_engine_client_with_runtime_and_file_fixture_v0(
             demo::ManifestDemoProposerV0::new_default(),
         )),
         Some(fixture) => Arc::new(DeterministicOfflineHttpSenderV0::new(fixture)),
-        None => Arc::new(ReqwestHttpSender::new(reqwest::Client::new())),
+        None => Arc::new(ReqwestHttpSender::new(production_http_client())),
     };
 
     let deps = EngineDeps {
         config,
         http,
-        resolver: Arc::new(EnvUpstreamResolver::new()),
+        resolver: Arc::new(EnvUpstreamResolver::from_table(upstream_table)),
         registry: Arc::new(DefaultProviderRegistry),
         normalizer: Arc::new(L0Normalizer::new()),
         trust_assigner: Arc::new(RoleTrustAssigner),
@@ -2490,36 +3473,174 @@ fn maybe_decompress(headers: &mut HeaderMap, body: Bytes) -> Result<Bytes, Proxy
     Ok(result)
 }
 
-fn build_upstream_url(resolver: &dyn UpstreamResolver, provider: Provider, req: &ProxyRequest) -> String {
-    // Primary: use original host from SDK header (any OpenAI-compatible provider).
-    // Validate against resolver's allowlist — defense in depth against header
-    // injection when the engine is used without the SDK (curl, other clients).
-    // Fallback: resolve from Provider enum (zero-SDK mode).
-    let base = req
-        .headers
-        .get("x-parapet-original-host")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|host| {
-            if resolver.is_allowed_host(host) {
-                Some(resolver.base_url_for_host(host))
-            } else {
-                tracing::warn!(
-                    host = host,
-                    "X-Parapet-Original-Host rejected: not in allowed hosts"
-                );
-                None
-            }
-        })
-        .unwrap_or_else(|| resolver.base_url(provider));
+fn emit_destination_mismatch_warn(provider: Provider) {
+    tracing::warn!(
+        rule = "destination_mismatch",
+        provider = ?provider,
+        "upstream URL destination mismatch"
+    );
+}
 
-    let base = base.trim_end_matches('/');
+fn build_upstream_url(
+    resolver: &dyn UpstreamResolver,
+    provider: Provider,
+    req: &ProxyRequest,
+) -> Result<String, UpstreamRefusal> {
+    let original_host = OriginalHost::from_headers(&req.headers);
+    let base = resolver.resolve(provider, original_host.clone())?;
+    let expected_raw = match original_host {
+        OriginalHost::Present(host) => resolver.base_url_for_host(host),
+        OriginalHost::Absent | OriginalHost::InvalidHeader { .. } => resolver.base_url(provider),
+    };
+
+    let Ok(expected_url) = url::Url::parse(&expected_raw) else {
+        emit_destination_mismatch_warn(provider);
+        return Err(UpstreamRefusal::DestinationMismatch);
+    };
+    let base_trimmed = base.trim_end_matches('/');
+    let Ok(base_url) = url::Url::parse(base_trimmed) else {
+        emit_destination_mismatch_warn(provider);
+        return Err(UpstreamRefusal::DestinationMismatch);
+    };
+    if base_url.host().is_none()
+        || !base_url.username().is_empty()
+        || base_url.password().is_some()
+        || base_url.query().is_some()
+        || base_url.fragment().is_some()
+        || base_url.scheme() != expected_url.scheme()
+        || base_url.host() != expected_url.host()
+        || base_url.port_or_known_default() != expected_url.port_or_known_default()
+    {
+        emit_destination_mismatch_warn(provider);
+        return Err(UpstreamRefusal::DestinationMismatch);
+    }
+
     let path_and_query = req
         .uri
         .path_and_query()
         .map(|pq| pq.as_str())
         .unwrap_or(req.uri.path());
+    if !path_and_query.starts_with('/') || path_and_query.starts_with("//") {
+        emit_destination_mismatch_warn(provider);
+        return Err(UpstreamRefusal::DestinationMismatch);
+    }
 
-    format!("{base}{path_and_query}")
+    let joined = format!("{base_trimmed}{path_and_query}");
+    let Ok(joined_url) = url::Url::parse(&joined) else {
+        emit_destination_mismatch_warn(provider);
+        return Err(UpstreamRefusal::DestinationMismatch);
+    };
+    if joined_url.scheme() != base_url.scheme()
+        || joined_url.host() != base_url.host()
+        || joined_url.port_or_known_default() != base_url.port_or_known_default()
+        || !joined_url.username().is_empty()
+        || joined_url.password().is_some()
+        || joined_url.fragment().is_some()
+    {
+        emit_destination_mismatch_warn(provider);
+        return Err(UpstreamRefusal::DestinationMismatch);
+    }
+
+    Ok(joined)
+}
+
+fn upstream_refusal_response(
+    adapter: &dyn ProviderAdapter,
+    resolver: &dyn UpstreamResolver,
+    refusal: UpstreamRefusal,
+) -> ProxyResponse {
+    let (status, code, message) = match refusal {
+        UpstreamRefusal::HostNotAllowed => (
+            StatusCode::BAD_REQUEST,
+            "parapet_upstream_host_not_allowed",
+            "parapet_upstream_host_not_allowed: X-Parapet-Original-Host is not allowlisted or is malformed; configure PARAPET_EXTRA_HOSTS to allow additional upstream hosts".to_string(),
+        ),
+        UpstreamRefusal::ConfigInvalid => {
+            let msg = match resolver.config_error() {
+                Some(err) => format!(
+                    "parapet_upstream_config_invalid: {}",
+                    err.key.client_key_name()
+                ),
+                None => "parapet_upstream_config_invalid".to_string(),
+            };
+            (
+                StatusCode::BAD_GATEWAY,
+                "parapet_upstream_config_invalid",
+                msg,
+            )
+        }
+        UpstreamRefusal::DestinationMismatch => (
+            StatusCode::BAD_GATEWAY,
+            "parapet_upstream_destination_mismatch",
+            "parapet_upstream_destination_mismatch: resolved URL origin did not match validated upstream origin".to_string(),
+        ),
+    };
+    let body = adapter.serialize_error(&message, status.as_u16());
+    let mut headers = HeaderMap::new();
+    headers.insert("content-type", HeaderValue::from_static("application/json"));
+    headers.insert("x-parapet-error", HeaderValue::from_static(code));
+    ProxyResponse {
+        status,
+        headers,
+        body: Body::from(body),
+    }
+}
+
+fn sanitize_location_host(headers: &HeaderMap) -> String {
+    let Some(raw) = headers
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return "none".to_string();
+    };
+    let Some(host) = url::Url::parse(raw)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_owned))
+    else {
+        return "relative_or_unparseable".to_string();
+    };
+    let mut out = String::new();
+    for ch in host.chars().take(253) {
+        if ch.is_control() {
+            for esc in ch.escape_default() {
+                out.push(esc);
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn upstream_redirect_refused_response(
+    adapter: &dyn ProviderAdapter,
+    request_id: &str,
+    status: StatusCode,
+    upstream_headers: &HeaderMap,
+) -> ProxyResponse {
+    let location_host = sanitize_location_host(upstream_headers);
+    tracing::warn!(
+        request_id = %request_id,
+        status = status.as_u16(),
+        location_host = %location_host,
+        rule = "parapet_upstream_redirect_refused",
+        "upstream redirect refused"
+    );
+    let body = adapter.serialize_error(
+        "parapet_upstream_redirect_refused: upstream redirects are not followed",
+        StatusCode::BAD_GATEWAY.as_u16(),
+    );
+    let mut headers = HeaderMap::new();
+    headers.insert("content-type", HeaderValue::from_static("application/json"));
+    headers.insert(
+        "x-parapet-error",
+        HeaderValue::from_static("parapet_upstream_redirect_refused"),
+    );
+    ProxyResponse {
+        status: StatusCode::BAD_GATEWAY,
+        headers,
+        body: Body::from(body),
+    }
 }
 
 fn extract_model(body: &Bytes) -> String {

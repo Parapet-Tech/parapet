@@ -12,9 +12,7 @@
 
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{HeaderMap, Method, Request, Response, StatusCode, Uri};
-#[cfg(test)]
-use axum::http::HeaderValue;
+use axum::http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, Uri};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
@@ -116,6 +114,162 @@ pub trait UpstreamClient: Send + Sync {
 // Provider detection
 // ---------------------------------------------------------------------------
 
+/// Classification of an inbound request path before provider detection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathClass {
+    Supported(Provider),
+    KnownUnsupported,
+    NonCanonical,
+    Unknown,
+}
+
+const KNOWN_UNSUPPORTED_SUBPATHS: &[&str] = &[
+    "/v1/responses",
+    "/v1/completions",
+    "/v1/embeddings",
+    "/v1/models",
+    "/v1/audio",
+    "/v1/images",
+    "/v1/files",
+    "/v1/batches",
+    "/v1/moderations",
+    "/v1/assistants",
+    "/v1/threads",
+    "/v1/realtime",
+    "/v1/messages/count_tokens",
+    "/v1/messages/batches",
+];
+
+fn contains_ascii_case_insensitive(haystack: &str, needle_lower: &str) -> bool {
+    let h = haystack.as_bytes();
+    let n = needle_lower.as_bytes();
+    if n.is_empty() || h.len() < n.len() {
+        return false;
+    }
+    h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
+}
+
+fn decode_dot_segment(seg: &str) -> String {
+    let bytes = seg.as_bytes();
+    let mut out = String::with_capacity(seg.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + 3 <= bytes.len() && bytes[i..i + 3].eq_ignore_ascii_case(b"%2e") {
+            out.push('.');
+            i += 3;
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
+fn is_non_canonical_path(path: &str) -> bool {
+    if !path.starts_with('/')
+        || path.contains('\\')
+        || path.contains("//")
+        || contains_ascii_case_insensitive(path, "%2f")
+        || contains_ascii_case_insensitive(path, "%5c")
+    {
+        return true;
+    }
+    for seg in path.split('/').skip(1) {
+        let decoded = decode_dot_segment(seg);
+        if decoded == "." || decoded == ".." {
+            return true;
+        }
+    }
+    false
+}
+
+fn matches_exact_or_segment_prefix(path: &str, prefix: &str) -> bool {
+    path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn is_known_unsupported_path(path: &str) -> bool {
+    let normalized = path.strip_prefix("/openai").unwrap_or(path);
+    KNOWN_UNSUPPORTED_SUBPATHS
+        .iter()
+        .any(|prefix| matches_exact_or_segment_prefix(normalized, prefix))
+}
+
+/// Classify a request path before `detect_provider`.
+pub fn classify_path(path: &str) -> PathClass {
+    if is_non_canonical_path(path) {
+        return PathClass::NonCanonical;
+    }
+    if is_known_unsupported_path(path) {
+        return PathClass::KnownUnsupported;
+    }
+    if let Some(provider) = detect_provider(path) {
+        return PathClass::Supported(provider);
+    }
+    PathClass::Unknown
+}
+
+fn sanitize_path_for_diagnostic(path: &str) -> String {
+    let mut byte_end = 0;
+    for ch in path.chars() {
+        let next = byte_end + ch.len_utf8();
+        if next > 128 {
+            break;
+        }
+        byte_end = next;
+    }
+    let truncated = &path[..byte_end];
+    let mut escaped = String::with_capacity(truncated.len());
+    for ch in truncated.chars() {
+        if ch.is_control() {
+            for esc in ch.escape_default() {
+                escaped.push(esc);
+            }
+        } else {
+            escaped.push(ch);
+        }
+    }
+    escaped
+}
+
+fn path_refusal_response(
+    path: &str,
+    status: StatusCode,
+    err_type: &'static str,
+    code: &'static str,
+) -> Response<Body> {
+    let safe_path = sanitize_path_for_diagnostic(path);
+    tracing::warn!(
+        path = %safe_path,
+        status = status.as_u16(),
+        error_type = err_type,
+        code = code,
+        "request path refused"
+    );
+    let message = format!(
+        "Parapet does not inspect {safe_path}. Supported: POST /v1/chat/completions, POST /openai/v1/chat/completions, POST /v1/messages. See docs/litellm.md and README.md."
+    );
+    let payload = serde_json::json!({
+        "error": {
+            "type": err_type,
+            "code": code,
+            "message": message,
+        }
+    });
+    let bytes = serde_json::to_vec(&payload).unwrap_or_default();
+    let mut resp = Response::builder()
+        .status(status)
+        .body(Body::from(bytes))
+        .unwrap();
+    resp.headers_mut()
+        .insert("content-type", HeaderValue::from_static("application/json"));
+    resp.headers_mut()
+        .insert("x-parapet-error", HeaderValue::from_static(code));
+    resp
+}
+
 /// Detect the LLM provider from the request path.
 ///
 /// Returns `None` for paths that do not map to a known provider.
@@ -186,10 +340,33 @@ pub async fn proxy_handler(
     let headers = request.headers().clone();
     let path = uri.path();
 
-    // Detect provider
-    let provider = match detect_provider(path) {
-        Some(p) => p,
-        None => return (StatusCode::NOT_FOUND, "unknown path").into_response(),
+    // Classify path before reading body or forwarding
+    let provider = match classify_path(path) {
+        PathClass::Supported(p) => p,
+        PathClass::NonCanonical => {
+            return path_refusal_response(
+                path,
+                StatusCode::BAD_REQUEST,
+                "parapet_path_not_canonical",
+                "path_not_canonical",
+            );
+        }
+        PathClass::KnownUnsupported => {
+            return path_refusal_response(
+                path,
+                StatusCode::NOT_IMPLEMENTED,
+                "parapet_unsupported_path",
+                "unsupported_wire_format",
+            );
+        }
+        PathClass::Unknown => {
+            return path_refusal_response(
+                path,
+                StatusCode::NOT_FOUND,
+                "parapet_unknown_path",
+                "unknown_path",
+            );
+        }
     };
 
     // Read body
@@ -457,6 +634,29 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
 
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            resp.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        assert_eq!(
+            resp.headers()
+                .get("x-parapet-error")
+                .and_then(|v| v.to_str().ok()),
+            Some("unknown_path")
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["type"], "parapet_unknown_path");
+        assert_eq!(json["error"]["code"], "unknown_path");
+        let msg = json["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("Parapet does not inspect /v1/unknown."));
+        assert!(msg.contains("POST /v1/chat/completions"));
+        assert!(msg.contains("POST /openai/v1/chat/completions"));
+        assert!(msg.contains("POST /v1/messages"));
     }
 
     // -----------------------------------------------------------------------
@@ -735,5 +935,141 @@ mod tests {
         let err = ProxyError::UpstreamTimeout("timed out".to_string());
         let resp = err.into_response();
         assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
+    }
+
+    // -----------------------------------------------------------------------
+    // Stage 0 path classification tests (T10, T11, T12)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn t10_classify_path_non_canonical() {
+        for path in [
+            "/v1/chat/completions/../../embeddings",
+            "/v1/chat/completions/%2e%2e/%2E%2E/embeddings",
+            "/v1//chat/completions",
+            "/v1/chat/completions%2f..",
+            "/v1\\chat\\completions",
+            "/v1/chat/completions/.%2e/embeddings",
+            "/v1/chat/completions/%2e./embeddings",
+            "/v1/chat/completions/%2e",
+            "/v1/chat/completions%5c..",
+        ] {
+            assert_eq!(
+                classify_path(path),
+                PathClass::NonCanonical,
+                "expected NonCanonical for {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn t11_classify_path_known_unsupported() {
+        for path in [
+            "/v1/responses",
+            "/v1/embeddings",
+            "/v1/completions",
+            "/v1/models",
+            "/v1/messages/count_tokens",
+            "/openai/v1/responses",
+            "/v1/audio",
+            "/v1/images",
+            "/v1/files",
+            "/v1/batches",
+            "/v1/moderations",
+            "/v1/assistants",
+            "/v1/threads",
+            "/v1/realtime",
+            "/v1/messages/batches",
+            "/openai/v1/embeddings",
+            "/openai/v1/messages/count_tokens",
+        ] {
+            assert_eq!(
+                classify_path(path),
+                PathClass::KnownUnsupported,
+                "expected KnownUnsupported for {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn t12_classify_path_supported_and_pinned_compat() {
+        assert_eq!(
+            classify_path("/v1/chat/completions"),
+            PathClass::Supported(Provider::OpenAi)
+        );
+        assert_eq!(
+            classify_path("/openai/v1/chat/completions"),
+            PathClass::Supported(Provider::OpenAi)
+        );
+        assert_eq!(
+            classify_path("/v1/messages"),
+            PathClass::Supported(Provider::Anthropic)
+        );
+        assert_eq!(
+            classify_path("/v1/chat/completionsXYZ"),
+            PathClass::Supported(Provider::OpenAi)
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_handler_refuses_unsupported_and_non_canonical_without_forwarding() {
+        let client = Arc::new(CapturingClient::new());
+        let app = build_router(client.clone());
+
+        let resp_501 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses?secret_query=should_not_echo")
+                    .body(Body::from("not even json"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_501.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(
+            resp_501
+                .headers()
+                .get("x-parapet-error")
+                .and_then(|v| v.to_str().ok()),
+            Some("unsupported_wire_format")
+        );
+        let body_501 = axum::body::to_bytes(resp_501.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json_501: serde_json::Value = serde_json::from_slice(&body_501).unwrap();
+        assert_eq!(json_501["error"]["type"], "parapet_unsupported_path");
+        assert_eq!(json_501["error"]["code"], "unsupported_wire_format");
+        let msg_501 = json_501["error"]["message"].as_str().unwrap();
+        assert!(msg_501.contains("Parapet does not inspect /v1/responses."));
+        assert!(!msg_501.contains("secret_query"));
+
+        let resp_400 = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions/../../embeddings")
+                    .body(Body::from("not even json"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_400.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            resp_400
+                .headers()
+                .get("x-parapet-error")
+                .and_then(|v| v.to_str().ok()),
+            Some("path_not_canonical")
+        );
+        let body_400 = axum::body::to_bytes(resp_400.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json_400: serde_json::Value = serde_json::from_slice(&body_400).unwrap();
+        assert_eq!(json_400["error"]["type"], "parapet_path_not_canonical");
+        assert_eq!(json_400["error"]["code"], "path_not_canonical");
+
+        assert!(client.captured_provider.lock().await.is_none());
     }
 }

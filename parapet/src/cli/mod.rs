@@ -1042,6 +1042,15 @@ fn run_engine_cmd(args: RunArgs, json_mode: bool) -> i32 {
         let (client, _store, root_cap) =
             match build_engine_client_with_runtime_v0(config, options) {
                 Ok(parts) => parts,
+                Err(crate::engine::StartupError::UpstreamConfig(diag)) => {
+                    return emit_cli_error(
+                        "run",
+                        "upstream_config_invalid",
+                        4,
+                        &diag.to_string(),
+                        json_mode,
+                    );
+                }
                 Err(_) => {
                     return emit_cli_error(
                         "run",
@@ -1379,6 +1388,15 @@ fn run_accept(args: AcceptArgs, json_mode: bool) -> i32 {
         let (client, _store, _root_cap) = match build_engine_client_with_runtime_v0(config, options)
         {
             Ok(parts) => parts,
+            Err(crate::engine::StartupError::UpstreamConfig(diag)) => {
+                return emit_cli_error(
+                    "accept",
+                    "upstream_config_invalid",
+                    4,
+                    &diag.to_string(),
+                    json_mode,
+                );
+            }
             Err(_) => {
                 return emit_cli_error(
                     "accept",
