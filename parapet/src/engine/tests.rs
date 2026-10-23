@@ -4158,6 +4158,118 @@ fn t_s1_08_fallback_key_http_refused_even_with_opt_in() {
 }
 
 #[test]
+fn t_s1_08b_fallback_key_http_refused_without_opt_in_gives_provider_specific_guidance() {
+    let raw_url = "http://127.0.0.1:11434";
+    let opts = UpstreamValidationOptions {
+        cli_upstreams: Vec::new(),
+        allow_loopback_http_upstream: false,
+        listener_port: Some(9800),
+    };
+    let cases = [
+        (
+            "OPENAI_BASE_URL",
+            "--upstream openai=http://<literal-loopback-IP>:<port>",
+            "PARAPET_OPENAI_BASE_URL",
+            "otherwise use https:// or remove OPENAI_BASE_URL from the engine's environment",
+            FIX_NON_HTTPS_OPENAI_FALLBACK,
+        ),
+        (
+            "ANTHROPIC_BASE_URL",
+            "--upstream anthropic=http://<literal-loopback-IP>:<port>",
+            "PARAPET_ANTHROPIC_BASE_URL",
+            "otherwise use https:// or remove ANTHROPIC_BASE_URL from the engine's environment",
+            FIX_NON_HTTPS_ANTHROPIC_FALLBACK,
+        ),
+    ];
+
+    for (
+        target_key,
+        expected_upstream_flag,
+        expected_parapet_env,
+        expected_remove_clause,
+        expected_fix,
+    ) in cases
+    {
+        let env_fn = |k: &str| {
+            if k == target_key {
+                Some(raw_url.to_string())
+            } else {
+                None
+            }
+        };
+        let err = UpstreamTable::from_env_fn_with_options(&env_fn, &opts)
+            .expect_err("no-flag ambient fallback http must fail closed");
+        let default_err = UpstreamTable::from_env_fn(&env_fn)
+            .expect_err("default from_env_fn ambient fallback http must fail closed");
+        assert_eq!(err, default_err, "target_key={target_key}");
+
+        assert_eq!(err.key, UpstreamKey::Static(target_key));
+        assert_eq!(err.rule, "non_https_upstream", "target_key={target_key}");
+        assert_eq!(err.fix, expected_fix, "target_key={target_key}");
+        assert_ne!(err.fix, FIX_FALLBACK_KEY_HTTP, "target_key={target_key}");
+        assert_ne!(err.fix, FIX_NON_HTTPS_UPSTREAM, "target_key={target_key}");
+        assert_eq!(err.value_len, raw_url.len(), "target_key={target_key}");
+
+        let display = err.to_string();
+        let debug = format!("{err:?}");
+        assert!(
+            display.contains(&format!("(value withheld, {} bytes", raw_url.len())),
+            "display missing withholding notice for {target_key}: {display}"
+        );
+
+        for surface in [err.fix, display.as_str()] {
+            assert!(
+                surface.contains(expected_upstream_flag),
+                "missing provider-specific --upstream form for {target_key}: {surface}"
+            );
+            assert!(
+                surface.contains(expected_parapet_env),
+                "missing provider-specific PARAPET_*_BASE_URL for {target_key}: {surface}"
+            );
+            assert!(
+                surface.contains("--allow-loopback-http-upstream"),
+                "missing --allow-loopback-http-upstream for {target_key}: {surface}"
+            );
+            assert!(
+                surface.contains(expected_remove_clause),
+                "missing https:// or remove fallback key clause for {target_key}: {surface}"
+            );
+            assert!(
+                !surface.contains("planned behind an explicit flag"),
+                "stale wording present for {target_key}: {surface}"
+            );
+            assert!(
+                !surface.contains("not supported in this release"),
+                "stale wording present for {target_key}: {surface}"
+            );
+            assert!(
+                !surface.contains("<provider>"),
+                "generic <provider> placeholder leaked into no-flag branch for {target_key}: {surface}"
+            );
+            assert!(
+                !surface.contains("PARAPET_<PROVIDER>_BASE_URL"),
+                "generic PARAPET_<PROVIDER>_BASE_URL placeholder leaked into no-flag branch for {target_key}: {surface}"
+            );
+        }
+
+        for surface in [display.as_str(), debug.as_str(), err.fix, err.rule] {
+            assert!(
+                !surface.contains(raw_url),
+                "refused URL value leaked for {target_key}: {surface}"
+            );
+            assert!(
+                !surface.contains("127.0.0.1"),
+                "refused host literal leaked for {target_key}: {surface}"
+            );
+            assert!(
+                !surface.contains("11434"),
+                "refused port literal leaked for {target_key}: {surface}"
+            );
+        }
+    }
+}
+
+#[test]
 fn t_s1_09_cli_upstream_shadows_conflicting_known_host_primary_and_fallback_env_vars() {
     let opts = UpstreamValidationOptions {
         cli_upstreams: vec![
