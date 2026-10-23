@@ -1303,9 +1303,17 @@ impl EngineUpstreamClient {
 
         let body_stream = redacted_stream.map(|b| Ok::<Bytes, std::io::Error>(b));
 
+        let mut resp_headers = upstream.headers;
+        // The SSE stream passes through StreamProcessor (and optional L5a
+        // redaction), which may rewrite, redact, or terminate the stream early
+        // on policy violation. Upstream framing headers are therefore stale;
+        // strip them and let hyper frame the downstream response stream.
+        resp_headers.remove(reqwest::header::CONTENT_LENGTH);
+        resp_headers.remove(reqwest::header::TRANSFER_ENCODING);
+
         ProxyResponse {
             status: upstream.status,
-            headers: upstream.headers,
+            headers: resp_headers,
             body: Body::from_stream(body_stream),
         }
     }

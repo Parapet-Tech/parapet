@@ -4670,3 +4670,77 @@ fn t_s1_16_startup_disclosure_emits_sanitized_origin_only_and_strips_base_path()
         assert!(!surface.contains("tenant-token-xyz"));
     }
 }
+
+#[tokio::test]
+async fn streaming_response_strips_stale_framing_headers() {
+    let sse_chunk_1 = "data: {\"id\":\"chatcmpl-s1-e13-stream\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_stream_bad\",\"type\":\"function\",\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"../escape.txt\\\",\\\"content\\\":\\\"bad\\\"}\"}}]},\"finish_reason\":null}]}\n\n";
+    let sse_chunk_2 = "data: {\"id\":\"chatcmpl-s1-e13-stream\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n";
+    let sse_chunk_3 = "data: [DONE]\n\n";
+    let original_len = sse_chunk_1.len() + sse_chunk_2.len() + sse_chunk_3.len();
+
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert("content-type", "text/event-stream".parse().unwrap());
+    response_headers.insert(
+        reqwest::header::CONTENT_LENGTH,
+        original_len.to_string().parse().unwrap(),
+    );
+    response_headers.insert(
+        reqwest::header::TRANSFER_ENCODING,
+        "chunked".parse().unwrap(),
+    );
+    let sender = Arc::new(RecordingHttpSender::with_stream_response(
+        response_headers,
+        vec![
+            Bytes::from(sse_chunk_1),
+            Bytes::from(sse_chunk_2),
+            Bytes::from(sse_chunk_3),
+        ],
+    ));
+
+    let config = config_with_l3_outbound("error");
+    let engine = engine_with_http_sender(config, sender);
+
+    let response = engine
+        .forward(
+            Provider::OpenAi,
+            openai_request_with_stream(true, HeaderMap::new()),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status, StatusCode::OK);
+    assert!(
+        response.headers.get(reqwest::header::CONTENT_LENGTH).is_none(),
+        "stale Content-Length must be stripped from transformed streaming response"
+    );
+    assert!(
+        response
+            .headers
+            .get(reqwest::header::TRANSFER_ENCODING)
+            .is_none(),
+        "stale Transfer-Encoding must be stripped from transformed streaming response"
+    );
+    assert_eq!(
+        response
+            .headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("text/event-stream")
+    );
+
+    let body = collect_proxy_body(response).await;
+    let body_str = String::from_utf8_lossy(&body);
+    assert!(
+        body_str.contains("tool call blocked"),
+        "expected SSE error notice in stream: {body_str}"
+    );
+    assert!(
+        !body_str.contains("../escape.txt"),
+        "blocked tool call arguments must be withheld: {body_str}"
+    );
+    assert_ne!(
+        body.len(),
+        original_len,
+        "transformed SSE stream length differs from upstream Content-Length"
+    );
+}
