@@ -3299,3 +3299,316 @@ async fn s1_e15_models_probe_get_v1_models_and_openai_v1_models_refused_501_zero
     disable_parapet_instance(&state_dir);
     let _ = child.wait_with_output().unwrap();
 }
+
+#[tokio::test]
+async fn s1_e16_streaming_l5a_cross_delta_redaction_and_non_streaming_parity() {
+    use parapet::engine::{HttpBody, HttpError, HttpResponse};
+
+    struct CrossDeltaTestSender {
+        sse_chunks: Vec<Bytes>,
+        json_body: Bytes,
+    }
+
+    #[async_trait::async_trait]
+    impl HttpSender for CrossDeltaTestSender {
+        async fn send(&self, request: HttpRequest) -> Result<HttpResponse, HttpError> {
+            let mut headers = HeaderMap::new();
+            if request.stream {
+                headers.insert(
+                    "content-type",
+                    HeaderValue::from_static("text/event-stream"),
+                );
+                let chunks = self.sse_chunks.clone();
+                let stream =
+                    futures_util::stream::iter(chunks.into_iter().map(Ok::<Bytes, HttpError>));
+                Ok(HttpResponse {
+                    status: StatusCode::OK,
+                    headers,
+                    body: HttpBody::Stream(Box::pin(stream)),
+                })
+            } else {
+                headers.insert("content-type", HeaderValue::from_static("application/json"));
+                Ok(HttpResponse {
+                    status: StatusCode::OK,
+                    headers,
+                    body: HttpBody::Full(self.json_body.clone()),
+                })
+            }
+        }
+    }
+
+    struct FixedHttpsResolver;
+    impl UpstreamResolver for FixedHttpsResolver {
+        fn base_url(&self, _provider: Provider) -> String {
+            "https://api.openai.com".to_string()
+        }
+    }
+
+    let l5a_yaml = r#"parapet: v1
+use_default_block_patterns: false
+canary_tokens:
+  - "PLAYGROUND_TEST_TOKEN_42"
+sensitive_patterns:
+  - "PLAYGROUND_TEST_TOKEN_[0-9]+"
+layers:
+  L0: { mode: sanitize }
+  L3_inbound: { mode: shadow }
+  L3_outbound: { mode: block, block_action: rewrite }
+  L5a: { mode: redact }
+"#;
+
+    let fragments = ["PLAY", "GROUND", "_TEST", "_TOKEN", "_", "4", "2"];
+    let mut sse_chunks: Vec<Bytes> = fragments
+        .iter()
+        .map(|frag| {
+            Bytes::from(format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{frag}\"}}}}]}}\n\n"
+            ))
+        })
+        .collect();
+    sse_chunks.push(Bytes::from("data: [DONE]\n\n"));
+
+    let json_body = Bytes::from(
+        serde_json::json!({
+            "id": "chatcmpl-s1-e16-non-stream",
+            "object": "chat.completion",
+            "created": 1_700_000_000u64,
+            "model": "gpt-4o-mini",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "PLAYGROUND_TEST_TOKEN_42"
+                },
+                "finish_reason": "stop"
+            }]
+        })
+        .to_string(),
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let state_dir = write_private_state_dir(tmp.path(), "state-s1-e16");
+    let store_root = state_dir.join("receipt-evidence");
+    let store = Arc::new(
+        parapet::effect::store::ProtectedEvidenceStoreV0::open(&store_root).expect("open store"),
+    );
+
+    let cfg = Arc::new(
+        load_config(&StringSource {
+            content: l5a_yaml.to_string(),
+        })
+        .unwrap(),
+    );
+    let parts = EnvelopePartsV0::new(
+        cfg.clone(),
+        store,
+        Arc::new(InjectedBuildIdentityV0::unavailable()),
+    );
+    let envelope = Arc::new(RuntimeEnvelopeV0::new(parts));
+
+    let deps = EngineDeps {
+        config: cfg,
+        http: Arc::new(CrossDeltaTestSender {
+            sse_chunks,
+            json_body,
+        }),
+        resolver: Arc::new(FixedHttpsResolver),
+        registry: Arc::new(DefaultProviderRegistry),
+        normalizer: Arc::new(L0Normalizer::new()),
+        trust_assigner: Arc::new(RoleTrustAssigner),
+        l1_scanner: None,
+        l1_model: None,
+        l2a_scanner: None,
+        l2a_semaphore: None,
+        inbound_scanner: Arc::new(DefaultInboundScanner::new()),
+        constraint_evaluator: Arc::new(DslConstraintEvaluator::new()),
+        output_scanner: Arc::new(L5aScanner),
+        session_store: None,
+        multi_turn_scanner: None,
+        orthogonal_sensor_router: Arc::new(NoopOrthogonalSensorRouter::new()),
+        signal_extractor: Arc::new(DefaultSignalExtractor::new()),
+        verdict_combiner: Arc::new(DefaultVerdictCombiner::new()),
+        emit_l1_signals: false,
+    };
+    let app = build_router(Arc::new(EngineUpstreamClient::new_with_envelope(
+        deps, envelope,
+    )));
+
+    // 1. Streaming request with token fragmented across SSE delta events
+    let stream_req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "model": "gpt-4o-mini",
+                "stream": true,
+                "messages": [{"role": "user", "content": "emit test token"}]
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let stream_resp = app.clone().oneshot(stream_req).await.unwrap();
+    assert_eq!(stream_resp.status(), StatusCode::OK);
+    let sse_bytes = axum::body::to_bytes(stream_resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let sse_text = String::from_utf8(sse_bytes.to_vec()).expect("valid utf-8 SSE");
+
+    // 2. Non-streaming parity request with identical logical content
+    let non_stream_req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "model": "gpt-4o-mini",
+                "stream": false,
+                "messages": [{"role": "user", "content": "emit test token"}]
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let non_stream_resp = app.oneshot(non_stream_req).await.unwrap();
+    assert_eq!(non_stream_resp.status(), StatusCode::OK);
+    let non_stream_bytes = axum::body::to_bytes(non_stream_resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let non_stream_json: serde_json::Value = serde_json::from_slice(&non_stream_bytes).unwrap();
+    let non_stream_content = non_stream_json["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap();
+
+    assert_eq!(non_stream_content, "[REDACTED]");
+
+    let mut reassembled = String::new();
+    for line in sse_text.lines() {
+        let trimmed = line.trim();
+        if let Some(data) = trimmed
+            .strip_prefix("data: ")
+            .or_else(|| trimmed.strip_prefix("data:"))
+        {
+            let data = data.trim();
+            if data == "[DONE]" {
+                continue;
+            }
+            let json: serde_json::Value =
+                serde_json::from_str(data).expect("SSE data line must be valid JSON");
+            if let Some(content) = json
+                .get("choices")
+                .and_then(|c| c.get(0))
+                .and_then(|c| c.get("delta"))
+                .and_then(|d| d.get("content"))
+                .and_then(|c| c.as_str())
+            {
+                reassembled.push_str(content);
+            }
+        }
+    }
+
+    assert!(
+        !sse_text.contains("PLAYGROUND_TEST_TOKEN_42"),
+        "SSE stream leaked full token: {sse_text}"
+    );
+    for frag in ["PLAY", "GROUND", "_TEST", "_TOKEN"] {
+        assert!(
+            !sse_text.contains(frag),
+            "SSE stream leaked sensitive fragment {frag}: {sse_text}"
+        );
+    }
+    assert!(
+        !reassembled.contains("PLAYGROUND_TEST_TOKEN_42"),
+        "reassembled SSE content leaked full token: {reassembled}"
+    );
+    assert!(
+        sse_text.contains("[REDACTED]"),
+        "SSE stream must contain [REDACTED]: {sse_text}"
+    );
+    assert!(
+        sse_text.contains("data: [DONE]"),
+        "SSE stream must preserve [DONE]: {sse_text}"
+    );
+    assert_eq!(reassembled, non_stream_content);
+
+    // 3. Control: ordinary non-sensitive fragmented SSE stream flows through intact
+    let benign_fragments = ["Hello", ", ", "ordinary ", "fragmented ", "stream", "!"];
+    let mut benign_sse_chunks: Vec<Bytes> = benign_fragments
+        .iter()
+        .map(|frag| {
+            Bytes::from(format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{frag}\"}}}}]}}\n\n"
+            ))
+        })
+        .collect();
+    benign_sse_chunks.push(Bytes::from("data: [DONE]\n\n"));
+
+    let benign_cfg = Arc::new(
+        load_config(&StringSource {
+            content: l5a_yaml.to_string(),
+        })
+        .unwrap(),
+    );
+    let benign_deps = EngineDeps {
+        config: benign_cfg,
+        http: Arc::new(CrossDeltaTestSender {
+            sse_chunks: benign_sse_chunks,
+            json_body: Bytes::new(),
+        }),
+        resolver: Arc::new(FixedHttpsResolver),
+        registry: Arc::new(DefaultProviderRegistry),
+        normalizer: Arc::new(L0Normalizer::new()),
+        trust_assigner: Arc::new(RoleTrustAssigner),
+        l1_scanner: None,
+        l1_model: None,
+        l2a_scanner: None,
+        l2a_semaphore: None,
+        inbound_scanner: Arc::new(DefaultInboundScanner::new()),
+        constraint_evaluator: Arc::new(DslConstraintEvaluator::new()),
+        output_scanner: Arc::new(L5aScanner),
+        session_store: None,
+        multi_turn_scanner: None,
+        orthogonal_sensor_router: Arc::new(NoopOrthogonalSensorRouter::new()),
+        signal_extractor: Arc::new(DefaultSignalExtractor::new()),
+        verdict_combiner: Arc::new(DefaultVerdictCombiner::new()),
+        emit_l1_signals: false,
+    };
+    let benign_app = build_router(Arc::new(EngineUpstreamClient::new_with(benign_deps)));
+    let benign_req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "model": "gpt-4o-mini",
+                "stream": true,
+                "messages": [{"role": "user", "content": "emit benign greeting"}]
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let benign_resp = benign_app.oneshot(benign_req).await.unwrap();
+    assert_eq!(benign_resp.status(), StatusCode::OK);
+    let benign_bytes = axum::body::to_bytes(benign_resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let benign_sse = String::from_utf8(benign_bytes.to_vec()).unwrap();
+    let mut benign_reassembled = String::new();
+    for line in benign_sse.lines() {
+        if let Some(data) = line
+            .trim()
+            .strip_prefix("data: ")
+            .or_else(|| line.trim().strip_prefix("data:"))
+        {
+            let data = data.trim();
+            if data == "[DONE]" {
+                continue;
+            }
+            let json: serde_json::Value = serde_json::from_str(data).unwrap();
+            if let Some(c) = json["choices"][0]["delta"]["content"].as_str() {
+                benign_reassembled.push_str(c);
+            }
+        }
+    }
+    assert_eq!(benign_reassembled, "Hello, ordinary fragmented stream!");
+    assert!(!benign_sse.contains("[REDACTED]"));
+}

@@ -4859,3 +4859,357 @@ async fn streaming_response_strips_stale_framing_headers() {
         "transformed SSE stream length differs from upstream Content-Length"
     );
 }
+
+fn reassemble_openai_sse_deltas(raw_sse: &str) -> String {
+    let mut out = String::new();
+    for line in raw_sse.lines() {
+        let trimmed = line.trim();
+        if let Some(data) = trimmed
+            .strip_prefix("data: ")
+            .or_else(|| trimmed.strip_prefix("data:"))
+        {
+            let data = data.trim();
+            if data == "[DONE]" {
+                continue;
+            }
+            let json: serde_json::Value =
+                serde_json::from_str(data).expect("emitted SSE data line must be valid JSON");
+            if let Some(content) = json
+                .get("choices")
+                .and_then(|c| c.get(0))
+                .and_then(|c| c.get("delta"))
+                .and_then(|d| d.get("content"))
+                .and_then(|c| c.as_str())
+            {
+                out.push_str(content);
+            }
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn streaming_l5a_cross_delta_sse_reproduction_and_non_streaming_parity() {
+    let token = "PLAYGROUND_TEST_TOKEN_42";
+    let fragments = ["PLAY", "GROUND", "_TEST", "_TOKEN", "_", "4", "2"];
+
+    let mut sse_chunks: Vec<Bytes> = fragments
+        .iter()
+        .map(|frag| {
+            Bytes::from(format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{frag}\"}}}}]}}\n\n"
+            ))
+        })
+        .collect();
+    sse_chunks.push(Bytes::from("data: [DONE]\n\n"));
+
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert("content-type", "text/event-stream".parse().unwrap());
+    let stream_sender = Arc::new(RecordingHttpSender::with_stream_response(
+        response_headers,
+        sse_chunks,
+    ));
+
+    let make_config = || {
+        let mut config = streaming_l5a_config(token);
+        config.policy.sensitive_patterns =
+            vec![CompiledPattern::compile("PLAYGROUND_TEST_TOKEN_[0-9]+").unwrap()];
+        config
+    };
+    let stream_engine = engine_with_http_sender(make_config(), stream_sender);
+
+    let stream_resp = stream_engine
+        .forward(
+            Provider::OpenAi,
+            openai_request_with_stream(true, HeaderMap::new()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stream_resp.status, StatusCode::OK);
+    let stream_body = collect_proxy_body(stream_resp).await;
+    let stream_text = String::from_utf8_lossy(&stream_body);
+    let reassembled = reassemble_openai_sse_deltas(&stream_text);
+
+    // Parity: identical logical content non-streaming
+    let mut json_headers = HeaderMap::new();
+    json_headers.insert("content-type", "application/json".parse().unwrap());
+    let non_stream_payload = serde_json::json!({
+        "id": "chatcmpl-parity",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": token
+            },
+            "finish_reason": "stop"
+        }]
+    });
+    let non_stream_sender = Arc::new(RecordingHttpSender::with_full_response(
+        json_headers,
+        Bytes::from(serde_json::to_vec(&non_stream_payload).unwrap()),
+    ));
+    let non_stream_engine = engine_with_http_sender(make_config(), non_stream_sender);
+    let non_stream_resp = non_stream_engine
+        .forward(
+            Provider::OpenAi,
+            openai_request_with_stream(false, HeaderMap::new()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(non_stream_resp.status, StatusCode::OK);
+    let non_stream_body = collect_proxy_body(non_stream_resp).await;
+    let non_stream_json: serde_json::Value = serde_json::from_slice(&non_stream_body).unwrap();
+    let non_stream_content = non_stream_json["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap();
+    assert_eq!(non_stream_content, "[REDACTED]");
+
+    // Streaming assertions: neither wire output nor reassembled content may contain the token or its fragments
+    assert!(
+        !stream_text.contains(token),
+        "raw SSE output leaked full token: {stream_text}"
+    );
+    for frag in ["PLAY", "GROUND", "_TEST", "_TOKEN"] {
+        assert!(
+            !stream_text.contains(frag),
+            "raw SSE output leaked sensitive fragment {frag}: {stream_text}"
+        );
+    }
+    assert!(
+        !reassembled.contains(token),
+        "reassembled SSE content leaked full token: {reassembled}"
+    );
+    assert!(
+        stream_text.contains("[REDACTED]"),
+        "expected [REDACTED] in downstream SSE output: {stream_text}"
+    );
+    assert_eq!(
+        reassembled, non_stream_content,
+        "streaming reassembled content must match non-streaming redacted content"
+    );
+}
+
+#[tokio::test]
+async fn streaming_l5a_cross_delta_regex_and_anthropic_parity() {
+    let fragments = [
+        "Prefix: ",
+        "PLAY",
+        "GROUND",
+        "_TEST",
+        "_TOKEN",
+        "_",
+        "4",
+        "2",
+        " :Suffix",
+    ];
+
+    // 1. OpenAI regex-only (no canary token) cross-delta redaction
+    let mut openai_chunks: Vec<Bytes> = fragments
+        .iter()
+        .map(|frag| {
+            Bytes::from(format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{frag}\"}}}}]}}\n\n"
+            ))
+        })
+        .collect();
+    openai_chunks.push(Bytes::from("data: [DONE]\n\n"));
+
+    let mut resp_headers = HeaderMap::new();
+    resp_headers.insert("content-type", "text/event-stream".parse().unwrap());
+    let sender = Arc::new(RecordingHttpSender::with_stream_response(
+        resp_headers,
+        openai_chunks,
+    ));
+
+    let mut regex_config = base_config_with_sensitive("PLAYGROUND_TEST_TOKEN_[0-9]+");
+    regex_config.policy.layers.l5a = Some(LayerConfig {
+        mode: "redact".to_string(),
+        block_action: None,
+        window_chars: Some(64),
+    });
+    let engine = engine_with_http_sender(regex_config, sender);
+    let resp = engine
+        .forward(
+            Provider::OpenAi,
+            openai_request_with_stream(true, HeaderMap::new()),
+        )
+        .await
+        .unwrap();
+    let body = collect_proxy_body(resp).await;
+    let text = String::from_utf8_lossy(&body);
+    let reassembled = reassemble_openai_sse_deltas(&text);
+    assert_eq!(reassembled, "Prefix: [REDACTED] :Suffix");
+    for frag in ["PLAY", "GROUND", "_TEST", "_TOKEN", "_42"] {
+        assert!(!text.contains(frag), "leaked fragment {frag}: {text}");
+    }
+
+    // 2. Anthropic SSE cross-delta redaction
+    let mut anthropic_lines = vec![
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-5-sonnet-20241022\"}}\n\n".to_string(),
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n".to_string(),
+    ];
+    for frag in ["PLAY", "GROUND", "_TEST", "_TOKEN", "_", "4", "2"] {
+        anthropic_lines.push(format!(
+            "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{frag}\"}}}}\n\n"
+        ));
+    }
+    anthropic_lines.push(
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n"
+            .to_string(),
+    );
+    anthropic_lines.push("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string());
+
+    let mut anth_headers = HeaderMap::new();
+    anth_headers.insert("content-type", "text/event-stream".parse().unwrap());
+    let anth_sender = Arc::new(RecordingHttpSender::with_stream_response(
+        anth_headers,
+        anthropic_lines.into_iter().map(Bytes::from).collect(),
+    ));
+    let anth_engine =
+        engine_with_http_sender(streaming_l5a_config("PLAYGROUND_TEST_TOKEN_42"), anth_sender);
+    let anth_resp = anth_engine
+        .forward(
+            Provider::Anthropic,
+            anthropic_request_with_stream(true, HeaderMap::new()),
+        )
+        .await
+        .unwrap();
+    let anth_body = collect_proxy_body(anth_resp).await;
+    let anth_text = String::from_utf8_lossy(&anth_body);
+    assert!(anth_text.contains("[REDACTED]"), "anth_text={anth_text}");
+    for frag in ["PLAY", "GROUND", "_TEST", "_TOKEN"] {
+        assert!(
+            !anth_text.contains(frag),
+            "Anthropic SSE leaked fragment {frag}: {anth_text}"
+        );
+    }
+    assert!(anth_text.contains("event: content_block_stop"));
+    assert!(anth_text.contains("event: message_stop"));
+}
+
+#[tokio::test]
+async fn streaming_l5a_ordinary_non_sensitive_fragmented_output_streams_incrementally() {
+    let config = Arc::new(streaming_l5a_config("PLAYGROUND_TEST_TOKEN_42"));
+    let scanner: Arc<dyn OutputScanner> = Arc::new(L5aScanner);
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(16);
+    let input_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    let mut redacted_stream = apply_streaming_redaction(input_stream, scanner, config, Some(24));
+
+    // Send initial role chunk + benign fragments exceeding the 24-char window before [DONE]
+    tx.send(Bytes::from(
+        "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+    ))
+    .await
+    .unwrap();
+    for frag in [
+        "Hello, ",
+        "this is ",
+        "ordinary ",
+        "non-sensitive ",
+        "fragmented ",
+        "streaming ",
+        "output!",
+    ] {
+        tx.send(Bytes::from(format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{frag}\"}}}}]}}\n\n"
+        )))
+        .await
+        .unwrap();
+    }
+
+    // Because total benign text (67 chars) > 24-char window, early chunks must be emitted BEFORE [DONE]
+    let mut pre_done_sse = String::new();
+    while !pre_done_sse.contains("Hello, ") {
+        let chunk = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            redacted_stream.next(),
+        )
+        .await
+        .expect("benign prefix outside window should stream before [DONE]")
+        .expect("expected early SSE chunk");
+        pre_done_sse.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    assert!(
+        pre_done_sse.contains("\"role\":\"assistant\""),
+        "expected role chunk in pre-[DONE] output: {pre_done_sse}"
+    );
+    assert!(
+        pre_done_sse.contains("Hello, "),
+        "expected early benign content chunk before [DONE]: {pre_done_sse}"
+    );
+
+    tx.send(Bytes::from(
+        "data: {\"choices\":[],\"usage\":{\"total_tokens\":12}}\n\n",
+    ))
+    .await
+    .unwrap();
+    tx.send(Bytes::from("data: [DONE]\n\n")).await.unwrap();
+    drop(tx);
+
+    let mut full_sse = pre_done_sse;
+    while let Some(chunk) = redacted_stream.next().await {
+        full_sse.push_str(&String::from_utf8_lossy(&chunk));
+    }
+
+    let reassembled = reassemble_openai_sse_deltas(&full_sse);
+    assert_eq!(
+        reassembled,
+        "Hello, this is ordinary non-sensitive fragmented streaming output!"
+    );
+    assert!(full_sse.contains("\"usage\":{\"total_tokens\":12}"));
+    assert!(full_sse.contains("data: [DONE]"));
+}
+
+#[tokio::test]
+async fn streaming_l5a_malformed_or_ambiguous_sse_content_fails_closed() {
+    let config = Arc::new(streaming_l5a_config("PLAYGROUND_TEST_TOKEN_42"));
+    let scanner: Arc<dyn OutputScanner> = Arc::new(L5aScanner);
+
+    // 1. Partial token fragments followed by malformed JSON data line must not leak held prefix
+    let malformed_chunks = vec![
+        Bytes::from("data: {\"choices\":[{\"delta\":{\"content\":\"PLAY\"}}]}\n\n"),
+        Bytes::from("data: {\"choices\":[{\"delta\":{\"content\":\"GROUND_TEST_TOKEN_42\"\n\n"),
+        Bytes::from("data: [DONE]\n\n"),
+    ];
+    let out_malformed = collect_stream(apply_streaming_redaction(
+        stream::iter(malformed_chunks),
+        scanner.clone(),
+        config.clone(),
+        Some(64),
+    ))
+    .await;
+    assert!(
+        !out_malformed.contains("PLAY"),
+        "malformed SSE stream must fail closed and withhold partial prefix: {out_malformed}"
+    );
+    assert!(
+        !out_malformed.contains("GROUND"),
+        "malformed SSE stream must withhold corrupted line: {out_malformed}"
+    );
+
+    // 2. Partial token fragments followed by ambiguous non-string delta.content must fail closed
+    let ambiguous_chunks = vec![
+        Bytes::from("data: {\"choices\":[{\"delta\":{\"content\":\"PLAY\"}}]}\n\n"),
+        Bytes::from(
+            "data: {\"choices\":[{\"delta\":{\"content\":[\"GROUND_TEST_TOKEN_42\"]}}]}\n\n",
+        ),
+        Bytes::from("data: [DONE]\n\n"),
+    ];
+    let out_ambiguous = collect_stream(apply_streaming_redaction(
+        stream::iter(ambiguous_chunks),
+        scanner,
+        config,
+        Some(64),
+    ))
+    .await;
+    assert!(
+        !out_ambiguous.contains("PLAY"),
+        "ambiguous SSE delta.content must fail closed and withhold partial prefix: {out_ambiguous}"
+    );
+    assert!(
+        !out_ambiguous.contains("GROUND"),
+        "ambiguous SSE delta.content must be withheld: {out_ambiguous}"
+    );
+}

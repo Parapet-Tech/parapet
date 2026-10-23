@@ -4460,47 +4460,208 @@ fn update_session_after_request(
     store.update(session);
 }
 
+const MAX_STREAM_REDACTION_BUFFER_CHARS: usize = 64 * 1024;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StreamRedactionMode {
+    Undetermined,
+    PlainText,
+    Sse,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeltaKind {
+    OpenAi,
+    Anthropic,
+}
+
+#[derive(Clone)]
+struct PendingDelta {
+    text: String,
+    event_line: Option<String>,
+    template: serde_json::Value,
+    kind: DeltaKind,
+}
+
+enum SseL5aAction {
+    OpenAiContentDelta {
+        content: String,
+        has_finish: bool,
+    },
+    OpenAiEmptyDeltaNoFinish {
+        has_role: bool,
+    },
+    AnthropicTextDelta {
+        text: String,
+    },
+    AnthropicTextBlockStartEmpty,
+    AnthropicTextBlockStartWithInitialText {
+        initial_text: String,
+        stripped_start_json: serde_json::Value,
+        block_index: serde_json::Value,
+    },
+    AnthropicContentBlockStop,
+    NonFlushPassthrough,
+    FlushAndPassthrough,
+    MalformedOrAmbiguous,
+}
+
+struct StreamingRedactionState {
+    input: Pin<Box<dyn Stream<Item = Bytes> + Send>>,
+    mode: StreamRedactionMode,
+    raw_buffer: String,
+    pending_event_line: Option<String>,
+    pending_deltas: std::collections::VecDeque<PendingDelta>,
+    deferred_events: Vec<(Option<String>, String)>,
+    out_queue: std::collections::VecDeque<Bytes>,
+    swallow_next_blank: bool,
+    eof: bool,
+}
+
 fn apply_streaming_redaction(
     input: impl Stream<Item = Bytes> + Send + 'static,
     scanner: Arc<dyn OutputScanner>,
     config: Arc<Config>,
     window_override: Option<usize>,
 ) -> Pin<Box<dyn Stream<Item = Bytes> + Send>> {
-    let window = window_override.unwrap_or_else(|| compute_redaction_window(&config));
-    let state = (Box::pin(input) as Pin<Box<dyn Stream<Item = Bytes> + Send>>, String::new());
+    let base_window = window_override.unwrap_or_else(|| compute_redaction_window(&config));
+    let min_canary_window = config
+        .policy
+        .canary_tokens
+        .iter()
+        .map(|t| t.chars().count())
+        .max()
+        .unwrap_or(0);
+    let effective_window = base_window.max(min_canary_window);
 
-    let stream = futures_util::stream::unfold(state, move |(mut input, mut buffer)| {
+    let init_state = StreamingRedactionState {
+        input: Box::pin(input) as Pin<Box<dyn Stream<Item = Bytes> + Send>>,
+        mode: StreamRedactionMode::Undetermined,
+        raw_buffer: String::new(),
+        pending_event_line: None,
+        pending_deltas: std::collections::VecDeque::new(),
+        deferred_events: Vec::new(),
+        out_queue: std::collections::VecDeque::new(),
+        swallow_next_blank: false,
+        eof: false,
+    };
+
+    let stream = futures_util::stream::unfold(init_state, move |mut state| {
         let scanner = scanner.clone();
         let config = config.clone();
         async move {
             loop {
-                match input.next().await {
+                if let Some(bytes) = state.out_queue.pop_front() {
+                    return Some((bytes, state));
+                }
+                if state.eof {
+                    return None;
+                }
+
+                match state.input.next().await {
                     Some(chunk) => {
                         let chunk_str = String::from_utf8_lossy(&chunk);
-                        buffer.push_str(&chunk_str);
+                        state.raw_buffer.push_str(&chunk_str);
 
-                        let redacted = scanner.scan_and_redact(&buffer, &config).content;
-                        let redacted_len = redacted.chars().count();
-                        if redacted_len > window {
-                            let cut = redacted_len - window;
-                            let emit = head_chars(&redacted, cut);
-                            // Keep the redacted tail so boundary matches stay redacted.
-                            buffer = tail_chars(&redacted, window);
-                            if !emit.is_empty() {
-                                return Some((Bytes::from(emit), (input, buffer)));
+                        if state.mode == StreamRedactionMode::Undetermined {
+                            let trimmed = state.raw_buffer.trim_start();
+                            if trimmed.is_empty() {
+                                continue;
                             }
+                            if trimmed.starts_with("data:")
+                                || trimmed.starts_with("event:")
+                                || trimmed.starts_with(':')
+                            {
+                                state.mode = StreamRedactionMode::Sse;
+                            } else if !trimmed.contains('\n')
+                                && ("data:".starts_with(trimmed) || "event:".starts_with(trimmed))
+                            {
+                                continue;
+                            } else {
+                                state.mode = StreamRedactionMode::PlainText;
+                            }
+                        }
+
+                        match state.mode {
+                            StreamRedactionMode::PlainText => {
+                                let scan = scanner.scan_and_redact(&state.raw_buffer, &config);
+                                let active_right_edge = !scan.redactions.is_empty()
+                                    && scan.content.ends_with("[REDACTED]")
+                                    && state.raw_buffer.chars().count()
+                                        < MAX_STREAM_REDACTION_BUFFER_CHARS;
+                                if !active_right_edge {
+                                    let redacted = scan.content;
+                                    let redacted_len = redacted.chars().count();
+                                    let hold = effective_window
+                                        .max(longest_canary_prefix_at_end(&redacted, &config));
+                                    if redacted_len > hold {
+                                        let cut = redacted_len - hold;
+                                        let emit = head_chars(&redacted, cut);
+                                        state.raw_buffer = tail_chars(&redacted, hold);
+                                        if !emit.is_empty() {
+                                            state.out_queue.push_back(Bytes::from(emit));
+                                        }
+                                    }
+                                }
+                            }
+                            StreamRedactionMode::Sse => {
+                                drain_sse_redaction_lines(
+                                    &mut state,
+                                    scanner.as_ref(),
+                                    &config,
+                                    effective_window,
+                                );
+                            }
+                            StreamRedactionMode::Undetermined => {}
                         }
                     }
                     None => {
-                        if buffer.is_empty() {
-                            return None;
+                        state.eof = true;
+                        if state.mode == StreamRedactionMode::Undetermined {
+                            let trimmed = state.raw_buffer.trim_start();
+                            state.mode = if trimmed.starts_with("data:")
+                                || trimmed.starts_with("event:")
+                                || trimmed.starts_with(':')
+                            {
+                                StreamRedactionMode::Sse
+                            } else {
+                                StreamRedactionMode::PlainText
+                            };
                         }
-                        let redacted = scanner.scan_and_redact(&buffer, &config).content;
-                        buffer.clear();
-                        if redacted.is_empty() {
-                            return None;
+
+                        match state.mode {
+                            StreamRedactionMode::PlainText => {
+                                if !state.raw_buffer.is_empty() {
+                                    let redacted =
+                                        scanner.scan_and_redact(&state.raw_buffer, &config).content;
+                                    state.raw_buffer.clear();
+                                    if !redacted.is_empty() {
+                                        state.out_queue.push_back(Bytes::from(redacted));
+                                    }
+                                }
+                            }
+                            StreamRedactionMode::Sse => {
+                                if !state.raw_buffer.trim().is_empty() {
+                                    let tail_line = std::mem::take(&mut state.raw_buffer);
+                                    process_sse_redaction_line(
+                                        &mut state,
+                                        &tail_line,
+                                        scanner.as_ref(),
+                                        &config,
+                                        effective_window,
+                                    );
+                                }
+                                state.raw_buffer.clear();
+                                if state.pending_event_line.take().is_some() {
+                                    // Unpaired trailing event: line without data: fails closed.
+                                    state.pending_deltas.clear();
+                                    state.deferred_events.clear();
+                                } else {
+                                    flush_sse_pending(&mut state, scanner.as_ref(), &config);
+                                }
+                            }
+                            StreamRedactionMode::Undetermined => {}
                         }
-                        return Some((Bytes::from(redacted), (input, buffer)));
                     }
                 }
             }
@@ -4509,6 +4670,696 @@ fn apply_streaming_redaction(
     .filter(|b| futures_util::future::ready(!b.is_empty()));
 
     Box::pin(stream)
+}
+
+fn drain_sse_redaction_lines(
+    state: &mut StreamingRedactionState,
+    scanner: &dyn OutputScanner,
+    config: &Config,
+    effective_window: usize,
+) {
+    while let Some(newline_pos) = state.raw_buffer.find('\n') {
+        let line = state.raw_buffer[..newline_pos].to_string();
+        state.raw_buffer.drain(..=newline_pos);
+        process_sse_redaction_line(state, &line, scanner, config, effective_window);
+    }
+}
+
+fn process_sse_redaction_line(
+    state: &mut StreamingRedactionState,
+    raw_line: &str,
+    scanner: &dyn OutputScanner,
+    config: &Config,
+    effective_window: usize,
+) {
+    let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+    let trimmed = line.trim();
+
+    if trimmed.is_empty() {
+        if state.swallow_next_blank {
+            state.swallow_next_blank = false;
+        } else {
+            state.out_queue.push_back(Bytes::from("\n"));
+        }
+        return;
+    }
+
+    if trimmed.starts_with(':') {
+        state.swallow_next_blank = false;
+        let redacted = scanner.scan_and_redact(line, config).content;
+        state.out_queue.push_back(Bytes::from(format!("{redacted}\n")));
+        return;
+    }
+
+    if trimmed.starts_with("event:") {
+        if state.pending_event_line.is_some() {
+            // Two consecutive event: lines without data: is malformed SSE framing.
+            state.pending_event_line = None;
+            state.pending_deltas.clear();
+            state.deferred_events.clear();
+            state.swallow_next_blank = true;
+            return;
+        }
+        state.pending_event_line = Some(line.to_string());
+        return;
+    }
+
+    if let Some(raw_data) = trimmed
+        .strip_prefix("data: ")
+        .or_else(|| trimmed.strip_prefix("data:"))
+    {
+        let event_line = state.pending_event_line.take();
+        let data_trimmed = raw_data.trim();
+
+        if data_trimmed == "[DONE]" {
+            flush_sse_pending(state, scanner, config);
+            emit_passthrough_sse_event(state, event_line, line, scanner, config);
+            return;
+        }
+
+        let json: serde_json::Value = match serde_json::from_str::<serde_json::Value>(data_trimmed)
+        {
+            Ok(v) if v.is_object() => v,
+            _ => {
+                // Fail closed on malformed/non-object JSON in SSE data line.
+                state.pending_deltas.clear();
+                state.deferred_events.clear();
+                state.swallow_next_blank = true;
+                return;
+            }
+        };
+
+        match classify_sse_json_for_l5a(event_line.as_deref(), &json) {
+            SseL5aAction::OpenAiContentDelta {
+                content,
+                has_finish,
+            } => {
+                if content.is_empty() {
+                    let has_role = json
+                        .get("choices")
+                        .and_then(|c| c.get(0))
+                        .and_then(|c| c.get("delta"))
+                        .and_then(|d| d.get("role"))
+                        .is_some_and(|v| v.is_string());
+                    if has_finish {
+                        flush_sse_pending(state, scanner, config);
+                        emit_passthrough_sse_event(state, event_line, line, scanner, config);
+                    } else if state.pending_deltas.is_empty() && has_role {
+                        emit_passthrough_sse_event(state, event_line, line, scanner, config);
+                    } else {
+                        state.swallow_next_blank = true;
+                    }
+                    return;
+                }
+
+                state.pending_deltas.push_back(PendingDelta {
+                    text: content,
+                    event_line,
+                    template: json,
+                    kind: DeltaKind::OpenAi,
+                });
+                state.swallow_next_blank = true;
+
+                if has_finish {
+                    flush_sse_pending(state, scanner, config);
+                } else {
+                    emit_window_ready_deltas(state, scanner, config, effective_window);
+                }
+            }
+            SseL5aAction::OpenAiEmptyDeltaNoFinish { has_role } => {
+                if has_role || state.pending_deltas.is_empty() {
+                    emit_passthrough_sse_event(state, event_line, line, scanner, config);
+                } else {
+                    state.swallow_next_blank = true;
+                }
+            }
+            SseL5aAction::AnthropicTextDelta { text } => {
+                if text.is_empty() && state.pending_deltas.is_empty() {
+                    emit_passthrough_sse_event(state, event_line, line, scanner, config);
+                    return;
+                }
+                if !text.is_empty() {
+                    state.pending_deltas.push_back(PendingDelta {
+                        text,
+                        event_line,
+                        template: json,
+                        kind: DeltaKind::Anthropic,
+                    });
+                }
+                state.swallow_next_blank = true;
+                emit_window_ready_deltas(state, scanner, config, effective_window);
+            }
+            SseL5aAction::AnthropicTextBlockStartEmpty => {
+                emit_passthrough_sse_event(state, event_line, line, scanner, config);
+            }
+            SseL5aAction::AnthropicTextBlockStartWithInitialText {
+                initial_text,
+                stripped_start_json,
+                block_index,
+            } => {
+                let stripped_line = format!(
+                    "data: {}",
+                    serde_json::to_string(&stripped_start_json).unwrap_or_default()
+                );
+                emit_passthrough_sse_event(state, event_line, &stripped_line, scanner, config);
+                let synth_template = serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": block_index,
+                    "delta": {
+                        "type": "text_delta",
+                        "text": ""
+                    }
+                });
+                state.pending_deltas.push_back(PendingDelta {
+                    text: initial_text,
+                    event_line: Some("event: content_block_delta".to_string()),
+                    template: synth_template,
+                    kind: DeltaKind::Anthropic,
+                });
+                state.swallow_next_blank = true;
+                emit_window_ready_deltas(state, scanner, config, effective_window);
+            }
+            SseL5aAction::AnthropicContentBlockStop => {
+                if has_active_boundary_candidate(&state.pending_deltas, scanner, config) {
+                    state
+                        .deferred_events
+                        .push((event_line, line.to_string()));
+                    state.swallow_next_blank = true;
+                } else {
+                    flush_sse_pending(state, scanner, config);
+                    emit_passthrough_sse_event(state, event_line, line, scanner, config);
+                }
+            }
+            SseL5aAction::NonFlushPassthrough => {
+                emit_passthrough_sse_event(state, event_line, line, scanner, config);
+            }
+            SseL5aAction::FlushAndPassthrough => {
+                flush_sse_pending(state, scanner, config);
+                emit_passthrough_sse_event(state, event_line, line, scanner, config);
+            }
+            SseL5aAction::MalformedOrAmbiguous => {
+                state.pending_deltas.clear();
+                state.deferred_events.clear();
+                state.swallow_next_blank = true;
+            }
+        }
+        return;
+    }
+
+    if trimmed.starts_with("id:") || trimmed.starts_with("retry:") {
+        if state.pending_event_line.take().is_some() {
+            state.pending_deltas.clear();
+            state.deferred_events.clear();
+            state.swallow_next_blank = true;
+            return;
+        }
+        let redacted = scanner.scan_and_redact(line, config).content;
+        state.out_queue.push_back(Bytes::from(format!("{redacted}\n")));
+        state.swallow_next_blank = false;
+        return;
+    }
+
+    // Unknown/malformed line in SSE mode: fail closed.
+    state.pending_event_line = None;
+    state.pending_deltas.clear();
+    state.deferred_events.clear();
+    state.swallow_next_blank = true;
+}
+
+fn classify_sse_json_for_l5a(
+    event_line: Option<&str>,
+    json: &serde_json::Value,
+) -> SseL5aAction {
+    if let Some(choices_val) = json.get("choices") {
+        if event_line.is_some() {
+            return SseL5aAction::MalformedOrAmbiguous;
+        }
+        let Some(choices) = choices_val.as_array() else {
+            return SseL5aAction::MalformedOrAmbiguous;
+        };
+        if choices.is_empty() {
+            return SseL5aAction::FlushAndPassthrough;
+        }
+        if choices.len() > 1 {
+            for choice in choices {
+                let Some(choice_obj) = choice.as_object() else {
+                    return SseL5aAction::MalformedOrAmbiguous;
+                };
+                if choice_obj.contains_key("message") || choice_obj.contains_key("text") {
+                    return SseL5aAction::MalformedOrAmbiguous;
+                }
+                if let Some(delta_val) = choice_obj.get("delta") {
+                    if !delta_val.is_null() {
+                        let Some(delta_obj) = delta_val.as_object() else {
+                            return SseL5aAction::MalformedOrAmbiguous;
+                        };
+                        if delta_obj.get("content").is_some_and(|c| !c.is_null()) {
+                            return SseL5aAction::MalformedOrAmbiguous;
+                        }
+                    }
+                }
+            }
+            return SseL5aAction::FlushAndPassthrough;
+        }
+
+        let Some(choice_obj) = choices[0].as_object() else {
+            return SseL5aAction::MalformedOrAmbiguous;
+        };
+        if choice_obj.contains_key("message") || choice_obj.contains_key("text") {
+            return SseL5aAction::MalformedOrAmbiguous;
+        }
+        if choice_obj
+            .get("finish_reason")
+            .is_some_and(|v| !v.is_null() && !v.is_string())
+        {
+            return SseL5aAction::MalformedOrAmbiguous;
+        }
+        let has_finish = choice_obj
+            .get("finish_reason")
+            .is_some_and(|v| !v.is_null());
+
+        match choice_obj.get("delta") {
+            None | Some(serde_json::Value::Null) => {
+                if has_finish {
+                    SseL5aAction::FlushAndPassthrough
+                } else {
+                    SseL5aAction::OpenAiEmptyDeltaNoFinish { has_role: false }
+                }
+            }
+            Some(serde_json::Value::Object(delta_obj)) => {
+                for (k, v) in delta_obj {
+                    if !matches!(k.as_str(), "role" | "content" | "tool_calls") && !v.is_null() {
+                        return SseL5aAction::MalformedOrAmbiguous;
+                    }
+                }
+                if delta_obj
+                    .get("role")
+                    .is_some_and(|v| !v.is_null() && !v.is_string())
+                {
+                    return SseL5aAction::MalformedOrAmbiguous;
+                }
+                let has_role = delta_obj.get("role").is_some_and(|v| v.is_string());
+
+                if let Some(tc) = delta_obj.get("tool_calls") {
+                    if !tc.is_null() {
+                        if !tc.is_array() {
+                            return SseL5aAction::MalformedOrAmbiguous;
+                        }
+                        match delta_obj.get("content") {
+                            None | Some(serde_json::Value::Null) => {
+                                return SseL5aAction::FlushAndPassthrough;
+                            }
+                            Some(serde_json::Value::String(s)) if s.is_empty() => {
+                                return SseL5aAction::FlushAndPassthrough;
+                            }
+                            _ => return SseL5aAction::MalformedOrAmbiguous,
+                        }
+                    }
+                }
+
+                match delta_obj.get("content") {
+                    None | Some(serde_json::Value::Null) => {
+                        if has_finish {
+                            SseL5aAction::FlushAndPassthrough
+                        } else {
+                            SseL5aAction::OpenAiEmptyDeltaNoFinish { has_role }
+                        }
+                    }
+                    Some(serde_json::Value::String(s)) => SseL5aAction::OpenAiContentDelta {
+                        content: s.clone(),
+                        has_finish,
+                    },
+                    Some(_) => SseL5aAction::MalformedOrAmbiguous,
+                }
+            }
+            Some(_) => SseL5aAction::MalformedOrAmbiguous,
+        }
+    } else {
+        let ev_name = event_line
+            .and_then(|l| {
+                l.trim()
+                    .strip_prefix("event: ")
+                    .or_else(|| l.trim().strip_prefix("event:"))
+            })
+            .map(str::trim);
+        let json_type = json.get("type").and_then(|t| t.as_str());
+
+        if let (Some(ev), Some(jt)) = (ev_name, json_type) {
+            if ev != jt {
+                return SseL5aAction::MalformedOrAmbiguous;
+            }
+        }
+
+        match ev_name.or(json_type) {
+            Some("content_block_delta") => {
+                let Some(delta_obj) = json.get("delta").and_then(|d| d.as_object()) else {
+                    return SseL5aAction::MalformedOrAmbiguous;
+                };
+                match delta_obj.get("type").and_then(|t| t.as_str()) {
+                    Some("text_delta") => {
+                        let Some(text) = delta_obj.get("text").and_then(|t| t.as_str()) else {
+                            return SseL5aAction::MalformedOrAmbiguous;
+                        };
+                        SseL5aAction::AnthropicTextDelta {
+                            text: text.to_string(),
+                        }
+                    }
+                    Some("input_json_delta") => {
+                        if !delta_obj
+                            .get("partial_json")
+                            .is_some_and(|v| v.is_string())
+                        {
+                            return SseL5aAction::MalformedOrAmbiguous;
+                        }
+                        SseL5aAction::FlushAndPassthrough
+                    }
+                    _ => SseL5aAction::MalformedOrAmbiguous,
+                }
+            }
+            Some("content_block_start") => {
+                let Some(cb_obj) = json.get("content_block").and_then(|c| c.as_object()) else {
+                    return SseL5aAction::MalformedOrAmbiguous;
+                };
+                match cb_obj.get("type").and_then(|t| t.as_str()) {
+                    Some("text") => {
+                        let Some(text) = cb_obj.get("text").and_then(|t| t.as_str()) else {
+                            return SseL5aAction::MalformedOrAmbiguous;
+                        };
+                        if text.is_empty() {
+                            SseL5aAction::AnthropicTextBlockStartEmpty
+                        } else {
+                            let mut stripped = json.clone();
+                            stripped["content_block"]["text"] =
+                                serde_json::Value::String(String::new());
+                            let block_index = json
+                                .get("index")
+                                .cloned()
+                                .unwrap_or_else(|| serde_json::Value::from(0));
+                            SseL5aAction::AnthropicTextBlockStartWithInitialText {
+                                initial_text: text.to_string(),
+                                stripped_start_json: stripped,
+                                block_index,
+                            }
+                        }
+                    }
+                    Some("tool_use") => SseL5aAction::FlushAndPassthrough,
+                    _ => SseL5aAction::MalformedOrAmbiguous,
+                }
+            }
+            Some("content_block_stop") => SseL5aAction::AnthropicContentBlockStop,
+            Some("message_start") => {
+                if let Some(content) = json.get("message").and_then(|m| m.get("content")) {
+                    if !content.as_array().is_some_and(|a| a.is_empty()) {
+                        return SseL5aAction::MalformedOrAmbiguous;
+                    }
+                }
+                SseL5aAction::NonFlushPassthrough
+            }
+            Some("ping") => SseL5aAction::NonFlushPassthrough,
+            Some("message_delta") | Some("message_stop") | Some("error") => {
+                SseL5aAction::FlushAndPassthrough
+            }
+            None => {
+                if json
+                    .as_object()
+                    .is_some_and(|o| o.len() == 1 && o.contains_key("error"))
+                {
+                    SseL5aAction::FlushAndPassthrough
+                } else {
+                    SseL5aAction::MalformedOrAmbiguous
+                }
+            }
+            Some(_) => SseL5aAction::MalformedOrAmbiguous,
+        }
+    }
+}
+
+fn has_active_boundary_candidate(
+    pending_deltas: &std::collections::VecDeque<PendingDelta>,
+    scanner: &dyn OutputScanner,
+    config: &Config,
+) -> bool {
+    if pending_deltas.is_empty() {
+        return false;
+    }
+    let combined: String = pending_deltas.iter().map(|d| d.text.as_str()).collect();
+    let scan = scanner.scan_and_redact(&combined, config);
+    if !scan.redactions.is_empty() && scan.content.ends_with("[REDACTED]") {
+        return true;
+    }
+    longest_canary_prefix_at_end(&scan.content, config) > 0
+}
+
+fn emit_window_ready_deltas(
+    state: &mut StreamingRedactionState,
+    scanner: &dyn OutputScanner,
+    config: &Config,
+    effective_window: usize,
+) {
+    let combined: String = state.pending_deltas.iter().map(|d| d.text.as_str()).collect();
+    let combined_chars = combined.chars().count();
+    if combined_chars <= effective_window {
+        return;
+    }
+
+    let scan = scanner.scan_and_redact(&combined, config);
+    if !scan.redactions.is_empty()
+        && scan.content.ends_with("[REDACTED]")
+        && combined_chars < MAX_STREAM_REDACTION_BUFFER_CHARS
+    {
+        return;
+    }
+
+    let hold_chars = effective_window.max(longest_canary_prefix_at_end(&scan.content, config));
+    if !scan.redactions.is_empty() {
+        collapse_pending_deltas(&mut state.pending_deltas, scan.content);
+    }
+
+    let total_chars: usize = state
+        .pending_deltas
+        .iter()
+        .map(|d| d.text.chars().count())
+        .sum();
+    if total_chars <= hold_chars {
+        return;
+    }
+
+    let mut releasable = total_chars - hold_chars;
+    while releasable > 0 {
+        let Some(mut front) = state.pending_deltas.pop_front() else {
+            break;
+        };
+        let front_chars = front.text.chars().count();
+        if front_chars <= releasable {
+            releasable -= front_chars;
+            if !front.text.is_empty() {
+                state
+                    .out_queue
+                    .push_back(Bytes::from(format_pending_delta(&front)));
+            }
+        } else {
+            let emit_text = head_chars(&front.text, releasable);
+            let rem_text = tail_chars(&front.text, front_chars - releasable);
+            let head_delta = split_head_delta(&mut front, emit_text, rem_text);
+            state
+                .out_queue
+                .push_back(Bytes::from(format_pending_delta(&head_delta)));
+            state.pending_deltas.push_front(front);
+            releasable = 0;
+        }
+    }
+}
+
+fn flush_sse_pending(
+    state: &mut StreamingRedactionState,
+    scanner: &dyn OutputScanner,
+    config: &Config,
+) {
+    if !state.pending_deltas.is_empty() {
+        let combined: String = state.pending_deltas.iter().map(|d| d.text.as_str()).collect();
+        let scan = scanner.scan_and_redact(&combined, config);
+        if !scan.redactions.is_empty() {
+            collapse_pending_deltas(&mut state.pending_deltas, scan.content);
+        }
+        while let Some(delta) = state.pending_deltas.pop_front() {
+            if !delta.text.is_empty() || delta_has_metadata(&delta) {
+                state
+                    .out_queue
+                    .push_back(Bytes::from(format_pending_delta(&delta)));
+            }
+        }
+    }
+
+    let deferred = std::mem::take(&mut state.deferred_events);
+    for (ev, line) in deferred {
+        emit_passthrough_sse_event(state, ev, &line, scanner, config);
+        state.out_queue.push_back(Bytes::from("\n"));
+    }
+}
+
+fn delta_has_metadata(delta: &PendingDelta) -> bool {
+    if delta.kind != DeltaKind::OpenAi {
+        return false;
+    }
+    let Some(choice) = delta.template.get("choices").and_then(|c| c.get(0)) else {
+        return false;
+    };
+    let has_finish = choice
+        .get("finish_reason")
+        .is_some_and(|v| !v.is_null());
+    let has_role = choice
+        .get("delta")
+        .and_then(|d| d.get("role"))
+        .is_some_and(|v| !v.is_null());
+    has_finish || has_role
+}
+
+fn collapse_pending_deltas(
+    pending_deltas: &mut std::collections::VecDeque<PendingDelta>,
+    new_text: String,
+) {
+    let Some(mut first) = pending_deltas.pop_front() else {
+        return;
+    };
+    if first.kind == DeltaKind::OpenAi {
+        let mut last_finish: Option<serde_json::Value> = None;
+        for d in pending_deltas.drain(..) {
+            if let Some(finish) = d
+                .template
+                .get("choices")
+                .and_then(|c| c.get(0))
+                .and_then(|c| c.get("finish_reason"))
+            {
+                if !finish.is_null() {
+                    last_finish = Some(finish.clone());
+                }
+            }
+        }
+        if let Some(finish) = last_finish {
+            if let Some(choice) = first
+                .template
+                .get_mut("choices")
+                .and_then(|c| c.get_mut(0))
+                .and_then(|c| c.as_object_mut())
+            {
+                choice.insert("finish_reason".to_string(), finish);
+            }
+        }
+    } else {
+        pending_deltas.clear();
+    }
+    first.text = new_text;
+    pending_deltas.push_back(first);
+}
+
+fn split_head_delta(
+    front: &mut PendingDelta,
+    emit_text: String,
+    rem_text: String,
+) -> PendingDelta {
+    let mut head = front.clone();
+    head.text = emit_text;
+    front.text = rem_text;
+
+    if front.kind == DeltaKind::OpenAi {
+        if let Some(choice) = head
+            .template
+            .get_mut("choices")
+            .and_then(|c| c.get_mut(0))
+            .and_then(|c| c.as_object_mut())
+        {
+            if choice.get("finish_reason").is_some_and(|v| !v.is_null()) {
+                choice.insert("finish_reason".to_string(), serde_json::Value::Null);
+            }
+        }
+        if let Some(delta_obj) = front
+            .template
+            .get_mut("choices")
+            .and_then(|c| c.get_mut(0))
+            .and_then(|c| c.get_mut("delta"))
+            .and_then(|d| d.as_object_mut())
+        {
+            delta_obj.remove("role");
+        }
+    }
+
+    head
+}
+
+fn format_pending_delta(delta: &PendingDelta) -> String {
+    let mut json = delta.template.clone();
+    match delta.kind {
+        DeltaKind::OpenAi => {
+            if let Some(delta_obj) = json
+                .get_mut("choices")
+                .and_then(|c| c.get_mut(0))
+                .and_then(|c| c.get_mut("delta"))
+                .and_then(|d| d.as_object_mut())
+            {
+                delta_obj.insert(
+                    "content".to_string(),
+                    serde_json::Value::String(delta.text.clone()),
+                );
+            }
+        }
+        DeltaKind::Anthropic => {
+            if let Some(delta_obj) = json.get_mut("delta").and_then(|d| d.as_object_mut()) {
+                delta_obj.insert(
+                    "text".to_string(),
+                    serde_json::Value::String(delta.text.clone()),
+                );
+            }
+        }
+    }
+    let serialized = serde_json::to_string(&json).unwrap_or_default();
+    match &delta.event_line {
+        Some(ev) => format!("{ev}\ndata: {serialized}\n\n"),
+        None => format!("data: {serialized}\n\n"),
+    }
+}
+
+fn emit_passthrough_sse_event(
+    state: &mut StreamingRedactionState,
+    event_line: Option<String>,
+    data_line: &str,
+    scanner: &dyn OutputScanner,
+    config: &Config,
+) {
+    if let Some(ev) = event_line {
+        let redacted_ev = scanner.scan_and_redact(&ev, config).content;
+        state
+            .out_queue
+            .push_back(Bytes::from(format!("{redacted_ev}\n")));
+    }
+    let redacted_data = scanner.scan_and_redact(data_line, config).content;
+    state
+        .out_queue
+        .push_back(Bytes::from(format!("{redacted_data}\n")));
+    state.swallow_next_blank = false;
+}
+
+fn longest_canary_prefix_at_end(text: &str, config: &Config) -> usize {
+    if text.is_empty() || config.policy.canary_tokens.is_empty() {
+        return 0;
+    }
+    let text_lower = text.to_lowercase();
+    let text_chars: Vec<char> = text_lower.chars().collect();
+    let mut max_prefix_chars = 0usize;
+    for token in &config.policy.canary_tokens {
+        if token.is_empty() {
+            continue;
+        }
+        let token_lower = token.to_lowercase();
+        let token_chars: Vec<char> = token_lower.chars().collect();
+        let max_k = token_chars.len().min(text_chars.len());
+        for k in (1..=max_k).rev() {
+            if text_chars[text_chars.len() - k..] == token_chars[..k] {
+                max_prefix_chars = max_prefix_chars.max(k);
+                break;
+            }
+        }
+    }
+    max_prefix_chars
 }
 
 fn compute_redaction_window(config: &Config) -> usize {
