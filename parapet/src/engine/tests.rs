@@ -4710,7 +4710,10 @@ async fn streaming_response_strips_stale_framing_headers() {
 
     assert_eq!(response.status, StatusCode::OK);
     assert!(
-        response.headers.get(reqwest::header::CONTENT_LENGTH).is_none(),
+        response
+            .headers
+            .get(reqwest::header::CONTENT_LENGTH)
+            .is_none(),
         "stale Content-Length must be stripped from transformed streaming response"
     );
     assert!(
