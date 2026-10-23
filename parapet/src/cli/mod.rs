@@ -1182,41 +1182,43 @@ fn run_engine_cmd(args: RunArgs, json_mode: bool) -> i32 {
         plane.spawn_listener(unix_listener);
         plane.spawn_signal_gate();
 
-        if json_mode {
-            let listen_addr = format!("127.0.0.1:{bound_port}");
-            let ready_json = CliUpstreamReadyJsonV0 {
-                schema: "parapet-upstream-ready/v0",
-                listen_addr: &listen_addr,
-                allow_loopback_http_upstream: args.allow_loopback_http_upstream,
-                upstreams: CliUpstreamsReadyMapJsonV0 {
-                    openai: CliUpstreamEndpointReadyJsonV0 {
-                        origin: &openai_meta.sanitized_origin,
-                        mode: openai_meta.mode.as_str(),
-                        source: openai_meta.source.as_str(),
+        if offline_fixture.is_none() {
+            if json_mode {
+                let listen_addr = format!("127.0.0.1:{bound_port}");
+                let ready_json = CliUpstreamReadyJsonV0 {
+                    schema: "parapet-upstream-ready/v0",
+                    listen_addr: &listen_addr,
+                    allow_loopback_http_upstream: args.allow_loopback_http_upstream,
+                    upstreams: CliUpstreamsReadyMapJsonV0 {
+                        openai: CliUpstreamEndpointReadyJsonV0 {
+                            origin: &openai_meta.sanitized_origin,
+                            mode: openai_meta.mode.as_str(),
+                            source: openai_meta.source.as_str(),
+                        },
+                        anthropic: CliUpstreamEndpointReadyJsonV0 {
+                            origin: &anthropic_meta.sanitized_origin,
+                            mode: anthropic_meta.mode.as_str(),
+                            source: anthropic_meta.source.as_str(),
+                        },
                     },
-                    anthropic: CliUpstreamEndpointReadyJsonV0 {
-                        origin: &anthropic_meta.sanitized_origin,
-                        mode: anthropic_meta.mode.as_str(),
-                        source: anthropic_meta.source.as_str(),
-                    },
-                },
-            };
-            if let Ok(mut bytes) = serde_json::to_vec(&ready_json) {
-                bytes.push(b'\n');
-                let _ = std::io::stderr().write_all(&bytes);
+                };
+                if let Ok(mut bytes) = serde_json::to_vec(&ready_json) {
+                    bytes.push(b'\n');
+                    let _ = std::io::stderr().write_all(&bytes);
+                    let _ = std::io::stderr().flush();
+                }
+            } else {
+                eprintln!(
+                    "parapet listening on 127.0.0.1:{bound_port} (openai={} [mode={} source={}], anthropic={} [mode={} source={}])",
+                    openai_meta.sanitized_origin,
+                    openai_meta.mode.as_str(),
+                    openai_meta.source.as_str(),
+                    anthropic_meta.sanitized_origin,
+                    anthropic_meta.mode.as_str(),
+                    anthropic_meta.source.as_str()
+                );
                 let _ = std::io::stderr().flush();
             }
-        } else {
-            eprintln!(
-                "parapet listening on 127.0.0.1:{bound_port} (openai={} [mode={} source={}], anthropic={} [mode={} source={}])",
-                openai_meta.sanitized_origin,
-                openai_meta.mode.as_str(),
-                openai_meta.source.as_str(),
-                anthropic_meta.sanitized_origin,
-                anthropic_meta.mode.as_str(),
-                anthropic_meta.source.as_str()
-            );
-            let _ = std::io::stderr().flush();
         }
 
         if let Some(ref ready_name) = args.ready_file {
