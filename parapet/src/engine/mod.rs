@@ -1303,9 +1303,17 @@ impl EngineUpstreamClient {
 
         let body_stream = redacted_stream.map(|b| Ok::<Bytes, std::io::Error>(b));
 
+        let mut resp_headers = upstream.headers;
+        // The SSE stream passes through StreamProcessor (and optional L5a
+        // redaction), which may rewrite, redact, or terminate the stream early
+        // on policy violation. Upstream framing headers are therefore stale;
+        // strip them and let hyper frame the downstream response stream.
+        resp_headers.remove(reqwest::header::CONTENT_LENGTH);
+        resp_headers.remove(reqwest::header::TRANSFER_ENCODING);
+
         ProxyResponse {
             status: upstream.status,
-            headers: upstream.headers,
+            headers: resp_headers,
             body: Body::from_stream(body_stream),
         }
     }
@@ -1837,11 +1845,11 @@ impl std::fmt::Debug for UpstreamConfigError {
 impl std::error::Error for UpstreamConfigError {}
 
 const FIX_NON_HTTPS_UPSTREAM: &str =
-    "plain-HTTP upstreams are not supported in this release; use an https:// URL (loopback HTTP support is planned behind an explicit flag)";
+    "plain http:// is allowed only for a literal loopback IP (127.0.0.0/8 or [::1]) with --allow-loopback-http-upstream; otherwise use an https:// URL";
 const FIX_NON_HTTPS_OPENAI_FALLBACK: &str =
-    "plain-HTTP upstreams are not supported in this release; use an https:// URL (loopback HTTP support is planned behind an explicit flag); set PARAPET_OPENAI_BASE_URL=https://api.openai.com to keep the hosted default, or remove OPENAI_BASE_URL from the engine's environment";
+    "OPENAI_BASE_URL cannot enable plain http://; for a local target pass --upstream openai=http://<literal-loopback-IP>:<port> or set PARAPET_OPENAI_BASE_URL to that literal-loopback URL, together with --allow-loopback-http-upstream; otherwise use https:// or remove OPENAI_BASE_URL from the engine's environment";
 const FIX_NON_HTTPS_ANTHROPIC_FALLBACK: &str =
-    "plain-HTTP upstreams are not supported in this release; use an https:// URL (loopback HTTP support is planned behind an explicit flag); set PARAPET_ANTHROPIC_BASE_URL=https://api.anthropic.com to keep the hosted default, or remove ANTHROPIC_BASE_URL from the engine's environment";
+    "ANTHROPIC_BASE_URL cannot enable plain http://; for a local target pass --upstream anthropic=http://<literal-loopback-IP>:<port> or set PARAPET_ANTHROPIC_BASE_URL to that literal-loopback URL, together with --allow-loopback-http-upstream; otherwise use https:// or remove ANTHROPIC_BASE_URL from the engine's environment";
 const FIX_EMPTY_URL: &str =
     "unset the environment variable to keep the default https:// upstream, or set it to a valid https:// URL";
 const FIX_EMPTY_OPENAI_FALLBACK: &str =
@@ -1864,6 +1872,65 @@ const FIX_EXTRA_HOST_INVALID: &str =
     "set PARAPET_EXTRA_HOSTS to a comma-separated list of bare lowercase DNS hostnames (no empty entries, scheme, port, path, userinfo, uppercase, or IP literals)";
 const FIX_HOST_KEY_COLLISION: &str =
     "remove colliding entries in PARAPET_EXTRA_HOSTS that map to the same PARAPET_<HOST>_BASE_URL environment variable key";
+const FIX_UPSTREAM_FLAG_SYNTAX: &str = "pass --upstream openai=<url> or --upstream anthropic=<url>";
+const FIX_UPSTREAM_PROVIDER_NAME: &str =
+    "supported --upstream providers in Stage 1 are 'openai' and 'anthropic'";
+const FIX_DUPLICATE_UPSTREAM_FLAG: &str = "specify --upstream for each provider at most once";
+const FIX_FALLBACK_KEY_HTTP: &str =
+    "ambient fallback environment variables (OPENAI_BASE_URL, ANTHROPIC_BASE_URL) cannot enable plain http://; for a local target pass --upstream <provider>=http://<literal-loopback-IP>:<port> or set PARAPET_<PROVIDER>_BASE_URL to that literal-loopback URL, together with --allow-loopback-http-upstream; otherwise use https:// or remove the fallback variable";
+const FIX_LOOPBACK_LITERAL_IP: &str =
+    "use a literal loopback IP such as http://127.0.0.1:<port> or http://[::1]:<port>; DNS 'localhost' is refused for plain HTTP";
+const FIX_NON_LOOPBACK_HTTP: &str =
+    "--allow-loopback-http-upstream only permits literal loopback IPs (127.0.0.0/8 or [::1]); use https:// for remote or LAN hosts";
+const FIX_SELF_LOOP_UPSTREAM: &str =
+    "upstream loopback port matches parapet's inbound listener port; point --upstream at the model server's distinct port, not parapet's own proxy port";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpstreamTransportMode {
+    Https,
+    LoopbackHttp,
+}
+
+impl UpstreamTransportMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Https => "https",
+            Self::LoopbackHttp => "loopback-http",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpstreamSource {
+    Cli,
+    Env,
+    Default,
+}
+
+impl UpstreamSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cli => "cli",
+            Self::Env => "env",
+            Self::Default => "default",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UpstreamValidationOptions {
+    pub cli_upstreams: Vec<String>,
+    pub allow_loopback_http_upstream: bool,
+    pub listener_port: Option<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamEndpointMetadata {
+    /// Sanitized origin ONLY (`scheme://host[:port]`), NEVER including base path, userinfo, query, or fragment.
+    pub sanitized_origin: String,
+    pub mode: UpstreamTransportMode,
+    pub source: UpstreamSource,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FallbackKeyKind {
@@ -1966,6 +2033,77 @@ fn authority_has_explicit_port(raw: &str) -> bool {
     }
 }
 
+fn authority_has_zero_port(raw: &str) -> bool {
+    let Some(auth) = authority_slice(raw) else {
+        return false;
+    };
+    let host_port = auth.rsplit_once('@').map(|(_, hp)| hp).unwrap_or(auth);
+    let port_str = if let Some((_, after_bracket)) = host_port.rsplit_once(']') {
+        after_bracket.strip_prefix(':')
+    } else {
+        host_port.rsplit_once(':').map(|(_, p)| p)
+    };
+    port_str.is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b == b'0'))
+}
+
+/// Extract the raw path slice after the authority (`scheme://authority`) and
+/// before any query (`?`) or fragment (`#`), prior to `url::Url::parse` normalization.
+/// Never confuses the scheme's `://` with a path `//`.
+fn raw_base_path_slice(raw: &str) -> Option<&str> {
+    let (_, after_scheme) = raw.split_once("://")?;
+    let auth_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let tail = &after_scheme[auth_end..];
+    if !tail.starts_with('/') {
+        return Some("");
+    }
+    let path_end = tail.find(['?', '#']).unwrap_or(tail.len());
+    Some(&tail[..path_end])
+}
+
+/// Returns `true` if the pre-parse raw base path contains a backslash (`\`),
+/// percent sign (`%`, including `%2e`, `%2E`, `%2e%2e`, `%2f`, `%5c`, etc.),
+/// double slash (`//`), or an exact `.` or `..` path segment.
+fn has_non_canonical_raw_base_path(raw: &str) -> bool {
+    let Some(raw_path) = raw_base_path_slice(raw) else {
+        return false;
+    };
+    if raw_path.is_empty() {
+        return false;
+    }
+    if raw_path.contains('\\') || raw_path.contains('%') || raw_path.contains("//") {
+        return true;
+    }
+    raw_path
+        .split('/')
+        .skip(1)
+        .any(|seg| seg == "." || seg == "..")
+}
+
+fn is_localhost_domain(host: &str) -> bool {
+    let trimmed = host.trim_end_matches('.');
+    trimmed.eq_ignore_ascii_case("localhost")
+        || trimmed.to_ascii_lowercase().ends_with(".localhost")
+}
+
+fn is_strict_loopback_ip(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Ipv4(v4)) => v4.is_loopback(),
+        Some(url::Host::Ipv6(v6)) => v6.is_loopback() && v6.to_ipv4_mapped().is_none(),
+        _ => false,
+    }
+}
+
+fn format_sanitized_origin(url: &url::Url) -> String {
+    let scheme = url.scheme();
+    let host = url.host_str().unwrap_or_default();
+    match url.port() {
+        Some(port) => format!("{scheme}://{host}:{port}"),
+        None => format!("{scheme}://{host}"),
+    }
+}
+
 fn classify_parsed_url(url: &url::Url, raw: &str) -> ParsedShape {
     let scheme_class = if url.scheme().eq_ignore_ascii_case("https") {
         SchemeClass::Https
@@ -2035,6 +2173,13 @@ fn fix_for_rule(rule: &'static str, fallback: FallbackKeyKind) -> &'static str {
         ("userinfo_forbidden", _) => FIX_USERINFO_FORBIDDEN,
         ("query_forbidden", _) => FIX_QUERY_FORBIDDEN,
         ("fragment_forbidden", _) => FIX_FRAGMENT_FORBIDDEN,
+        ("invalid_upstream_flag_syntax", _) => FIX_UPSTREAM_FLAG_SYNTAX,
+        ("unknown_upstream_provider", _) => FIX_UPSTREAM_PROVIDER_NAME,
+        ("duplicate_upstream_flag", _) => FIX_DUPLICATE_UPSTREAM_FLAG,
+        ("fallback_key_http_forbidden", _) => FIX_FALLBACK_KEY_HTTP,
+        ("loopback_http_requires_literal_ip", _) => FIX_LOOPBACK_LITERAL_IP,
+        ("non_loopback_http_upstream", _) => FIX_NON_LOOPBACK_HTTP,
+        ("self_loop_upstream", _) => FIX_SELF_LOOP_UPSTREAM,
         _ => FIX_UNPARSEABLE_URL,
     }
 }
@@ -2049,11 +2194,23 @@ fn emit_config_refusal_warn(err: &UpstreamConfigError) {
     );
 }
 
-fn validate_upstream_url(
+#[derive(Clone)]
+struct ValidatedUpstreamEntry {
+    normalized_url: String,
+    parsed_url: url::Url,
+    key: UpstreamKey,
+    value_len: usize,
+    shape: ParsedShape,
+    mode: UpstreamTransportMode,
+    is_strict_loopback: bool,
+}
+
+fn validate_upstream_url_with_options(
     raw: &str,
     key: UpstreamKey,
     fallback: FallbackKeyKind,
-) -> Result<String, UpstreamConfigError> {
+    options: &UpstreamValidationOptions,
+) -> Result<ValidatedUpstreamEntry, UpstreamConfigError> {
     let value_len = raw.len();
     if raw.is_empty() {
         let err = UpstreamConfigError {
@@ -2067,7 +2224,11 @@ fn validate_upstream_url(
         emit_config_refusal_warn(&err);
         return Err(err);
     }
-    if raw != raw.trim() || raw.bytes().any(|b| b <= 0x20 || b == 0x7f || b == b'\\') {
+    if raw != raw.trim()
+        || raw.bytes().any(|b| b <= 0x20 || b == 0x7f || b == b'\\')
+        || has_non_canonical_raw_base_path(raw)
+        || authority_has_zero_port(raw)
+    {
         let err = UpstreamConfigError {
             key,
             rule: "unparseable",
@@ -2092,7 +2253,19 @@ fn validate_upstream_url(
         return Err(err);
     };
     let shape = classify_parsed_url(&url, raw);
-    if shape.scheme_class == SchemeClass::Http {
+    if shape.scheme_class == SchemeClass::Other {
+        let err = UpstreamConfigError {
+            key,
+            rule: "unsupported_scheme",
+            fix: fix_for_rule("unsupported_scheme", fallback),
+            value_len,
+            shape: Some(shape),
+            entry_index: None,
+        };
+        emit_config_refusal_warn(&err);
+        return Err(err);
+    }
+    if shape.scheme_class == SchemeClass::Http && !options.allow_loopback_http_upstream {
         let err = UpstreamConfigError {
             key,
             rule: "non_https_upstream",
@@ -2104,11 +2277,14 @@ fn validate_upstream_url(
         emit_config_refusal_warn(&err);
         return Err(err);
     }
-    if shape.scheme_class == SchemeClass::Other {
+    if shape.scheme_class == SchemeClass::Http
+        && options.allow_loopback_http_upstream
+        && fallback != FallbackKeyKind::None
+    {
         let err = UpstreamConfigError {
             key,
-            rule: "unsupported_scheme",
-            fix: fix_for_rule("unsupported_scheme", fallback),
+            rule: "fallback_key_http_forbidden",
+            fix: fix_for_rule("fallback_key_http_forbidden", fallback),
             value_len,
             shape: Some(shape),
             entry_index: None,
@@ -2164,8 +2340,89 @@ fn validate_upstream_url(
         emit_config_refusal_warn(&err);
         return Err(err);
     }
+    let parsed_path = url.path();
+    if parsed_path.contains('\\')
+        || parsed_path.contains('%')
+        || parsed_path.contains("//")
+        || parsed_path
+            .split('/')
+            .skip(1)
+            .any(|seg| seg == "." || seg == "..")
+    {
+        let err = UpstreamConfigError {
+            key,
+            rule: "unparseable",
+            fix: fix_for_rule("unparseable", fallback),
+            value_len,
+            shape: None,
+            entry_index: None,
+        };
+        emit_config_refusal_warn(&err);
+        return Err(err);
+    }
 
-    Ok(url.as_str().trim_end_matches('/').to_string())
+    let is_strict_loopback = is_strict_loopback_ip(&url);
+    let mode = if shape.scheme_class == SchemeClass::Http {
+        if !is_strict_loopback {
+            let is_localhost = shape.host_class == HostClass::LocalhostName
+                || url.host_str().is_some_and(is_localhost_domain);
+            let rule = if is_localhost {
+                "loopback_http_requires_literal_ip"
+            } else {
+                "non_loopback_http_upstream"
+            };
+            let err = UpstreamConfigError {
+                key,
+                rule,
+                fix: fix_for_rule(rule, fallback),
+                value_len,
+                shape: Some(shape),
+                entry_index: None,
+            };
+            emit_config_refusal_warn(&err);
+            return Err(err);
+        }
+        UpstreamTransportMode::LoopbackHttp
+    } else {
+        UpstreamTransportMode::Https
+    };
+
+    let effective_port = url.port_or_known_default().unwrap_or(80);
+    if is_strict_loopback
+        && options
+            .listener_port
+            .is_some_and(|lp| lp != 0 && lp == effective_port)
+    {
+        let err = UpstreamConfigError {
+            key,
+            rule: "self_loop_upstream",
+            fix: fix_for_rule("self_loop_upstream", fallback),
+            value_len,
+            shape: Some(shape),
+            entry_index: None,
+        };
+        emit_config_refusal_warn(&err);
+        return Err(err);
+    }
+
+    let normalized_url = url.as_str().trim_end_matches('/').to_string();
+    Ok(ValidatedUpstreamEntry {
+        normalized_url,
+        parsed_url: url,
+        key,
+        value_len,
+        shape,
+        mode,
+        is_strict_loopback,
+    })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SelfLoopCheckItem {
+    key: UpstreamKey,
+    value_len: usize,
+    shape: ParsedShape,
+    effective_port: u16,
 }
 
 /// Startup-validated, immutable upstream routing table.
@@ -2173,8 +2430,11 @@ fn validate_upstream_url(
 pub struct UpstreamTable {
     openai_base_url: String,
     anthropic_base_url: String,
+    openai_metadata: UpstreamEndpointMetadata,
+    anthropic_metadata: UpstreamEndpointMetadata,
     extra_hosts: Vec<String>,
     host_overrides: std::collections::HashMap<String, String>,
+    loopback_entries: Vec<SelfLoopCheckItem>,
 }
 
 fn read_process_env_for_upstream_validation(key: &str) -> Option<String> {
@@ -2197,8 +2457,128 @@ fn read_process_env_for_upstream_validation(key: &str) -> Option<String> {
     }
 }
 
+fn parse_cli_upstreams(
+    options: &UpstreamValidationOptions,
+) -> Result<
+    (
+        Option<ValidatedUpstreamEntry>,
+        Option<ValidatedUpstreamEntry>,
+    ),
+    UpstreamConfigError,
+> {
+    let mut cli_openai: Option<ValidatedUpstreamEntry> = None;
+    let mut cli_anthropic: Option<ValidatedUpstreamEntry> = None;
+
+    for raw_arg in &options.cli_upstreams {
+        let Some((provider_raw, raw_url)) = raw_arg.split_once('=') else {
+            let err = UpstreamConfigError {
+                key: UpstreamKey::Static("--upstream"),
+                rule: "invalid_upstream_flag_syntax",
+                fix: FIX_UPSTREAM_FLAG_SYNTAX,
+                value_len: raw_arg.len(),
+                shape: None,
+                entry_index: None,
+            };
+            emit_config_refusal_warn(&err);
+            return Err(err);
+        };
+        if provider_raw.is_empty() {
+            let err = UpstreamConfigError {
+                key: UpstreamKey::Static("--upstream"),
+                rule: "invalid_upstream_flag_syntax",
+                fix: FIX_UPSTREAM_FLAG_SYNTAX,
+                value_len: raw_arg.len(),
+                shape: None,
+                entry_index: None,
+            };
+            emit_config_refusal_warn(&err);
+            return Err(err);
+        }
+        match provider_raw {
+            "openai" => {
+                if cli_openai.is_some() {
+                    let err = UpstreamConfigError {
+                        key: UpstreamKey::Static("--upstream openai"),
+                        rule: "duplicate_upstream_flag",
+                        fix: FIX_DUPLICATE_UPSTREAM_FLAG,
+                        value_len: raw_url.len(),
+                        shape: None,
+                        entry_index: None,
+                    };
+                    emit_config_refusal_warn(&err);
+                    return Err(err);
+                }
+                let entry = validate_upstream_url_with_options(
+                    raw_url,
+                    UpstreamKey::Static("--upstream openai"),
+                    FallbackKeyKind::None,
+                    options,
+                )?;
+                cli_openai = Some(entry);
+            }
+            "anthropic" => {
+                if cli_anthropic.is_some() {
+                    let err = UpstreamConfigError {
+                        key: UpstreamKey::Static("--upstream anthropic"),
+                        rule: "duplicate_upstream_flag",
+                        fix: FIX_DUPLICATE_UPSTREAM_FLAG,
+                        value_len: raw_url.len(),
+                        shape: None,
+                        entry_index: None,
+                    };
+                    emit_config_refusal_warn(&err);
+                    return Err(err);
+                }
+                let entry = validate_upstream_url_with_options(
+                    raw_url,
+                    UpstreamKey::Static("--upstream anthropic"),
+                    FallbackKeyKind::None,
+                    options,
+                )?;
+                cli_anthropic = Some(entry);
+            }
+            _ => {
+                let err = UpstreamConfigError {
+                    key: UpstreamKey::Static("--upstream"),
+                    rule: "unknown_upstream_provider",
+                    fix: FIX_UPSTREAM_PROVIDER_NAME,
+                    value_len: raw_arg.len(),
+                    shape: None,
+                    entry_index: None,
+                };
+                emit_config_refusal_warn(&err);
+                return Err(err);
+            }
+        }
+    }
+
+    Ok((cli_openai, cli_anthropic))
+}
+
 impl UpstreamTable {
     pub fn from_env_fn(get: &dyn Fn(&str) -> Option<String>) -> Result<Self, UpstreamConfigError> {
+        Self::from_env_fn_with_options(get, &UpstreamValidationOptions::default())
+    }
+
+    pub fn from_env_fn_with_options(
+        get: &dyn Fn(&str) -> Option<String>,
+        options: &UpstreamValidationOptions,
+    ) -> Result<Self, UpstreamConfigError> {
+        let (cli_openai, cli_anthropic) = parse_cli_upstreams(options)?;
+        let mut loopback_entries: Vec<SelfLoopCheckItem> = Vec::new();
+        let mut record_loopback = |entry: &ValidatedUpstreamEntry| {
+            if entry.is_strict_loopback {
+                if let Some(effective_port) = entry.parsed_url.port_or_known_default() {
+                    loopback_entries.push(SelfLoopCheckItem {
+                        key: entry.key.clone(),
+                        value_len: entry.value_len,
+                        shape: entry.shape,
+                        effective_port,
+                    });
+                }
+            }
+        };
+
         let mut extra_hosts: Vec<String> = Vec::new();
         let mut extra_host_keys: Vec<(usize, String)> = Vec::new();
 
@@ -2259,11 +2639,25 @@ impl UpstreamTable {
             }
         }
 
-        let openai_base_url = if let Some(primary) = get("PARAPET_OPENAI_BASE_URL") {
-            let valid = validate_upstream_url(
+        let (mut openai_base_url, mut openai_metadata, openai_explicit) = if let Some(entry) =
+            &cli_openai
+        {
+            record_loopback(entry);
+            (
+                entry.normalized_url.clone(),
+                UpstreamEndpointMetadata {
+                    sanitized_origin: format_sanitized_origin(&entry.parsed_url),
+                    mode: entry.mode,
+                    source: UpstreamSource::Cli,
+                },
+                true,
+            )
+        } else if let Some(primary) = get("PARAPET_OPENAI_BASE_URL") {
+            let entry = validate_upstream_url_with_options(
                 &primary,
                 UpstreamKey::Static("PARAPET_OPENAI_BASE_URL"),
                 FallbackKeyKind::None,
+                options,
             )?;
             if get("OPENAI_BASE_URL").is_some() {
                 tracing::info!(
@@ -2272,27 +2666,70 @@ impl UpstreamTable {
                     "fallback upstream base URL environment variable is shadowed by primary"
                 );
             }
-            valid
+            record_loopback(&entry);
+            (
+                entry.normalized_url,
+                UpstreamEndpointMetadata {
+                    sanitized_origin: format_sanitized_origin(&entry.parsed_url),
+                    mode: entry.mode,
+                    source: UpstreamSource::Env,
+                },
+                true,
+            )
         } else if let Some(fallback) = get("OPENAI_BASE_URL") {
-            let valid = validate_upstream_url(
+            let entry = validate_upstream_url_with_options(
                 &fallback,
                 UpstreamKey::Static("OPENAI_BASE_URL"),
                 FallbackKeyKind::OpenAi,
+                options,
             )?;
             tracing::warn!(
                 key = "OPENAI_BASE_URL",
                 "using fallback upstream base URL environment variable; prefer PARAPET_OPENAI_BASE_URL"
             );
-            valid
+            record_loopback(&entry);
+            (
+                entry.normalized_url,
+                UpstreamEndpointMetadata {
+                    sanitized_origin: format_sanitized_origin(&entry.parsed_url),
+                    mode: entry.mode,
+                    source: UpstreamSource::Env,
+                },
+                true,
+            )
         } else {
-            "https://api.openai.com".to_string()
+            (
+                "https://api.openai.com".to_string(),
+                UpstreamEndpointMetadata {
+                    sanitized_origin: "https://api.openai.com".to_string(),
+                    mode: UpstreamTransportMode::Https,
+                    source: UpstreamSource::Default,
+                },
+                false,
+            )
         };
 
-        let anthropic_base_url = if let Some(primary) = get("PARAPET_ANTHROPIC_BASE_URL") {
-            let valid = validate_upstream_url(
+        let (mut anthropic_base_url, mut anthropic_metadata, anthropic_explicit) = if let Some(
+            entry,
+        ) =
+            &cli_anthropic
+        {
+            record_loopback(entry);
+            (
+                entry.normalized_url.clone(),
+                UpstreamEndpointMetadata {
+                    sanitized_origin: format_sanitized_origin(&entry.parsed_url),
+                    mode: entry.mode,
+                    source: UpstreamSource::Cli,
+                },
+                true,
+            )
+        } else if let Some(primary) = get("PARAPET_ANTHROPIC_BASE_URL") {
+            let entry = validate_upstream_url_with_options(
                 &primary,
                 UpstreamKey::Static("PARAPET_ANTHROPIC_BASE_URL"),
                 FallbackKeyKind::None,
+                options,
             )?;
             if get("ANTHROPIC_BASE_URL").is_some() {
                 tracing::info!(
@@ -2301,57 +2738,133 @@ impl UpstreamTable {
                     "fallback upstream base URL environment variable is shadowed by primary"
                 );
             }
-            valid
+            record_loopback(&entry);
+            (
+                entry.normalized_url,
+                UpstreamEndpointMetadata {
+                    sanitized_origin: format_sanitized_origin(&entry.parsed_url),
+                    mode: entry.mode,
+                    source: UpstreamSource::Env,
+                },
+                true,
+            )
         } else if let Some(fallback) = get("ANTHROPIC_BASE_URL") {
-            let valid = validate_upstream_url(
+            let entry = validate_upstream_url_with_options(
                 &fallback,
                 UpstreamKey::Static("ANTHROPIC_BASE_URL"),
                 FallbackKeyKind::Anthropic,
+                options,
             )?;
             tracing::warn!(
                 key = "ANTHROPIC_BASE_URL",
                 "using fallback upstream base URL environment variable; prefer PARAPET_ANTHROPIC_BASE_URL"
             );
-            valid
+            record_loopback(&entry);
+            (
+                entry.normalized_url,
+                UpstreamEndpointMetadata {
+                    sanitized_origin: format_sanitized_origin(&entry.parsed_url),
+                    mode: entry.mode,
+                    source: UpstreamSource::Env,
+                },
+                true,
+            )
         } else {
-            "https://api.anthropic.com".to_string()
+            (
+                "https://api.anthropic.com".to_string(),
+                UpstreamEndpointMetadata {
+                    sanitized_origin: "https://api.anthropic.com".to_string(),
+                    mode: UpstreamTransportMode::Https,
+                    source: UpstreamSource::Default,
+                },
+                false,
+            )
         };
 
         let mut host_overrides = std::collections::HashMap::new();
+        if let Some(entry) = &cli_openai {
+            host_overrides.insert("api.openai.com".to_string(), entry.normalized_url.clone());
+        }
+        if let Some(entry) = &cli_anthropic {
+            host_overrides.insert(
+                "api.anthropic.com".to_string(),
+                entry.normalized_url.clone(),
+            );
+        }
+
         for &known_host in KNOWN_LLM_HOSTS {
+            if (known_host == "api.openai.com" && cli_openai.is_some())
+                || (known_host == "api.anthropic.com" && cli_anthropic.is_some())
+            {
+                continue;
+            }
             let env_key = known_host_static_env_key(known_host)
                 .expect("every KNOWN_LLM_HOSTS entry has a static env key");
             if let Some(raw) = get(env_key) {
-                let valid = validate_upstream_url(
+                let entry = validate_upstream_url_with_options(
                     &raw,
                     UpstreamKey::Static(env_key),
                     FallbackKeyKind::None,
+                    options,
                 )?;
-                host_overrides.insert(known_host.to_string(), valid);
+                record_loopback(&entry);
+                if known_host == "api.openai.com" && !openai_explicit {
+                    openai_base_url = entry.normalized_url.clone();
+                    openai_metadata = UpstreamEndpointMetadata {
+                        sanitized_origin: format_sanitized_origin(&entry.parsed_url),
+                        mode: entry.mode,
+                        source: UpstreamSource::Env,
+                    };
+                }
+                if known_host == "api.anthropic.com" && !anthropic_explicit {
+                    anthropic_base_url = entry.normalized_url.clone();
+                    anthropic_metadata = UpstreamEndpointMetadata {
+                        sanitized_origin: format_sanitized_origin(&entry.parsed_url),
+                        mode: entry.mode,
+                        source: UpstreamSource::Env,
+                    };
+                }
+                host_overrides.insert(known_host.to_string(), entry.normalized_url);
+            } else if known_host == "api.openai.com" && openai_explicit {
+                host_overrides.insert("api.openai.com".to_string(), openai_base_url.clone());
+            } else if known_host == "api.anthropic.com" && anthropic_explicit {
+                host_overrides.insert("api.anthropic.com".to_string(), anthropic_base_url.clone());
             }
         }
         for host in &extra_hosts {
             let env_key = derive_host_env_key(host);
             if let Some(raw) = get(&env_key) {
-                let valid = validate_upstream_url(
+                let entry = validate_upstream_url_with_options(
                     &raw,
                     UpstreamKey::ValidatedHostKey(env_key),
                     FallbackKeyKind::None,
+                    options,
                 )?;
-                host_overrides.insert(host.clone(), valid);
+                record_loopback(&entry);
+                host_overrides.insert(host.clone(), entry.normalized_url);
             }
         }
 
         Ok(Self {
             openai_base_url,
             anthropic_base_url,
+            openai_metadata,
+            anthropic_metadata,
             extra_hosts,
             host_overrides,
+            loopback_entries,
         })
     }
 
     pub fn from_process_env() -> Result<Self, UpstreamConfigError> {
-        let table = Self::from_env_fn(&read_process_env_for_upstream_validation)?;
+        Self::from_process_env_with_options(&UpstreamValidationOptions::default())
+    }
+
+    pub fn from_process_env_with_options(
+        options: &UpstreamValidationOptions,
+    ) -> Result<Self, UpstreamConfigError> {
+        let table =
+            Self::from_env_fn_with_options(&read_process_env_for_upstream_validation, options)?;
         let mut unrelated_count = 0usize;
         for (os_key, _) in std::env::vars_os() {
             let Some(key) = os_key.to_str() else {
@@ -2359,7 +2872,7 @@ impl UpstreamTable {
             };
             if !key.starts_with("PARAPET_") || !key.ends_with("_BASE_URL") {
                 continue;
-            }
+            };
             if key == "PARAPET_OPENAI_BASE_URL" || key == "PARAPET_ANTHROPIC_BASE_URL" {
                 continue;
             }
@@ -2381,6 +2894,38 @@ impl UpstreamTable {
             );
         }
         Ok(table)
+    }
+
+    pub fn check_no_self_loop(&self, bound_port: u16) -> Result<(), UpstreamConfigError> {
+        if bound_port == 0 {
+            return Ok(());
+        }
+        for item in &self.loopback_entries {
+            if item.effective_port == bound_port {
+                let err = UpstreamConfigError {
+                    key: item.key.clone(),
+                    rule: "self_loop_upstream",
+                    fix: FIX_SELF_LOOP_UPSTREAM,
+                    value_len: item.value_len,
+                    shape: Some(item.shape),
+                    entry_index: None,
+                };
+                emit_config_refusal_warn(&err);
+                return Err(err);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn endpoint_metadata(&self, provider: Provider) -> &UpstreamEndpointMetadata {
+        match provider {
+            Provider::OpenAi => &self.openai_metadata,
+            Provider::Anthropic => &self.anthropic_metadata,
+        }
+    }
+
+    pub fn sanitized_origin(&self, provider: Provider) -> &str {
+        &self.endpoint_metadata(provider).sanitized_origin
     }
 
     pub fn is_allowed_host(&self, host: &str) -> bool {
@@ -2448,7 +2993,14 @@ impl EnvUpstreamResolver {
     }
 
     pub fn from_env_fn(get: &dyn Fn(&str) -> Option<String>) -> Self {
-        match UpstreamTable::from_env_fn(get) {
+        Self::from_env_fn_with_options(get, &UpstreamValidationOptions::default())
+    }
+
+    pub fn from_env_fn_with_options(
+        get: &dyn Fn(&str) -> Option<String>,
+        options: &UpstreamValidationOptions,
+    ) -> Self {
+        match UpstreamTable::from_env_fn_with_options(get, options) {
             Ok(table) => Self { state: Ok(table) },
             Err(error) => {
                 let openai_legacy = get("PARAPET_OPENAI_BASE_URL")
@@ -2659,6 +3211,13 @@ impl HttpSender for ReqwestHttpSender {
 
 pub fn build_engine_client(config: Arc<Config>) -> Result<EngineUpstreamClient, StartupError> {
     let upstream_table = UpstreamTable::from_process_env().map_err(StartupError::UpstreamConfig)?;
+    build_engine_client_with_upstream_table(config, upstream_table)
+}
+
+pub fn build_engine_client_with_upstream_table(
+    config: Arc<Config>,
+    upstream_table: UpstreamTable,
+) -> Result<EngineUpstreamClient, StartupError> {
     let session_store: Option<Arc<dyn crate::session::SessionStore>> = None; // Sprint 2
 
     // L1: harness path for generalist, legacy scanner for ensemble.
@@ -3030,6 +3589,28 @@ pub fn build_engine_client_with_runtime_v0(
 
 #[cfg(not(windows))]
 #[allow(clippy::type_complexity)]
+pub fn build_engine_client_with_runtime_and_upstream_v0(
+    config: Arc<Config>,
+    options: EngineRuntimeOptionsV0,
+    upstream_table: UpstreamTable,
+) -> Result<
+    (
+        EngineUpstreamClient,
+        Arc<crate::effect::store::ProtectedEvidenceStoreV0>,
+        Option<Arc<crate::effect::file::RootCapabilityV0>>,
+    ),
+    StartupError,
+> {
+    build_engine_client_with_runtime_and_file_fixture_and_upstream_v0(
+        config,
+        options,
+        None,
+        upstream_table,
+    )
+}
+
+#[cfg(not(windows))]
+#[allow(clippy::type_complexity)]
 fn build_engine_client_with_runtime_and_file_fixture_v0(
     config: Arc<Config>,
     options: EngineRuntimeOptionsV0,
@@ -3043,6 +3624,29 @@ fn build_engine_client_with_runtime_and_file_fixture_v0(
     StartupError,
 > {
     let upstream_table = UpstreamTable::from_process_env().map_err(StartupError::UpstreamConfig)?;
+    build_engine_client_with_runtime_and_file_fixture_and_upstream_v0(
+        config,
+        options,
+        file_fixture_override,
+        upstream_table,
+    )
+}
+
+#[cfg(not(windows))]
+#[allow(clippy::type_complexity)]
+fn build_engine_client_with_runtime_and_file_fixture_and_upstream_v0(
+    config: Arc<Config>,
+    options: EngineRuntimeOptionsV0,
+    file_fixture_override: Option<crate::effect::file::FileFixtureV0>,
+    upstream_table: UpstreamTable,
+) -> Result<
+    (
+        EngineUpstreamClient,
+        Arc<crate::effect::store::ProtectedEvidenceStoreV0>,
+        Option<Arc<crate::effect::file::RootCapabilityV0>>,
+    ),
+    StartupError,
+> {
     let session_store: Option<Arc<dyn crate::session::SessionStore>> = None;
 
     let (l1_model, l1_scanner): (Option<Arc<dyn L1Model>>, Option<Arc<dyn L1Scanner>>) =
@@ -3535,17 +4139,37 @@ fn build_upstream_url(
         return Err(UpstreamRefusal::DestinationMismatch);
     }
 
-    let path_and_query = req
-        .uri
-        .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or(req.uri.path());
-    if !path_and_query.starts_with('/') || path_and_query.starts_with("//") {
+    let raw_path = req.uri.path();
+    let raw_query = req.uri.query();
+    if !raw_path.starts_with('/') || raw_path.starts_with("//") {
         emit_destination_mismatch_warn(provider);
         return Err(UpstreamRefusal::DestinationMismatch);
     }
 
-    let joined = format!("{base_trimmed}{path_and_query}");
+    let canonical_path = if provider == Provider::OpenAi
+        && (raw_path == "/openai/v1/chat/completions"
+            || raw_path.starts_with("/openai/v1/chat/completions/"))
+    {
+        raw_path.strip_prefix("/openai").unwrap_or(raw_path)
+    } else {
+        raw_path
+    };
+
+    let canonical_path_and_query = match raw_query {
+        Some(q) => format!("{canonical_path}?{q}"),
+        None => canonical_path.to_string(),
+    };
+
+    let base_path = base_url.path().trim_end_matches('/');
+    let effective_base = if (base_path == "/v1" || base_path.ends_with("/v1"))
+        && (canonical_path == "/v1" || canonical_path.starts_with("/v1/"))
+    {
+        base_trimmed.strip_suffix("/v1").unwrap_or(base_trimmed)
+    } else {
+        base_trimmed
+    };
+
+    let joined = format!("{effective_base}{canonical_path_and_query}");
     let Ok(joined_url) = url::Url::parse(&joined) else {
         emit_destination_mismatch_warn(provider);
         return Err(UpstreamRefusal::DestinationMismatch);

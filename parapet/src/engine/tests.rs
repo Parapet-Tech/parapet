@@ -3988,3 +3988,874 @@ async fn t18_l1_block_verdict_takes_precedence_over_disallowed_original_host() {
     );
     assert_eq!(sender.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
+
+// ===================================================================
+// Stage 1: Explicit Loopback-HTTP Upstream Mode (t_s1_01..t_s1_16)
+// ===================================================================
+
+#[test]
+fn t_s1_01_http_ipv4_loopback_accepted_with_opt_in() {
+    let opts = UpstreamValidationOptions {
+        cli_upstreams: vec!["openai=http://127.0.0.1:11434".to_string()],
+        allow_loopback_http_upstream: true,
+        listener_port: Some(9800),
+    };
+    let table =
+        UpstreamTable::from_env_fn_with_options(&|_| None, &opts).expect("valid ipv4 loopback");
+    assert_eq!(table.base_url(Provider::OpenAi), "http://127.0.0.1:11434");
+    assert_eq!(
+        table.sanitized_origin(Provider::OpenAi),
+        "http://127.0.0.1:11434"
+    );
+    let meta = table.endpoint_metadata(Provider::OpenAi);
+    assert_eq!(meta.sanitized_origin, "http://127.0.0.1:11434");
+    assert_eq!(meta.mode, UpstreamTransportMode::LoopbackHttp);
+    assert_eq!(meta.source, UpstreamSource::Cli);
+    assert_eq!(meta.mode.as_str(), "loopback-http");
+    assert_eq!(meta.source.as_str(), "cli");
+}
+
+#[test]
+fn t_s1_02_http_ipv4_127_subnet_accepted_with_opt_in() {
+    let opts = UpstreamValidationOptions {
+        cli_upstreams: vec!["openai=http://127.0.0.2:8080/v1".to_string()],
+        allow_loopback_http_upstream: true,
+        listener_port: Some(9800),
+    };
+    let table =
+        UpstreamTable::from_env_fn_with_options(&|_| None, &opts).expect("valid 127/8 loopback");
+    assert_eq!(table.base_url(Provider::OpenAi), "http://127.0.0.2:8080/v1");
+    assert_eq!(
+        table.sanitized_origin(Provider::OpenAi),
+        "http://127.0.0.2:8080"
+    );
+    let meta = table.endpoint_metadata(Provider::OpenAi);
+    assert_eq!(meta.mode, UpstreamTransportMode::LoopbackHttp);
+    assert_eq!(meta.source, UpstreamSource::Cli);
+}
+
+#[test]
+fn t_s1_03_http_ipv6_loopback_accepted_with_opt_in() {
+    let opts = UpstreamValidationOptions {
+        cli_upstreams: vec!["openai=http://[::1]:11434".to_string()],
+        allow_loopback_http_upstream: true,
+        listener_port: Some(9800),
+    };
+    let table =
+        UpstreamTable::from_env_fn_with_options(&|_| None, &opts).expect("valid ipv6 loopback");
+    assert_eq!(table.base_url(Provider::OpenAi), "http://[::1]:11434");
+    assert_eq!(
+        table.sanitized_origin(Provider::OpenAi),
+        "http://[::1]:11434"
+    );
+    let meta = table.endpoint_metadata(Provider::OpenAi);
+    assert_eq!(meta.mode, UpstreamTransportMode::LoopbackHttp);
+    assert_eq!(meta.source, UpstreamSource::Cli);
+}
+
+#[test]
+fn t_s1_04_http_loopback_refused_without_opt_in() {
+    let opts = UpstreamValidationOptions {
+        cli_upstreams: vec!["openai=http://127.0.0.1:11434".to_string()],
+        allow_loopback_http_upstream: false,
+        listener_port: Some(9800),
+    };
+    let err = UpstreamTable::from_env_fn_with_options(&|_| None, &opts)
+        .expect_err("loopback http without opt-in must be refused");
+    assert_eq!(err.key, UpstreamKey::Static("--upstream openai"));
+    assert_eq!(err.rule, "non_https_upstream");
+    assert_eq!(err.value_len, "http://127.0.0.1:11434".len());
+}
+
+#[test]
+fn t_s1_05_http_localhost_and_subdomains_refused_with_opt_in() {
+    for raw in [
+        "http://localhost:11434",
+        "http://localhost.:11434",
+        "http://model.localhost:11434",
+    ] {
+        let opts = UpstreamValidationOptions {
+            cli_upstreams: vec![format!("openai={raw}")],
+            allow_loopback_http_upstream: true,
+            listener_port: Some(9800),
+        };
+        let err = UpstreamTable::from_env_fn_with_options(&|_| None, &opts)
+            .expect_err("localhost DNS must be refused for plain http");
+        assert_eq!(err.key, UpstreamKey::Static("--upstream openai"));
+        assert_eq!(err.rule, "loopback_http_requires_literal_ip", "raw={raw}");
+        assert_eq!(err.value_len, raw.len());
+    }
+}
+
+#[test]
+fn t_s1_06_http_ipv4_mapped_ipv6_refused_with_opt_in() {
+    for raw in [
+        "http://[::ffff:127.0.0.1]:11434",
+        "http://[::ffff:7f00:1]:11434",
+        "http://[::ffff:8.8.8.8]:11434",
+    ] {
+        let opts = UpstreamValidationOptions {
+            cli_upstreams: vec![format!("openai={raw}")],
+            allow_loopback_http_upstream: true,
+            listener_port: Some(9800),
+        };
+        let err = UpstreamTable::from_env_fn_with_options(&|_| None, &opts)
+            .expect_err("IPv4-mapped IPv6 must be refused for plain http");
+        assert_eq!(err.key, UpstreamKey::Static("--upstream openai"));
+        assert_eq!(err.rule, "non_loopback_http_upstream", "raw={raw}");
+        assert_eq!(err.value_len, raw.len());
+    }
+}
+
+#[test]
+fn t_s1_07_http_lan_metadata_unspecified_and_remote_refused_with_opt_in() {
+    for raw in [
+        "http://192.168.1.20:11434",
+        "http://10.0.0.5:8000",
+        "http://172.16.0.1:8000",
+        "http://169.254.169.254/latest",
+        "http://100.64.0.1:8080",
+        "http://0.0.0.0:11434",
+        "http://[::]:11434",
+        "http://api.openai.com",
+    ] {
+        let opts = UpstreamValidationOptions {
+            cli_upstreams: vec![format!("openai={raw}")],
+            allow_loopback_http_upstream: true,
+            listener_port: Some(9800),
+        };
+        let err = UpstreamTable::from_env_fn_with_options(&|_| None, &opts)
+            .expect_err("non-loopback http must be refused even with opt-in");
+        assert_eq!(err.key, UpstreamKey::Static("--upstream openai"));
+        assert_eq!(err.rule, "non_loopback_http_upstream", "raw={raw}");
+        assert_eq!(err.value_len, raw.len());
+    }
+}
+
+#[test]
+fn t_s1_08_fallback_key_http_refused_even_with_opt_in() {
+    let opts = UpstreamValidationOptions {
+        cli_upstreams: Vec::new(),
+        allow_loopback_http_upstream: true,
+        listener_port: Some(9800),
+    };
+    for target_key in ["OPENAI_BASE_URL", "ANTHROPIC_BASE_URL"] {
+        let err = UpstreamTable::from_env_fn_with_options(
+            &|k| {
+                if k == target_key {
+                    Some("http://127.0.0.1:11434".to_string())
+                } else {
+                    None
+                }
+            },
+            &opts,
+        )
+        .expect_err("fallback key must never enable plain http");
+        assert_eq!(err.key, UpstreamKey::Static(target_key));
+        assert_eq!(err.rule, "fallback_key_http_forbidden");
+        assert_eq!(err.value_len, "http://127.0.0.1:11434".len());
+    }
+}
+
+#[test]
+fn t_s1_08b_fallback_key_http_refused_without_opt_in_gives_provider_specific_guidance() {
+    let raw_url = "http://127.0.0.1:11434";
+    let opts = UpstreamValidationOptions {
+        cli_upstreams: Vec::new(),
+        allow_loopback_http_upstream: false,
+        listener_port: Some(9800),
+    };
+    let cases = [
+        (
+            "OPENAI_BASE_URL",
+            "--upstream openai=http://<literal-loopback-IP>:<port>",
+            "PARAPET_OPENAI_BASE_URL",
+            "otherwise use https:// or remove OPENAI_BASE_URL from the engine's environment",
+            FIX_NON_HTTPS_OPENAI_FALLBACK,
+        ),
+        (
+            "ANTHROPIC_BASE_URL",
+            "--upstream anthropic=http://<literal-loopback-IP>:<port>",
+            "PARAPET_ANTHROPIC_BASE_URL",
+            "otherwise use https:// or remove ANTHROPIC_BASE_URL from the engine's environment",
+            FIX_NON_HTTPS_ANTHROPIC_FALLBACK,
+        ),
+    ];
+
+    for (
+        target_key,
+        expected_upstream_flag,
+        expected_parapet_env,
+        expected_remove_clause,
+        expected_fix,
+    ) in cases
+    {
+        let env_fn = |k: &str| {
+            if k == target_key {
+                Some(raw_url.to_string())
+            } else {
+                None
+            }
+        };
+        let err = UpstreamTable::from_env_fn_with_options(&env_fn, &opts)
+            .expect_err("no-flag ambient fallback http must fail closed");
+        let default_err = UpstreamTable::from_env_fn(&env_fn)
+            .expect_err("default from_env_fn ambient fallback http must fail closed");
+        assert_eq!(err, default_err, "target_key={target_key}");
+
+        assert_eq!(err.key, UpstreamKey::Static(target_key));
+        assert_eq!(err.rule, "non_https_upstream", "target_key={target_key}");
+        assert_eq!(err.fix, expected_fix, "target_key={target_key}");
+        assert_ne!(err.fix, FIX_FALLBACK_KEY_HTTP, "target_key={target_key}");
+        assert_ne!(err.fix, FIX_NON_HTTPS_UPSTREAM, "target_key={target_key}");
+        assert_eq!(err.value_len, raw_url.len(), "target_key={target_key}");
+
+        let display = err.to_string();
+        let debug = format!("{err:?}");
+        assert!(
+            display.contains(&format!("(value withheld, {} bytes", raw_url.len())),
+            "display missing withholding notice for {target_key}: {display}"
+        );
+
+        for surface in [err.fix, display.as_str()] {
+            assert!(
+                surface.contains(expected_upstream_flag),
+                "missing provider-specific --upstream form for {target_key}: {surface}"
+            );
+            assert!(
+                surface.contains(expected_parapet_env),
+                "missing provider-specific PARAPET_*_BASE_URL for {target_key}: {surface}"
+            );
+            assert!(
+                surface.contains("--allow-loopback-http-upstream"),
+                "missing --allow-loopback-http-upstream for {target_key}: {surface}"
+            );
+            assert!(
+                surface.contains(expected_remove_clause),
+                "missing https:// or remove fallback key clause for {target_key}: {surface}"
+            );
+            assert!(
+                !surface.contains("planned behind an explicit flag"),
+                "stale wording present for {target_key}: {surface}"
+            );
+            assert!(
+                !surface.contains("not supported in this release"),
+                "stale wording present for {target_key}: {surface}"
+            );
+            assert!(
+                !surface.contains("<provider>"),
+                "generic <provider> placeholder leaked into no-flag branch for {target_key}: {surface}"
+            );
+            assert!(
+                !surface.contains("PARAPET_<PROVIDER>_BASE_URL"),
+                "generic PARAPET_<PROVIDER>_BASE_URL placeholder leaked into no-flag branch for {target_key}: {surface}"
+            );
+        }
+
+        for surface in [display.as_str(), debug.as_str(), err.fix, err.rule] {
+            assert!(
+                !surface.contains(raw_url),
+                "refused URL value leaked for {target_key}: {surface}"
+            );
+            assert!(
+                !surface.contains("127.0.0.1"),
+                "refused host literal leaked for {target_key}: {surface}"
+            );
+            assert!(
+                !surface.contains("11434"),
+                "refused port literal leaked for {target_key}: {surface}"
+            );
+        }
+    }
+}
+
+#[test]
+fn t_s1_09_cli_upstream_shadows_conflicting_known_host_primary_and_fallback_env_vars() {
+    let opts = UpstreamValidationOptions {
+        cli_upstreams: vec![
+            "openai=http://127.0.0.1:11434".to_string(),
+            "anthropic=http://127.0.0.1:11435".to_string(),
+        ],
+        allow_loopback_http_upstream: true,
+        listener_port: Some(9800),
+    };
+    let table = UpstreamTable::from_env_fn_with_options(
+        &|k| match k {
+            "PARAPET_API_OPENAI_COM_BASE_URL" => {
+                Some("https://conflicting-openai-host.example/v1".to_string())
+            }
+            "PARAPET_API_ANTHROPIC_COM_BASE_URL" => {
+                Some("https://conflicting-anthropic-host.example/v1".to_string())
+            }
+            "PARAPET_OPENAI_BASE_URL" => Some("http://bad".to_string()),
+            "OPENAI_BASE_URL" => Some("http://127.0.0.1:9800/v1".to_string()),
+            "PARAPET_ANTHROPIC_BASE_URL" => Some("http://bad".to_string()),
+            "ANTHROPIC_BASE_URL" => Some("http://127.0.0.1:9800/v1".to_string()),
+            "PARAPET_API_GROQ_COM_BASE_URL" => Some("https://groq-gw.internal/proxy".to_string()),
+            _ => None,
+        },
+        &opts,
+    )
+    .expect("CLI overrides must shadow conflicting known-host, primary, and fallback env vars");
+
+    let resolver = EnvUpstreamResolver::from_table(table.clone());
+    assert_eq!(
+        resolver.resolve(Provider::OpenAi, OriginalHost::Absent),
+        Ok("http://127.0.0.1:11434".to_string())
+    );
+    assert_eq!(
+        resolver.resolve(Provider::OpenAi, OriginalHost::Present("api.openai.com")),
+        Ok("http://127.0.0.1:11434".to_string())
+    );
+    assert_eq!(
+        resolver.resolve(Provider::Anthropic, OriginalHost::Absent),
+        Ok("http://127.0.0.1:11435".to_string())
+    );
+    assert_eq!(
+        resolver.resolve(
+            Provider::Anthropic,
+            OriginalHost::Present("api.anthropic.com")
+        ),
+        Ok("http://127.0.0.1:11435".to_string())
+    );
+    assert_eq!(
+        resolver.resolve(Provider::OpenAi, OriginalHost::Present("api.groq.com")),
+        Ok("https://groq-gw.internal/proxy".to_string())
+    );
+
+    let openai_meta = table.endpoint_metadata(Provider::OpenAi);
+    assert_eq!(openai_meta.sanitized_origin, "http://127.0.0.1:11434");
+    assert_eq!(openai_meta.mode, UpstreamTransportMode::LoopbackHttp);
+    assert_eq!(openai_meta.source, UpstreamSource::Cli);
+
+    let anthropic_meta = table.endpoint_metadata(Provider::Anthropic);
+    assert_eq!(anthropic_meta.sanitized_origin, "http://127.0.0.1:11435");
+    assert_eq!(anthropic_meta.mode, UpstreamTransportMode::LoopbackHttp);
+    assert_eq!(anthropic_meta.source, UpstreamSource::Cli);
+}
+
+#[test]
+fn t_s1_10_invalid_cli_upstream_never_falls_back_to_env_or_default() {
+    let opts = UpstreamValidationOptions {
+        cli_upstreams: vec!["openai=http://192.168.1.1:8000".to_string()],
+        allow_loopback_http_upstream: true,
+        listener_port: Some(9800),
+    };
+    let err = UpstreamTable::from_env_fn_with_options(
+        &|k| match k {
+            "PARAPET_OPENAI_BASE_URL" => Some("https://api.openai.com".to_string()),
+            "PARAPET_API_OPENAI_COM_BASE_URL" => Some("https://api.openai.com".to_string()),
+            _ => None,
+        },
+        &opts,
+    )
+    .expect_err("invalid CLI upstream must fail closed immediately");
+    assert_eq!(err.key, UpstreamKey::Static("--upstream openai"));
+    assert_eq!(err.rule, "non_loopback_http_upstream");
+}
+
+#[test]
+fn t_s1_11_duplicate_and_malformed_cli_upstream_flags() {
+    let dup_opts = UpstreamValidationOptions {
+        cli_upstreams: vec![
+            "openai=https://a.example".to_string(),
+            "openai=https://b.example".to_string(),
+        ],
+        allow_loopback_http_upstream: false,
+        listener_port: None,
+    };
+    let dup_err = UpstreamTable::from_env_fn_with_options(&|_| None, &dup_opts)
+        .expect_err("duplicate openai flag must fail");
+    assert_eq!(dup_err.key, UpstreamKey::Static("--upstream openai"));
+    assert_eq!(dup_err.rule, "duplicate_upstream_flag");
+
+    let dup_anth_opts = UpstreamValidationOptions {
+        cli_upstreams: vec![
+            "anthropic=https://a.example".to_string(),
+            "anthropic=https://b.example".to_string(),
+        ],
+        allow_loopback_http_upstream: false,
+        listener_port: None,
+    };
+    let dup_anth_err = UpstreamTable::from_env_fn_with_options(&|_| None, &dup_anth_opts)
+        .expect_err("duplicate anthropic flag must fail");
+    assert_eq!(
+        dup_anth_err.key,
+        UpstreamKey::Static("--upstream anthropic")
+    );
+    assert_eq!(dup_anth_err.rule, "duplicate_upstream_flag");
+
+    for bad_syntax in ["no_equals", "=https://a.example"] {
+        let opts = UpstreamValidationOptions {
+            cli_upstreams: vec![bad_syntax.to_string()],
+            allow_loopback_http_upstream: false,
+            listener_port: None,
+        };
+        let err = UpstreamTable::from_env_fn_with_options(&|_| None, &opts)
+            .expect_err("malformed flag syntax must fail");
+        assert_eq!(err.key, UpstreamKey::Static("--upstream"));
+        assert_eq!(err.rule, "invalid_upstream_flag_syntax");
+        assert_eq!(err.value_len, bad_syntax.len());
+    }
+
+    let unk_opts = UpstreamValidationOptions {
+        cli_upstreams: vec!["unknown=https://a.example".to_string()],
+        allow_loopback_http_upstream: false,
+        listener_port: None,
+    };
+    let unk_err = UpstreamTable::from_env_fn_with_options(&|_| None, &unk_opts)
+        .expect_err("unknown provider must fail");
+    assert_eq!(unk_err.key, UpstreamKey::Static("--upstream"));
+    assert_eq!(unk_err.rule, "unknown_upstream_provider");
+}
+
+#[test]
+fn t_s1_12_self_loop_pre_bind_and_injectable_post_bind_seam() {
+    // (a) Pre-bind fixed port self-loop refusal
+    let pre_opts = UpstreamValidationOptions {
+        cli_upstreams: vec!["openai=http://127.0.0.1:9800".to_string()],
+        allow_loopback_http_upstream: true,
+        listener_port: Some(9800),
+    };
+    let pre_err = UpstreamTable::from_env_fn_with_options(&|_| None, &pre_opts)
+        .expect_err("pre-bind self-loop must fail");
+    assert_eq!(pre_err.key, UpstreamKey::Static("--upstream openai"));
+    assert_eq!(pre_err.rule, "self_loop_upstream");
+
+    // (b) Post-bind seam (`listener_port: None`, simulating `--port 0`)
+    for (cli_upstreams, env_override, expected_key) in [
+        (
+            vec!["openai=http://127.0.0.1:54321".to_string()],
+            None,
+            UpstreamKey::Static("--upstream openai"),
+        ),
+        (
+            vec!["openai=http://[::1]:54321".to_string()],
+            None,
+            UpstreamKey::Static("--upstream openai"),
+        ),
+        (
+            Vec::new(),
+            Some(("PARAPET_API_OPENAI_COM_BASE_URL", "http://127.0.0.1:54321")),
+            UpstreamKey::Static("PARAPET_API_OPENAI_COM_BASE_URL"),
+        ),
+    ] {
+        let opts = UpstreamValidationOptions {
+            cli_upstreams,
+            allow_loopback_http_upstream: true,
+            listener_port: None,
+        };
+        let table = UpstreamTable::from_env_fn_with_options(
+            &|k| match env_override {
+                Some((ek, ev)) if k == ek => Some(ev.to_string()),
+                _ => None,
+            },
+            &opts,
+        )
+        .expect("passes pre-bind when listener_port is None");
+        assert!(table.check_no_self_loop(9800).is_ok());
+        let post_err = table
+            .check_no_self_loop(54321)
+            .expect_err("post-bind self-loop must fail when bound_port matches");
+        assert_eq!(post_err.key, expected_key);
+        assert_eq!(post_err.rule, "self_loop_upstream");
+    }
+}
+
+#[test]
+fn t_s1_13_pre_parse_raw_base_path_and_stage0_structural_checks_on_loopback_http() {
+    let s = Stage0SentinelRun::generate();
+
+    // (a) Stage 0 structural checks on opt-in loopback HTTP
+    for (raw, expected_rule) in [
+        ("http://user:pass@127.0.0.1:11434", "userinfo_forbidden"),
+        ("http://127.0.0.1:11434?k=v", "query_forbidden"),
+        ("http://127.0.0.1:11434#frag", "fragment_forbidden"),
+        ("http://127.0.0.1:0", "unparseable"),
+    ] {
+        let opts = UpstreamValidationOptions {
+            cli_upstreams: vec![format!("openai={raw}")],
+            allow_loopback_http_upstream: true,
+            listener_port: Some(9800),
+        };
+        let err = UpstreamTable::from_env_fn_with_options(&|_| None, &opts)
+            .expect_err("structural violation on loopback http must fail");
+        assert_eq!(err.rule, expected_rule, "raw={raw}");
+    }
+
+    // (b) Polaris R3: Pre-parse raw base-path rejections before Url::parse normalization
+    let path_tok = &s.tokens[2].full;
+    let raw_base_path_cases = vec![
+        "http://127.0.0.1:11434/v1/../chat".to_string(),
+        "http://127.0.0.1:11434/v1/./chat".to_string(),
+        "http://127.0.0.1:11434/..".to_string(),
+        "http://127.0.0.1:11434/.".to_string(),
+        "http://127.0.0.1:11434/v1/%2e/chat".to_string(),
+        "http://127.0.0.1:11434/v1/%2E/chat".to_string(),
+        "http://127.0.0.1:11434/v1/%2e%2e/chat".to_string(),
+        "http://127.0.0.1:11434/v1/%2E%2E/chat".to_string(),
+        "http://127.0.0.1:11434/v1/%2e%2E/chat".to_string(),
+        "http://127.0.0.1:11434/v1/%2E%2e/chat".to_string(),
+        "http://127.0.0.1:11434/v1/.%2e/chat".to_string(),
+        "http://127.0.0.1:11434/v1/%2e./chat".to_string(),
+        "http://127.0.0.1:11434/v1//chat".to_string(),
+        "http://127.0.0.1:11434//v1/chat".to_string(),
+        "http://127.0.0.1:11434/v1\\chat".to_string(),
+        "http://127.0.0.1:11434\\v1\\chat".to_string(),
+        format!("http://127.0.0.1:11434/{path_tok}/../v1"),
+        format!("http://127.0.0.1:11434/{path_tok}/%2e%2e/v1"),
+        format!("http://127.0.0.1:11434/{path_tok}//v1"),
+        format!("https://gw.example/{path_tok}/../v1"),
+        format!("https://gw.example/{path_tok}/%2E/v1"),
+    ];
+
+    for raw in &raw_base_path_cases {
+        let opts = UpstreamValidationOptions {
+            cli_upstreams: vec![format!("openai={raw}")],
+            allow_loopback_http_upstream: true,
+            listener_port: Some(9800),
+        };
+        let err = UpstreamTable::from_env_fn_with_options(&|_| None, &opts)
+            .expect_err("non-canonical raw base path must be refused before Url::parse");
+        assert_eq!(err.key, UpstreamKey::Static("--upstream openai"));
+        assert_eq!(err.rule, "unparseable", "raw={raw}");
+        assert_eq!(err.shape, None, "raw={raw}");
+        assert_eq!(err.fix, FIX_UNPARSEABLE_URL, "raw={raw}");
+        assert_eq!(err.value_len, raw.len(), "raw={raw}");
+
+        let display = err.to_string();
+        let debug = format!("{err:?}");
+        for surface in [
+            display.as_bytes(),
+            debug.as_bytes(),
+            err.rule.as_bytes(),
+            err.fix.as_bytes(),
+        ] {
+            s.assert_clean("t_s1_13 raw base path error", surface);
+        }
+    }
+}
+
+#[test]
+fn t_s1_14_ingress_alias_canonicalization_and_base_overlap_url_join() {
+    let cases = [
+        (
+            "http://127.0.0.1:11434",
+            "http://127.0.0.1:11434/v1/chat/completions",
+        ),
+        (
+            "http://127.0.0.1:11434/",
+            "http://127.0.0.1:11434/v1/chat/completions",
+        ),
+        (
+            "http://127.0.0.1:11434/v1",
+            "http://127.0.0.1:11434/v1/chat/completions",
+        ),
+        (
+            "http://127.0.0.1:11434/v1/",
+            "http://127.0.0.1:11434/v1/chat/completions",
+        ),
+        (
+            "http://127.0.0.1:11434/tenant/v1",
+            "http://127.0.0.1:11434/tenant/v1/chat/completions",
+        ),
+        (
+            "http://127.0.0.1:11434/proxy",
+            "http://127.0.0.1:11434/proxy/v1/chat/completions",
+        ),
+        (
+            "https://groq-gw.internal/proxy",
+            "https://groq-gw.internal/proxy/v1/chat/completions",
+        ),
+    ];
+
+    for (base, expected_no_query) in cases {
+        let opts = UpstreamValidationOptions {
+            cli_upstreams: vec![format!("openai={base}")],
+            allow_loopback_http_upstream: true,
+            listener_port: Some(9800),
+        };
+        let table = UpstreamTable::from_env_fn_with_options(&|_| None, &opts)
+            .expect("valid base for join matrix");
+        let resolver = EnvUpstreamResolver::from_table(table);
+
+        for alias in ["/v1/chat/completions", "/openai/v1/chat/completions"] {
+            let req = proxy_request_with_header(alias, None);
+            let joined =
+                build_upstream_url(&resolver, Provider::OpenAi, &req).expect("join without query");
+            assert_eq!(joined, expected_no_query, "base={base} alias={alias}");
+            assert!(!joined.contains("/v1/v1"));
+            assert!(!joined.contains("/v1/openai/v1"));
+
+            let with_q = format!("{alias}?stream=true&tag=a%2Bb");
+            let req_q = proxy_request_with_header(&with_q, None);
+            let joined_q =
+                build_upstream_url(&resolver, Provider::OpenAi, &req_q).expect("join with query");
+            assert_eq!(
+                joined_q,
+                format!("{expected_no_query}?stream=true&tag=a%2Bb"),
+                "base={base} alias={with_q}"
+            );
+        }
+    }
+}
+
+#[test]
+fn t_s1_15_provenance_no_copy_sentinel_sweep_on_all_stage1_rules() {
+    let s = Stage0SentinelRun::generate();
+    let tok = &s.tokens[0].full;
+
+    let writer = SharedLogBuffer::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
+        .with_writer(writer.clone())
+        .with_ansi(false)
+        .without_time()
+        .finish();
+
+    tracing::subscriber::with_default(subscriber, || {
+        let cli_cases = vec![
+            (
+                vec![format!("{tok}")],
+                true,
+                Some(9800),
+                "invalid_upstream_flag_syntax",
+            ),
+            (
+                vec![format!("{tok}=https://api.openai.com")],
+                true,
+                Some(9800),
+                "unknown_upstream_provider",
+            ),
+            (
+                vec![
+                    "openai=https://api.openai.com".to_string(),
+                    format!("openai=https://{tok}.example"),
+                ],
+                true,
+                Some(9800),
+                "duplicate_upstream_flag",
+            ),
+            (
+                vec![format!("openai=http://{tok}.localhost:11434")],
+                true,
+                Some(9800),
+                "loopback_http_requires_literal_ip",
+            ),
+            (
+                vec![format!("openai=http://{tok}.example:11434")],
+                true,
+                Some(9800),
+                "non_loopback_http_upstream",
+            ),
+            (
+                vec![format!("openai=http://127.0.0.1:9800/{tok}")],
+                true,
+                Some(9800),
+                "self_loop_upstream",
+            ),
+            (
+                vec![format!("openai=http://127.0.0.1:11434/{tok}/../v1")],
+                true,
+                Some(9800),
+                "unparseable",
+            ),
+        ];
+
+        for (cli_upstreams, allow_loopback_http_upstream, listener_port, expected_rule) in cli_cases
+        {
+            let opts = UpstreamValidationOptions {
+                cli_upstreams,
+                allow_loopback_http_upstream,
+                listener_port,
+            };
+            let err = UpstreamTable::from_env_fn_with_options(&|_| None, &opts)
+                .expect_err("stage1 sentinel case must fail");
+            assert_eq!(err.rule, expected_rule);
+            for surface in [
+                err.to_string().as_bytes(),
+                format!("{err:?}").as_bytes(),
+                err.key.to_string().as_bytes(),
+                err.rule.as_bytes(),
+                err.fix.as_bytes(),
+            ] {
+                s.assert_clean("t_s1_15 cli error surface", surface);
+            }
+        }
+
+        let fallback_val = format!("http://127.0.0.1:11434/{tok}");
+        let fb_opts = UpstreamValidationOptions {
+            cli_upstreams: Vec::new(),
+            allow_loopback_http_upstream: true,
+            listener_port: Some(9800),
+        };
+        let fb_err = UpstreamTable::from_env_fn_with_options(
+            &|k| {
+                if k == "OPENAI_BASE_URL" {
+                    Some(fallback_val.clone())
+                } else {
+                    None
+                }
+            },
+            &fb_opts,
+        )
+        .expect_err("fallback http sentinel must fail");
+        assert_eq!(fb_err.rule, "fallback_key_http_forbidden");
+        for surface in [
+            fb_err.to_string().as_bytes(),
+            format!("{fb_err:?}").as_bytes(),
+            fb_err.key.to_string().as_bytes(),
+            fb_err.rule.as_bytes(),
+            fb_err.fix.as_bytes(),
+        ] {
+            s.assert_clean("t_s1_15 fallback error surface", surface);
+        }
+    });
+
+    let log_bytes = writer.buf.lock().unwrap().clone();
+    s.assert_clean("t_s1_15 tracing buffer", &log_bytes);
+}
+
+#[test]
+fn t_s1_16_startup_disclosure_emits_sanitized_origin_only_and_strips_base_path() {
+    let opts = UpstreamValidationOptions {
+        cli_upstreams: vec![
+            "openai=http://127.0.0.1:11434/sk-secret-path-canary/v1".to_string(),
+            "anthropic=https://gw.example:8443/tenant-token-xyz/v1".to_string(),
+        ],
+        allow_loopback_http_upstream: true,
+        listener_port: Some(9800),
+    };
+    let table = UpstreamTable::from_env_fn_with_options(&|_| None, &opts)
+        .expect("valid urls with secret-like base paths");
+
+    assert_eq!(
+        table.base_url(Provider::OpenAi),
+        "http://127.0.0.1:11434/sk-secret-path-canary/v1"
+    );
+    assert_eq!(
+        table.base_url(Provider::Anthropic),
+        "https://gw.example:8443/tenant-token-xyz/v1"
+    );
+
+    let openai_meta = table.endpoint_metadata(Provider::OpenAi);
+    let anthropic_meta = table.endpoint_metadata(Provider::Anthropic);
+    assert_eq!(openai_meta.sanitized_origin, "http://127.0.0.1:11434");
+    assert_eq!(anthropic_meta.sanitized_origin, "https://gw.example:8443");
+
+    let human_disclosure = format!(
+        "parapet listening on 127.0.0.1:9800 (openai={} [mode={} source={}], anthropic={} [mode={} source={}])",
+        openai_meta.sanitized_origin,
+        openai_meta.mode.as_str(),
+        openai_meta.source.as_str(),
+        anthropic_meta.sanitized_origin,
+        anthropic_meta.mode.as_str(),
+        anthropic_meta.source.as_str(),
+    );
+    let json_disclosure = serde_json::json!({
+        "schema": "parapet-upstream-ready/v0",
+        "listen_addr": "127.0.0.1:9800",
+        "allow_loopback_http_upstream": true,
+        "upstreams": {
+            "openai": {
+                "origin": openai_meta.sanitized_origin,
+                "mode": openai_meta.mode.as_str(),
+                "source": openai_meta.source.as_str(),
+            },
+            "anthropic": {
+                "origin": anthropic_meta.sanitized_origin,
+                "mode": anthropic_meta.mode.as_str(),
+                "source": anthropic_meta.source.as_str(),
+            }
+        }
+    })
+    .to_string();
+
+    for surface in [
+        format!("{openai_meta:?}"),
+        format!("{anthropic_meta:?}"),
+        human_disclosure,
+        json_disclosure,
+    ] {
+        assert!(!surface.contains("sk-secret-path-canary"));
+        assert!(!surface.contains("tenant-token-xyz"));
+    }
+}
+
+#[tokio::test]
+async fn streaming_response_strips_stale_framing_headers() {
+    let sse_chunk_1 = "data: {\"id\":\"chatcmpl-s1-e13-stream\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_stream_bad\",\"type\":\"function\",\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"../escape.txt\\\",\\\"content\\\":\\\"bad\\\"}\"}}]},\"finish_reason\":null}]}\n\n";
+    let sse_chunk_2 = "data: {\"id\":\"chatcmpl-s1-e13-stream\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n";
+    let sse_chunk_3 = "data: [DONE]\n\n";
+    let original_len = sse_chunk_1.len() + sse_chunk_2.len() + sse_chunk_3.len();
+
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert("content-type", "text/event-stream".parse().unwrap());
+    response_headers.insert(
+        reqwest::header::CONTENT_LENGTH,
+        original_len.to_string().parse().unwrap(),
+    );
+    response_headers.insert(
+        reqwest::header::TRANSFER_ENCODING,
+        "chunked".parse().unwrap(),
+    );
+    let sender = Arc::new(RecordingHttpSender::with_stream_response(
+        response_headers,
+        vec![
+            Bytes::from(sse_chunk_1),
+            Bytes::from(sse_chunk_2),
+            Bytes::from(sse_chunk_3),
+        ],
+    ));
+
+    let config = config_with_l3_outbound("error");
+    let engine = engine_with_http_sender(config, sender);
+
+    let response = engine
+        .forward(
+            Provider::OpenAi,
+            openai_request_with_stream(true, HeaderMap::new()),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status, StatusCode::OK);
+    assert!(
+        response
+            .headers
+            .get(reqwest::header::CONTENT_LENGTH)
+            .is_none(),
+        "stale Content-Length must be stripped from transformed streaming response"
+    );
+    assert!(
+        response
+            .headers
+            .get(reqwest::header::TRANSFER_ENCODING)
+            .is_none(),
+        "stale Transfer-Encoding must be stripped from transformed streaming response"
+    );
+    assert_eq!(
+        response
+            .headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("text/event-stream")
+    );
+
+    let body = collect_proxy_body(response).await;
+    let body_str = String::from_utf8_lossy(&body);
+    assert!(
+        body_str.contains("tool call blocked"),
+        "expected SSE error notice in stream: {body_str}"
+    );
+    assert!(
+        !body_str.contains("../escape.txt"),
+        "blocked tool call arguments must be withheld: {body_str}"
+    );
+    assert_ne!(
+        body.len(),
+        original_len,
+        "transformed SSE stream length differs from upstream Content-Length"
+    );
+}

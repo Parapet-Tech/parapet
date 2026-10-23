@@ -271,6 +271,42 @@ fn path_refusal_response(
     resp
 }
 
+fn method_not_allowed_response(path: &str, method: &Method) -> Response<Body> {
+    let safe_path = sanitize_path_for_diagnostic(path);
+    tracing::warn!(
+        path = %safe_path,
+        method = %method,
+        status = StatusCode::METHOD_NOT_ALLOWED.as_u16(),
+        error_type = "parapet_method_not_allowed",
+        code = "method_not_allowed",
+        "request method refused"
+    );
+    let message = format!(
+        "Method {method} is not allowed on {safe_path}. Supported: POST /v1/chat/completions, POST /openai/v1/chat/completions, POST /v1/messages."
+    );
+    let payload = serde_json::json!({
+        "error": {
+            "type": "parapet_method_not_allowed",
+            "code": "method_not_allowed",
+            "message": message,
+        }
+    });
+    let bytes = serde_json::to_vec(&payload).unwrap_or_default();
+    let mut resp = Response::builder()
+        .status(StatusCode::METHOD_NOT_ALLOWED)
+        .body(Body::from(bytes))
+        .unwrap();
+    resp.headers_mut()
+        .insert("content-type", HeaderValue::from_static("application/json"));
+    resp.headers_mut()
+        .insert("allow", HeaderValue::from_static("POST"));
+    resp.headers_mut().insert(
+        "x-parapet-error",
+        HeaderValue::from_static("method_not_allowed"),
+    );
+    resp
+}
+
 /// Detect the LLM provider from the request path.
 ///
 /// Returns `None` for paths that do not map to a known provider.
@@ -369,6 +405,10 @@ pub async fn proxy_handler(
             );
         }
     };
+
+    if method != Method::POST {
+        return method_not_allowed_response(path, &method);
+    }
 
     // Read body
     let body = match axum::body::to_bytes(request.into_body(), 10 * 1024 * 1024).await {
@@ -1092,5 +1132,92 @@ mod tests {
         }
 
         assert!(client.captured_provider.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn t_s1_17_proxy_handler_non_post_supported_routes_with_valid_json_return_405_zero_forward(
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingClient {
+            count: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl UpstreamClient for CountingClient {
+            async fn forward(
+                &self,
+                _provider: Provider,
+                _request: ProxyRequest,
+            ) -> Result<ProxyResponse, ProxyError> {
+                self.count.fetch_add(1, Ordering::SeqCst);
+                Ok(ProxyResponse::from_bytes(
+                    StatusCode::OK,
+                    b"{\"ok\":true}".to_vec(),
+                ))
+            }
+        }
+
+        let client = Arc::new(CountingClient {
+            count: AtomicUsize::new(0),
+        });
+        let app = build_router(client.clone());
+        let valid_json = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#;
+
+        for path in [
+            "/v1/chat/completions",
+            "/openai/v1/chat/completions",
+            "/v1/messages",
+        ] {
+            for method in ["GET", "PUT", "DELETE"] {
+                let req = Request::builder()
+                    .method(method)
+                    .uri(format!("{path}?secret_query=should_not_echo"))
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer secret-token-should-not-echo")
+                    .body(Body::from(valid_json))
+                    .unwrap();
+                let resp = app.clone().oneshot(req).await.unwrap();
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "method={method} path={path}"
+                );
+                assert_eq!(
+                    resp.headers().get("allow").and_then(|v| v.to_str().ok()),
+                    Some("POST"),
+                    "method={method} path={path}"
+                );
+                assert_eq!(
+                    resp.headers()
+                        .get("content-type")
+                        .and_then(|v| v.to_str().ok()),
+                    Some("application/json"),
+                    "method={method} path={path}"
+                );
+                assert_eq!(
+                    resp.headers()
+                        .get("x-parapet-error")
+                        .and_then(|v| v.to_str().ok()),
+                    Some("method_not_allowed"),
+                    "method={method} path={path}"
+                );
+                let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(json["error"]["type"], "parapet_method_not_allowed");
+                assert_eq!(json["error"]["code"], "method_not_allowed");
+                let msg = json["error"]["message"].as_str().unwrap();
+                assert!(msg.contains(&format!("Method {method} is not allowed on {path}.")));
+                assert!(msg.contains("POST /v1/chat/completions"));
+                assert!(msg.contains("POST /openai/v1/chat/completions"));
+                assert!(msg.contains("POST /v1/messages"));
+                assert!(!msg.contains("secret_query"));
+                assert!(!msg.contains("secret-token-should-not-echo"));
+            }
+        }
+
+        assert_eq!(client.count.load(Ordering::SeqCst), 0);
     }
 }

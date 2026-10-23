@@ -39,7 +39,8 @@ use crate::effect::store::{
 use crate::effect::{EnvelopeResponseResultV0, EnvelopeResultSinkV0, FileEffectProfileV0, RunIdV0};
 #[cfg(not(windows))]
 use crate::engine::{
-    build_engine_client_with_runtime_v0, EngineRuntimeOptionsV0, OfflineUpstreamFixtureV0,
+    build_engine_client_with_runtime_and_upstream_v0, build_engine_client_with_runtime_v0,
+    EngineRuntimeOptionsV0, OfflineUpstreamFixtureV0, UpstreamTable, UpstreamValidationOptions,
 };
 #[cfg(not(windows))]
 use crate::receipt::receipt_projection;
@@ -155,6 +156,15 @@ struct RunArgs {
     /// Optional relative filename inside state-dir written when ready
     #[arg(long)]
     ready_file: Option<String>,
+
+    /// Override upstream base URL for a provider (`openai=<url>` or `anthropic=<url>`).
+    /// May be passed at most once per provider.
+    #[arg(long = "upstream", value_name = "PROVIDER=URL")]
+    upstream: Vec<String>,
+
+    /// Explicitly allow plain HTTP (`http://`) upstreams to literal loopback IPs (`127.0.0.0/8` or `[::1]`).
+    #[arg(long = "allow-loopback-http-upstream", default_value_t = false)]
+    allow_loopback_http_upstream: bool,
 }
 
 #[derive(Args)]
@@ -303,6 +313,30 @@ struct CliRunJsonV0<'a> {
     file_cleanup: &'static str,
     file_cleanup_label: &'static str,
     evidence_retained: bool,
+}
+
+#[cfg(not(windows))]
+#[derive(serde::Serialize)]
+struct CliUpstreamEndpointReadyJsonV0<'a> {
+    origin: &'a str,
+    mode: &'static str,
+    source: &'static str,
+}
+
+#[cfg(not(windows))]
+#[derive(serde::Serialize)]
+struct CliUpstreamsReadyMapJsonV0<'a> {
+    openai: CliUpstreamEndpointReadyJsonV0<'a>,
+    anthropic: CliUpstreamEndpointReadyJsonV0<'a>,
+}
+
+#[cfg(not(windows))]
+#[derive(serde::Serialize)]
+struct CliUpstreamReadyJsonV0<'a> {
+    schema: &'static str,
+    listen_addr: &'a str,
+    allow_loopback_http_upstream: bool,
+    upstreams: CliUpstreamsReadyMapJsonV0<'a>,
 }
 
 #[cfg(not(windows))]
@@ -999,6 +1033,17 @@ fn run_engine_cmd(args: RunArgs, json_mode: bool) -> i32 {
         }
     }
 
+    if offline_fixture.is_some() && (!args.upstream.is_empty() || args.allow_loopback_http_upstream)
+    {
+        return emit_cli_error(
+            "run",
+            "invalid_offline_fixture_combination",
+            2,
+            "--offline-fixture cannot be combined with --upstream or --allow-loopback-http-upstream",
+            json_mode,
+        );
+    }
+
     let Ok(cfg) = config::load_config(&config::FileSource {
         path: args.config.clone(),
     }) else {
@@ -1011,6 +1056,28 @@ fn run_engine_cmd(args: RunArgs, json_mode: bool) -> i32 {
         );
     };
     let config = std::sync::Arc::new(cfg);
+
+    let upstream_opts = UpstreamValidationOptions {
+        cli_upstreams: args.upstream.clone(),
+        allow_loopback_http_upstream: args.allow_loopback_http_upstream,
+        listener_port: if args.port != 0 {
+            Some(args.port)
+        } else {
+            None
+        },
+    };
+    let upstream_table = match UpstreamTable::from_process_env_with_options(&upstream_opts) {
+        Ok(table) => table,
+        Err(diag) => {
+            return emit_cli_error(
+                "run",
+                "upstream_config_invalid",
+                4,
+                &diag.to_string(),
+                json_mode,
+            );
+        }
+    };
 
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -1029,6 +1096,35 @@ fn run_engine_cmd(args: RunArgs, json_mode: bool) -> i32 {
     };
 
     rt.block_on(async move {
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], args.port));
+        let Ok(listener) = tokio::net::TcpListener::bind(addr).await else {
+            return emit_cli_error(
+                "run",
+                "bind_failed",
+                4,
+                "failed to bind local TCP listener",
+                json_mode,
+            );
+        };
+        let bound_port = listener.local_addr().map(|a| a.port()).unwrap_or(args.port);
+        if let Err(diag) = upstream_table.check_no_self_loop(bound_port) {
+            drop(listener);
+            return emit_cli_error(
+                "run",
+                "upstream_config_invalid",
+                4,
+                &diag.to_string(),
+                json_mode,
+            );
+        }
+
+        let openai_meta = upstream_table
+            .endpoint_metadata(crate::proxy::Provider::OpenAi)
+            .clone();
+        let anthropic_meta = upstream_table
+            .endpoint_metadata(crate::proxy::Provider::Anthropic)
+            .clone();
+
         let options = EngineRuntimeOptionsV0 {
             state_dir: args.state_dir.clone(),
             effect_root: args.effect_root.clone(),
@@ -1040,7 +1136,8 @@ fn run_engine_cmd(args: RunArgs, json_mode: bool) -> i32 {
         };
         let contract_hash = config.contract_hash.clone();
         let (client, _store, root_cap) =
-            match build_engine_client_with_runtime_v0(config, options) {
+            match build_engine_client_with_runtime_and_upstream_v0(config, options, upstream_table)
+            {
                 Ok(parts) => parts,
                 Err(crate::engine::StartupError::UpstreamConfig(diag)) => {
                     return emit_cli_error(
@@ -1067,17 +1164,6 @@ fn run_engine_cmd(args: RunArgs, json_mode: bool) -> i32 {
         let upstream: std::sync::Arc<dyn crate::proxy::UpstreamClient> =
             std::sync::Arc::new(client);
         let app = crate::proxy::build_router(upstream);
-        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], args.port));
-        let Ok(listener) = tokio::net::TcpListener::bind(addr).await else {
-            return emit_cli_error(
-                "run",
-                "bind_failed",
-                4,
-                "failed to bind local TCP listener",
-                json_mode,
-            );
-        };
-        let bound_port = listener.local_addr().map(|a| a.port()).unwrap_or(args.port);
 
         let Ok((plane, unix_listener, mut shutdown_rx)) = EngineControlPlane::bind(
             &args.state_dir,
@@ -1095,6 +1181,45 @@ fn run_engine_cmd(args: RunArgs, json_mode: bool) -> i32 {
         };
         plane.spawn_listener(unix_listener);
         plane.spawn_signal_gate();
+
+        if offline_fixture.is_none() {
+            if json_mode {
+                let listen_addr = format!("127.0.0.1:{bound_port}");
+                let ready_json = CliUpstreamReadyJsonV0 {
+                    schema: "parapet-upstream-ready/v0",
+                    listen_addr: &listen_addr,
+                    allow_loopback_http_upstream: args.allow_loopback_http_upstream,
+                    upstreams: CliUpstreamsReadyMapJsonV0 {
+                        openai: CliUpstreamEndpointReadyJsonV0 {
+                            origin: &openai_meta.sanitized_origin,
+                            mode: openai_meta.mode.as_str(),
+                            source: openai_meta.source.as_str(),
+                        },
+                        anthropic: CliUpstreamEndpointReadyJsonV0 {
+                            origin: &anthropic_meta.sanitized_origin,
+                            mode: anthropic_meta.mode.as_str(),
+                            source: anthropic_meta.source.as_str(),
+                        },
+                    },
+                };
+                if let Ok(mut bytes) = serde_json::to_vec(&ready_json) {
+                    bytes.push(b'\n');
+                    let _ = std::io::stderr().write_all(&bytes);
+                    let _ = std::io::stderr().flush();
+                }
+            } else {
+                eprintln!(
+                    "parapet listening on 127.0.0.1:{bound_port} (openai={} [mode={} source={}], anthropic={} [mode={} source={}])",
+                    openai_meta.sanitized_origin,
+                    openai_meta.mode.as_str(),
+                    openai_meta.source.as_str(),
+                    anthropic_meta.sanitized_origin,
+                    anthropic_meta.mode.as_str(),
+                    anthropic_meta.source.as_str()
+                );
+                let _ = std::io::stderr().flush();
+            }
+        }
 
         if let Some(ref ready_name) = args.ready_file {
             let _ = write_private_file(
