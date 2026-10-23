@@ -43,6 +43,15 @@ struct Cli {
     /// Optional ready-file basename inside state-dir written after listener bind
     #[arg(long)]
     ready_file: Option<String>,
+
+    /// Override upstream base URL for a provider (`openai=<url>` or `anthropic=<url>`).
+    /// May be passed at most once per provider.
+    #[arg(long = "upstream", value_name = "PROVIDER=URL")]
+    upstream: Vec<String>,
+
+    /// Explicitly allow plain HTTP (`http://`) upstreams to literal loopback IPs (`127.0.0.0/8` or `[::1]`).
+    #[arg(long = "allow-loopback-http-upstream", default_value_t = false)]
+    allow_loopback_http_upstream: bool,
 }
 
 #[tokio::main]
@@ -54,6 +63,66 @@ async fn main() {
         .init();
 
     let cli = Cli::parse();
+
+    if cli.offline_fixture.is_some()
+        && (!cli.upstream.is_empty() || cli.allow_loopback_http_upstream)
+    {
+        tracing::error!(
+            "--offline-fixture cannot be combined with --upstream or --allow-loopback-http-upstream"
+        );
+        std::process::exit(2);
+    }
+
+    #[cfg(windows)]
+    if cli.state_dir.is_some() || cli.effect_root.is_some() || cli.offline_fixture.is_some() {
+        tracing::error!("state-dir and effect-root are not supported on Windows");
+        std::process::exit(6);
+    }
+
+    #[cfg(not(windows))]
+    let (profile, offline_fixture) = if cli.state_dir.is_some() {
+        if let Some(ref ready_name) = cli.ready_file {
+            if ready_name.is_empty()
+                || ready_name.contains('/')
+                || ready_name.contains('\\')
+                || ready_name == "."
+                || ready_name == ".."
+            {
+                tracing::error!("invalid ready-file");
+                std::process::exit(2);
+            }
+        }
+        let profile = match cli.file_effect_profile.as_deref() {
+            None => None,
+            Some("v0") => Some(parapet::effect::FileEffectProfileV0::select_explicitly()),
+            Some(_) => {
+                tracing::error!("invalid file-effect-profile");
+                std::process::exit(2);
+            }
+        };
+        let offline_fixture = match cli.offline_fixture.as_deref() {
+            None => None,
+            Some(raw) => match engine::OfflineUpstreamFixtureV0::parse(raw) {
+                Some(f) => Some(f),
+                None => {
+                    tracing::error!("invalid offline-fixture");
+                    std::process::exit(2);
+                }
+            },
+        };
+        (profile, offline_fixture)
+    } else {
+        if cli.effect_root.is_some()
+            || cli.file_effect_profile.is_some()
+            || cli.max_content_bytes.is_some()
+            || cli.offline_fixture.is_some()
+            || cli.ready_file.is_some()
+        {
+            tracing::error!("runtime options require --state-dir");
+            std::process::exit(2);
+        }
+        (None, None)
+    };
 
     let addr = SocketAddr::from(([127, 0, 0, 1], cli.port));
     tracing::info!(%addr, "parapet starting");
@@ -77,14 +146,44 @@ async fn main() {
         "config loaded"
     );
 
+    let upstream_opts = engine::UpstreamValidationOptions {
+        cli_upstreams: cli.upstream.clone(),
+        allow_loopback_http_upstream: cli.allow_loopback_http_upstream,
+        listener_port: if cli.port != 0 { Some(cli.port) } else { None },
+    };
+    let upstream_table = match engine::UpstreamTable::from_process_env_with_options(&upstream_opts)
+    {
+        Ok(table) => table,
+        Err(e) => {
+            tracing::error!(%e, "engine startup failed");
+            std::process::exit(1);
+        }
+    };
+
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(_) => {
+            tracing::error!("failed to bind listener");
+            std::process::exit(1);
+        }
+    };
+    let bound_port = listener.local_addr().map(|a| a.port()).unwrap_or(cli.port);
+    if let Err(e) = upstream_table.check_no_self_loop(bound_port) {
+        drop(listener);
+        tracing::error!(%e, "engine startup failed");
+        std::process::exit(1);
+    }
+    let openai_meta = upstream_table
+        .endpoint_metadata(proxy::Provider::OpenAi)
+        .clone();
+    let anthropic_meta = upstream_table
+        .endpoint_metadata(proxy::Provider::Anthropic)
+        .clone();
+
     #[cfg(windows)]
     {
-        if cli.state_dir.is_some() || cli.effect_root.is_some() || cli.offline_fixture.is_some() {
-            tracing::error!("state-dir and effect-root are not supported on Windows");
-            std::process::exit(6);
-        }
         let upstream: std::sync::Arc<dyn proxy::UpstreamClient> =
-            match engine::build_engine_client(config) {
+            match engine::build_engine_client_with_upstream_table(config, upstream_table) {
                 Ok(client) => std::sync::Arc::new(client),
                 Err(e) => {
                     tracing::error!(%e, "engine startup failed");
@@ -92,10 +191,18 @@ async fn main() {
                 }
             };
         let app = proxy::build_router(upstream);
-        let listener = tokio::net::TcpListener::bind(addr)
-            .await
-            .expect("failed to bind to address");
-        tracing::info!(%addr, "parapet listening");
+        tracing::info!(
+            %addr,
+            bound_port,
+            allow_loopback_http_upstream = cli.allow_loopback_http_upstream,
+            openai_origin = %openai_meta.sanitized_origin,
+            openai_mode = openai_meta.mode.as_str(),
+            openai_source = openai_meta.source.as_str(),
+            anthropic_origin = %anthropic_meta.sanitized_origin,
+            anthropic_mode = anthropic_meta.mode.as_str(),
+            anthropic_source = anthropic_meta.source.as_str(),
+            "parapet listening"
+        );
         axum::serve(listener, app).await.expect("server error");
     }
 
@@ -104,35 +211,6 @@ async fn main() {
         use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
         if let Some(state_dir) = cli.state_dir {
-            if let Some(ref ready_name) = cli.ready_file {
-                if ready_name.is_empty()
-                    || ready_name.contains('/')
-                    || ready_name.contains('\\')
-                    || ready_name == "."
-                    || ready_name == ".."
-                {
-                    tracing::error!("invalid ready-file");
-                    std::process::exit(2);
-                }
-            }
-            let profile = match cli.file_effect_profile.as_deref() {
-                None => None,
-                Some("v0") => Some(parapet::effect::FileEffectProfileV0::select_explicitly()),
-                Some(_) => {
-                    tracing::error!("invalid file-effect-profile");
-                    std::process::exit(2);
-                }
-            };
-            let offline_fixture = match cli.offline_fixture.as_deref() {
-                None => None,
-                Some(raw) => match engine::OfflineUpstreamFixtureV0::parse(raw) {
-                    Some(f) => Some(f),
-                    None => {
-                        tracing::error!("invalid offline-fixture");
-                        std::process::exit(2);
-                    }
-                },
-            };
             if !state_dir.exists() {
                 if std::fs::DirBuilder::new()
                     .recursive(true)
@@ -174,7 +252,11 @@ async fn main() {
             };
             let contract_hash = config.contract_hash.clone();
             let (client, _store, root_cap) =
-                match engine::build_engine_client_with_runtime_v0(config, options) {
+                match engine::build_engine_client_with_runtime_and_upstream_v0(
+                    config,
+                    options,
+                    upstream_table,
+                ) {
                     Ok(parts) => parts,
                     Err(e) => {
                         tracing::error!(%e, "engine runtime initialization failed");
@@ -183,14 +265,6 @@ async fn main() {
                 };
             let upstream: std::sync::Arc<dyn proxy::UpstreamClient> = std::sync::Arc::new(client);
             let app = proxy::build_router(upstream);
-            let listener = match tokio::net::TcpListener::bind(addr).await {
-                Ok(l) => l,
-                Err(_) => {
-                    tracing::error!("failed to bind listener");
-                    std::process::exit(1);
-                }
-            };
-            let bound_port = listener.local_addr().map(|a| a.port()).unwrap_or(cli.port);
             let (plane, unix_listener, mut shutdown_rx) =
                 match parapet::cli::control::EngineControlPlane::bind(
                     &state_dir,
@@ -206,6 +280,18 @@ async fn main() {
                 };
             plane.spawn_listener(unix_listener);
             plane.spawn_signal_gate();
+            tracing::info!(
+                %addr,
+                bound_port,
+                allow_loopback_http_upstream = cli.allow_loopback_http_upstream,
+                openai_origin = %openai_meta.sanitized_origin,
+                openai_mode = openai_meta.mode.as_str(),
+                openai_source = openai_meta.source.as_str(),
+                anthropic_origin = %anthropic_meta.sanitized_origin,
+                anthropic_mode = anthropic_meta.mode.as_str(),
+                anthropic_source = anthropic_meta.source.as_str(),
+                "parapet listening"
+            );
             if let Some(ready_name) = cli.ready_file.as_deref() {
                 let _ = parapet::cli::control::write_private_file(
                     &state_dir,
@@ -213,7 +299,6 @@ async fn main() {
                     format!("{bound_port}\n").as_bytes(),
                 );
             }
-            tracing::info!(%addr, "parapet listening");
             let serve_res = axum::serve(listener, app)
                 .with_graceful_shutdown(async move {
                     let _ = shutdown_rx.changed().await;
@@ -224,17 +309,8 @@ async fn main() {
                 std::process::exit(1);
             }
         } else {
-            if cli.effect_root.is_some()
-                || cli.file_effect_profile.is_some()
-                || cli.max_content_bytes.is_some()
-                || cli.offline_fixture.is_some()
-                || cli.ready_file.is_some()
-            {
-                tracing::error!("runtime options require --state-dir");
-                std::process::exit(2);
-            }
             let upstream: std::sync::Arc<dyn proxy::UpstreamClient> =
-                match engine::build_engine_client(config) {
+                match engine::build_engine_client_with_upstream_table(config, upstream_table) {
                     Ok(client) => std::sync::Arc::new(client),
                     Err(e) => {
                         tracing::error!(%e, "engine startup failed");
@@ -242,10 +318,18 @@ async fn main() {
                     }
                 };
             let app = proxy::build_router(upstream);
-            let listener = tokio::net::TcpListener::bind(addr)
-                .await
-                .expect("failed to bind to address");
-            tracing::info!(%addr, "parapet listening");
+            tracing::info!(
+                %addr,
+                bound_port,
+                allow_loopback_http_upstream = cli.allow_loopback_http_upstream,
+                openai_origin = %openai_meta.sanitized_origin,
+                openai_mode = openai_meta.mode.as_str(),
+                openai_source = openai_meta.source.as_str(),
+                anthropic_origin = %anthropic_meta.sanitized_origin,
+                anthropic_mode = anthropic_meta.mode.as_str(),
+                anthropic_source = anthropic_meta.source.as_str(),
+                "parapet listening"
+            );
             axum::serve(listener, app).await.expect("server error");
         }
     }
