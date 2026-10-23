@@ -619,7 +619,11 @@ async fn r3_parapet_engine_refuses_old_litellm_doc_config_and_doc_contract_holds
     assert!(doc.contains("https://litellm.internal.example"));
     assert!(doc.contains("PARAPET_OPENAI_BASE_URL"));
     assert!(doc.contains("OPENAI_BASE_URL"));
-    assert!(doc.contains("not yet supported"));
+    assert!(doc.contains("--upstream \"openai=http://127.0.0.1:4000\""));
+    assert!(doc.contains("--allow-loopback-http-upstream"));
+    assert!(doc.contains("literal loopback IPs"));
+    assert!(!doc.contains("not yet supported"));
+    assert!(!doc.contains("planned behind an explicit flag"));
 }
 
 #[tokio::test]
@@ -1937,6 +1941,13 @@ async fn s1_e01_cli_run_loopback_http_refused_without_opt_in_flag() {
         stderr_str.contains("--upstream openai: non_https_upstream"),
         "stderr={stderr_str}"
     );
+    assert!(
+        stderr_str.contains("literal loopback IP")
+            && stderr_str.contains("--allow-loopback-http-upstream"),
+        "stderr must provide the current actionable opt-in guidance: {stderr_str}"
+    );
+    assert!(!stderr_str.contains("planned behind an explicit flag"));
+    assert!(!stderr_str.contains("not supported in this release"));
     assert!(!stdout_str.contains("127.0.0.1") && !stderr_str.contains("127.0.0.1"));
     assert!(!stdout_str.contains(&port_str) && !stderr_str.contains(&port_str));
 }
@@ -2044,6 +2055,17 @@ async fn s1_e03_cli_run_fallback_openai_base_url_http_refused_with_opt_in() {
         stderr_str.contains("OPENAI_BASE_URL: fallback_key_http_forbidden"),
         "stderr={stderr_str}"
     );
+    assert!(
+        stderr_str.contains("ambient fallback environment variables")
+            && stderr_str.contains("cannot enable plain http://")
+            && stderr_str.contains("--upstream <provider>=http://<literal-loopback-IP>:<port>")
+            && stderr_str.contains("PARAPET_<PROVIDER>_BASE_URL")
+            && stderr_str.contains("together with --allow-loopback-http-upstream")
+            && stderr_str.contains("otherwise use https:// or remove the fallback variable"),
+        "fallback guidance must require an explicit/primary destination plus the opt-in flag: {stderr_str}"
+    );
+    assert!(!stderr_str.contains("planned behind an explicit flag"));
+    assert!(!stderr_str.contains("not supported in this release"));
     let port_str = recorder.addr.port().to_string();
     assert!(!stderr_str.contains(&port_str), "stderr={stderr_str}");
     assert!(!stderr_str.contains(&fallback_url), "stderr={stderr_str}");

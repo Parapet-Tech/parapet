@@ -1845,11 +1845,11 @@ impl std::fmt::Debug for UpstreamConfigError {
 impl std::error::Error for UpstreamConfigError {}
 
 const FIX_NON_HTTPS_UPSTREAM: &str =
-    "plain-HTTP upstreams are not supported in this release; use an https:// URL (loopback HTTP support is planned behind an explicit flag)";
+    "plain http:// is allowed only for a literal loopback IP (127.0.0.0/8 or [::1]) with --allow-loopback-http-upstream; otherwise use an https:// URL";
 const FIX_NON_HTTPS_OPENAI_FALLBACK: &str =
-    "plain-HTTP upstreams are not supported in this release; use an https:// URL (loopback HTTP support is planned behind an explicit flag); set PARAPET_OPENAI_BASE_URL=https://api.openai.com to keep the hosted default, or remove OPENAI_BASE_URL from the engine's environment";
+    "OPENAI_BASE_URL cannot enable plain http://; for a local target pass --upstream openai=http://<literal-loopback-IP>:<port> or set PARAPET_OPENAI_BASE_URL to that literal-loopback URL, together with --allow-loopback-http-upstream; otherwise use https:// or remove OPENAI_BASE_URL from the engine's environment";
 const FIX_NON_HTTPS_ANTHROPIC_FALLBACK: &str =
-    "plain-HTTP upstreams are not supported in this release; use an https:// URL (loopback HTTP support is planned behind an explicit flag); set PARAPET_ANTHROPIC_BASE_URL=https://api.anthropic.com to keep the hosted default, or remove ANTHROPIC_BASE_URL from the engine's environment";
+    "ANTHROPIC_BASE_URL cannot enable plain http://; for a local target pass --upstream anthropic=http://<literal-loopback-IP>:<port> or set PARAPET_ANTHROPIC_BASE_URL to that literal-loopback URL, together with --allow-loopback-http-upstream; otherwise use https:// or remove ANTHROPIC_BASE_URL from the engine's environment";
 const FIX_EMPTY_URL: &str =
     "unset the environment variable to keep the default https:// upstream, or set it to a valid https:// URL";
 const FIX_EMPTY_OPENAI_FALLBACK: &str =
@@ -1877,7 +1877,7 @@ const FIX_UPSTREAM_PROVIDER_NAME: &str =
     "supported --upstream providers in Stage 1 are 'openai' and 'anthropic'";
 const FIX_DUPLICATE_UPSTREAM_FLAG: &str = "specify --upstream for each provider at most once";
 const FIX_FALLBACK_KEY_HTTP: &str =
-    "ambient fallback environment variables (OPENAI_BASE_URL, ANTHROPIC_BASE_URL) cannot enable plain http://; pass --upstream <provider>=http://127.0.0.1:<port> or set PARAPET_<PROVIDER>_BASE_URL with --allow-loopback-http-upstream";
+    "ambient fallback environment variables (OPENAI_BASE_URL, ANTHROPIC_BASE_URL) cannot enable plain http://; for a local target pass --upstream <provider>=http://<literal-loopback-IP>:<port> or set PARAPET_<PROVIDER>_BASE_URL to that literal-loopback URL, together with --allow-loopback-http-upstream; otherwise use https:// or remove the fallback variable";
 const FIX_LOOPBACK_LITERAL_IP: &str =
     "use a literal loopback IP such as http://127.0.0.1:<port> or http://[::1]:<port>; DNS 'localhost' is refused for plain HTTP";
 const FIX_NON_LOOPBACK_HTTP: &str =
