@@ -1296,7 +1296,6 @@ impl EngineUpstreamClient {
                     request_id: Some(ctx.request_id.clone()),
                     contract_hash: Some(ctx.contract_hash.clone()),
                     provider: Some(ctx.provider_str),
-                    model: Some(ctx.model.clone()),
                 };
                 apply_streaming_redaction_with_context(
                     processed_stream,
@@ -4530,7 +4529,7 @@ impl SseProtocol {
 
 /// Stable top-level diagnostic code for L5a streaming content suppression.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StreamL5aSuppressionCode {
+enum StreamL5aSuppressionCode {
     /// Buffered decoded text exceeded `MAX_STREAM_REDACTION_BUFFER_CHARS` (64 KiB / 65,536 chars).
     DecodedContentOverCap,
     /// SSE framing, JSON payload, or protocol boundary state was malformed or ambiguous.
@@ -4540,7 +4539,7 @@ pub enum StreamL5aSuppressionCode {
 }
 
 impl StreamL5aSuppressionCode {
-    pub const fn as_str(self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
             Self::DecodedContentOverCap => "l5a_stream_decoded_content_over_cap",
             Self::MalformedOrAmbiguousSse => "l5a_stream_malformed_or_ambiguous_sse",
@@ -4551,7 +4550,7 @@ impl StreamL5aSuppressionCode {
 
 /// Non-secret, deterministic sub-reason for L5a streaming response suppression.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StreamL5aSuppressionReason {
+enum StreamL5aSuppressionReason {
     /// SSE decoded text deltas exceeded the 64 KiB (65,536-char) redaction buffer cap.
     SseDecodedContentOverCap,
     /// Plain-text stream exceeded the 64 KiB (65,536-char) redaction buffer cap.
@@ -4579,7 +4578,7 @@ pub enum StreamL5aSuppressionReason {
 }
 
 impl StreamL5aSuppressionReason {
-    pub const fn code(self) -> StreamL5aSuppressionCode {
+    const fn code(self) -> StreamL5aSuppressionCode {
         match self {
             Self::SseDecodedContentOverCap | Self::PlainTextDecodedContentOverCap => {
                 StreamL5aSuppressionCode::DecodedContentOverCap
@@ -4601,7 +4600,7 @@ impl StreamL5aSuppressionReason {
         }
     }
 
-    pub const fn detail(self) -> &'static str {
+    const fn detail(self) -> &'static str {
         match self {
             Self::SseDecodedContentOverCap => "sse_decoded_content_over_cap",
             Self::PlainTextDecodedContentOverCap => "plain_text_decoded_content_over_cap",
@@ -4626,7 +4625,6 @@ struct StreamL5aDiagnosticContext {
     request_id: Option<String>,
     contract_hash: Option<String>,
     provider: Option<&'static str>,
-    model: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -5029,17 +5027,15 @@ fn emit_stream_l5a_suppression_diagnostic(
     let sse_protocol = state.sse_protocol.as_str();
     let sensitive_regex_enabled = state.sensitive_regex_enabled;
 
-    if let (Some(request_id), Some(contract_hash), Some(provider), Some(model)) = (
+    if let (Some(request_id), Some(contract_hash), Some(provider)) = (
         state.diag_ctx.request_id.as_deref(),
         state.diag_ctx.contract_hash.as_deref(),
         state.diag_ctx.provider,
-        state.diag_ctx.model.as_deref(),
     ) {
         tracing::warn!(
             request_id = %request_id,
             contract_hash = %contract_hash,
             provider = provider,
-            model = %model,
             layer = "L5a",
             mode = "streaming",
             verdict = "suppress",

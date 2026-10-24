@@ -5905,6 +5905,35 @@ fn streaming_l5a_suppression_reason_taxonomy_mapping() {
 
 #[tokio::test]
 async fn streaming_l5a_diagnostics_emit_once_per_stream_reason_coded_and_non_secret() {
+    const CHILD_ENV: &str = "PARAPET_STREAMING_L5A_DIAG_CHILD";
+    if std::env::var_os(CHILD_ENV).is_none() {
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("locate current Rust test executable"),
+        )
+        .arg("--exact")
+        .arg("engine::tests::streaming_l5a_diagnostics_emit_once_per_stream_reason_coded_and_non_secret")
+        .arg("--nocapture")
+        .env(CHILD_ENV, "1")
+        .output()
+        .expect("spawn isolated streaming L5a diagnostic test child process");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "isolated streaming L5a diagnostic child failed with {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            stdout,
+            stderr,
+        );
+        assert!(
+            stdout.contains("running 1 test") && stdout.contains("1 passed; 0 failed"),
+            "isolated streaming L5a diagnostic child did not execute exactly 1 passing test\nstdout:\n{}\nstderr:\n{}",
+            stdout,
+            stderr,
+        );
+        return;
+    }
+
     let secret_canary = "CANARY_DIAG_99182736";
     let secret_token = "BEGIN_SECRET_DIAG_TOKEN_887766_END_SECRET";
     let secret_url = "https://internal-secret.example/v1/keys";
@@ -5974,13 +6003,18 @@ async fn streaming_l5a_diagnostics_emit_once_per_stream_reason_coded_and_non_sec
             sse_chunks,
         ));
         let engine = engine_with_http_sender(make_cfg(), sender);
-        let resp = engine
-            .forward(
-                Provider::OpenAi,
-                openai_request_with_stream(true, HeaderMap::new()),
-            )
-            .await
-            .unwrap();
+        let req_body = serde_json::json!({
+            "model": format!("gpt-4o-{secret_canary}-{secret_token}-{secret_url}-{secret_path}"),
+            "stream": true,
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let req = ProxyRequest {
+            method: Method::POST,
+            uri: Uri::from_static("/v1/chat/completions"),
+            headers: HeaderMap::new(),
+            body: Bytes::from(serde_json::to_vec(&req_body).unwrap()),
+        };
+        let resp = engine.forward(Provider::OpenAi, req).await.unwrap();
         let body = collect_proxy_body(resp).await;
         let body_text = String::from_utf8_lossy(&body);
         assert!(reassemble_openai_sse_deltas(&body_text).is_empty());
@@ -5996,6 +6030,10 @@ async fn streaming_l5a_diagnostics_emit_once_per_stream_reason_coded_and_non_sec
         assert!(log.contains("reason_code=\"l5a_stream_decoded_content_over_cap\""));
         assert!(log.contains("detail=\"sse_decoded_content_over_cap\""));
         assert!(log.contains("stream_mode=\"sse\""));
+        assert!(
+            !log.contains("model="),
+            "diagnostic log must omit client-controlled model field: {log}"
+        );
         assert_no_secrets_in_log(&log, "sse_over_cap");
     }
 
