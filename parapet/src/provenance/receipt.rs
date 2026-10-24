@@ -21,7 +21,7 @@ pub struct SegmentReceipt {
     pub start: usize,
     pub end: usize,
     pub source: Source,
-    pub sha256: Sha256Digest,
+    pub sha256: Option<Sha256Digest>,
     pub scanned: bool,
     pub exemption: Option<ExemptionReason>,
 }
@@ -53,7 +53,7 @@ impl CarrierReceipt {
                     start: s.start,
                     end: s.end,
                     source: s.source,
-                    sha256: s.sha256,
+                    sha256: matches!(treatment, Treatment::Exempt(_)).then_some(s.sha256),
                     scanned: treatment.is_untrusted(),
                     exemption: match treatment {
                         Treatment::Exempt(reason) => Some(reason),

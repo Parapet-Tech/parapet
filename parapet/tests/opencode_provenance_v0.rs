@@ -452,6 +452,8 @@ fn valid_carrier_verifies_and_receipt_is_structural() {
             (true, None),
         ]
     );
+    assert!(receipt.segments[0].sha256.is_some());
+    assert!(receipt.segments[1..].iter().all(|s| s.sha256.is_none()));
 }
 
 // ---------- verifier: profile gate ----------
@@ -1155,6 +1157,7 @@ fn failures_receipts_and_debug_output_carry_no_content_or_secrets() {
         .unwrap()
         .to_string();
     let key_text = String::from_utf8_lossy(KEY).to_string();
+    let user_digest = Sha256Digest::of(USER.as_bytes()).to_hex();
     let forbidden = [
         "CANARY-REPO-7f3a",
         "CANARY-USER-91c2",
@@ -1173,7 +1176,8 @@ fn failures_receipts_and_debug_output_carry_no_content_or_secrets() {
     let inputs = project(&geometry_of(&verified));
     rendered.push(format!("{inputs:?}"));
     let report = scan(&inputs, &RecordingScorer::new(|_| true));
-    rendered.push(serde_json::to_string(&CarrierReceipt::verified(&verified, &report)).unwrap());
+    let mut receipts =
+        vec![serde_json::to_string(&CarrierReceipt::verified(&verified, &report)).unwrap()];
 
     let mut failures = vec![
         h.verifier.verify(None, &body).unwrap_err(),
@@ -1205,10 +1209,21 @@ fn failures_receipts_and_debug_output_carry_no_content_or_secrets() {
     );
 
     for e in &failures {
-        rendered.push(e.to_string());
-        rendered.push(format!("{e:?}"));
-        rendered.push(serde_json::to_string(&CarrierReceipt::rejected(e)).unwrap());
+        let display = e.to_string();
+        let debug = format!("{e:?}");
+        assert!(!display.contains(&user_digest));
+        assert!(!debug.contains(&user_digest));
+        rendered.push(display);
+        rendered.push(debug);
+        receipts.push(serde_json::to_string(&CarrierReceipt::rejected(e)).unwrap());
     }
+    for receipt in &receipts {
+        assert!(
+            !receipt.contains(&user_digest),
+            "leaked user segment digest in {receipt}"
+        );
+    }
+    rendered.extend(receipts);
 
     for text in &rendered {
         for needle in forbidden
