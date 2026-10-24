@@ -5813,3 +5813,318 @@ async fn streaming_l5a_leading_id_retry_comment_bom_and_split_prefixes_redact_ac
         );
     }
 }
+
+#[test]
+fn streaming_l5a_suppression_reason_taxonomy_mapping() {
+    let over_cap_cases = [
+        (
+            StreamL5aSuppressionReason::SseDecodedContentOverCap,
+            "sse_decoded_content_over_cap",
+        ),
+        (
+            StreamL5aSuppressionReason::PlainTextDecodedContentOverCap,
+            "plain_text_decoded_content_over_cap",
+        ),
+    ];
+    for (reason, expected_detail) in over_cap_cases {
+        assert_eq!(
+            reason.code(),
+            StreamL5aSuppressionCode::DecodedContentOverCap
+        );
+        assert_eq!(
+            reason.code().as_str(),
+            "l5a_stream_decoded_content_over_cap"
+        );
+        assert_eq!(reason.detail(), expected_detail);
+    }
+
+    let sse_fail_closed_cases = [
+        (
+            StreamL5aSuppressionReason::OverlongSseLine,
+            "overlong_sse_line",
+        ),
+        (
+            StreamL5aSuppressionReason::IncompleteSseLineAtEof,
+            "incomplete_sse_line_at_eof",
+        ),
+        (
+            StreamL5aSuppressionReason::UnpairedSseEventLine,
+            "unpaired_sse_event_line",
+        ),
+        (
+            StreamL5aSuppressionReason::MalformedSseFieldLine,
+            "malformed_sse_field_line",
+        ),
+        (
+            StreamL5aSuppressionReason::MalformedSseDataJson,
+            "malformed_sse_data_json",
+        ),
+        (
+            StreamL5aSuppressionReason::MalformedOrAmbiguousSsePayload,
+            "malformed_or_ambiguous_sse_payload",
+        ),
+        (
+            StreamL5aSuppressionReason::SseProtocolOrBoundaryViolation,
+            "sse_protocol_or_boundary_violation",
+        ),
+        (
+            StreamL5aSuppressionReason::UnterminatedSseContentAtEof,
+            "unterminated_sse_content_at_eof",
+        ),
+        (
+            StreamL5aSuppressionReason::DeferredSseEventCapExceeded,
+            "deferred_sse_event_cap_exceeded",
+        ),
+    ];
+    for (reason, expected_detail) in sse_fail_closed_cases {
+        assert_eq!(
+            reason.code(),
+            StreamL5aSuppressionCode::MalformedOrAmbiguousSse
+        );
+        assert_eq!(
+            reason.code().as_str(),
+            "l5a_stream_malformed_or_ambiguous_sse"
+        );
+        assert_eq!(reason.detail(), expected_detail);
+    }
+
+    let upstream_err = StreamL5aSuppressionReason::UpstreamErrorEventWithBufferedContent;
+    assert_eq!(
+        upstream_err.code(),
+        StreamL5aSuppressionCode::UpstreamErrorInterrupted
+    );
+    assert_eq!(
+        upstream_err.code().as_str(),
+        "l5a_stream_upstream_error_interrupted"
+    );
+    assert_eq!(
+        upstream_err.detail(),
+        "upstream_error_event_with_buffered_content"
+    );
+}
+
+#[tokio::test]
+async fn streaming_l5a_diagnostics_emit_once_per_stream_reason_coded_and_non_secret() {
+    let secret_canary = "CANARY_DIAG_99182736";
+    let secret_token = "BEGIN_SECRET_DIAG_TOKEN_887766_END_SECRET";
+    let secret_url = "https://internal-secret.example/v1/keys";
+    let secret_path = "/home/user/.ssh/id_ed25519_diag";
+
+    let make_cfg = || {
+        let mut cfg = streaming_l5a_config(secret_canary);
+        cfg.policy.sensitive_patterns =
+            vec![CompiledPattern::compile(r"BEGIN_SECRET_[A-Z0-9_]+_END_SECRET").unwrap()];
+        cfg.policy.layers.l5a = Some(LayerConfig {
+            mode: "redact".to_string(),
+            block_action: None,
+            window_chars: Some(64),
+        });
+        cfg
+    };
+
+    let capture_logs = || {
+        let writer = SharedLogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (writer, guard)
+    };
+
+    let assert_no_secrets_in_log = |log: &str, case_label: &str| {
+        for forbidden in [
+            secret_canary,
+            secret_token,
+            "DIAG_TOKEN_887766",
+            secret_url,
+            secret_path,
+            "BBBBBBBB",
+        ] {
+            assert!(
+                !log.contains(forbidden),
+                "{case_label}: diagnostic log leaked sensitive material `{forbidden}`: {log}"
+            );
+        }
+    };
+
+    // 1. SSE decoded-content-over-cap via EngineUpstreamClient::forward (20 chunks > 64 KiB)
+    {
+        let (writer, _guard) = capture_logs();
+        let chunk_payload = "B".repeat(4096);
+        let mut sse_chunks = vec![Bytes::from(format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{secret_canary} {secret_token} {secret_url} {secret_path} \"}}}}]}}\n\n"
+        ))];
+        for _ in 0..20 {
+            sse_chunks.push(Bytes::from(format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{chunk_payload}\"}}}}]}}\n\n"
+            )));
+        }
+        sse_chunks.push(Bytes::from(
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        ));
+        sse_chunks.push(Bytes::from("data: [DONE]\n\n"));
+
+        let mut resp_headers = HeaderMap::new();
+        resp_headers.insert("content-type", "text/event-stream".parse().unwrap());
+        let sender = Arc::new(RecordingHttpSender::with_stream_response(
+            resp_headers,
+            sse_chunks,
+        ));
+        let engine = engine_with_http_sender(make_cfg(), sender);
+        let resp = engine
+            .forward(
+                Provider::OpenAi,
+                openai_request_with_stream(true, HeaderMap::new()),
+            )
+            .await
+            .unwrap();
+        let body = collect_proxy_body(resp).await;
+        let body_text = String::from_utf8_lossy(&body);
+        assert!(reassemble_openai_sse_deltas(&body_text).is_empty());
+        assert!(body_text.contains("data: [DONE]"));
+
+        let log = String::from_utf8(writer.buf.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            log.matches("L5a streaming response content suppressed")
+                .count(),
+            1,
+            "expected exactly one suppression diagnostic for over-cap SSE stream, got: {log}"
+        );
+        assert!(log.contains("reason_code=\"l5a_stream_decoded_content_over_cap\""));
+        assert!(log.contains("detail=\"sse_decoded_content_over_cap\""));
+        assert!(log.contains("stream_mode=\"sse\""));
+        assert_no_secrets_in_log(&log, "sse_over_cap");
+    }
+
+    // 2. Plain-text decoded-content-over-cap across multiple chunks + EOF
+    {
+        let (writer, _guard) = capture_logs();
+        let scanner: Arc<dyn OutputScanner> = Arc::new(L5aScanner);
+        let config = Arc::new(make_cfg());
+        let chunk_payload = "B".repeat(8192);
+        let mut plain_chunks = vec![Bytes::from(format!(
+            "{secret_canary} {secret_token} {secret_url} {secret_path} "
+        ))];
+        for _ in 0..10 {
+            plain_chunks.push(Bytes::from(chunk_payload.clone()));
+        }
+        let out = collect_stream(apply_streaming_redaction(
+            stream::iter(plain_chunks),
+            scanner,
+            config,
+            Some(64),
+        ))
+        .await;
+        assert!(out.is_empty());
+
+        let log = String::from_utf8(writer.buf.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            log.matches("L5a streaming response content suppressed")
+                .count(),
+            1,
+            "expected exactly one suppression diagnostic for over-cap plain-text stream, got: {log}"
+        );
+        assert!(log.contains("reason_code=\"l5a_stream_decoded_content_over_cap\""));
+        assert!(log.contains("detail=\"plain_text_decoded_content_over_cap\""));
+        assert!(log.contains("stream_mode=\"plain_text\""));
+        assert_no_secrets_in_log(&log, "plain_text_over_cap");
+    }
+
+    // 3. Malformed/ambiguous SSE fail-closed variants each emit once and never log secret content
+    let sse_failure_matrix: Vec<(&str, Vec<Bytes>, &str)> = vec![
+        (
+            "malformed_json",
+            vec![
+                Bytes::from(format!(
+                    "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{secret_canary}\"}}}}]}}\n\n"
+                )),
+                Bytes::from(format!(
+                    "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{secret_token} {secret_url}\"\n\n"
+                )),
+                Bytes::from(format!(
+                    "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{secret_path}\"}}}}]}}\n\n"
+                )),
+                Bytes::from("data: [DONE]\n\n"),
+            ],
+            "malformed_sse_data_json",
+        ),
+        (
+            "ambiguous_payload",
+            vec![
+                Bytes::from(format!(
+                    "data: {{\"choices\":[{{\"delta\":{{\"content\":[\"{secret_canary}\",\"{secret_token}\"]}}}}]}}\n\n"
+                )),
+                Bytes::from("data: [DONE]\n\n"),
+            ],
+            "malformed_or_ambiguous_sse_payload",
+        ),
+        (
+            "overlong_line",
+            vec![
+                Bytes::from(format!(
+                    "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{secret_canary}\"}}}}]}}\n\n"
+                )),
+                Bytes::from(format!(
+                    "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{secret_token}{}\"",
+                    "B".repeat(MAX_SSE_RAW_LINE_CHARS + 64)
+                )),
+                Bytes::from(format!("{secret_url} {secret_path}\"}}}}]\n\n")),
+                Bytes::from("data: [DONE]\n\n"),
+            ],
+            "overlong_sse_line",
+        ),
+        (
+            "protocol_violation",
+            vec![
+                Bytes::from("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"),
+                Bytes::from(format!(
+                    "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{secret_token} {secret_path}\"}}}}]}}\n\n"
+                )),
+                Bytes::from("data: [DONE]\n\n"),
+            ],
+            "sse_protocol_or_boundary_violation",
+        ),
+        (
+            "truncated_at_eof",
+            vec![Bytes::from(format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{secret_canary} {secret_token}\"}}}}]}}\n\n"
+            ))],
+            "unterminated_sse_content_at_eof",
+        ),
+    ];
+
+    for (case_label, chunks, expected_detail) in sse_failure_matrix {
+        let (writer, _guard) = capture_logs();
+        let scanner: Arc<dyn OutputScanner> = Arc::new(L5aScanner);
+        let config = Arc::new(make_cfg());
+        let out = collect_stream(apply_streaming_redaction(
+            stream::iter(chunks),
+            scanner,
+            config,
+            Some(64),
+        ))
+        .await;
+        assert!(!out.contains(secret_canary), "{case_label}: leaked canary");
+        assert!(!out.contains(secret_token), "{case_label}: leaked token");
+
+        let log = String::from_utf8(writer.buf.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            log.matches("L5a streaming response content suppressed")
+                .count(),
+            1,
+            "{case_label}: expected exactly one suppression diagnostic, got: {log}"
+        );
+        assert!(
+            log.contains("reason_code=\"l5a_stream_malformed_or_ambiguous_sse\""),
+            "{case_label}: missing reason_code in {log}"
+        );
+        assert!(
+            log.contains(&format!("detail=\"{expected_detail}\"")),
+            "{case_label}: expected detail={expected_detail} in {log}"
+        );
+        assert_no_secrets_in_log(&log, case_label);
+    }
+}

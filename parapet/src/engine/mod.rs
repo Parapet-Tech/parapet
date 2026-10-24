@@ -1292,12 +1292,19 @@ impl EngineUpstreamClient {
                     mode = "streaming",
                     "L5a streaming redaction active"
                 );
-                apply_streaming_redaction_with_mode(
+                let diag_ctx = StreamL5aDiagnosticContext {
+                    request_id: Some(ctx.request_id.clone()),
+                    contract_hash: Some(ctx.contract_hash.clone()),
+                    provider: Some(ctx.provider_str),
+                    model: Some(ctx.model.clone()),
+                };
+                apply_streaming_redaction_with_context(
                     processed_stream,
                     self.deps.output_scanner.clone(),
                     self.deps.config.clone(),
                     layer.window_chars,
                     known_sse,
+                    diag_ctx,
                 )
             } else {
                 Box::pin(processed_stream) as Pin<Box<dyn Stream<Item = Bytes> + Send>>
@@ -4488,6 +4495,16 @@ enum StreamRedactionMode {
     Sse,
 }
 
+impl StreamRedactionMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Undetermined => "undetermined",
+            Self::PlainText => "plain_text",
+            Self::Sse => "sse",
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SseLineState {
     Normal,
@@ -4499,6 +4516,117 @@ enum SseProtocol {
     Undetermined,
     OpenAi,
     Anthropic,
+}
+
+impl SseProtocol {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Undetermined => "undetermined",
+            Self::OpenAi => "openai",
+            Self::Anthropic => "anthropic",
+        }
+    }
+}
+
+/// Stable top-level diagnostic code for L5a streaming content suppression.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamL5aSuppressionCode {
+    /// Buffered decoded text exceeded `MAX_STREAM_REDACTION_BUFFER_CHARS` (64 KiB / 65,536 chars).
+    DecodedContentOverCap,
+    /// SSE framing, JSON payload, or protocol boundary state was malformed or ambiguous.
+    MalformedOrAmbiguousSse,
+    /// Upstream SSE `error` event interrupted uncommitted buffered text content.
+    UpstreamErrorInterrupted,
+}
+
+impl StreamL5aSuppressionCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DecodedContentOverCap => "l5a_stream_decoded_content_over_cap",
+            Self::MalformedOrAmbiguousSse => "l5a_stream_malformed_or_ambiguous_sse",
+            Self::UpstreamErrorInterrupted => "l5a_stream_upstream_error_interrupted",
+        }
+    }
+}
+
+/// Non-secret, deterministic sub-reason for L5a streaming response suppression.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamL5aSuppressionReason {
+    /// SSE decoded text deltas exceeded the 64 KiB (65,536-char) redaction buffer cap.
+    SseDecodedContentOverCap,
+    /// Plain-text stream exceeded the 64 KiB (65,536-char) redaction buffer cap.
+    PlainTextDecodedContentOverCap,
+    /// Raw SSE line exceeded the 64 KiB (65,536-char) line cap.
+    OverlongSseLine,
+    /// Trailing SSE line at EOF had no terminating newline.
+    IncompleteSseLineAtEof,
+    /// `event:` line was not paired with a following `data:` line before blank line, next `event:`, or EOF.
+    UnpairedSseEventLine,
+    /// Unrecognized non-SSE line encountered after stream entered SSE mode.
+    MalformedSseFieldLine,
+    /// SSE `data:` payload was neither `[DONE]` nor a valid JSON object.
+    MalformedSseDataJson,
+    /// SSE JSON payload had ambiguous or unsupported content/delta structure.
+    MalformedOrAmbiguousSsePayload,
+    /// SSE stream violated OpenAI/Anthropic protocol ordering or terminal boundary state.
+    SseProtocolOrBoundaryViolation,
+    /// SSE stream reached EOF with buffered content or an open block before a terminal boundary.
+    UnterminatedSseContentAtEof,
+    /// Non-content SSE events deferred behind buffered content exceeded `MAX_DEFERRED_SSE_EVENTS`.
+    DeferredSseEventCapExceeded,
+    /// Upstream SSE `error` event arrived while content was buffered or a text block was open.
+    UpstreamErrorEventWithBufferedContent,
+}
+
+impl StreamL5aSuppressionReason {
+    pub const fn code(self) -> StreamL5aSuppressionCode {
+        match self {
+            Self::SseDecodedContentOverCap | Self::PlainTextDecodedContentOverCap => {
+                StreamL5aSuppressionCode::DecodedContentOverCap
+            }
+            Self::OverlongSseLine
+            | Self::IncompleteSseLineAtEof
+            | Self::UnpairedSseEventLine
+            | Self::MalformedSseFieldLine
+            | Self::MalformedSseDataJson
+            | Self::MalformedOrAmbiguousSsePayload
+            | Self::SseProtocolOrBoundaryViolation
+            | Self::UnterminatedSseContentAtEof
+            | Self::DeferredSseEventCapExceeded => {
+                StreamL5aSuppressionCode::MalformedOrAmbiguousSse
+            }
+            Self::UpstreamErrorEventWithBufferedContent => {
+                StreamL5aSuppressionCode::UpstreamErrorInterrupted
+            }
+        }
+    }
+
+    pub const fn detail(self) -> &'static str {
+        match self {
+            Self::SseDecodedContentOverCap => "sse_decoded_content_over_cap",
+            Self::PlainTextDecodedContentOverCap => "plain_text_decoded_content_over_cap",
+            Self::OverlongSseLine => "overlong_sse_line",
+            Self::IncompleteSseLineAtEof => "incomplete_sse_line_at_eof",
+            Self::UnpairedSseEventLine => "unpaired_sse_event_line",
+            Self::MalformedSseFieldLine => "malformed_sse_field_line",
+            Self::MalformedSseDataJson => "malformed_sse_data_json",
+            Self::MalformedOrAmbiguousSsePayload => "malformed_or_ambiguous_sse_payload",
+            Self::SseProtocolOrBoundaryViolation => "sse_protocol_or_boundary_violation",
+            Self::UnterminatedSseContentAtEof => "unterminated_sse_content_at_eof",
+            Self::DeferredSseEventCapExceeded => "deferred_sse_event_cap_exceeded",
+            Self::UpstreamErrorEventWithBufferedContent => {
+                "upstream_error_event_with_buffered_content"
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct StreamL5aDiagnosticContext {
+    request_id: Option<String>,
+    contract_hash: Option<String>,
+    provider: Option<&'static str>,
+    model: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -4587,6 +4715,9 @@ struct StreamingRedactionState {
     buffered_chars: usize,
     content_suppressed: bool,
     stream_failed_closed: bool,
+    suppression_reason: Option<StreamL5aSuppressionReason>,
+    sensitive_regex_enabled: bool,
+    diag_ctx: StreamL5aDiagnosticContext,
     deferred_events: Vec<(Option<String>, String)>,
     out_queue: std::collections::VecDeque<Bytes>,
     swallow_next_blank: bool,
@@ -4611,12 +4742,31 @@ fn apply_streaming_redaction(
     apply_streaming_redaction_with_mode(input, scanner, config, window_override, false)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn apply_streaming_redaction_with_mode(
     input: impl Stream<Item = Bytes> + Send + 'static,
     scanner: Arc<dyn OutputScanner>,
     config: Arc<Config>,
     window_override: Option<usize>,
     known_sse: bool,
+) -> Pin<Box<dyn Stream<Item = Bytes> + Send>> {
+    apply_streaming_redaction_with_context(
+        input,
+        scanner,
+        config,
+        window_override,
+        known_sse,
+        StreamL5aDiagnosticContext::default(),
+    )
+}
+
+fn apply_streaming_redaction_with_context(
+    input: impl Stream<Item = Bytes> + Send + 'static,
+    scanner: Arc<dyn OutputScanner>,
+    config: Arc<Config>,
+    window_override: Option<usize>,
+    known_sse: bool,
+    diag_ctx: StreamL5aDiagnosticContext,
 ) -> Pin<Box<dyn Stream<Item = Bytes> + Send>> {
     let base_window = window_override.unwrap_or_else(|| compute_redaction_window(&config));
     let min_canary_window = config
@@ -4649,6 +4799,9 @@ fn apply_streaming_redaction_with_mode(
         buffered_chars: 0,
         content_suppressed: false,
         stream_failed_closed: false,
+        suppression_reason: None,
+        sensitive_regex_enabled,
+        diag_ctx,
         deferred_events: Vec::new(),
         out_queue: std::collections::VecDeque::new(),
         swallow_next_blank: false,
@@ -4693,7 +4846,11 @@ fn apply_streaming_redaction_with_mode(
                                 .saturating_add(chunk_str.chars().count());
                             if new_total > MAX_STREAM_REDACTION_BUFFER_CHARS {
                                 state.raw_buffer.clear();
-                                state.content_suppressed = true;
+                                suppress_stream_content(
+                                    &mut state,
+                                    StreamL5aSuppressionReason::PlainTextDecodedContentOverCap,
+                                    new_total,
+                                );
                                 continue;
                             }
                         }
@@ -4713,11 +4870,14 @@ fn apply_streaming_redaction_with_mode(
 
                         match state.mode {
                             StreamRedactionMode::PlainText => {
-                                if state.raw_buffer.chars().count()
-                                    > MAX_STREAM_REDACTION_BUFFER_CHARS
-                                {
+                                let raw_chars = state.raw_buffer.chars().count();
+                                if raw_chars > MAX_STREAM_REDACTION_BUFFER_CHARS {
                                     state.raw_buffer.clear();
-                                    state.content_suppressed = true;
+                                    suppress_stream_content(
+                                        &mut state,
+                                        StreamL5aSuppressionReason::PlainTextDecodedContentOverCap,
+                                        raw_chars,
+                                    );
                                     continue;
                                 }
                                 if !sensitive_regex_enabled {
@@ -4792,12 +4952,16 @@ fn apply_streaming_redaction_with_mode(
 
                         match state.mode {
                             StreamRedactionMode::PlainText => {
+                                let raw_chars = state.raw_buffer.chars().count();
                                 if state.content_suppressed
-                                    || state.raw_buffer.chars().count()
-                                        > MAX_STREAM_REDACTION_BUFFER_CHARS
+                                    || raw_chars > MAX_STREAM_REDACTION_BUFFER_CHARS
                                 {
                                     state.raw_buffer.clear();
-                                    state.content_suppressed = true;
+                                    suppress_stream_content(
+                                        &mut state,
+                                        StreamL5aSuppressionReason::PlainTextDecodedContentOverCap,
+                                        raw_chars,
+                                    );
                                 } else if !state.raw_buffer.is_empty() {
                                     let redacted =
                                         scanner.scan_and_redact(&state.raw_buffer, &config).content;
@@ -4808,21 +4972,35 @@ fn apply_streaming_redaction_with_mode(
                                 }
                             }
                             StreamRedactionMode::Sse => {
-                                if state.sse_line_state == SseLineState::DiscardingOverlongLine
-                                    || !state.raw_buffer.trim().is_empty()
-                                    || state.pending_event_line.take().is_some()
-                                    || state.stream_failed_closed
-                                    || !state.pending_deltas.is_empty()
+                                let has_unterminated_line = !state.raw_buffer.trim().is_empty();
+                                let had_unpaired_event = state.pending_event_line.take().is_some();
+                                let has_open_content = !state.pending_deltas.is_empty()
                                     || matches!(
                                         state.anthropic_block_state,
                                         AnthropicBlockState::TextOpen { .. }
                                             | AnthropicBlockState::ToolUseOpen { .. }
-                                    )
+                                    );
+                                if state.sse_line_state == SseLineState::DiscardingOverlongLine
+                                    || has_unterminated_line
+                                    || had_unpaired_event
+                                    || state.stream_failed_closed
+                                    || has_open_content
                                 {
                                     // Overlong/incomplete trailing SSE line, unpaired event:, or
                                     // unterminated content segment without logical terminal boundary fails closed.
+                                    let eof_reason = if state.sse_line_state
+                                        == SseLineState::DiscardingOverlongLine
+                                    {
+                                        StreamL5aSuppressionReason::OverlongSseLine
+                                    } else if has_unterminated_line {
+                                        StreamL5aSuppressionReason::IncompleteSseLineAtEof
+                                    } else if had_unpaired_event {
+                                        StreamL5aSuppressionReason::UnpairedSseEventLine
+                                    } else {
+                                        StreamL5aSuppressionReason::UnterminatedSseContentAtEof
+                                    };
                                     state.raw_buffer.clear();
-                                    fail_closed_sse_state(&mut state);
+                                    fail_closed_sse_state(&mut state, eof_reason);
                                 } else {
                                     state.raw_buffer.clear();
                                     flush_sse_pending(&mut state, scanner.as_ref(), &config);
@@ -4840,7 +5018,82 @@ fn apply_streaming_redaction_with_mode(
     Box::pin(stream)
 }
 
-fn fail_closed_sse_state(state: &mut StreamingRedactionState) {
+fn emit_stream_l5a_suppression_diagnostic(
+    state: &StreamingRedactionState,
+    reason: StreamL5aSuppressionReason,
+    buffered_chars: usize,
+) {
+    let reason_code = reason.code().as_str();
+    let detail = reason.detail();
+    let stream_mode = state.mode.as_str();
+    let sse_protocol = state.sse_protocol.as_str();
+    let sensitive_regex_enabled = state.sensitive_regex_enabled;
+
+    if let (Some(request_id), Some(contract_hash), Some(provider), Some(model)) = (
+        state.diag_ctx.request_id.as_deref(),
+        state.diag_ctx.contract_hash.as_deref(),
+        state.diag_ctx.provider,
+        state.diag_ctx.model.as_deref(),
+    ) {
+        tracing::warn!(
+            request_id = %request_id,
+            contract_hash = %contract_hash,
+            provider = provider,
+            model = %model,
+            layer = "L5a",
+            mode = "streaming",
+            verdict = "suppress",
+            stream_mode = stream_mode,
+            sse_protocol = sse_protocol,
+            reason_code = reason_code,
+            detail = detail,
+            buffered_chars = buffered_chars,
+            cap_chars = MAX_STREAM_REDACTION_BUFFER_CHARS,
+            sensitive_regex_enabled = sensitive_regex_enabled,
+            "L5a streaming response content suppressed"
+        );
+    } else {
+        tracing::warn!(
+            layer = "L5a",
+            mode = "streaming",
+            verdict = "suppress",
+            stream_mode = stream_mode,
+            sse_protocol = sse_protocol,
+            reason_code = reason_code,
+            detail = detail,
+            buffered_chars = buffered_chars,
+            cap_chars = MAX_STREAM_REDACTION_BUFFER_CHARS,
+            sensitive_regex_enabled = sensitive_regex_enabled,
+            "L5a streaming response content suppressed"
+        );
+    }
+}
+
+fn record_stream_suppression_once(
+    state: &mut StreamingRedactionState,
+    reason: StreamL5aSuppressionReason,
+    buffered_chars: usize,
+) {
+    if state.suppression_reason.is_none() {
+        state.suppression_reason = Some(reason);
+        emit_stream_l5a_suppression_diagnostic(state, reason, buffered_chars);
+    }
+}
+
+fn suppress_stream_content(
+    state: &mut StreamingRedactionState,
+    reason: StreamL5aSuppressionReason,
+    buffered_chars: usize,
+) {
+    state.content_suppressed = true;
+    record_stream_suppression_once(state, reason, buffered_chars);
+}
+
+fn fail_closed_sse_state(
+    state: &mut StreamingRedactionState,
+    reason: StreamL5aSuppressionReason,
+) {
+    let buffered = state.buffered_chars;
     state.pending_event_line = None;
     state.pending_deltas.clear();
     state.buffered_chars = 0;
@@ -4848,6 +5101,7 @@ fn fail_closed_sse_state(state: &mut StreamingRedactionState) {
     state.content_suppressed = true;
     state.stream_failed_closed = true;
     state.swallow_next_blank = true;
+    record_stream_suppression_once(state, reason, buffered);
 }
 
 fn drain_sse_redaction_lines(
@@ -4876,7 +5130,7 @@ fn drain_sse_redaction_lines(
         if let Some(newline_pos) = state.raw_buffer.find('\n') {
             if state.raw_buffer[..newline_pos].chars().count() > MAX_SSE_RAW_LINE_CHARS {
                 state.raw_buffer.drain(..=newline_pos);
-                fail_closed_sse_state(state);
+                fail_closed_sse_state(state, StreamL5aSuppressionReason::OverlongSseLine);
                 continue;
             }
             let line = state.raw_buffer[..newline_pos].to_string();
@@ -4893,7 +5147,7 @@ fn drain_sse_redaction_lines(
             if state.raw_buffer.chars().count() > MAX_SSE_RAW_LINE_CHARS {
                 state.raw_buffer.clear();
                 state.sse_line_state = SseLineState::DiscardingOverlongLine;
-                fail_closed_sse_state(state);
+                fail_closed_sse_state(state, StreamL5aSuppressionReason::OverlongSseLine);
             }
             return;
         }
@@ -4917,7 +5171,7 @@ fn process_sse_redaction_line(
 
     if trimmed.is_empty() {
         if state.pending_event_line.take().is_some() {
-            fail_closed_sse_state(state);
+            fail_closed_sse_state(state, StreamL5aSuppressionReason::UnpairedSseEventLine);
             return;
         }
         if state.swallow_next_blank {
@@ -4944,7 +5198,7 @@ fn process_sse_redaction_line(
     if trimmed.starts_with("event:") {
         if state.pending_event_line.is_some() {
             // Two consecutive event: lines without data: is malformed SSE framing.
-            fail_closed_sse_state(state);
+            fail_closed_sse_state(state, StreamL5aSuppressionReason::UnpairedSseEventLine);
             return;
         }
         state.pending_event_line = Some(line.to_string());
@@ -4963,7 +5217,10 @@ fn process_sse_redaction_line(
                 || state.sse_protocol == SseProtocol::Anthropic
                 || state.openai_done_seen
             {
-                fail_closed_sse_state(state);
+                fail_closed_sse_state(
+                    state,
+                    StreamL5aSuppressionReason::SseProtocolOrBoundaryViolation,
+                );
                 return;
             }
             state.sse_protocol = SseProtocol::OpenAi;
@@ -4979,7 +5236,7 @@ fn process_sse_redaction_line(
             Ok(v) if v.is_object() => v,
             _ => {
                 // Fail closed on malformed/non-object JSON in SSE data line.
-                fail_closed_sse_state(state);
+                fail_closed_sse_state(state, StreamL5aSuppressionReason::MalformedSseDataJson);
                 return;
             }
         };
@@ -4995,7 +5252,10 @@ fn process_sse_redaction_line(
                     || state.openai_content_finished
                     || !state.deferred_events.is_empty()
                 {
-                    fail_closed_sse_state(state);
+                    fail_closed_sse_state(
+                        state,
+                        StreamL5aSuppressionReason::SseProtocolOrBoundaryViolation,
+                    );
                     return;
                 }
                 state.sse_protocol = SseProtocol::OpenAi;
@@ -5036,7 +5296,10 @@ fn process_sse_redaction_line(
                     || state.openai_done_seen
                     || state.openai_content_finished
                 {
-                    fail_closed_sse_state(state);
+                    fail_closed_sse_state(
+                        state,
+                        StreamL5aSuppressionReason::SseProtocolOrBoundaryViolation,
+                    );
                     return;
                 }
                 state.sse_protocol = SseProtocol::OpenAi;
@@ -5051,13 +5314,19 @@ fn process_sse_redaction_line(
             }
             SseL5aAction::OpenAiFinishChunk { choice_index } => {
                 if state.sse_protocol == SseProtocol::Anthropic || state.openai_done_seen {
-                    fail_closed_sse_state(state);
+                    fail_closed_sse_state(
+                        state,
+                        StreamL5aSuppressionReason::SseProtocolOrBoundaryViolation,
+                    );
                     return;
                 }
                 state.sse_protocol = SseProtocol::OpenAi;
                 if choice_index == 0 {
                     if state.openai_content_finished {
-                        fail_closed_sse_state(state);
+                        fail_closed_sse_state(
+                            state,
+                            StreamL5aSuppressionReason::SseProtocolOrBoundaryViolation,
+                        );
                         return;
                     }
                     state.openai_content_finished = true;
@@ -5065,7 +5334,10 @@ fn process_sse_redaction_line(
                     emit_passthrough_sse_event(state, event_line, line, scanner, config);
                 } else {
                     if !state.pending_deltas.is_empty() || state.content_suppressed {
-                        fail_closed_sse_state(state);
+                        fail_closed_sse_state(
+                            state,
+                            StreamL5aSuppressionReason::SseProtocolOrBoundaryViolation,
+                        );
                         return;
                     }
                     emit_passthrough_sse_event(state, event_line, line, scanner, config);
@@ -5076,14 +5348,20 @@ fn process_sse_redaction_line(
                 choice_index,
             } => {
                 if state.sse_protocol == SseProtocol::Anthropic || state.openai_done_seen {
-                    fail_closed_sse_state(state);
+                    fail_closed_sse_state(
+                        state,
+                        StreamL5aSuppressionReason::SseProtocolOrBoundaryViolation,
+                    );
                     return;
                 }
                 state.sse_protocol = SseProtocol::OpenAi;
                 if has_finish {
                     if choice_index == 0 {
                         if state.openai_content_finished {
-                            fail_closed_sse_state(state);
+                            fail_closed_sse_state(
+                                state,
+                                StreamL5aSuppressionReason::SseProtocolOrBoundaryViolation,
+                            );
                             return;
                         }
                         state.openai_content_finished = true;
@@ -5097,7 +5375,10 @@ fn process_sse_redaction_line(
                     emit_passthrough_sse_event(state, event_line, line, scanner, config);
                 } else {
                     if state.deferred_events.len() >= MAX_DEFERRED_SSE_EVENTS {
-                        fail_closed_sse_state(state);
+                        fail_closed_sse_state(
+                            state,
+                            StreamL5aSuppressionReason::DeferredSseEventCapExceeded,
+                        );
                         return;
                     }
                     state.deferred_events.push((event_line, line.to_string()));
@@ -5106,7 +5387,10 @@ fn process_sse_redaction_line(
             }
             SseL5aAction::OpenAiEmptyChoices => {
                 if state.sse_protocol == SseProtocol::Anthropic || state.openai_done_seen {
-                    fail_closed_sse_state(state);
+                    fail_closed_sse_state(
+                        state,
+                        StreamL5aSuppressionReason::SseProtocolOrBoundaryViolation,
+                    );
                     return;
                 }
                 state.sse_protocol = SseProtocol::OpenAi;
@@ -5118,7 +5402,10 @@ fn process_sse_redaction_line(
                     emit_passthrough_sse_event(state, event_line, line, scanner, config);
                 } else {
                     if state.deferred_events.len() >= MAX_DEFERRED_SSE_EVENTS {
-                        fail_closed_sse_state(state);
+                        fail_closed_sse_state(
+                            state,
+                            StreamL5aSuppressionReason::DeferredSseEventCapExceeded,
+                        );
                         return;
                     }
                     state.deferred_events.push((event_line, line.to_string()));
@@ -5131,7 +5418,10 @@ fn process_sse_redaction_line(
                     || !state.pending_deltas.is_empty()
                     || state.content_suppressed
                 {
-                    fail_closed_sse_state(state);
+                    fail_closed_sse_state(
+                        state,
+                        StreamL5aSuppressionReason::SseProtocolOrBoundaryViolation,
+                    );
                     return;
                 }
                 state.sse_protocol = SseProtocol::OpenAi;
@@ -5142,7 +5432,10 @@ fn process_sse_redaction_line(
                     || state.anthropic_block_state != AnthropicBlockState::Idle
                     || !state.pending_deltas.is_empty()
                 {
-                    fail_closed_sse_state(state);
+                    fail_closed_sse_state(
+                        state,
+                        StreamL5aSuppressionReason::SseProtocolOrBoundaryViolation,
+                    );
                     return;
                 }
                 state.sse_protocol = SseProtocol::Anthropic;
@@ -5156,7 +5449,10 @@ fn process_sse_redaction_line(
                     )
                     || !state.pending_deltas.is_empty()
                 {
-                    fail_closed_sse_state(state);
+                    fail_closed_sse_state(
+                        state,
+                        StreamL5aSuppressionReason::SseProtocolOrBoundaryViolation,
+                    );
                     return;
                 }
                 state.sse_protocol = SseProtocol::Anthropic;
@@ -5176,7 +5472,10 @@ fn process_sse_redaction_line(
                     )
                     || !state.pending_deltas.is_empty()
                 {
-                    fail_closed_sse_state(state);
+                    fail_closed_sse_state(
+                        state,
+                        StreamL5aSuppressionReason::SseProtocolOrBoundaryViolation,
+                    );
                     return;
                 }
                 state.sse_protocol = SseProtocol::Anthropic;
@@ -5218,7 +5517,10 @@ fn process_sse_redaction_line(
                     )
                     || !state.pending_deltas.is_empty()
                 {
-                    fail_closed_sse_state(state);
+                    fail_closed_sse_state(
+                        state,
+                        StreamL5aSuppressionReason::SseProtocolOrBoundaryViolation,
+                    );
                     return;
                 }
                 state.sse_protocol = SseProtocol::Anthropic;
@@ -5228,7 +5530,10 @@ fn process_sse_redaction_line(
             }
             SseL5aAction::AnthropicTextDelta { text, block_index } => {
                 if state.sse_protocol == SseProtocol::OpenAi {
-                    fail_closed_sse_state(state);
+                    fail_closed_sse_state(
+                        state,
+                        StreamL5aSuppressionReason::SseProtocolOrBoundaryViolation,
+                    );
                     return;
                 }
                 state.sse_protocol = SseProtocol::Anthropic;
@@ -5240,7 +5545,10 @@ fn process_sse_redaction_line(
                     AnthropicBlockState::TextOpen { index } => {
                         if let (Some(expected), Some(actual)) = (index, block_index) {
                             if expected != actual {
-                                fail_closed_sse_state(state);
+                                fail_closed_sse_state(
+                                    state,
+                                    StreamL5aSuppressionReason::SseProtocolOrBoundaryViolation,
+                                );
                                 return;
                             }
                         }
@@ -5248,7 +5556,10 @@ fn process_sse_redaction_line(
                     AnthropicBlockState::ToolUseOpen { .. }
                     | AnthropicBlockState::BlockClosed
                     | AnthropicBlockState::MessageEnded => {
-                        fail_closed_sse_state(state);
+                        fail_closed_sse_state(
+                            state,
+                            StreamL5aSuppressionReason::SseProtocolOrBoundaryViolation,
+                        );
                         return;
                     }
                 }
@@ -5278,7 +5589,10 @@ fn process_sse_redaction_line(
             }
             SseL5aAction::AnthropicInputJsonDelta { block_index } => {
                 if state.sse_protocol == SseProtocol::OpenAi || !state.pending_deltas.is_empty() {
-                    fail_closed_sse_state(state);
+                    fail_closed_sse_state(
+                        state,
+                        StreamL5aSuppressionReason::SseProtocolOrBoundaryViolation,
+                    );
                     return;
                 }
                 state.sse_protocol = SseProtocol::Anthropic;
@@ -5290,7 +5604,10 @@ fn process_sse_redaction_line(
                     AnthropicBlockState::ToolUseOpen { index } => {
                         if let (Some(expected), Some(actual)) = (index, block_index) {
                             if expected != actual {
-                                fail_closed_sse_state(state);
+                                fail_closed_sse_state(
+                                    state,
+                                    StreamL5aSuppressionReason::SseProtocolOrBoundaryViolation,
+                                );
                                 return;
                             }
                         }
@@ -5298,7 +5615,10 @@ fn process_sse_redaction_line(
                     AnthropicBlockState::TextOpen { .. }
                     | AnthropicBlockState::BlockClosed
                     | AnthropicBlockState::MessageEnded => {
-                        fail_closed_sse_state(state);
+                        fail_closed_sse_state(
+                            state,
+                            StreamL5aSuppressionReason::SseProtocolOrBoundaryViolation,
+                        );
                         return;
                     }
                 }
@@ -5306,7 +5626,10 @@ fn process_sse_redaction_line(
             }
             SseL5aAction::AnthropicContentBlockStop { block_index } => {
                 if state.sse_protocol == SseProtocol::OpenAi {
-                    fail_closed_sse_state(state);
+                    fail_closed_sse_state(
+                        state,
+                        StreamL5aSuppressionReason::SseProtocolOrBoundaryViolation,
+                    );
                     return;
                 }
                 state.sse_protocol = SseProtocol::Anthropic;
@@ -5314,7 +5637,10 @@ fn process_sse_redaction_line(
                     AnthropicBlockState::TextOpen { index } => {
                         if let (Some(expected), Some(actual)) = (index, block_index) {
                             if expected != actual {
-                                fail_closed_sse_state(state);
+                                fail_closed_sse_state(
+                                    state,
+                                    StreamL5aSuppressionReason::SseProtocolOrBoundaryViolation,
+                                );
                                 return;
                             }
                         }
@@ -5325,7 +5651,10 @@ fn process_sse_redaction_line(
                     AnthropicBlockState::ToolUseOpen { index } => {
                         if let (Some(expected), Some(actual)) = (index, block_index) {
                             if expected != actual {
-                                fail_closed_sse_state(state);
+                                fail_closed_sse_state(
+                                    state,
+                                    StreamL5aSuppressionReason::SseProtocolOrBoundaryViolation,
+                                );
                                 return;
                             }
                         }
@@ -5335,7 +5664,10 @@ fn process_sse_redaction_line(
                     AnthropicBlockState::Idle
                     | AnthropicBlockState::BlockClosed
                     | AnthropicBlockState::MessageEnded => {
-                        fail_closed_sse_state(state);
+                        fail_closed_sse_state(
+                            state,
+                            StreamL5aSuppressionReason::SseProtocolOrBoundaryViolation,
+                        );
                     }
                 }
             }
@@ -5348,7 +5680,10 @@ fn process_sse_redaction_line(
                     )
                     || !state.pending_deltas.is_empty()
                 {
-                    fail_closed_sse_state(state);
+                    fail_closed_sse_state(
+                        state,
+                        StreamL5aSuppressionReason::SseProtocolOrBoundaryViolation,
+                    );
                     return;
                 }
                 state.sse_protocol = SseProtocol::Anthropic;
@@ -5357,7 +5692,10 @@ fn process_sse_redaction_line(
             }
             SseL5aAction::AnthropicPing => {
                 if state.sse_protocol == SseProtocol::OpenAi {
-                    fail_closed_sse_state(state);
+                    fail_closed_sse_state(
+                        state,
+                        StreamL5aSuppressionReason::SseProtocolOrBoundaryViolation,
+                    );
                     return;
                 }
                 state.sse_protocol = SseProtocol::Anthropic;
@@ -5370,15 +5708,23 @@ fn process_sse_redaction_line(
                         AnthropicBlockState::TextOpen { .. }
                     )
                 {
+                    let buffered = state.buffered_chars;
                     state.pending_deltas.clear();
                     state.buffered_chars = 0;
                     state.deferred_events.clear();
-                    state.content_suppressed = true;
+                    suppress_stream_content(
+                        state,
+                        StreamL5aSuppressionReason::UpstreamErrorEventWithBufferedContent,
+                        buffered,
+                    );
                 }
                 emit_passthrough_sse_event(state, event_line, line, scanner, config);
             }
             SseL5aAction::MalformedOrAmbiguous => {
-                fail_closed_sse_state(state);
+                fail_closed_sse_state(
+                    state,
+                    StreamL5aSuppressionReason::MalformedOrAmbiguousSsePayload,
+                );
             }
         }
         return;
@@ -5398,7 +5744,7 @@ fn process_sse_redaction_line(
     }
 
     // Unknown/malformed line in SSE mode: fail closed.
-    fail_closed_sse_state(state);
+    fail_closed_sse_state(state, StreamL5aSuppressionReason::MalformedSseFieldLine);
 }
 
 fn push_sse_content_delta(
@@ -5427,7 +5773,11 @@ fn push_sse_content_delta(
     if new_buffered > MAX_STREAM_REDACTION_BUFFER_CHARS {
         state.pending_deltas.clear();
         state.buffered_chars = 0;
-        state.content_suppressed = true;
+        suppress_stream_content(
+            state,
+            StreamL5aSuppressionReason::SseDecodedContentOverCap,
+            new_buffered,
+        );
         if has_finish && delta.kind == DeltaKind::OpenAi {
             state.openai_content_finished = true;
             emit_stripped_openai_finish_from_delta(state, &delta, scanner, config);
