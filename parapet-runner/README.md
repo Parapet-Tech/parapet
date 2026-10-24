@@ -224,3 +224,93 @@ The command fails closed on unsafe trajectory paths, non-contiguous trajectory
 blocks, source-order drift, payload-hash mismatch, missing/extra detector rows,
 label or cell drift, unknown CDF fallback levels, and frozen-pin drift. Event
 payload text is never written to the output or receipt.
+
+## Resource budgets
+
+Production `run` training, evaluation, baselines and builds, and the `eval`
+command use the resource guard. Defaults: one locked Parapet job per host,
+12 GiB total tracked RSS, 4 GiB available headroom, 32 processes,
+2 workers, 4 hours, niceness 10, polling every 2 seconds. The host lock is
+Parapet-only; unrelated applications can still consume resources.
+
+```sh
+python -m parapet_runner budget-run --profile train --wall 2h --max-rss 16G --max-workers 4 -- python scripts/train_l2b.py --help
+python -m parapet_runner budget-run --show-config
+```
+
+Resolution: CLI > environment > profile > YAML defaults > built-in defaults.
+Sizes accept `512M`, `12G`; durations accept `90m`, `4h`.
+`PARAPET_BUDGET_CONFIG` selects an optional local config (default
+`~/.config/parapet/budget.yaml`); keep this user file untracked. Example:
+
+```yaml
+defaults:
+  max_rss_bytes: 12G
+  min_free_bytes: 4G
+  max_processes: 32
+  max_workers: 2
+  wall_seconds: 4h
+  poll_seconds: 2s
+  nice: 10
+profiles:
+  quick:
+    wall_seconds: 90m
+    max_rss_bytes: 512M
+  train:
+    max_workers: 2
+  eval:
+    max_rss_bytes: 4G
+```
+
+Select with `--profile` or `PARAPET_BUDGET_PROFILE`. Environment overrides:
+`PARAPET_BUDGET_MAX_RSS_GB`, `PARAPET_BUDGET_MIN_FREE_GB`,
+`PARAPET_BUDGET_EXPECTED_RSS_GB` (bare values mean GiB),
+`PARAPET_BUDGET_MAX_PROCESSES`, `PARAPET_BUDGET_MAX_WORKERS`,
+`PARAPET_BUDGET_WALL`, `PARAPET_BUDGET_NICE`, `PARAPET_BUDGET_POLL`.
+CLI equivalents: `--max-rss`, `--min-free`, `--expected-rss`, `--max-processes`,
+`--max-workers`, `--wall`, `--nice`, `--poll`.
+`--show-config` prints resolved values and sources without starting a job.
+`PARAPET_JOB_LOCK` overrides `~/.cache/parapet/job.lock`; a held lock reports
+its PID and executable basename in owner-only (0600) metadata. The lease covers
+the entire `run`, `eval`, or `budget-run` job through final output emission.
+Only `budget-run` accepts `--no-lock`, an operator escape hatch that is not
+mechanically read-only and is recorded in receipts. Caps are exported to OpenMP, BLAS, MKL, Accelerate and Loky.
+
+`max_rss_bytes` is an enforced runtime kill cap, never a preflight reservation.
+Preflight requires available memory >= `min_free_bytes` (4 GiB by default).
+Optionally set `expected_rss_bytes` in defaults/profiles, `--expected-rss 6G`,
+or `PARAPET_BUDGET_EXPECTED_RSS_GB=6` to require headroom plus expected RSS.
+Expected RSS is unset by default. On macOS, available memory is the sum of
+free + inactive + speculative + purgeable pages times the page size.
+
+Raise limits for a single command:
+
+```sh
+python -m parapet_runner budget-run --max-rss 24G --wall 8h --max-workers 4 -- python train.py
+PARAPET_BUDGET_MAX_RSS_GB=24 PARAPET_BUDGET_WALL=8h python -m parapet_runner budget-run -- python train.py
+```
+
+Accounting sums the union of the process group and PPID descendants, including
+children calling `setsid`. Observed PIDs remain tracked until exit even after
+reparenting. On breach the guard re-enumerates, sends SIGTERM to the group and
+tracked PIDs, waits up to 5 seconds, re-enumerates, then sends SIGKILL. The wait
+is shortened at 1.5 times the wall limit. Poll sleeps cannot cross the wall
+limit. Brief spikes between polls may be missed. A double-fork daemon that
+reparents to PID 1 between polls can escape tracking: macOS has no reliable
+user-space hook without cgroups. This is a known limitation, not a guarantee;
+the live double-fork regression is a non-strict xfail.
+
+`BudgetedExecutor.run` implements `CommandExecutor`; `run_with_receipt` returns
+both result and receipt, also retained on the executor. Run manifests store
+optional `runtime.budget_receipts` with peaks, wall time, resolved budget,
+reason, lock bypass and containment limitation. `budget-run` prints its receipt
+to stdout on its own line; human diagnostics go to stderr with a trailing newline.
+Configuration errors name the source and fix and exit 2 without a traceback.
+Exit codes: RSS 120, process cap 121, wall 122, preflight 123, lock 124;
+otherwise preserve child exit status (signals map to 128 + signal on CLI).
+Live tests require `ps` and skip with an explicit reason if denied.
+
+Job receipts include `cpu_user_s` and `cpu_sys_s`, measured using the
+`resource.getrusage(RUSAGE_CHILDREN)` delta around the job. This counts only
+reaped descendants, not reparented orphans. Run manifests include a final job
+receipt; `eval` writes `budget_receipt.json` before releasing its lease.

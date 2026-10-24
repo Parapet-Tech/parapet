@@ -10,6 +10,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from .budget import BudgetReceipt
 from .config import TrainConfig
 
 try:
@@ -53,6 +54,7 @@ class RuntimeIdentity(BaseModel):
     parapet_eval_hash: str
     pg2_model_id: str
     eval_config_hash: str
+    budget_receipts: list[BudgetReceipt] | None = None
     env_hash: str
 
 

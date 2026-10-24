@@ -7,6 +7,7 @@ import hashlib
 import json
 import random as _random
 import shutil
+import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -17,6 +18,7 @@ import yaml
 from pydantic import BaseModel, Field
 
 from .baseline import CommandExecutor, SubprocessCommandExecutor, parse_eval_result_json
+from .budget import BudgetConfigError, JobLockHeld, add_budget_flags, budget_run, executor_from_args
 from .config import ThresholdPolicy, TrainConfig
 from .manifest import (
     BaselineFamily,
@@ -1283,133 +1285,137 @@ def _parse_thresholds(raw: str) -> list[float]:
 
 
 def _cli_run(args: argparse.Namespace) -> int:
-    curation_manifest_path = Path(args.curation_manifest).resolve()
-    train_config_path = Path(args.train_config).resolve()
-    output_dir = Path(args.output_dir).resolve()
+    executor = executor_from_args(args)
+    if args.show_config:
+        return 0
+    with executor.job("parapet-runner") as job_receipt:
+        curation_manifest_path = Path(args.curation_manifest).resolve()
+        train_config_path = Path(args.train_config).resolve()
+        output_dir = Path(args.output_dir).resolve()
 
-    workspace_root = (
-        Path(args.workspace_root).resolve()
-        if args.workspace_root is not None
-        else _default_workspace_root()
-    )
-    trainer_script = _resolve_relative_path(Path(args.trainer_script), base_dir=workspace_root)
-    parapet_eval_bin = _resolve_relative_path(Path(args.parapet_eval_bin), base_dir=workspace_root)
-    l1_eval_config = _resolve_relative_path(Path(args.l1_eval_config), base_dir=workspace_root)
-    pg2_eval_config = _resolve_relative_path(Path(args.pg2_eval_config), base_dir=workspace_root)
-    protectai_data_root = _resolve_relative_path(Path(args.protectai_data_root), base_dir=workspace_root)
-    rust_crate_dir: Path | None = None
-    if not args.skip_recompile:
-        rust_crate_dir = _resolve_relative_path(Path(args.rust_crate_dir), base_dir=workspace_root)
-
-    curation_raw = _load_structured_file(curation_manifest_path)
-    train_config_raw = _load_structured_file(train_config_path)
-    curation_manifest = CurationManifest.model_validate(curation_raw)
-    train_config = TrainConfig.model_validate(train_config_raw)
-
-    thresholds = _parse_thresholds(args.calibration_thresholds)
-    executor = SubprocessCommandExecutor()
-    trainer = TrainScriptTrainer(
-        trainer_script=trainer_script,
-        workspace_root=workspace_root,
-        command_executor=executor,
-        python_bin=args.python_bin,
-    )
-    build_features = ["eval"]
-    if args.pg2_mode == "on":
-        build_features.append("l2a")
-
-    evaluator = ParapetEvalEvaluator(
-        parapet_eval_bin=parapet_eval_bin,
-        eval_config=l1_eval_config,
-        workspace_root=workspace_root,
-        command_executor=executor,
-        rust_crate_dir=rust_crate_dir,
-        weights_install_target=args.weights_install_target,
-        build_features=build_features,
-    )
-    threshold_calibrator = F1GridSearchCalibrator(thresholds=thresholds)
-
-    baseline_providers: list[BaselineProvider] = []
-    if args.pg2_mode == "on":
-        baseline_providers.append(
-            ParapetEvalPG2BaselineProvider(
-                parapet_eval_bin=parapet_eval_bin,
-                eval_config=pg2_eval_config,
-                workspace_root=workspace_root,
-                command_executor=executor,
-            )
+        workspace_root = (
+            Path(args.workspace_root).resolve()
+            if args.workspace_root is not None
+            else _default_workspace_root()
         )
-    if args.protectai_mode != "off":
-        baseline_providers.append(
-            ProtectAIBaselineProvider(
-                data_root=protectai_data_root,
-                trainer=trainer,
-                evaluator=evaluator,
-                threshold_calibrator=threshold_calibrator,
-                baseline_family=args.protectai_mode,
-                target_size=args.protectai_target_size,
-                seed=train_config.seed,
-            )
-        )
-    if args.random_mode == "on":
-        random_attack_pool = _resolve_relative_path(Path(args.random_attack_pool), base_dir=workspace_root)
-        random_benign_pool = _resolve_relative_path(Path(args.random_benign_pool), base_dir=workspace_root)
-        baseline_providers.append(
-            RandomBaselineProvider(
-                attack_pool=random_attack_pool,
-                benign_pool=random_benign_pool,
-                trainer=trainer,
-                evaluator=evaluator,
-                threshold_calibrator=threshold_calibrator,
-                target_size=args.protectai_target_size,  # same size-matched target
-                seed=train_config.seed,
-            )
-        )
+        trainer_script = _resolve_relative_path(Path(args.trainer_script), base_dir=workspace_root)
+        parapet_eval_bin = _resolve_relative_path(Path(args.parapet_eval_bin), base_dir=workspace_root)
+        l1_eval_config = _resolve_relative_path(Path(args.l1_eval_config), base_dir=workspace_root)
+        pg2_eval_config = _resolve_relative_path(Path(args.pg2_eval_config), base_dir=workspace_root)
+        protectai_data_root = _resolve_relative_path(Path(args.protectai_data_root), base_dir=workspace_root)
+        rust_crate_dir: Path | None = None
+        if not args.skip_recompile:
+            rust_crate_dir = _resolve_relative_path(Path(args.rust_crate_dir), base_dir=workspace_root)
 
-    deps = ExperimentDependencies(
-        split_resolver=ManifestSplitResolver(
-            root_dir=curation_manifest_path.parent,
-            verify_content_hashes=not args.skip_split_hash_verify,
-        ),
-        trainer=trainer,
-        evaluator=evaluator,
-        baseline_provider=(
-            CompositeBaselineProvider(baseline_providers)
-            if baseline_providers
-            else NoopBaselineProvider()
-        ),
-        error_analyzer=YamlErrorAnalyzer(),
-        runtime_identity_provider=RuntimeIdentityCollector(
-            workspace_root=workspace_root,
+        curation_raw = _load_structured_file(curation_manifest_path)
+        train_config_raw = _load_structured_file(train_config_path)
+        curation_manifest = CurationManifest.model_validate(curation_raw)
+        train_config = TrainConfig.model_validate(train_config_raw)
+
+        thresholds = _parse_thresholds(args.calibration_thresholds)
+        trainer = TrainScriptTrainer(
             trainer_script=trainer_script,
-            parapet_eval_binary=parapet_eval_bin,
-            pg2_model_id=args.pg2_model_id,
-            eval_config=l1_eval_config,
+            workspace_root=workspace_root,
             command_executor=executor,
-        ),
-        threshold_calibrator=threshold_calibrator,
-        artifact_verifier=(
-            None
-            if args.skip_output_hash_verify
-            else OutputHashVerifier(root_dir=curation_manifest_path.parent)
-        ),
-    )
+            python_bin=args.python_bin,
+        )
+        build_features = ["eval"]
+        if args.pg2_mode == "on":
+            build_features.append("l2a")
 
-    run_manifest = ExperimentRunner(deps).run_experiment(
-        curation_manifest=curation_manifest,
-        train_config=train_config,
-        output_dir=output_dir,
-        run_id=args.run_id,
-    )
+        evaluator = ParapetEvalEvaluator(
+            parapet_eval_bin=parapet_eval_bin,
+            eval_config=l1_eval_config,
+            workspace_root=workspace_root,
+            command_executor=executor,
+            rust_crate_dir=rust_crate_dir,
+            weights_install_target=args.weights_install_target,
+            build_features=build_features,
+        )
+        threshold_calibrator = F1GridSearchCalibrator(thresholds=thresholds)
 
-    run_manifest_path = (
-        Path(args.run_manifest_path).resolve()
-        if args.run_manifest_path
-        else (output_dir / "run_manifest.json")
-    )
-    write_run_manifest(run_manifest_path, run_manifest)
-    print(run_manifest_path)
-    return 0
+        baseline_providers: list[BaselineProvider] = []
+        if args.pg2_mode == "on":
+            baseline_providers.append(
+                ParapetEvalPG2BaselineProvider(
+                    parapet_eval_bin=parapet_eval_bin,
+                    eval_config=pg2_eval_config,
+                    workspace_root=workspace_root,
+                    command_executor=executor,
+                )
+            )
+        if args.protectai_mode != "off":
+            baseline_providers.append(
+                ProtectAIBaselineProvider(
+                    data_root=protectai_data_root,
+                    trainer=trainer,
+                    evaluator=evaluator,
+                    threshold_calibrator=threshold_calibrator,
+                    baseline_family=args.protectai_mode,
+                    target_size=args.protectai_target_size,
+                    seed=train_config.seed,
+                )
+            )
+        if args.random_mode == "on":
+            random_attack_pool = _resolve_relative_path(Path(args.random_attack_pool), base_dir=workspace_root)
+            random_benign_pool = _resolve_relative_path(Path(args.random_benign_pool), base_dir=workspace_root)
+            baseline_providers.append(
+                RandomBaselineProvider(
+                    attack_pool=random_attack_pool,
+                    benign_pool=random_benign_pool,
+                    trainer=trainer,
+                    evaluator=evaluator,
+                    threshold_calibrator=threshold_calibrator,
+                    target_size=args.protectai_target_size,  # same size-matched target
+                    seed=train_config.seed,
+                )
+            )
+
+        deps = ExperimentDependencies(
+            split_resolver=ManifestSplitResolver(
+                root_dir=curation_manifest_path.parent,
+                verify_content_hashes=not args.skip_split_hash_verify,
+            ),
+            trainer=trainer,
+            evaluator=evaluator,
+            baseline_provider=(
+                CompositeBaselineProvider(baseline_providers)
+                if baseline_providers
+                else NoopBaselineProvider()
+            ),
+            error_analyzer=YamlErrorAnalyzer(),
+            runtime_identity_provider=RuntimeIdentityCollector(
+                workspace_root=workspace_root,
+                trainer_script=trainer_script,
+                parapet_eval_binary=parapet_eval_bin,
+                pg2_model_id=args.pg2_model_id,
+                eval_config=l1_eval_config,
+                command_executor=executor,
+            ),
+            threshold_calibrator=threshold_calibrator,
+            artifact_verifier=(
+                None
+                if args.skip_output_hash_verify
+                else OutputHashVerifier(root_dir=curation_manifest_path.parent)
+            ),
+        )
+
+        run_manifest = ExperimentRunner(deps).run_experiment(
+            curation_manifest=curation_manifest,
+            train_config=train_config,
+            output_dir=output_dir,
+            run_id=args.run_id,
+        )
+
+        run_manifest_path = (
+            Path(args.run_manifest_path).resolve()
+            if args.run_manifest_path
+            else (output_dir / "run_manifest.json")
+        )
+        run_manifest.runtime.budget_receipts = [*executor.receipts, job_receipt()]
+        write_run_manifest(run_manifest_path, run_manifest)
+        print(run_manifest_path)
+        return 0
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -1417,6 +1423,10 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command")
 
     run = subparsers.add_parser("run", help="Run train -> val calibration -> holdout eval pipeline")
+    add_budget_flags(run)
+    guarded = subparsers.add_parser("budget-run", help="Run a command under a host budget")
+    add_budget_flags(guarded, allow_no_lock=True)
+    guarded.add_argument("child_command", nargs=argparse.REMAINDER)
     run.add_argument("--curation-manifest", type=Path, required=True)
     run.add_argument("--train-config", type=Path, required=True)
     run.add_argument("--output-dir", type=Path, required=True)
@@ -1510,6 +1520,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     eval_cmd = subparsers.add_parser("eval", help="Run parapet-eval against a dataset directory")
     eval_cmd.add_argument("--dataset", type=Path, required=True, help="Directory of YAML eval/staged files")
+    add_budget_flags(eval_cmd)
     eval_cmd.add_argument("--output-dir", type=Path, required=True, help="Where to write results")
     eval_cmd.add_argument("--workspace-root", type=Path)
     eval_cmd.add_argument("--parapet-eval-bin", type=Path, default=Path("parapet/target/release/parapet-eval.exe"))
@@ -1576,92 +1587,96 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _cli_eval(args: argparse.Namespace) -> int:
-    workspace_root = (
-        Path(args.workspace_root).resolve()
-        if args.workspace_root is not None
-        else _default_workspace_root()
-    )
-    parapet_eval_bin = _resolve_relative_path(Path(args.parapet_eval_bin), base_dir=workspace_root)
-    eval_config_path = _resolve_relative_path(Path(args.eval_config), base_dir=workspace_root)
-    dataset = Path(args.dataset).resolve()
-    output_dir = Path(args.output_dir).resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
+    executor = executor_from_args(args)
+    if args.show_config:
+        return 0
+    with executor.job("parapet-runner") as job_receipt:
+        workspace_root = (
+            Path(args.workspace_root).resolve()
+            if args.workspace_root is not None
+            else _default_workspace_root()
+        )
+        parapet_eval_bin = _resolve_relative_path(Path(args.parapet_eval_bin), base_dir=workspace_root)
+        eval_config_path = _resolve_relative_path(Path(args.eval_config), base_dir=workspace_root)
+        dataset = Path(args.dataset).resolve()
+        output_dir = Path(args.output_dir).resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load all labeled artifacts from the dataset directory and convert to eval YAML.
-    import sys
-    converted_dir = output_dir / "_eval_dataset"
-    converted_dir.mkdir(parents=True, exist_ok=True)
+        # Load all labeled artifacts from the dataset directory and convert to eval YAML.
+        import sys
+        converted_dir = output_dir / "_eval_dataset"
+        converted_dir.mkdir(parents=True, exist_ok=True)
 
-    total_cases = 0
-    skipped = 0
-    for data_file in _iter_labeled_dataset_files(dataset):
-        out_path = converted_dir / data_file.with_suffix(".yaml").name
-        if args.skip_converted and out_path.exists():
-            print(f"  {data_file.name}: skip", file=sys.stderr)
-            continue
-        try:
-            entries = _load_labeled_entries(data_file)
-        except Exception as exc:
-            print(f"  SKIP {data_file.name}: {exc}", file=sys.stderr)
-            skipped += 1
-            continue
-        if not entries:
-            continue
-        split_name = data_file.stem
-        cases = _build_eval_cases(entries, split_name=split_name)
-        _write_yaml_entries(out_path, cases)
-        total_cases += len(cases)
-        print(f"  {data_file.name}: {len(cases)} cases", file=sys.stderr)
+        total_cases = 0
+        skipped = 0
+        for data_file in _iter_labeled_dataset_files(dataset):
+            out_path = converted_dir / data_file.with_suffix(".yaml").name
+            if args.skip_converted and out_path.exists():
+                print(f"  {data_file.name}: skip", file=sys.stderr)
+                continue
+            try:
+                entries = _load_labeled_entries(data_file)
+            except Exception as exc:
+                print(f"  SKIP {data_file.name}: {exc}", file=sys.stderr)
+                skipped += 1
+                continue
+            if not entries:
+                continue
+            split_name = data_file.stem
+            cases = _build_eval_cases(entries, split_name=split_name)
+            _write_yaml_entries(out_path, cases)
+            total_cases += len(cases)
+            print(f"  {data_file.name}: {len(cases)} cases", file=sys.stderr)
 
-    print(f"Converted {total_cases} cases from {dataset} ({skipped} files skipped)", file=sys.stderr)
+        print(f"Converted {total_cases} cases from {dataset} ({skipped} files skipped)", file=sys.stderr)
 
-    # Set threshold in eval config
-    base_config = yaml.safe_load(eval_config_path.read_text(encoding="utf-8"))
-    threshold_config = _set_l1_threshold(base_config, args.threshold)
-    config_path = output_dir / "eval_config.yaml"
-    config_path.write_text(
-        yaml.safe_dump(threshold_config, sort_keys=False, allow_unicode=True),
-        encoding="utf-8",
-    )
+        # Set threshold in eval config
+        base_config = yaml.safe_load(eval_config_path.read_text(encoding="utf-8"))
+        threshold_config = _set_l1_threshold(base_config, args.threshold)
+        config_path = output_dir / "eval_config.yaml"
+        config_path.write_text(
+            yaml.safe_dump(threshold_config, sort_keys=False, allow_unicode=True),
+            encoding="utf-8",
+        )
 
-    output_json = output_dir / "eval.json"
-    command = [
-        str(parapet_eval_bin),
-        "--config", str(config_path),
-        "--dataset", str(converted_dir),
-        "--layer", args.layer,
-        "--json",
-        "--output", str(output_json),
-        "--max-failures", str(args.max_failures),
-    ]
+        output_json = output_dir / "eval.json"
+        command = [
+            str(parapet_eval_bin),
+            "--config", str(config_path),
+            "--dataset", str(converted_dir),
+            "--layer", args.layer,
+            "--json",
+            "--output", str(output_json),
+            "--max-failures", str(args.max_failures),
+        ]
 
-    print(f"Running: {' '.join(command)}", file=sys.stderr)
-    executor = SubprocessCommandExecutor()
-    result = executor.run(command, cwd=workspace_root)
+        print(f"Running: {' '.join(command)}", file=sys.stderr)
+        result = executor.run(command, cwd=workspace_root)
 
-    if result.stderr:
-        print(result.stderr, file=sys.stderr)
+        if result.stderr:
+            print(result.stderr, file=sys.stderr)
 
-    if not output_json.exists():
-        print(f"eval binary did not produce output: exit={result.returncode}", file=sys.stderr)
-        return 1
+        if not output_json.exists():
+            print(f"eval binary did not produce output: exit={result.returncode}", file=sys.stderr)
+            return 1
 
-    payload = json.loads(output_json.read_text(encoding="utf-8"))
-    eval_result = parse_eval_result_json(payload, threshold_fallback=args.threshold)
+        payload = json.loads(output_json.read_text(encoding="utf-8"))
+        eval_result = parse_eval_result_json(payload, threshold_fallback=args.threshold)
 
-    error_analyzer = YamlErrorAnalyzer()
-    error_analyzer.write(
-        eval_result=eval_result,
-        baseline_results={},
-        baseline_deltas={},
-        output_dir=output_dir,
-    )
+        error_analyzer = YamlErrorAnalyzer()
+        error_analyzer.write(
+            eval_result=eval_result,
+            baseline_results={},
+            baseline_deltas={},
+            output_dir=output_dir,
+        )
 
-    print(f"F1={eval_result.f1:.4f}  P={eval_result.precision:.4f}  R={eval_result.recall:.4f}")
-    print(f"FP={eval_result.false_positives}  FN={eval_result.false_negatives}  N={eval_result.holdout_size}")
-    print(f"Results: {output_json}")
-    print(f"Errors:  {output_dir / 'errors.yaml'}")
-    return 0 if result.returncode in (0, 1) else result.returncode
+        (output_dir / "budget_receipt.json").write_text(job_receipt().model_dump_json() + "\n")
+        print(f"F1={eval_result.f1:.4f}  P={eval_result.precision:.4f}  R={eval_result.recall:.4f}")
+        print(f"FP={eval_result.false_positives}  FN={eval_result.false_negatives}  N={eval_result.holdout_size}")
+        print(f"Results: {output_json}")
+        print(f"Errors:  {output_dir / 'errors.yaml'}")
+        return 0 if result.returncode in (0, 1) else result.returncode
 
 
 def _cli_temporal_score(args: argparse.Namespace) -> int:
@@ -1713,9 +1728,11 @@ def _cli_temporal_validate(args: argparse.Namespace) -> int:
     return 0
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def _main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
+    if args.command == "budget-run":
+        return budget_run(args)
     if args.command == "run":
         return _cli_run(args)
     if args.command == "eval":
@@ -1730,6 +1747,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _cli_temporal_adapt(args)
     parser.print_help()
     return 1
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    try:
+        return _main(argv)
+    except JobLockHeld as exc:
+        print(str(exc), file=sys.stderr)
+        return 124
+    except BudgetConfigError as exc:
+        print(" ".join(str(exc).splitlines()), file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

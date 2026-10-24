@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import pickle
 import random as random_mod
 import re
@@ -468,7 +469,7 @@ def main() -> int:
             min_samples_leaf=5,
             max_features="sqrt",
             random_state=args.seed,
-            n_jobs=-1,
+            n_jobs=int(os.environ.get("PARAPET_MAX_WORKERS", "2")),
         )
         rf.fit(X_train, y_train)
         rf_pred = rf.predict(X_val)
@@ -497,7 +498,7 @@ def main() -> int:
             colsample_bytree=0.8,
             min_child_weight=5,
             random_state=args.seed,
-            n_jobs=-1,
+            n_jobs=int(os.environ.get("PARAPET_MAX_WORKERS", "2")),
             tree_method="hist",
             eval_metric="logloss",
         )

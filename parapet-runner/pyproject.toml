@@ -34,3 +34,5 @@ bench = [
 [tool.pytest.ini_options]
 addopts = "-p no:cacheprovider -p no:tmpdir"
 testpaths = ["tests"]
+
+markers = ["live_process: real POSIX process containment tests (requires ps)"]
