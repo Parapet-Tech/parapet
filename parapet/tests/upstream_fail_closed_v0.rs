@@ -3612,3 +3612,117 @@ layers:
     assert_eq!(benign_reassembled, "Hello, ordinary fragmented stream!");
     assert!(!benign_sse.contains("[REDACTED]"));
 }
+
+#[tokio::test]
+async fn streaming_redaction_cross_delta_canary_full_handler() {
+    let fake_server = FakeOpenAiServer::spawn().await;
+    let fake_port = fake_server.addr.port();
+    let secret_base_canary = "sk-cross-delta-base-canary";
+
+    let mut chunks: Vec<String> = ["PLAY", "GROUND", "_TEST", "_TOKEN", "_", "4", "2"]
+        .into_iter()
+        .map(|fragment| {
+            format!(
+                "data: {}\n\n",
+                serde_json::json!({
+                    "id": "c1", "object": "chat.completion.chunk",
+                    "choices": [{"index": 0, "delta": {"content": fragment}, "finish_reason": null}]
+                })
+            )
+        })
+        .collect();
+    chunks.push(format!(
+        "data: {}\n\n",
+        serde_json::json!({
+            "id": "c1", "object": "chat.completion.chunk",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+        })
+    ));
+    chunks.push("data: [DONE]\n\n".to_string());
+    fake_server.enqueue(FakeServerAction::Sse { chunks });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg_path = tmp.path().join("parapet.yaml");
+    std::fs::write(
+        &cfg_path,
+        format!("{MANDATORY_PROFILE_YAML}\ncanary_tokens: [PLAYGROUND_TEST_TOKEN_42]\n"),
+    )
+    .unwrap();
+    let state_dir = write_private_state_dir(tmp.path(), "state-cross-delta");
+    let upstream_arg = format!("openai=http://127.0.0.1:{fake_port}/{secret_base_canary}/v1");
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_parapet"));
+    clear_all_upstream_env(&mut cmd);
+    let child = cmd
+        .args([
+            "run",
+            "--json",
+            "--port",
+            "0",
+            "--config",
+            cfg_path.to_str().unwrap(),
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--ready-file",
+            "ready.port",
+            "--upstream",
+            &upstream_arg,
+            "--allow-loopback-http-upstream",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn parapet run for cross_delta");
+
+    let bound_port = wait_for_ready_port(&state_dir.join("ready.port")).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://127.0.0.1:{bound_port}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "gpt-4o-mini",
+            "stream": true,
+            "messages": [{"role": "user", "content": "Stream the split test token"}]
+        }))
+        .send()
+        .await
+        .expect("send streaming request");
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        content_type.contains("text/event-stream"),
+        "content-type={content_type}"
+    );
+
+    let sse_text = resp.text().await.expect("read SSE stream");
+    // Settle the child before assertions that intentionally fail on the unfixed engine.
+    disable_parapet_instance(&state_dir);
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert!(!sse_text.contains("PLAYGROUND_TEST_TOKEN_42"));
+    let mut content = String::new();
+    let mut done = false;
+    for event in sse_text.split("\n\n").filter(|event| !event.is_empty()) {
+        let data = event.strip_prefix("data: ").expect("SSE data event");
+        if data == "[DONE]" {
+            done = true;
+            continue;
+        }
+        let value: serde_json::Value = serde_json::from_str(data).expect("valid SSE JSON");
+        for choice in value["choices"].as_array().expect("choices array") {
+            if let Some(delta) = choice["delta"]["content"].as_str() {
+                content.push_str(delta);
+            }
+        }
+    }
+    assert!(done, "stream completion preserved");
+    assert!(
+        !content.contains("PLAYGROUND_TEST_TOKEN_42"),
+        "client reassembled leaked content: {content}"
+    );
+    assert!(sse_text.contains("[REDACTED]"));
+}

@@ -4461,12 +4461,19 @@ fn update_session_after_request(
 }
 
 const MAX_STREAM_REDACTION_BUFFER_CHARS: usize = 64 * 1024;
+const MAX_SSE_RAW_LINE_CHARS: usize = 64 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StreamRedactionMode {
     Undetermined,
     PlainText,
     Sse,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SseLineState {
+    Normal,
+    DiscardingOverlongLine,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -4509,6 +4516,7 @@ enum SseL5aAction {
 struct StreamingRedactionState {
     input: Pin<Box<dyn Stream<Item = Bytes> + Send>>,
     mode: StreamRedactionMode,
+    sse_line_state: SseLineState,
     raw_buffer: String,
     pending_event_line: Option<String>,
     pending_deltas: std::collections::VecDeque<PendingDelta>,
@@ -4537,6 +4545,7 @@ fn apply_streaming_redaction(
     let init_state = StreamingRedactionState {
         input: Box::pin(input) as Pin<Box<dyn Stream<Item = Bytes> + Send>>,
         mode: StreamRedactionMode::Undetermined,
+        sse_line_state: SseLineState::Normal,
         raw_buffer: String::new(),
         pending_event_line: None,
         pending_deltas: std::collections::VecDeque::new(),
@@ -4566,9 +4575,11 @@ fn apply_streaming_redaction(
                         if state.mode == StreamRedactionMode::Undetermined {
                             let trimmed = state.raw_buffer.trim_start();
                             if trimmed.is_empty() {
-                                continue;
-                            }
-                            if trimmed.starts_with("data:")
+                                if state.raw_buffer.chars().count() <= MAX_SSE_RAW_LINE_CHARS {
+                                    continue;
+                                }
+                                state.mode = StreamRedactionMode::PlainText;
+                            } else if trimmed.starts_with("data:")
                                 || trimmed.starts_with("event:")
                                 || trimmed.starts_with(':')
                             {
@@ -4576,7 +4587,10 @@ fn apply_streaming_redaction(
                             } else if !trimmed.contains('\n')
                                 && ("data:".starts_with(trimmed) || "event:".starts_with(trimmed))
                             {
-                                continue;
+                                if state.raw_buffer.chars().count() <= MAX_SSE_RAW_LINE_CHARS {
+                                    continue;
+                                }
+                                state.mode = StreamRedactionMode::Sse;
                             } else {
                                 state.mode = StreamRedactionMode::PlainText;
                             }
@@ -4641,22 +4655,15 @@ fn apply_streaming_redaction(
                                 }
                             }
                             StreamRedactionMode::Sse => {
-                                if !state.raw_buffer.trim().is_empty() {
-                                    let tail_line = std::mem::take(&mut state.raw_buffer);
-                                    process_sse_redaction_line(
-                                        &mut state,
-                                        &tail_line,
-                                        scanner.as_ref(),
-                                        &config,
-                                        effective_window,
-                                    );
-                                }
-                                state.raw_buffer.clear();
-                                if state.pending_event_line.take().is_some() {
-                                    // Unpaired trailing event: line without data: fails closed.
-                                    state.pending_deltas.clear();
-                                    state.deferred_events.clear();
+                                if state.sse_line_state == SseLineState::DiscardingOverlongLine
+                                    || !state.raw_buffer.trim().is_empty()
+                                    || state.pending_event_line.take().is_some()
+                                {
+                                    // Overlong/incomplete trailing SSE line or unpaired event: fails closed.
+                                    state.raw_buffer.clear();
+                                    fail_closed_sse_state(&mut state);
                                 } else {
+                                    state.raw_buffer.clear();
                                     flush_sse_pending(&mut state, scanner.as_ref(), &config);
                                 }
                             }
@@ -4672,16 +4679,48 @@ fn apply_streaming_redaction(
     Box::pin(stream)
 }
 
+fn fail_closed_sse_state(state: &mut StreamingRedactionState) {
+    state.pending_event_line = None;
+    state.pending_deltas.clear();
+    state.deferred_events.clear();
+    state.swallow_next_blank = true;
+}
+
 fn drain_sse_redaction_lines(
     state: &mut StreamingRedactionState,
     scanner: &dyn OutputScanner,
     config: &Config,
     effective_window: usize,
 ) {
-    while let Some(newline_pos) = state.raw_buffer.find('\n') {
-        let line = state.raw_buffer[..newline_pos].to_string();
-        state.raw_buffer.drain(..=newline_pos);
-        process_sse_redaction_line(state, &line, scanner, config, effective_window);
+    loop {
+        if state.sse_line_state == SseLineState::DiscardingOverlongLine {
+            if let Some(newline_pos) = state.raw_buffer.find('\n') {
+                state.raw_buffer.drain(..=newline_pos);
+                state.sse_line_state = SseLineState::Normal;
+                continue;
+            } else {
+                state.raw_buffer.clear();
+                return;
+            }
+        }
+
+        if let Some(newline_pos) = state.raw_buffer.find('\n') {
+            if state.raw_buffer[..newline_pos].chars().count() > MAX_SSE_RAW_LINE_CHARS {
+                state.raw_buffer.drain(..=newline_pos);
+                fail_closed_sse_state(state);
+                continue;
+            }
+            let line = state.raw_buffer[..newline_pos].to_string();
+            state.raw_buffer.drain(..=newline_pos);
+            process_sse_redaction_line(state, &line, scanner, config, effective_window);
+        } else {
+            if state.raw_buffer.chars().count() > MAX_SSE_RAW_LINE_CHARS {
+                state.raw_buffer.clear();
+                state.sse_line_state = SseLineState::DiscardingOverlongLine;
+                fail_closed_sse_state(state);
+            }
+            return;
+        }
     }
 }
 
@@ -4707,7 +4746,9 @@ fn process_sse_redaction_line(
     if trimmed.starts_with(':') {
         state.swallow_next_blank = false;
         let redacted = scanner.scan_and_redact(line, config).content;
-        state.out_queue.push_back(Bytes::from(format!("{redacted}\n")));
+        state
+            .out_queue
+            .push_back(Bytes::from(format!("{redacted}\n")));
         return;
     }
 
@@ -4841,9 +4882,7 @@ fn process_sse_redaction_line(
             }
             SseL5aAction::AnthropicContentBlockStop => {
                 if has_active_boundary_candidate(&state.pending_deltas, scanner, config) {
-                    state
-                        .deferred_events
-                        .push((event_line, line.to_string()));
+                    state.deferred_events.push((event_line, line.to_string()));
                     state.swallow_next_blank = true;
                 } else {
                     flush_sse_pending(state, scanner, config);
@@ -4874,7 +4913,9 @@ fn process_sse_redaction_line(
             return;
         }
         let redacted = scanner.scan_and_redact(line, config).content;
-        state.out_queue.push_back(Bytes::from(format!("{redacted}\n")));
+        state
+            .out_queue
+            .push_back(Bytes::from(format!("{redacted}\n")));
         state.swallow_next_blank = false;
         return;
     }
@@ -4886,10 +4927,7 @@ fn process_sse_redaction_line(
     state.swallow_next_blank = true;
 }
 
-fn classify_sse_json_for_l5a(
-    event_line: Option<&str>,
-    json: &serde_json::Value,
-) -> SseL5aAction {
+fn classify_sse_json_for_l5a(event_line: Option<&str>, json: &serde_json::Value) -> SseL5aAction {
     if let Some(choices_val) = json.get("choices") {
         if event_line.is_some() {
             return SseL5aAction::MalformedOrAmbiguous;
@@ -4927,7 +4965,7 @@ fn classify_sse_json_for_l5a(
         };
         if choice_obj.contains_key("message") || choice_obj.contains_key("text") {
             return SseL5aAction::MalformedOrAmbiguous;
-        }
+        };
         if choice_obj
             .get("finish_reason")
             .is_some_and(|v| !v.is_null() && !v.is_string())
@@ -5025,10 +5063,7 @@ fn classify_sse_json_for_l5a(
                         }
                     }
                     Some("input_json_delta") => {
-                        if !delta_obj
-                            .get("partial_json")
-                            .is_some_and(|v| v.is_string())
-                        {
+                        if !delta_obj.get("partial_json").is_some_and(|v| v.is_string()) {
                             return SseL5aAction::MalformedOrAmbiguous;
                         }
                         SseL5aAction::FlushAndPassthrough
@@ -5116,7 +5151,11 @@ fn emit_window_ready_deltas(
     config: &Config,
     effective_window: usize,
 ) {
-    let combined: String = state.pending_deltas.iter().map(|d| d.text.as_str()).collect();
+    let combined: String = state
+        .pending_deltas
+        .iter()
+        .map(|d| d.text.as_str())
+        .collect();
     let combined_chars = combined.chars().count();
     if combined_chars <= effective_window {
         return;
@@ -5176,7 +5215,11 @@ fn flush_sse_pending(
     config: &Config,
 ) {
     if !state.pending_deltas.is_empty() {
-        let combined: String = state.pending_deltas.iter().map(|d| d.text.as_str()).collect();
+        let combined: String = state
+            .pending_deltas
+            .iter()
+            .map(|d| d.text.as_str())
+            .collect();
         let scan = scanner.scan_and_redact(&combined, config);
         if !scan.redactions.is_empty() {
             collapse_pending_deltas(&mut state.pending_deltas, scan.content);
@@ -5204,9 +5247,7 @@ fn delta_has_metadata(delta: &PendingDelta) -> bool {
     let Some(choice) = delta.template.get("choices").and_then(|c| c.get(0)) else {
         return false;
     };
-    let has_finish = choice
-        .get("finish_reason")
-        .is_some_and(|v| !v.is_null());
+    let has_finish = choice.get("finish_reason").is_some_and(|v| !v.is_null());
     let has_role = choice
         .get("delta")
         .and_then(|d| d.get("role"))
@@ -5252,11 +5293,7 @@ fn collapse_pending_deltas(
     pending_deltas.push_back(first);
 }
 
-fn split_head_delta(
-    front: &mut PendingDelta,
-    emit_text: String,
-    rem_text: String,
-) -> PendingDelta {
+fn split_head_delta(front: &mut PendingDelta, emit_text: String, rem_text: String) -> PendingDelta {
     let mut head = front.clone();
     head.text = emit_text;
     front.text = rem_text;

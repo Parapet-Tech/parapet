@@ -102,6 +102,122 @@ async fn streaming_redaction_regex_across_chunk_boundary() {
     assert!(output.contains(" here"));
 }
 
+// Model content fragmentation across SSE events, rather than transport byte splits.
+const CROSS_DELTA_TOKEN: &str = "PLAYGROUND_TEST_TOKEN_42";
+
+fn cross_delta_sse_chunks() -> Vec<Bytes> {
+    let mut chunks: Vec<Bytes> = ["PLAY", "GROUND", "_TEST", "_TOKEN", "_", "4", "2"]
+        .into_iter()
+        .map(|fragment| {
+            Bytes::from(format!(
+                "data: {}\n\n",
+                serde_json::json!({
+                    "id": "c1",
+                    "choices": [{"index": 0, "delta": {"content": fragment}, "finish_reason": null}]
+                })
+            ))
+        })
+        .collect();
+    chunks.push(Bytes::from(format!(
+        "data: {}\n\n",
+        serde_json::json!({"id": "c1", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
+    )));
+    chunks.push(Bytes::from_static(b"data: [DONE]\n\n"));
+    chunks
+}
+
+fn assert_cross_delta_redacted(output: &str) {
+    assert!(
+        !output.contains(CROSS_DELTA_TOKEN),
+        "literal token in SSE wire"
+    );
+    let mut content = String::new();
+    let mut done = false;
+    for event in output.split("\n\n").filter(|event| !event.is_empty()) {
+        let data = event.strip_prefix("data: ").expect("SSE data event");
+        if data == "[DONE]" {
+            done = true;
+            continue;
+        }
+        let value: serde_json::Value = serde_json::from_str(data).expect("valid SSE JSON");
+        for choice in value["choices"].as_array().expect("choices array") {
+            if let Some(delta) = choice["delta"]["content"].as_str() {
+                content.push_str(delta);
+            }
+        }
+    }
+    assert!(done, "stream completion preserved");
+    assert!(
+        !content.contains(CROSS_DELTA_TOKEN),
+        "client reassembled leaked content: {content}"
+    );
+    assert!(output.contains("[REDACTED]"), "redaction marker missing");
+}
+
+async fn check_cross_delta_redaction(config: Config, window: Option<usize>) {
+    let output = collect_stream(apply_streaming_redaction(
+        stream::iter(cross_delta_sse_chunks()),
+        Arc::new(L5aScanner),
+        Arc::new(config),
+        window,
+    ))
+    .await;
+    assert_cross_delta_redacted(&output);
+}
+
+#[tokio::test]
+async fn streaming_redaction_cross_delta_canary_default_window() {
+    check_cross_delta_redaction(base_config_with_canary(CROSS_DELTA_TOKEN), None).await;
+}
+
+#[tokio::test]
+async fn streaming_redaction_cross_delta_canary_large_window() {
+    check_cross_delta_redaction(base_config_with_canary(CROSS_DELTA_TOKEN), Some(65_536)).await;
+}
+
+#[tokio::test]
+async fn streaming_redaction_cross_delta_regex_default_window() {
+    check_cross_delta_redaction(
+        base_config_with_sensitive(r"PLAYGROUND_TEST_TOKEN_\d{2}"),
+        None,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn streaming_redaction_cross_delta_regex_large_window() {
+    check_cross_delta_redaction(
+        base_config_with_sensitive(r"PLAYGROUND_TEST_TOKEN_\d{2}"),
+        Some(65_536),
+    )
+    .await;
+}
+
+#[test]
+fn non_streaming_redaction_cross_delta_content_parity() {
+    for mut config in [
+        base_config_with_canary(CROSS_DELTA_TOKEN),
+        base_config_with_sensitive(r"PLAYGROUND_TEST_TOKEN_\d{2}"),
+    ] {
+        config.policy.layers.l5a = Some(LayerConfig {
+            mode: "redact".to_string(),
+            block_action: None,
+            window_chars: None,
+        });
+        let engine = engine_with_config(config);
+        let body = Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": CROSS_DELTA_TOKEN}}]
+            }))
+            .unwrap(),
+        );
+        let result = engine.handle_non_streaming_response(Provider::OpenAi, &body, &test_ctx());
+        assert!(result.status_override.is_none());
+        let value: serde_json::Value = serde_json::from_slice(&result.body).unwrap();
+        assert_eq!(value["choices"][0]["message"]["content"], "[REDACTED]");
+    }
+}
+
 // -------------------------------------------------------------------
 // L3-outbound rewrite/error tests (non-streaming)
 // -------------------------------------------------------------------
@@ -4993,15 +5109,7 @@ async fn streaming_l5a_cross_delta_sse_reproduction_and_non_streaming_parity() {
 #[tokio::test]
 async fn streaming_l5a_cross_delta_regex_and_anthropic_parity() {
     let fragments = [
-        "Prefix: ",
-        "PLAY",
-        "GROUND",
-        "_TEST",
-        "_TOKEN",
-        "_",
-        "4",
-        "2",
-        " :Suffix",
+        "Prefix: ", "PLAY", "GROUND", "_TEST", "_TOKEN", "_", "4", "2", " :Suffix",
     ];
 
     // 1. OpenAI regex-only (no canary token) cross-delta redaction
@@ -5066,8 +5174,10 @@ async fn streaming_l5a_cross_delta_regex_and_anthropic_parity() {
         anth_headers,
         anthropic_lines.into_iter().map(Bytes::from).collect(),
     ));
-    let anth_engine =
-        engine_with_http_sender(streaming_l5a_config("PLAYGROUND_TEST_TOKEN_42"), anth_sender);
+    let anth_engine = engine_with_http_sender(
+        streaming_l5a_config("PLAYGROUND_TEST_TOKEN_42"),
+        anth_sender,
+    );
     let anth_resp = anth_engine
         .forward(
             Provider::Anthropic,
@@ -5211,5 +5321,83 @@ async fn streaming_l5a_malformed_or_ambiguous_sse_content_fails_closed() {
     assert!(
         !out_ambiguous.contains("GROUND"),
         "ambiguous SSE delta.content must be withheld: {out_ambiguous}"
+    );
+}
+
+#[tokio::test]
+async fn streaming_l5a_overlong_or_incomplete_sse_line_bounded_fail_closed() {
+    let config = Arc::new(streaming_l5a_config("PLAYGROUND_TEST_TOKEN_42"));
+    let scanner: Arc<dyn OutputScanner> = Arc::new(L5aScanner);
+
+    // 1. Overlong incomplete SSE line split across chunks whose tail resembles a fresh `data:` event
+    let overlong_head = format!(
+        "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{}\"",
+        "X".repeat(MAX_SSE_RAW_LINE_CHARS + 128)
+    );
+    let overlong_mid = "Y".repeat(MAX_SSE_RAW_LINE_CHARS);
+    // Tail of the SAME unterminated line starts with `data: ` to attempt reparsing after cap discard
+    let overlong_tail_with_newline =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"GROUND_TEST_TOKEN_42\"}}]}\n\n";
+
+    let overlong_chunks = vec![
+        Bytes::from("data: {\"choices\":[{\"delta\":{\"content\":\"PLAY\"}}]}\n\n"),
+        Bytes::from(overlong_head.clone()),
+        Bytes::from(overlong_mid),
+        Bytes::from(overlong_tail_with_newline),
+        Bytes::from("data: [DONE]\n\n"),
+    ];
+    let out_overlong = collect_stream(apply_streaming_redaction(
+        stream::iter(overlong_chunks),
+        scanner.clone(),
+        config.clone(),
+        Some(64),
+    ))
+    .await;
+    assert!(
+        !out_overlong.contains("PLAY"),
+        "overlong SSE line must fail closed and drop held prefix: {out_overlong}"
+    );
+    assert!(
+        !out_overlong.contains("GROUND"),
+        "tail of overlong SSE line must not be reparsed as a fresh event: {out_overlong}"
+    );
+    assert!(
+        !out_overlong.contains("XXXX"),
+        "overlong SSE line body must be discarded: {out_overlong}"
+    );
+
+    // 2. Overlong SSE line whose tail has no newline before EOF must not be reparsed at EOF
+    let overlong_eof_chunks = vec![
+        Bytes::from("data: {\"choices\":[{\"delta\":{\"content\":\"PLAY\"}}]}\n\n"),
+        Bytes::from(overlong_head),
+        Bytes::from("data: {\"choices\":[{\"delta\":{\"content\":\"GROUND_TEST_TOKEN_42\"}}]}"),
+    ];
+    let out_overlong_eof = collect_stream(apply_streaming_redaction(
+        stream::iter(overlong_eof_chunks),
+        scanner.clone(),
+        config.clone(),
+        Some(64),
+    ))
+    .await;
+    assert!(
+        out_overlong_eof.is_empty(),
+        "overlong unterminated SSE line at EOF must fail closed with empty output: {out_overlong_eof}"
+    );
+
+    // 3. Incomplete (unterminated) SSE line at EOF after held prefix fails closed
+    let incomplete_eof_chunks = vec![
+        Bytes::from("data: {\"choices\":[{\"delta\":{\"content\":\"PLAY\"}}]}\n\n"),
+        Bytes::from("data: {\"choices\":[{\"delta\":{\"content\":\"GROUND_TEST_TOKEN_42\"}}]}"),
+    ];
+    let out_incomplete_eof = collect_stream(apply_streaming_redaction(
+        stream::iter(incomplete_eof_chunks),
+        scanner,
+        config,
+        Some(64),
+    ))
+    .await;
+    assert!(
+        out_incomplete_eof.is_empty(),
+        "incomplete trailing SSE line without newline at EOF must fail closed: {out_incomplete_eof}"
     );
 }
