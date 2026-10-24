@@ -19,42 +19,46 @@ use base64::Engine as _;
 use flate2::read::{DeflateDecoder, GzDecoder};
 use std::io::Read as _;
 
+use crate::config::L4Mode;
 use crate::config::{Config, FailureMode, L2aMode, PatternAction};
 use crate::constraint::{ConstraintEvaluator, DslConstraintEvaluator, ToolCallVerdict};
 use crate::effect::RequestCaptureV0;
 #[cfg(not(windows))]
 use crate::effect::RuntimeEnvelopeV0;
-use crate::layers::l1::{EnsembleL1Scanner, L1Scanner, L1Verdict, L1Block, SvmModel};
-use crate::layers::l1_harness::{L1Harness, L1Model, L1Signal, threshold_outcome, OutcomeView};
+use crate::layers::l1::{EnsembleL1Scanner, L1Block, L1Scanner, L1Verdict, SvmModel};
+use crate::layers::l1_harness::{L1Harness, L1Model, L1Signal, OutcomeView};
 use crate::layers::l2a::L2aScanner;
 use crate::layers::l3_inbound::{DefaultInboundScanner, InboundScanner, InboundVerdict};
-use crate::config::L4Mode;
 use crate::layers::l4::{DefaultMultiTurnScanner, L4Verdict, MultiTurnScanner};
 use crate::layers::l5a::{L5aScanner, OutputScanner};
 use crate::message::ToolCall;
-use crate::normalize::{neutralize_role_markers, normalize_messages_with_spans_and_evidence, L0Normalizer, Normalizer};
+use crate::normalize::{
+    normalize_messages_dual_view, L0DualScanView, L0Normalizer, L0ScanViews, Normalizer,
+};
 use crate::provider::{adapter_for, ProviderAdapter, ProviderType};
-use crate::proxy::{ProxyError, ProxyRequest, ProxyResponse, Provider, UpstreamClient};
-use crate::routing::{L0Evidence, NoopOrthogonalSensorRouter, OrthogonalSensorRouter, RoutingEvidenceContext};
-use crate::stream::{
-    classify_initial_sse_str, decode_utf8_chunk, AnthropicChunkClassifier, InitialSseMode,
-    OpenAiChunkClassifier, StreamProcessor, ToolCallBlockMode, ToolCallValidator, ValidationResult,
+use crate::proxy::{Provider, ProxyError, ProxyRequest, ProxyResponse, UpstreamClient};
+use crate::routing::{
+    L0Evidence, NoopOrthogonalSensorRouter, OrthogonalSensorRouter, RoutingEvidenceContext,
 };
 use crate::signal::combiner::{DefaultVerdictCombiner, VerdictCombiner};
 use crate::signal::extractor::{DefaultSignalExtractor, SignalExtractor};
 use crate::signal::Signal;
+use crate::stream::{
+    classify_initial_sse_str, decode_utf8_chunk, AnthropicChunkClassifier, InitialSseMode,
+    OpenAiChunkClassifier, StreamProcessor, ToolCallBlockMode, ToolCallValidator, ValidationResult,
+};
 use crate::trust::{RoleTrustAssigner, TrustAssigner};
 use async_trait::async_trait;
 use axum::body::Body;
-use bytes::Bytes;
-use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 #[cfg(test)]
 use axum::http::Uri;
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
+use bytes::Bytes;
 use futures_util::stream::{Stream, StreamExt};
 use futures_util::TryStreamExt;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -499,15 +503,12 @@ impl UpstreamClient for EngineUpstreamClient {
         // does not change enforcement: content mutation and span remapping still
         // go through the injected normalizer exactly as before.
         let mut l0_evidence: Option<Vec<L0Evidence>> = None;
-        if let Some(layer) = &self.deps.config.policy.layers.l0 {
+        let scan_views: L0ScanViews = if let Some(layer) = &self.deps.config.policy.layers.l0 {
             if layer.mode == "sanitize" {
-                let msg_evidence = normalize_messages_with_spans_and_evidence(
-                    self.deps.normalizer.as_ref(),
-                    &mut messages,
-                );
-                // Role marker neutralization: replace chat template tokens in untrusted content.
-                // Runs after normalization so span offsets are already remapped.
-                let replacements = neutralize_role_markers(&mut messages);
+                match normalize_messages_dual_view(self.deps.normalizer.as_ref(), &messages) {
+                    Ok((views, msg_evidence, replacements)) => {
+                        messages = views.html_stripped.clone();
+
                 if !replacements.is_empty() {
                     tracing::info!(
                         request_id = %ctx.request_id,
@@ -536,7 +537,9 @@ impl UpstreamClient for EngineUpstreamClient {
                             pre_byte_len: m.evidence.pre_byte_len,
                             post_byte_len: m.evidence.post_byte_len,
                             removed_invisible_count: m.evidence.removed_invisible_count,
-                            confusable_replacement_count: m.evidence.confusable_replacement_count,
+                                    confusable_replacement_count: m
+                                        .evidence
+                                        .confusable_replacement_count,
                             html_stripped: m.evidence.html_stripped,
                             role_marker_neutralized_count: role_counts
                                 .get(m.message_index)
@@ -545,8 +548,29 @@ impl UpstreamClient for EngineUpstreamClient {
                         })
                         .collect(),
                 );
+                        views
             }
+                    Err(build_err) => {
+                        tracing::warn!(
+                            request_id = %ctx.request_id,
+                            contract_hash = %ctx.contract_hash,
+                            provider = ctx.provider_str,
+                            model = %ctx.model,
+                            layer = "L0",
+                            error = %build_err,
+                            "L0 dual-view build failure; failing closed"
+                        );
+                        let body =
+                            adapter.serialize_error("request blocked by content policy", 403);
+                        return Ok(ProxyResponse::blocked(body, "L0"));
         }
+                }
+            } else {
+                L0ScanViews::passthrough(&messages)
+            }
+        } else {
+            L0ScanViews::passthrough(&messages)
+        };
 
         // Collect-then-decide: run all inbound layers before deciding.
         // Store the first block response; later layers still run for signal collection.
@@ -566,50 +590,38 @@ impl UpstreamClient for EngineUpstreamClient {
         // Harness path produces Vec<L1Signal> for the signal extractor and
         // derives L1Verdict for backward-compatible blocking/logging.
         // Legacy path produces L1Result directly (ensemble scanners).
-        if let (Some(model), Some(l1_config)) = (&self.deps.l1_model, &self.deps.config.policy.layers.l1) {
+        if let (Some(model), Some(l1_config)) =
+            (&self.deps.l1_model, &self.deps.config.policy.layers.l1)
+        {
             let l1_start = Instant::now();
             let l1_scan = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                L1Harness::scan(&messages, model.as_ref())
+                L1Harness::scan_dual_view(&scan_views, model.as_ref(), l1_config.threshold)
             }));
             let l1_ms = l1_start.elapsed().as_secs_f64() * 1000.0;
 
             match l1_scan {
-                Ok(signals) => {
-                    // Derive verdict from harness signals.
-                    //
-                    // Mention dampening: if attack signal is concentrated in
-                    // quoted regions, compare raw_unquoted_score against
-                    // threshold instead of raw_score.
-                    //
-                    // Squash score is emitted to the signal bus for downstream
-                    // consumers but does NOT participate in the verdict. At
-                    // threshold=0.0 the squash transform generates too many
-                    // false positives on benign text (665 extra FPs for 45 TPs
-                    // on the holdout set).
-                    let verdict = signals.iter()
-                        .find_map(|s| {
-                            let outcome = threshold_outcome(s, l1_config.threshold);
-                            let eff = outcome.effective_raw;
-                            if outcome.threshold_breached {
-                                let mention = outcome.outcome_view == OutcomeView::Unquoted;
+                Ok(Ok(dual_result)) => {
+                    let verdict = if let Some(ref breached) = dual_result.breached {
+                        let eff = breached.outcome.effective_raw;
+                        let mention = breached.outcome.outcome_view == OutcomeView::Unquoted;
                                 let score_label = if mention { "unquoted_score" } else { "score" };
-                                Some(L1Verdict::Block(L1Block {
+                        L1Verdict::Block(L1Block {
                                     reason: format!(
                                         "L1 {} {:.3} >= threshold {:.3}",
                                         score_label, eff, l1_config.threshold
                                     ),
-                                    message_index: s.message_index,
-                                    role: s.role.clone(),
+                            message_index: breached.signal.message_index,
+                            role: breached.signal.role.clone(),
                                     score: eff,
-                                }))
-                            } else {
-                                None
-                            }
                         })
-                        .unwrap_or(L1Verdict::Allow);
+                    } else {
+                        L1Verdict::Allow
+                    };
 
                     match &verdict {
-                        L1Verdict::Block(block) if l1_config.mode == crate::config::L1Mode::Block => {
+                        L1Verdict::Block(block)
+                            if l1_config.mode == crate::config::L1Mode::Block =>
+                        {
                             tracing::info!(
                                 request_id = %ctx.request_id,
                                 contract_hash = %ctx.contract_hash,
@@ -624,7 +636,8 @@ impl UpstreamClient for EngineUpstreamClient {
                                 latency_ms = l1_ms,
                                 "L1 classifier blocked"
                             );
-                            let body = adapter.serialize_error("request blocked by content policy", 403);
+                            let body =
+                                adapter.serialize_error("request blocked by content policy", 403);
                             pending_block = Some(ProxyResponse::blocked(body, "L1"));
                         }
                         L1Verdict::Block(block) => {
@@ -657,28 +670,78 @@ impl UpstreamClient for EngineUpstreamClient {
                         }
                     }
 
-                    l1_signals_opt = Some(signals);
+                    l1_signals_opt = Some(dual_result.signals);
+                }
+                Ok(Err(dual_err)) => {
+                    tracing::warn!(
+                        request_id = %ctx.request_id,
+                        contract_hash = %ctx.contract_hash,
+                        provider = ctx.provider_str,
+                        model = %ctx.model,
+                        layer = "L1",
+                        error = %dual_err,
+                        latency_ms = l1_ms,
+                        "L1 dual-view invariant failure; failing closed"
+                    );
+                    if pending_block.is_none() {
+                        let body =
+                            adapter.serialize_error("request blocked by content policy", 403);
+                        pending_block = Some(ProxyResponse::blocked(body, "L1"));
+                    }
                 }
                 Err(_) => {
-                    if let Some(resp) = handle_layer_error(on_failure, adapter.as_ref(), "L1", "scanner_panic", "scanner panicked", &ctx.request_id) {
+                    if let Some(resp) = handle_layer_error(
+                        on_failure,
+                        adapter.as_ref(),
+                        "L1",
+                        "scanner_panic",
+                        "scanner panicked",
+                        &ctx.request_id,
+                    ) {
                         return Ok(resp);
                     }
                 }
             }
-        } else if let (Some(scanner), Some(l1_config)) = (&self.deps.l1_scanner, &self.deps.config.policy.layers.l1) {
+        } else if let (Some(scanner), Some(l1_config)) =
+            (&self.deps.l1_scanner, &self.deps.config.policy.layers.l1)
+        {
             // Legacy scanner path (ensemble specialists).
             let l1_start = Instant::now();
             let l1_scan = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                scanner.scan(&messages, l1_config)
+                let strip_res = scanner.scan(scan_views.html_stripped_messages(), l1_config);
+                let pre_res = scanner.scan(scan_views.pre_html_messages(), l1_config);
+                (strip_res, pre_res)
             }));
             let l1_ms = l1_start.elapsed().as_secs_f64() * 1000.0;
 
             match l1_scan {
-                Ok(l1_result) => {
-                    l1_result_opt = Some(l1_result);
+                Ok((strip_res, pre_res)) => {
+                    let verdict = match (&strip_res.verdict, &pre_res.verdict) {
+                        (L1Verdict::Block(b), _) => L1Verdict::Block(b.clone()),
+                        (_, L1Verdict::Block(b)) => L1Verdict::Block(b.clone()),
+                        _ => L1Verdict::Allow,
+                    };
+                    let per_message_scores = if matches!(pre_res.verdict, L1Verdict::Block(_))
+                        && !matches!(strip_res.verdict, L1Verdict::Block(_))
+                    {
+                        pre_res.per_message_scores
+                    } else {
+                        strip_res.per_message_scores
+                    };
+                    l1_result_opt = Some(crate::layers::l1::L1Result {
+                        verdict,
+                        per_message_scores,
+                    });
                 }
                 Err(_) => {
-                    if let Some(resp) = handle_layer_error(on_failure, adapter.as_ref(), "L1", "scanner_panic", "scanner panicked", &ctx.request_id) {
+                    if let Some(resp) = handle_layer_error(
+                        on_failure,
+                        adapter.as_ref(),
+                        "L1",
+                        "scanner_panic",
+                        "scanner panicked",
+                        &ctx.request_id,
+                    ) {
                         return Ok(resp);
                     }
                 }
@@ -701,7 +764,8 @@ impl UpstreamClient for EngineUpstreamClient {
                             latency_ms = l1_ms,
                             "L1 classifier blocked"
                         );
-                        let body = adapter.serialize_error("request blocked by content policy", 403);
+                        let body =
+                            adapter.serialize_error("request blocked by content policy", 403);
                         pending_block = Some(ProxyResponse::blocked(body, "L1"));
                     }
                     L1Verdict::Block(block) => {
@@ -770,7 +834,8 @@ impl UpstreamClient for EngineUpstreamClient {
                         l2a_signals = signals;
 
                         // Per-layer enforcement.
-                        let has_block = l2a_signals.iter()
+                        let has_block = l2a_signals
+                            .iter()
                             .any(|s| s.score >= l2a_config.block_threshold);
                         match (&l2a_config.mode, has_block) {
                             (L2aMode::Block, true) => {
@@ -786,9 +851,8 @@ impl UpstreamClient for EngineUpstreamClient {
                                     "L2a blocked"
                                 );
                                 if pending_block.is_none() {
-                                    let body = adapter.serialize_error(
-                                        "request blocked by content policy", 403
-                                    );
+                                    let body = adapter
+                                        .serialize_error("request blocked by content policy", 403);
                                     pending_block = Some(ProxyResponse::blocked(body, "L2a"));
                                 }
                             }
@@ -819,26 +883,54 @@ impl UpstreamClient for EngineUpstreamClient {
                     }
                     Ok(Ok(Err(scan_err))) => {
                         // Scanner returned an error (classify failure or cardinality mismatch).
-                        if let Some(resp) = handle_layer_error(on_failure, adapter.as_ref(), "L2a", "scan_error", &format!("scan error: {scan_err}"), &ctx.request_id) {
+                        if let Some(resp) = handle_layer_error(
+                            on_failure,
+                            adapter.as_ref(),
+                            "L2a",
+                            "scan_error",
+                            &format!("scan error: {scan_err}"),
+                            &ctx.request_id,
+                        ) {
                             return Ok(resp);
                         }
                     }
                     Ok(Err(join_err)) => {
                         // Scan task panicked.
-                        if let Some(resp) = handle_layer_error(on_failure, adapter.as_ref(), "L2a", "scanner_panic", &format!("scan panicked: {join_err}"), &ctx.request_id) {
+                        if let Some(resp) = handle_layer_error(
+                            on_failure,
+                            adapter.as_ref(),
+                            "L2a",
+                            "scanner_panic",
+                            &format!("scan panicked: {join_err}"),
+                            &ctx.request_id,
+                        ) {
                             return Ok(resp);
                         }
                     }
                     Err(_) => {
                         // Timeout.
-                        if let Some(resp) = handle_layer_error(on_failure, adapter.as_ref(), "L2a", "scan_timeout", &format!("scan timed out ({}ms)", l2a_config.timeout_ms), &ctx.request_id) {
+                        if let Some(resp) = handle_layer_error(
+                            on_failure,
+                            adapter.as_ref(),
+                            "L2a",
+                            "scan_timeout",
+                            &format!("scan timed out ({}ms)", l2a_config.timeout_ms),
+                            &ctx.request_id,
+                        ) {
                             return Ok(resp);
                         }
                     }
                 }
             } else {
                 // Concurrency limit reached.
-                if let Some(resp) = handle_layer_error(on_failure, adapter.as_ref(), "L2a", "concurrency_limit", "concurrency limit reached", &ctx.request_id) {
+                if let Some(resp) = handle_layer_error(
+                    on_failure,
+                    adapter.as_ref(),
+                    "L2a",
+                    "concurrency_limit",
+                    "concurrency limit reached",
+                    &ctx.request_id,
+                ) {
                     return Ok(resp);
                 }
             }
@@ -859,14 +951,40 @@ impl UpstreamClient for EngineUpstreamClient {
             let scanner_ref = &self.deps.inbound_scanner;
             let config_ref = &self.deps.config;
             let l3i_scan = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                scanner_ref.scan(&messages, config_ref)
+                scanner_ref.scan_dual_view(&scan_views, config_ref)
             }));
             let l3i_ms = l3i_start.elapsed().as_secs_f64() * 1000.0;
 
             match l3i_scan {
-                Ok(result) => { inbound_result_opt = Some(result); }
+                Ok(Ok(result)) => {
+                    inbound_result_opt = Some(result);
+                }
+                Ok(Err(dual_err)) => {
+                    tracing::warn!(
+                        request_id = %ctx.request_id,
+                        contract_hash = %ctx.contract_hash,
+                        provider = ctx.provider_str,
+                        model = %ctx.model,
+                        layer = "L3-inbound",
+                        error = %dual_err,
+                        latency_ms = l3i_ms,
+                        "L3 dual-view invariant failure; failing closed"
+                    );
+                    if pending_block.is_none() {
+                        let body =
+                            adapter.serialize_error("request blocked by content policy", 403);
+                        pending_block = Some(ProxyResponse::blocked(body, "L3-inbound"));
+                    }
+                }
                 Err(_) => {
-                    if let Some(resp) = handle_layer_error(on_failure, adapter.as_ref(), "L3-inbound", "scanner_panic", "scanner panicked", &ctx.request_id) {
+                    if let Some(resp) = handle_layer_error(
+                        on_failure,
+                        adapter.as_ref(),
+                        "L3-inbound",
+                        "scanner_panic",
+                        "scanner panicked",
+                        &ctx.request_id,
+                    ) {
                         return Ok(resp);
                     }
                 }
@@ -878,7 +996,11 @@ impl UpstreamClient for EngineUpstreamClient {
             for m in &inbound_result.matched_patterns {
                 if m.action == PatternAction::Evidence {
                     evidence_count += 1;
-                    if let Some(cat) = self.deps.config.policy.block_patterns
+                        if let Some(cat) = self
+                            .deps
+                            .config
+                            .policy
+                            .block_patterns
                         .get(m.pattern_index)
                         .and_then(|p| p.category.as_ref())
                     {
@@ -899,6 +1021,7 @@ impl UpstreamClient for EngineUpstreamClient {
                         verdict = "block",
                         role = ?block.role,
                         message_index = block.message_index,
+                        inspected_view = block.scan_view.map(|view| view.as_str()).unwrap_or("not_applicable"),
                         reason = %block.reason,
                         matched_patterns = inbound_result.matched_patterns.len(),
                         evidence_count = evidence_count,
@@ -906,8 +1029,16 @@ impl UpstreamClient for EngineUpstreamClient {
                         "inbound blocked"
                     );
                     if pending_block.is_none() {
-                        let body = adapter.serialize_error("request blocked by content policy", 403);
-                        pending_block = Some(ProxyResponse::blocked(body, "L3-inbound"));
+                        let body =
+                            adapter.serialize_error("request blocked by content policy", 403);
+                        let mut response = ProxyResponse::blocked(body, "L3-inbound");
+                        if let Some(view) = block.scan_view {
+                            response.headers.insert(
+                                "x-parapet-blocked-view",
+                                HeaderValue::from_static(view.as_str()),
+                            );
+                        }
+                        pending_block = Some(response);
                     }
                 }
                 InboundVerdict::Block(block) => {
@@ -921,6 +1052,7 @@ impl UpstreamClient for EngineUpstreamClient {
                         verdict = "block_shadow",
                         role = ?block.role,
                         message_index = block.message_index,
+                        inspected_view = block.scan_view.map(|view| view.as_str()).unwrap_or("not_applicable"),
                         reason = %block.reason,
                         matched_patterns = inbound_result.matched_patterns.len(),
                         evidence_count = evidence_count,
@@ -964,7 +1096,10 @@ impl UpstreamClient for EngineUpstreamClient {
         let heuristic_signals = self.deps.orthogonal_sensor_router.route(&routing_context);
 
         // 5) L4 multi-turn scanning (if enabled)
-        if let (Some(scanner), Some(l4_config)) = (&self.deps.multi_turn_scanner, &self.deps.config.policy.layers.l4) {
+        if let (Some(scanner), Some(l4_config)) = (
+            &self.deps.multi_turn_scanner,
+            &self.deps.config.policy.layers.l4,
+        ) {
             let l4_start = Instant::now();
             let l4_scan = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 scanner.scan(&messages, l4_config)
@@ -972,17 +1107,29 @@ impl UpstreamClient for EngineUpstreamClient {
             let l4_ms = l4_start.elapsed().as_secs_f64() * 1000.0;
 
             match l4_scan {
-                Ok(result) => { l4_result_opt = Some(result); }
+                Ok(result) => {
+                    l4_result_opt = Some(result);
+                }
                 Err(_) => {
-                    if let Some(resp) = handle_layer_error(on_failure, adapter.as_ref(), "L4", "scanner_panic", "scanner panicked", &ctx.request_id) {
+                    if let Some(resp) = handle_layer_error(
+                        on_failure,
+                        adapter.as_ref(),
+                        "L4",
+                        "scanner_panic",
+                        "scanner panicked",
+                        &ctx.request_id,
+                    ) {
                         return Ok(resp);
                     }
                 }
             }
 
             if let Some(ref l4_result) = l4_result_opt {
-            let categories: Vec<&str> = l4_result.matched_categories.iter()
-                .map(|c| c.category.as_str()).collect();
+                let categories: Vec<&str> = l4_result
+                    .matched_categories
+                    .iter()
+                    .map(|c| c.category.as_str())
+                    .collect();
 
             match &l4_result.verdict {
                 L4Verdict::Block { reason } if l4_config.mode == L4Mode::Block => {
@@ -999,7 +1146,8 @@ impl UpstreamClient for EngineUpstreamClient {
                         "multi-turn attack blocked"
                     );
                     if pending_block.is_none() {
-                        let body = adapter.serialize_error("request blocked by content policy", 403);
+                            let body =
+                                adapter.serialize_error("request blocked by content policy", 403);
                         pending_block = Some(ProxyResponse::blocked(body, "L4"));
                     }
                 }
@@ -1038,7 +1186,10 @@ impl UpstreamClient for EngineUpstreamClient {
 
         // 5.5) Capture L2a score headers before signals are moved into the combiner.
         let l2a_max_fused = l2a_signals.iter().map(|s| s.score).fold(0.0f32, f32::max);
-        let l2a_max_raw = l2a_signals.iter().filter_map(|s| s.raw_model_score).fold(0.0f32, f32::max);
+        let l2a_max_raw = l2a_signals
+            .iter()
+            .filter_map(|s| s.raw_model_score)
+            .fold(0.0f32, f32::max);
         let l2a_has_scores = !l2a_signals.is_empty();
 
         // Verdict processor (shadow — log only, no behavioral change).
@@ -1052,7 +1203,11 @@ impl UpstreamClient for EngineUpstreamClient {
             signals.extend(l2a_signals);
             signals.extend(heuristic_signals);
             if let Some(ref l3r) = inbound_result_opt {
-                signals.extend(self.deps.signal_extractor.extract_l3(l3r, &*self.deps.config));
+                signals.extend(
+                    self.deps
+                        .signal_extractor
+                        .extract_l3(l3r, &*self.deps.config),
+                );
             }
             if let Some(ref l4r) = l4_result_opt {
                 signals.extend(self.deps.signal_extractor.extract_l4(l4r));
@@ -1077,7 +1232,12 @@ impl UpstreamClient for EngineUpstreamClient {
             if self.deps.emit_l1_signals {
                 attach_l1_signal_headers(&mut resp.headers, &l1_signals_opt);
             }
-            attach_l2a_score_headers(&mut resp.headers, l2a_has_scores, l2a_max_fused, l2a_max_raw);
+            attach_l2a_score_headers(
+                &mut resp.headers,
+                l2a_has_scores,
+                l2a_max_fused,
+                l2a_max_raw,
+            );
             return Ok(resp);
         }
 
@@ -1115,12 +1275,7 @@ impl UpstreamClient for EngineUpstreamClient {
             stream,
         };
 
-        let upstream = self
-            .deps
-            .http
-            .send(http_req)
-            .await
-            .map_err(|e| match e {
+        let upstream = self.deps.http.send(http_req).await.map_err(|e| match e {
                 HttpError::Timeout(msg) => ProxyError::UpstreamTimeout(msg),
                 HttpError::Transport(msg) => ProxyError::UpstreamFailure(msg),
             })?;
@@ -1140,7 +1295,12 @@ impl UpstreamClient for EngineUpstreamClient {
             if self.deps.emit_l1_signals {
                 attach_l1_signal_headers(&mut resp.headers, &l1_signals_opt);
             }
-            attach_l2a_score_headers(&mut resp.headers, l2a_has_scores, l2a_max_fused, l2a_max_raw);
+            attach_l2a_score_headers(
+                &mut resp.headers,
+                l2a_has_scores,
+                l2a_max_fused,
+                l2a_max_raw,
+            );
             return Ok(resp);
         }
 
@@ -1183,7 +1343,12 @@ impl UpstreamClient for EngineUpstreamClient {
         if self.deps.emit_l1_signals {
             attach_l1_signal_headers(&mut resp_headers, &l1_signals_opt);
         }
-        attach_l2a_score_headers(&mut resp_headers, l2a_has_scores, l2a_max_fused, l2a_max_raw);
+        attach_l2a_score_headers(
+            &mut resp_headers,
+            l2a_has_scores,
+            l2a_max_fused,
+            l2a_max_raw,
+        );
         if let Some(extra) = processed.extra_headers {
             for (key, value) in extra.iter() {
                 resp_headers.insert(key, value.clone());
@@ -1226,7 +1391,8 @@ impl EngineUpstreamClient {
             );
         }
 
-        let (validator, block_mode) = if let Some(layer) = &self.deps.config.policy.layers.l3_outbound {
+        let (validator, block_mode) =
+            if let Some(layer) = &self.deps.config.policy.layers.l3_outbound {
             if layer.mode == "block" {
                 let mode = match layer.block_action.as_deref() {
                     Some("error") => ToolCallBlockMode::Error,
@@ -1244,10 +1410,16 @@ impl EngineUpstreamClient {
                     mode,
                 )
             } else {
-                (Arc::new(AllowAllToolCalls) as Arc<dyn ToolCallValidator>, ToolCallBlockMode::Error)
+                    (
+                        Arc::new(AllowAllToolCalls) as Arc<dyn ToolCallValidator>,
+                        ToolCallBlockMode::Error,
+                    )
             }
         } else {
-            (Arc::new(AllowAllToolCalls) as Arc<dyn ToolCallValidator>, ToolCallBlockMode::Error)
+                (
+                    Arc::new(AllowAllToolCalls) as Arc<dyn ToolCallValidator>,
+                    ToolCallBlockMode::Error,
+                )
         };
 
         let classifier: Arc<dyn crate::stream::ChunkClassifier> = match provider {
@@ -1446,7 +1618,8 @@ impl EngineUpstreamClient {
                             "outbound blocked (error mode)"
                         );
                         // Generic message to client — internal reason already logged above
-                        let body = adapter.serialize_error("request blocked by content policy", 403);
+                        let body =
+                            adapter.serialize_error("request blocked by content policy", 403);
                         return ProcessedResponse {
                             status_override: Some(StatusCode::FORBIDDEN),
                             body: Bytes::from(body),
@@ -1561,12 +1734,19 @@ impl EngineUpstreamClient {
                                 "layer runtime error — blocking request (on_failure: closed)"
                             );
                             let err_body = adapter.serialize_error(
-                                "service unavailable (guardrail layer error)", 503
+                                "service unavailable (guardrail layer error)",
+                                503,
                             );
                             let mut hdrs = HeaderMap::new();
-                            if let Ok(v) = "error".parse() { hdrs.insert("x-parapet-action", v); }
-                            if let Ok(v) = "L5a".parse() { hdrs.insert("x-parapet-layer", v); }
-                            if let Ok(v) = "scanner_panic".parse() { hdrs.insert("x-parapet-error", v); }
+                            if let Ok(v) = "error".parse() {
+                                hdrs.insert("x-parapet-action", v);
+                            }
+                            if let Ok(v) = "L5a".parse() {
+                                hdrs.insert("x-parapet-layer", v);
+                            }
+                            if let Ok(v) = "scanner_panic".parse() {
+                                hdrs.insert("x-parapet-error", v);
+                            }
                             return ProcessedResponse {
                                 status_override: Some(StatusCode::SERVICE_UNAVAILABLE),
                                 body: Bytes::from(err_body),
@@ -3180,10 +3360,7 @@ impl HttpSender for ReqwestHttpSender {
             req = req.timeout(std::time::Duration::from_millis(timeout_ms));
         }
 
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| {
+        let resp = req.send().await.map_err(|e| {
                 if e.is_timeout() {
                     HttpError::Timeout(e.to_string())
                 } else {
@@ -3195,7 +3372,9 @@ impl HttpSender for ReqwestHttpSender {
         let headers = resp.headers().clone();
 
         if request.stream {
-            let stream = resp.bytes_stream().map_err(|e| HttpError::Transport(e.to_string()));
+            let stream = resp
+                .bytes_stream()
+                .map_err(|e| HttpError::Transport(e.to_string()));
             Ok(HttpResponse {
                 status,
                 headers,
@@ -3236,18 +3415,21 @@ pub fn build_engine_client_with_upstream_table(
             if l1_config.specialists.is_empty() {
                 (Some(Arc::new(SvmModel)), None)
             } else {
-                (None, Some(Arc::new(EnsembleL1Scanner::new(
+                (
+                    None,
+                    Some(Arc::new(EnsembleL1Scanner::new(
                     &l1_config.specialists,
                     l1_config.min_agree,
                     l1_config.generalist_solo_threshold,
-                ))))
+                    ))),
+                )
             }
         } else {
             (None, None)
         };
 
-    let multi_turn_scanner: Option<Arc<dyn MultiTurnScanner>> =
-        if config.policy.layers.l4.is_some() {
+    let multi_turn_scanner: Option<Arc<dyn MultiTurnScanner>> = if config.policy.layers.l4.is_some()
+    {
             Some(Arc::new(DefaultMultiTurnScanner::new()))
         } else {
             None
@@ -3260,15 +3442,16 @@ pub fn build_engine_client_with_upstream_table(
     if config.policy.layers.l2a.is_some() {
         return Err(StartupError::FeatureDisabled(
             "policy.layers.l2a is configured but binary was built without \
-             --features l2a. Rebuild with: cargo build --features l2a".into()
+             --features l2a. Rebuild with: cargo build --features l2a"
+                .into(),
         ));
     }
 
     #[cfg(feature = "l2a")]
     let l2a_scanner: Option<Arc<dyn L2aScanner>> =
         if let Some(l2a_config) = &config.policy.layers.l2a {
-            use crate::layers::l2a::DefaultL2aScanner;
             use crate::layers::l2a::DefaultHeuristicScanner;
+            use crate::layers::l2a::DefaultL2aScanner;
             use crate::layers::l2a_model::OnnxPromptGuard;
 
             let classifier = OnnxPromptGuard::init(l2a_config)
@@ -3285,7 +3468,8 @@ pub fn build_engine_client_with_upstream_table(
     #[cfg(not(feature = "l2a"))]
     let l2a_scanner: Option<Arc<dyn L2aScanner>> = None;
 
-    let l2a_semaphore = config.policy.layers.l2a.as_ref().map(|l2a_config| {
+    let l2a_semaphore =
+        config.policy.layers.l2a.as_ref().map(|l2a_config| {
         Arc::new(tokio::sync::Semaphore::new(l2a_config.max_concurrent_scans))
     });
 
@@ -3364,6 +3548,10 @@ impl OfflineUpstreamFixtureV0 {
             "demo_injection_benign_v0" => Some(Self::Demo(demo::DemoJourneyV0::InjectionBenign)),
             #[cfg(not(windows))]
             "demo_mismatch_v0" => Some(Self::Demo(demo::DemoJourneyV0::Mismatch)),
+            #[cfg(not(windows))]
+            "demo_ordinary_overreach_v0" => {
+                Some(Self::Demo(demo::DemoJourneyV0::OrdinaryOverreach))
+            }
             _ => None,
         }
     }
@@ -3831,10 +4019,12 @@ fn build_engine_client_with_runtime_and_file_fixture_and_upstream_v0(
 
     let http: Arc<dyn HttpSender> = match options.offline_fixture {
         #[cfg(not(windows))]
-        Some(OfflineUpstreamFixtureV0::Demo(journey)) => Arc::new(demo::DemoProposerHttpSenderV0::new(
+        Some(OfflineUpstreamFixtureV0::Demo(journey)) => {
+            Arc::new(demo::DemoProposerHttpSenderV0::new(
             journey,
             demo::ManifestDemoProposerV0::new_default(),
-        )),
+            ))
+        }
         Some(fixture) => Arc::new(DeterministicOfflineHttpSenderV0::new(fixture)),
         None => Arc::new(ReqwestHttpSender::new(production_http_client())),
     };
@@ -3926,9 +4116,15 @@ fn effect_runtime_error(
 fn layer_error_503(adapter: &dyn ProviderAdapter, layer: &str, error_type: &str) -> ProxyResponse {
     let body = adapter.serialize_error("service unavailable (guardrail layer error)", 503);
     let mut headers = HeaderMap::new();
-    if let Ok(v) = "error".parse() { headers.insert("x-parapet-action", v); }
-    if let Ok(v) = layer.parse() { headers.insert("x-parapet-layer", v); }
-    if let Ok(v) = error_type.parse() { headers.insert("x-parapet-error", v); }
+    if let Ok(v) = "error".parse() {
+        headers.insert("x-parapet-action", v);
+    }
+    if let Ok(v) = layer.parse() {
+        headers.insert("x-parapet-layer", v);
+    }
+    if let Ok(v) = error_type.parse() {
+        headers.insert("x-parapet-error", v);
+    }
     ProxyResponse {
         status: StatusCode::SERVICE_UNAVAILABLE,
         headers,
@@ -3987,7 +4183,11 @@ fn handle_layer_error(
 /// Attach evidence signal headers to a response for observability/eval.
 ///
 /// Only writes headers when evidence_count > 0 to avoid noise on clean requests.
-fn attach_evidence_headers(headers: &mut HeaderMap, evidence_count: usize, evidence_categories: &[String]) {
+fn attach_evidence_headers(
+    headers: &mut HeaderMap,
+    evidence_count: usize,
+    evidence_categories: &[String],
+) {
     if evidence_count == 0 {
         return;
     }
@@ -4020,7 +4220,12 @@ fn attach_l1_signal_headers(headers: &mut HeaderMap, signals: &Option<Vec<L1Sign
 
 /// Emits both the fused score (what the threshold applies to) and the raw
 /// model score (pre-fusion PG2 softmax) so sweeps can target either.
-fn attach_l2a_score_headers(headers: &mut HeaderMap, has_scores: bool, max_fused: f32, max_raw: f32) {
+fn attach_l2a_score_headers(
+    headers: &mut HeaderMap,
+    has_scores: bool,
+    max_fused: f32,
+    max_raw: f32,
+) {
     if !has_scores {
         return;
     }
@@ -4341,9 +4546,7 @@ fn accepts_event_stream(headers: &HeaderMap) -> bool {
             v.split(',').any(|part| {
                 let token = part.trim();
                 token.eq_ignore_ascii_case("text/event-stream")
-                    || token
-                        .to_ascii_lowercase()
-                        .starts_with("text/event-stream;")
+                    || token.to_ascii_lowercase().starts_with("text/event-stream;")
             })
         })
         .unwrap_or(false)
@@ -4900,7 +5103,8 @@ fn apply_streaming_redaction_with_context(
                             }
                             StreamRedactionMode::Sse => {
                                 if !state.bom_stripped && !state.raw_buffer.is_empty() {
-                                    if let Some(stripped) = state.raw_buffer.strip_prefix('\u{FEFF}')
+                                    if let Some(stripped) =
+                                        state.raw_buffer.strip_prefix('\u{FEFF}')
                                     {
                                         state.raw_buffer = stripped.to_string();
                                     }
@@ -5081,10 +5285,7 @@ fn suppress_stream_content(
     record_stream_suppression_once(state, reason, buffered_chars);
 }
 
-fn fail_closed_sse_state(
-    state: &mut StreamingRedactionState,
-    reason: StreamL5aSuppressionReason,
-) {
+fn fail_closed_sse_state(state: &mut StreamingRedactionState, reason: StreamL5aSuppressionReason) {
     let buffered = state.buffered_chars;
     state.pending_event_line = None;
     state.pending_deltas.clear();
@@ -6541,13 +6742,13 @@ fn parse_trust_header(headers: &HeaderMap, body: &[u8], messages: &mut [crate::m
                     continue;
                 }
 
-                messages[region.msg_idx].trust_spans.push(
-                    crate::trust::TrustSpan::untrusted(
+                messages[region.msg_idx]
+                    .trust_spans
+                    .push(crate::trust::TrustSpan::untrusted(
                         raw_start,
                         raw_end,
                         span.src.clone().unwrap_or_else(|| "unknown".to_string()),
-                    ),
-                );
+                    ));
                 matched = true;
             }
         }
@@ -6613,7 +6814,8 @@ fn find_messages_array_range(body: &str) -> Option<(usize, usize)> {
         match b {
             b'"' => {
                 // Check if this starts the "messages" key at root level
-                if brace_depth == 1 && bracket_depth == 0
+                if brace_depth == 1
+                    && bracket_depth == 0
                     && i + key.len() <= bytes.len()
                     && &bytes[i..i + key.len()] == key
                 {
@@ -6774,8 +6976,8 @@ fn escaped_byte_to_raw(escaped: &str, target_esc_pos: usize) -> usize {
                 if esc_pos + 6 > target_esc_pos {
                     break;
                 }
-                let hex_str = std::str::from_utf8(&bytes[esc_pos + 2..esc_pos + 6])
-                    .unwrap_or("0000");
+                let hex_str =
+                    std::str::from_utf8(&bytes[esc_pos + 2..esc_pos + 6]).unwrap_or("0000");
                 let code_unit = u32::from_str_radix(hex_str, 16).unwrap_or(0);
 
                 // High surrogate (U+D800..U+DBFF) followed by \uXXXX low surrogate?
@@ -6784,8 +6986,8 @@ fn escaped_byte_to_raw(escaped: &str, target_esc_pos: usize) -> usize {
                     && bytes[esc_pos + 6] == b'\\'
                     && bytes[esc_pos + 7] == b'u'
                 {
-                    let low_hex = std::str::from_utf8(&bytes[esc_pos + 8..esc_pos + 12])
-                        .unwrap_or("0000");
+                    let low_hex =
+                        std::str::from_utf8(&bytes[esc_pos + 8..esc_pos + 12]).unwrap_or("0000");
                     let low_unit = u32::from_str_radix(low_hex, 16).unwrap_or(0);
 
                     if (0xDC00..=0xDFFF).contains(&low_unit) {
@@ -6793,9 +6995,7 @@ fn escaped_byte_to_raw(escaped: &str, target_esc_pos: usize) -> usize {
                         if esc_pos + 12 > target_esc_pos {
                             break;
                         }
-                        let cp = 0x10000
-                            + ((code_unit - 0xD800) << 10)
-                            + (low_unit - 0xDC00);
+                        let cp = 0x10000 + ((code_unit - 0xD800) << 10) + (low_unit - 0xDC00);
                         let char_len = char::from_u32(cp).map_or(4, |c| c.len_utf8());
                         esc_pos += 12;
                         raw_pos += char_len;
@@ -6977,7 +7177,11 @@ fn parse_openai_tool_call(value: &serde_json::Value) -> Result<ToolCall, String>
 
     let arguments = parse_openai_arguments(function.get("arguments"))?;
 
-    Ok(ToolCall { id, name, arguments })
+    Ok(ToolCall {
+        id,
+        name,
+        arguments,
+    })
 }
 
 fn parse_openai_arguments(value: Option<&serde_json::Value>) -> Result<serde_json::Value, String> {
@@ -7010,7 +7214,11 @@ fn parse_anthropic_tool_call(value: &serde_json::Value) -> Result<ToolCall, Stri
         Some(v) => v.clone(),
     };
 
-    Ok(ToolCall { id, name, arguments })
+    Ok(ToolCall {
+        id,
+        name,
+        arguments,
+    })
 }
 
 #[cfg(test)]

@@ -32,6 +32,10 @@ pub struct InboundBlock {
     pub reason: String,
     pub message_index: usize,
     pub role: Role,
+    /// L0 content view that produced the blocking pattern match. `None` means
+    /// the block came from a non-view surface such as tool arguments or an
+    /// original-length policy check.
+    pub scan_view: Option<crate::normalize::L0ScanView>,
 }
 
 /// Result from inbound scanning: verdict + all pattern matches collected.
@@ -59,9 +63,142 @@ pub enum MatchSource {
     ToolCallArgument { tool_call_id: String },
 }
 
+/// Error returned when dual-view L3 inbound scanning must fail closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InboundDualScanError {
+    /// Custom `InboundScanner` implementation does not override `scan_dual_view`.
+    UnsupportedScanner,
+    /// Views are misaligned or missing required metadata.
+    InvalidScanViews { reason: &'static str },
+    /// A content match in a scan view could not be mapped back to a valid original byte range.
+    MissingSourceMapping {
+        view: crate::normalize::L0ScanView,
+        message_index: usize,
+        pattern_index: usize,
+    },
+    /// Original forwarded content or untrusted-span character length could not be established.
+    MissingOriginalLength { message_index: usize },
+}
+
+impl std::fmt::Display for InboundDualScanError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InboundDualScanError::UnsupportedScanner => {
+                write!(f, "custom InboundScanner does not implement scan_dual_view")
+            }
+            InboundDualScanError::InvalidScanViews { reason } => {
+                write!(f, "invalid L0 dual scan views for L3: {reason}")
+            }
+            InboundDualScanError::MissingSourceMapping {
+                view,
+                message_index,
+                pattern_index,
+            } => {
+                write!(
+                    f,
+                    "missing L0 source mapping in {view:?} for message {message_index}, pattern {pattern_index}"
+                )
+            }
+            InboundDualScanError::MissingOriginalLength { message_index } => {
+                write!(
+                    f,
+                    "missing original forwarded content length for message {message_index}"
+                )
+            }
+        }
+    }
+}
+
 /// Scans inbound messages for block patterns and untrusted content policy.
 pub trait InboundScanner: Send + Sync {
     fn scan(&self, messages: &[Message], config: &Config) -> InboundResult;
+
+    /// Scan both complete L0 views (`pre_html` and `html_stripped`), merging
+    /// findings with `Block > Allow`, deduplicating by stable finding identity
+    /// and verified original byte range, scanning tool-call arguments once,
+    /// and anchoring `max_length` to original forwarded content lengths.
+    ///
+    /// Custom scanners must explicitly override this method; the default fails
+    /// closed with `InboundDualScanError::UnsupportedScanner`.
+    fn scan_dual_view(
+        &self,
+        _views: &dyn crate::normalize::L0DualScanView,
+        _config: &Config,
+    ) -> Result<InboundResult, InboundDualScanError> {
+        Err(InboundDualScanError::UnsupportedScanner)
+    }
+}
+
+fn validate_dual_views(
+    views: &dyn crate::normalize::L0DualScanView,
+) -> Result<(), InboundDualScanError> {
+    let pre_messages = views.pre_html_messages();
+    let strip_messages = views.html_stripped_messages();
+    if pre_messages.len() != strip_messages.len() {
+        return Err(InboundDualScanError::InvalidScanViews {
+            reason: "pre_html and html_stripped message counts differ",
+        });
+    }
+    for i in 0..strip_messages.len() {
+        if pre_messages[i].role != strip_messages[i].role
+            || pre_messages[i].trust != strip_messages[i].trust
+        {
+            return Err(InboundDualScanError::InvalidScanViews {
+                reason: "pre_html and html_stripped message metadata misaligned",
+            });
+        }
+        if views.original_byte_len(i).is_none() || views.original_char_len(i).is_none() {
+            return Err(InboundDualScanError::MissingOriginalLength { message_index: i });
+        }
+        if views
+            .offset_mappings(crate::normalize::L0ScanView::PreHtml, i)
+            .is_none()
+        {
+            return Err(InboundDualScanError::InvalidScanViews {
+                reason: "missing pre_html offset mappings",
+            });
+        }
+        if views
+            .offset_mappings(crate::normalize::L0ScanView::HtmlStripped, i)
+            .is_none()
+        {
+            return Err(InboundDualScanError::InvalidScanViews {
+                reason: "missing html_stripped offset mappings",
+            });
+        }
+        let untrusted_span_count = strip_messages[i].untrusted_ranges().len();
+        for span_idx in 0..untrusted_span_count {
+            if views
+                .original_untrusted_span_char_len(i, span_idx)
+                .is_none()
+            {
+                return Err(InboundDualScanError::MissingOriginalLength { message_index: i });
+            }
+        }
+        if untrusted_span_count > 0 && views.original_total_untrusted_span_char_len(i).is_none() {
+            return Err(InboundDualScanError::MissingOriginalLength { message_index: i });
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ContentDedupKey {
+    pattern_index: usize,
+    message_index: usize,
+    role_tag: u8,
+    is_block: bool,
+    orig_start: usize,
+    orig_end: usize,
+}
+
+fn role_tag(role: &Role) -> u8 {
+    match role {
+        Role::System => 0,
+        Role::User => 1,
+        Role::Assistant => 2,
+        Role::Tool => 3,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -130,8 +267,7 @@ impl InboundScanner for DefaultInboundScanner {
                             break;
                         }
                         if let Some(ref gate) = pattern.trust_gate {
-                            if *gate == TrustLevel::Untrusted
-                                && msg.trust != TrustLevel::Untrusted
+                            if *gate == TrustLevel::Untrusted && msg.trust != TrustLevel::Untrusted
                             {
                                 continue;
                             }
@@ -167,13 +303,17 @@ impl InboundScanner for DefaultInboundScanner {
                     format!("block pattern matched: {}", pattern_str)
                 }
                 MatchSource::ToolCallArgument { .. } => {
-                    format!("block pattern matched in tool_call arguments: {}", pattern_str)
+                    format!(
+                        "block pattern matched in tool_call arguments: {}",
+                        pattern_str
+                    )
                 }
             };
             Some(InboundVerdict::Block(InboundBlock {
                 reason,
                 message_index: first.message_index,
                 role: first.role.clone(),
+                scan_view: None,
             }))
         } else {
             None
@@ -181,7 +321,10 @@ impl InboundScanner for DefaultInboundScanner {
 
         // If pass 1 found a block, return it with all collected matches.
         if let Some(verdict) = pattern_verdict {
-            return InboundResult { verdict, matched_patterns };
+            return InboundResult {
+                verdict,
+                matched_patterns,
+            };
         }
 
         // Pass 2: Untrusted content policy (max_length) — still early-return.
@@ -203,6 +346,7 @@ impl InboundScanner for DefaultInboundScanner {
                             ),
                             message_index: idx,
                             role: msg.role.clone(),
+                            scan_view: None,
                         }),
                         matched_patterns, // empty — no pattern matches
                     };
@@ -245,6 +389,7 @@ impl InboundScanner for DefaultInboundScanner {
                             ),
                             message_index: idx,
                             role: msg.role.clone(),
+                            scan_view: None,
                         }),
                         matched_patterns, // empty — no pattern matches
                     };
@@ -260,6 +405,265 @@ impl InboundScanner for DefaultInboundScanner {
             verdict: InboundVerdict::Allow,
             matched_patterns, // empty
         }
+    }
+
+    fn scan_dual_view(
+        &self,
+        views: &dyn crate::normalize::L0DualScanView,
+        config: &Config,
+    ) -> Result<InboundResult, InboundDualScanError> {
+        validate_dual_views(views)?;
+
+        const MAX_MATCHES: usize = 256;
+        let strip_messages = views.html_stripped_messages();
+        let pre_messages = views.pre_html_messages();
+
+        let mut matched_patterns: Vec<PatternMatch> = Vec::with_capacity(MAX_MATCHES);
+        let mut seen_content_keys: HashSet<ContentDedupKey> = HashSet::with_capacity(MAX_MATCHES);
+        let mut seen_stripped_msg_pat: HashSet<(usize, usize)> =
+            HashSet::with_capacity(MAX_MATCHES);
+        let mut first_block: Option<InboundBlock> = None;
+
+        // 1. Existing view (`html_stripped`) findings first, including single pass over tool_calls (C-2).
+        for (idx, msg) in strip_messages.iter().enumerate() {
+            for (pat_idx, pattern) in config.policy.block_patterns.iter().enumerate() {
+                let can_collect = matched_patterns.len() < MAX_MATCHES;
+                let need_block_check =
+                    first_block.is_none() && pattern.action == PatternAction::Block;
+                if !can_collect && !need_block_check {
+                    continue;
+                }
+                if let Some(ref gate) = pattern.trust_gate {
+                    if *gate == TrustLevel::Untrusted
+                        && msg.trust != TrustLevel::Untrusted
+                        && msg.untrusted_ranges().is_empty()
+                    {
+                        continue;
+                    }
+                }
+                if let Some(m) = pattern.regex.find(&msg.content) {
+                    let (orig_start, orig_end) = views
+                        .map_range_to_original(
+                            crate::normalize::L0ScanView::HtmlStripped,
+                            idx,
+                            m.start(),
+                            m.end(),
+                        )
+                        .ok_or(InboundDualScanError::MissingSourceMapping {
+                            view: crate::normalize::L0ScanView::HtmlStripped,
+                            message_index: idx,
+                            pattern_index: pat_idx,
+                        })?;
+
+                    if pattern.action == PatternAction::Block && first_block.is_none() {
+                        first_block = Some(InboundBlock {
+                            reason: format!("block pattern matched: {}", pattern.pattern),
+                            message_index: idx,
+                            role: msg.role.clone(),
+                            scan_view: Some(crate::normalize::L0ScanView::HtmlStripped),
+                        });
+                    }
+
+                    if can_collect && seen_stripped_msg_pat.insert((pat_idx, idx)) {
+                        seen_content_keys.insert(ContentDedupKey {
+                            pattern_index: pat_idx,
+                            message_index: idx,
+                            role_tag: role_tag(&msg.role),
+                            is_block: pattern.action == PatternAction::Block,
+                            orig_start,
+                            orig_end,
+                        });
+                        matched_patterns.push(PatternMatch {
+                            pattern_index: pat_idx,
+                            message_index: idx,
+                            role: msg.role.clone(),
+                            source: MatchSource::Content,
+                            action: pattern.action.clone(),
+                        });
+                    }
+                }
+            }
+
+            // C-2: Tool-call arguments are not an L0 scan view; scan once here and never duplicate in pre_html.
+            for tc in &msg.tool_calls {
+                for s in json_string_values(&tc.arguments) {
+                    for (pat_idx, pattern) in config.policy.block_patterns.iter().enumerate() {
+                        let can_collect = matched_patterns.len() < MAX_MATCHES;
+                        let need_block_check =
+                            first_block.is_none() && pattern.action == PatternAction::Block;
+                        if !can_collect && !need_block_check {
+                            continue;
+                        }
+                        if let Some(ref gate) = pattern.trust_gate {
+                            if *gate == TrustLevel::Untrusted && msg.trust != TrustLevel::Untrusted
+                            {
+                                continue;
+                            }
+                        }
+                        if pattern.is_match(&s) {
+                            if pattern.action == PatternAction::Block && first_block.is_none() {
+                                first_block = Some(InboundBlock {
+                                    reason: format!(
+                                        "block pattern matched in tool_call arguments: {}",
+                                        pattern.pattern
+                                    ),
+                                    message_index: idx,
+                                    role: msg.role.clone(),
+                                    scan_view: None,
+                                });
+                            }
+                            if can_collect && seen_stripped_msg_pat.insert((pat_idx, idx)) {
+                                matched_patterns.push(PatternMatch {
+                                    pattern_index: pat_idx,
+                                    message_index: idx,
+                                    role: msg.role.clone(),
+                                    source: MatchSource::ToolCallArgument {
+                                        tool_call_id: tc.id.clone(),
+                                    },
+                                    action: pattern.action.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Pre-HTML view (`pre_html`) content findings in scanner order, deduplicated by
+        // stable identity + verified mapped original message range.
+        for (idx, msg) in pre_messages.iter().enumerate() {
+            for (pat_idx, pattern) in config.policy.block_patterns.iter().enumerate() {
+                let can_collect = matched_patterns.len() < MAX_MATCHES;
+                let need_block_check =
+                    first_block.is_none() && pattern.action == PatternAction::Block;
+                if !can_collect && !need_block_check {
+                    continue;
+                }
+                if let Some(ref gate) = pattern.trust_gate {
+                    if *gate == TrustLevel::Untrusted
+                        && msg.trust != TrustLevel::Untrusted
+                        && msg.untrusted_ranges().is_empty()
+                    {
+                        continue;
+                    }
+                }
+                if let Some(m) = pattern.regex.find(&msg.content) {
+                    let (orig_start, orig_end) = views
+                        .map_range_to_original(
+                            crate::normalize::L0ScanView::PreHtml,
+                            idx,
+                            m.start(),
+                            m.end(),
+                        )
+                        .ok_or(InboundDualScanError::MissingSourceMapping {
+                            view: crate::normalize::L0ScanView::PreHtml,
+                            message_index: idx,
+                            pattern_index: pat_idx,
+                        })?;
+
+                    let key = ContentDedupKey {
+                        pattern_index: pat_idx,
+                        message_index: idx,
+                        role_tag: role_tag(&msg.role),
+                        is_block: pattern.action == PatternAction::Block,
+                        orig_start,
+                        orig_end,
+                    };
+                    if !seen_content_keys.contains(&key) {
+                        if pattern.action == PatternAction::Block && first_block.is_none() {
+                            first_block = Some(InboundBlock {
+                                reason: format!("block pattern matched: {}", pattern.pattern),
+                                message_index: idx,
+                                role: msg.role.clone(),
+                                scan_view: Some(crate::normalize::L0ScanView::PreHtml),
+                            });
+                        }
+                        if can_collect {
+                            matched_patterns.push(PatternMatch {
+                                pattern_index: pat_idx,
+                                message_index: idx,
+                                role: msg.role.clone(),
+                                source: MatchSource::Content,
+                                action: pattern.action.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(block) = first_block {
+            return Ok(InboundResult {
+                verdict: InboundVerdict::Block(block),
+                matched_patterns,
+            });
+        }
+
+        // Pass 2: Untrusted content policy (max_length) anchored to original forwarded content length.
+        for (idx, msg) in strip_messages.iter().enumerate() {
+            if msg.trust != TrustLevel::Untrusted {
+                continue;
+            }
+
+            let policy = policy_for_message(msg, config);
+            if let Some(max_len) = policy.max_length {
+                let len = views
+                    .original_char_len(idx)
+                    .ok_or(InboundDualScanError::MissingOriginalLength { message_index: idx })?;
+                if len > max_len {
+                    return Ok(InboundResult {
+                        verdict: InboundVerdict::Block(InboundBlock {
+                            reason: format!(
+                                "untrusted content exceeds max_length: {len} > {max_len}"
+                            ),
+                            message_index: idx,
+                            role: msg.role.clone(),
+                            scan_view: None,
+                        }),
+                        matched_patterns,
+                    });
+                }
+            }
+        }
+
+        // Pass 3: Per-span trust checking anchored to original forwarded untrusted-span character length.
+        for (idx, msg) in strip_messages.iter().enumerate() {
+            if msg.trust_spans.is_empty() || msg.trust == TrustLevel::Untrusted {
+                continue;
+            }
+
+            let untrusted_spans = msg.untrusted_ranges();
+            if untrusted_spans.is_empty() {
+                continue;
+            }
+
+            let policy = policy_for_message(msg, config);
+            if let Some(max_len) = policy.max_length {
+                let total_untrusted_chars = views
+                    .original_total_untrusted_span_char_len(idx)
+                    .ok_or(InboundDualScanError::MissingOriginalLength { message_index: idx })?;
+
+                if total_untrusted_chars > max_len {
+                    return Ok(InboundResult {
+                        verdict: InboundVerdict::Block(InboundBlock {
+                            reason: format!(
+                                "untrusted span content exceeds max_length: {} > {}",
+                                total_untrusted_chars, max_len
+                            ),
+                            message_index: idx,
+                            role: msg.role.clone(),
+                            scan_view: None,
+                        }),
+                        matched_patterns,
+                    });
+                }
+            }
+        }
+
+        Ok(InboundResult {
+            verdict: InboundVerdict::Allow,
+            matched_patterns,
+        })
     }
 }
 
@@ -331,12 +735,15 @@ mod tests {
                 version: "v1".to_string(),
                 tools,
                 block_patterns: vec![
-                    crate::config::CompiledPattern::compile("ignore previous instructions").unwrap(),
+                    crate::config::CompiledPattern::compile("ignore previous instructions")
+                        .unwrap(),
                     crate::config::CompiledPattern::compile("you are now [A-Z]+").unwrap(),
                 ],
                 canary_tokens: Vec::new(),
                 sensitive_patterns: Vec::new(),
-                untrusted_content_policy: ContentPolicy { max_length: Some(10) },
+                untrusted_content_policy: ContentPolicy {
+                    max_length: Some(10),
+                },
                 trust: TrustConfig::default(),
                 layers: LayerConfigs::default(),
             },
@@ -488,7 +895,9 @@ mod tests {
                 allowed: true,
                 trust: Some(TrustLevel::Untrusted),
                 constraints: HashMap::new(),
-                result_policy: Some(ContentPolicy { max_length: Some(3) }),
+                result_policy: Some(ContentPolicy {
+                    max_length: Some(3),
+                }),
             },
         );
 
@@ -551,7 +960,10 @@ mod tests {
             trust_spans: Vec::new(),
         };
         // Mark the middle section as untrusted
-        let start = msg.content.find("untrusted content that is very long").unwrap();
+        let start = msg
+            .content
+            .find("untrusted content that is very long")
+            .unwrap();
         let end = start + "untrusted content that is very long".len();
         msg.trust_spans
             .push(crate::trust::TrustSpan::untrusted(start, end, "rag"));
@@ -559,7 +971,9 @@ mod tests {
         let result = scanner().scan(&[msg], &config);
         assert!(matches!(result.verdict, InboundVerdict::Block(_)));
         if let InboundVerdict::Block(block) = result.verdict {
-            assert!(block.reason.contains("untrusted span content exceeds max_length"));
+            assert!(block
+                .reason
+                .contains("untrusted span content exceeds max_length"));
         }
     }
 
@@ -669,7 +1083,9 @@ mod tests {
         let result = scanner().scan(&[msg], &config);
         assert!(matches!(result.verdict, InboundVerdict::Block(_)));
         if let InboundVerdict::Block(block) = result.verdict {
-            assert!(block.reason.contains("untrusted span content exceeds max_length"));
+            assert!(block
+                .reason
+                .contains("untrusted span content exceeds max_length"));
         }
     }
 
@@ -1048,7 +1464,10 @@ mod tests {
             trust: TrustLevel::Trusted,
             trust_spans: Vec::new(),
         };
-        let start = msg.content.find("untrusted content that is very long").unwrap();
+        let start = msg
+            .content
+            .find("untrusted content that is very long")
+            .unwrap();
         let end = start + "untrusted content that is very long".len();
         msg.trust_spans
             .push(crate::trust::TrustSpan::untrusted(start, end, "rag"));
@@ -1070,7 +1489,10 @@ mod tests {
         let messages: Vec<Message> = (0..30)
             .map(|_| Message {
                 role: Role::User,
-                content: (0..10).map(|j| format!("pat{j}")).collect::<Vec<_>>().join(" "),
+                content: (0..10)
+                    .map(|j| format!("pat{j}"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
                 tool_calls: Vec::new(),
                 tool_call_id: None,
                 tool_name: None,
@@ -1088,9 +1510,8 @@ mod tests {
     fn dedup_same_pattern_same_message() {
         // A pattern that could match twice in the same content should only produce one entry
         let mut config = base_config();
-        config.policy.block_patterns = vec![
-            crate::config::CompiledPattern::compile("bad").unwrap(),
-        ];
+        config.policy.block_patterns =
+            vec![crate::config::CompiledPattern::compile("bad").unwrap()];
 
         let messages = vec![Message {
             role: Role::User,
@@ -1116,15 +1537,13 @@ mod tests {
     fn evidence_pattern_does_not_block() {
         let mut config = base_config();
         config.policy.untrusted_content_policy.max_length = None;
-        config.policy.block_patterns = vec![
-            crate::config::CompiledPattern::compile_with(
+        config.policy.block_patterns = vec![crate::config::CompiledPattern::compile_with(
                 "exfil_pattern",
                 crate::config::PatternAction::Evidence,
                 None,
                 Some("exfil".to_string()),
             )
-            .unwrap(),
-        ];
+        .unwrap()];
 
         let messages = vec![Message {
             role: Role::User,
@@ -1139,7 +1558,10 @@ mod tests {
         let result = scanner().scan(&messages, &config);
         assert_eq!(result.verdict, InboundVerdict::Allow);
         assert_eq!(result.matched_patterns.len(), 1);
-        assert_eq!(result.matched_patterns[0].action, crate::config::PatternAction::Evidence);
+        assert_eq!(
+            result.matched_patterns[0].action,
+            crate::config::PatternAction::Evidence
+        );
     }
 
     #[test]
@@ -1195,15 +1617,13 @@ mod tests {
     #[test]
     fn trust_gated_pattern_skips_trusted_message() {
         let mut config = base_config();
-        config.policy.block_patterns = vec![
-            crate::config::CompiledPattern::compile_with(
+        config.policy.block_patterns = vec![crate::config::CompiledPattern::compile_with(
                 "gated_pattern",
                 crate::config::PatternAction::Block,
                 Some(TrustLevel::Untrusted),
                 None,
             )
-            .unwrap(),
-        ];
+        .unwrap()];
 
         let messages = vec![Message {
             role: Role::System,
@@ -1223,15 +1643,13 @@ mod tests {
     #[test]
     fn trust_gated_pattern_matches_untrusted_message() {
         let mut config = base_config();
-        config.policy.block_patterns = vec![
-            crate::config::CompiledPattern::compile_with(
+        config.policy.block_patterns = vec![crate::config::CompiledPattern::compile_with(
                 "gated_pattern",
                 crate::config::PatternAction::Block,
                 Some(TrustLevel::Untrusted),
                 None,
             )
-            .unwrap(),
-        ];
+        .unwrap()];
 
         let messages = vec![Message {
             role: Role::User,
@@ -1251,15 +1669,13 @@ mod tests {
     #[test]
     fn trust_gated_pattern_matches_trusted_message_with_untrusted_spans() {
         let mut config = base_config();
-        config.policy.block_patterns = vec![
-            crate::config::CompiledPattern::compile_with(
+        config.policy.block_patterns = vec![crate::config::CompiledPattern::compile_with(
                 "gated_pattern",
                 crate::config::PatternAction::Block,
                 Some(TrustLevel::Untrusted),
                 None,
             )
-            .unwrap(),
-        ];
+        .unwrap()];
 
         let mut msg = Message {
             role: Role::System,
@@ -1299,5 +1715,322 @@ mod tests {
 
         let result = scanner().scan(&messages, &config);
         assert!(matches!(result.verdict, InboundVerdict::Block(_)));
+    }
+
+    #[test]
+    fn dual_view_deduplicates_shared_span_and_retains_unique_pre_html_in_order() {
+        let mut config = base_config();
+        config.policy.block_patterns = vec![
+            crate::config::CompiledPattern::compile_with(
+                "shared_pat",
+                crate::config::PatternAction::Evidence,
+                None,
+                None,
+            )
+            .unwrap(),
+            crate::config::CompiledPattern::compile_with(
+                "script_only_pat",
+                crate::config::PatternAction::Evidence,
+                None,
+                None,
+            )
+            .unwrap(),
+            crate::config::CompiledPattern::compile_with(
+                "split_pat",
+                crate::config::PatternAction::Evidence,
+                None,
+                None,
+            )
+            .unwrap(),
+        ];
+
+        let normalizer = crate::normalize::L0Normalizer::new();
+        let messages = vec![Message {
+            role: Role::User,
+            content: "<b>shared_pat</b> and split_<b></b>pat and <script>script_only_pat</script>"
+                .to_string(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+            trust: TrustLevel::Untrusted,
+            trust_spans: Vec::new(),
+        }];
+
+        let (views, _, _) =
+            crate::normalize::normalize_messages_dual_view(&normalizer, &messages).unwrap();
+        let result = scanner()
+            .scan_dual_view(&views, &config)
+            .expect("dual view scan should succeed");
+
+        // html_stripped matches pattern 0 ("shared_pat") and pattern 2 ("split_pat") first;
+        // pre_html matches pattern 0 (deduplicated via same mapped original range) and pattern 1 ("script_only_pat") second.
+        let indices: Vec<usize> = result
+            .matched_patterns
+            .iter()
+            .map(|m| m.pattern_index)
+            .collect();
+        assert_eq!(indices, vec![0, 2, 1]);
+    }
+
+    #[test]
+    fn dual_view_block_reports_the_pre_html_inspection_view() {
+        let mut config = base_config();
+        config.policy.block_patterns = vec![crate::config::CompiledPattern::compile(
+            "unique_pre_html_block",
+        )
+        .unwrap()];
+
+        let normalizer = crate::normalize::L0Normalizer::new();
+        let messages = vec![Message {
+            role: Role::User,
+            content: "safe<script>unique_pre_html_block</script>tail".to_string(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+            trust: TrustLevel::Untrusted,
+            trust_spans: Vec::new(),
+        }];
+
+        let (views, _, _) =
+            crate::normalize::normalize_messages_dual_view(&normalizer, &messages).unwrap();
+        let result = scanner()
+            .scan_dual_view(&views, &config)
+            .expect("dual view scan should succeed");
+
+        match result.verdict {
+            InboundVerdict::Block(block) => assert_eq!(
+                block.scan_view,
+                Some(crate::normalize::L0ScanView::PreHtml)
+            ),
+            InboundVerdict::Allow => panic!("pre_html-only pattern must block"),
+        }
+    }
+
+    #[test]
+    fn dual_view_c2_tool_call_arguments_scanned_once_and_not_duplicated() {
+        let mut config = base_config();
+        config.policy.block_patterns = vec![crate::config::CompiledPattern::compile_with(
+            "secret_arg",
+            crate::config::PatternAction::Evidence,
+            None,
+            None,
+        )
+        .unwrap()];
+
+        let normalizer = crate::normalize::L0Normalizer::new();
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: "calling tool".to_string(),
+            tool_calls: vec![crate::message::ToolCall {
+                id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({ "path": "secret_arg_file" }),
+            }],
+            tool_call_id: None,
+            tool_name: None,
+            trust: TrustLevel::Trusted,
+            trust_spans: Vec::new(),
+        }];
+
+        let (views, _, _) =
+            crate::normalize::normalize_messages_dual_view(&normalizer, &messages).unwrap();
+        let result = scanner()
+            .scan_dual_view(&views, &config)
+            .expect("dual view scan should succeed");
+
+        assert_eq!(result.matched_patterns.len(), 1);
+        assert_eq!(
+            result.matched_patterns[0].source,
+            MatchSource::ToolCallArgument {
+                tool_call_id: "call_1".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn dual_view_max_matches_applied_after_deduplication() {
+        let mut config = base_config();
+        let mut patterns = Vec::new();
+        for i in 0..255 {
+            patterns.push(
+                crate::config::CompiledPattern::compile_with(
+                    &format!("shared_{i}_end"),
+                    crate::config::PatternAction::Evidence,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            );
+        }
+        patterns.push(
+            crate::config::CompiledPattern::compile_with(
+                "unique_pre_html_255",
+                crate::config::PatternAction::Evidence,
+                None,
+                None,
+            )
+            .unwrap(),
+        );
+        config.policy.block_patterns = patterns;
+
+        let mut text = String::new();
+        for i in 0..255 {
+            text.push_str(&format!("shared_{i}_end "));
+        }
+        text.push_str("<script>unique_pre_html_255</script>");
+
+        let normalizer = crate::normalize::L0Normalizer::new();
+        let messages = vec![Message {
+            role: Role::User,
+            content: text,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+            trust: TrustLevel::Untrusted,
+            trust_spans: Vec::new(),
+        }];
+
+        let (views, _, _) =
+            crate::normalize::normalize_messages_dual_view(&normalizer, &messages).unwrap();
+        let result = scanner()
+            .scan_dual_view(&views, &config)
+            .expect("dual view scan should succeed");
+
+        // All 255 shared patterns are deduplicated across views, leaving room for pattern 255 (unique_pre_html_255) within MAX_MATCHES = 256.
+        assert_eq!(result.matched_patterns.len(), 256);
+        assert_eq!(result.matched_patterns[255].pattern_index, 255);
+    }
+
+    #[test]
+    fn dual_view_over_256_evidence_matches_then_block_still_blocks_with_bounded_matches() {
+        let mut config = base_config();
+        let mut patterns = Vec::new();
+        for i in 0..260 {
+            patterns.push(
+                crate::config::CompiledPattern::compile_with(
+                    &format!("ev_pat_{i}_end"),
+                    crate::config::PatternAction::Evidence,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            );
+        }
+        patterns.push(
+            crate::config::CompiledPattern::compile_with(
+                "late_block_pat",
+                crate::config::PatternAction::Block,
+                None,
+                None,
+            )
+            .unwrap(),
+        );
+        config.policy.block_patterns = patterns;
+
+        let mut base_ev = String::new();
+        for i in 0..260 {
+            base_ev.push_str(&format!("ev_pat_{i}_end "));
+        }
+
+        let normalizer = crate::normalize::L0Normalizer::new();
+
+        // Case 1: >256 Evidence matches followed by a Block match in html_stripped.
+        let strip_messages = vec![Message {
+            role: Role::User,
+            content: format!("{base_ev}late_block_pat"),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+            trust: TrustLevel::Untrusted,
+            trust_spans: Vec::new(),
+        }];
+        let (strip_views, _, _) =
+            crate::normalize::normalize_messages_dual_view(&normalizer, &strip_messages).unwrap();
+        let strip_res = scanner()
+            .scan_dual_view(&strip_views, &config)
+            .expect("dual view scan should succeed");
+        assert_eq!(strip_res.matched_patterns.len(), 256);
+        assert!(matches!(
+            strip_res.verdict,
+            InboundVerdict::Block(ref b) if b.reason.contains("late_block_pat")
+        ));
+
+        // Case 2: >256 Evidence matches followed by a Block match only present in pre_html (<script>).
+        let pre_messages = vec![Message {
+            role: Role::User,
+            content: format!("{base_ev}<script>late_block_pat</script>"),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+            trust: TrustLevel::Untrusted,
+            trust_spans: Vec::new(),
+        }];
+        let (pre_views, _, _) =
+            crate::normalize::normalize_messages_dual_view(&normalizer, &pre_messages).unwrap();
+        let pre_res = scanner()
+            .scan_dual_view(&pre_views, &config)
+            .expect("dual view scan should succeed");
+        assert_eq!(pre_res.matched_patterns.len(), 256);
+        assert!(matches!(
+            pre_res.verdict,
+            InboundVerdict::Block(ref b) if b.reason.contains("late_block_pat")
+        ));
+    }
+
+    #[test]
+    fn dual_view_custom_scanner_default_trait_fails_closed() {
+        struct LegacyOnlyScanner;
+        impl InboundScanner for LegacyOnlyScanner {
+            fn scan(&self, _messages: &[Message], _config: &Config) -> InboundResult {
+                InboundResult {
+                    verdict: InboundVerdict::Allow,
+                    matched_patterns: Vec::new(),
+                }
+            }
+        }
+
+        let config = base_config();
+        let normalizer = crate::normalize::L0Normalizer::new();
+        let messages = vec![Message::new(Role::User, "hello")];
+        let (views, _, _) =
+            crate::normalize::normalize_messages_dual_view(&normalizer, &messages).unwrap();
+
+        let err = LegacyOnlyScanner
+            .scan_dual_view(&views, &config)
+            .expect_err("custom InboundScanner without scan_dual_view override must fail closed");
+        assert_eq!(err, InboundDualScanError::UnsupportedScanner);
+    }
+
+    #[test]
+    fn dual_view_max_length_uses_original_forwarded_content_length() {
+        let mut config = base_config();
+        config.policy.block_patterns.clear();
+        config.policy.untrusted_content_policy.max_length = Some(20);
+
+        let normalizer = crate::normalize::L0Normalizer::new();
+        // html_stripped strips everything after '<script>', leaving 5 chars ("short"),
+        // but original forwarded content is 42 chars (> 20).
+        let messages = vec![Message {
+            role: Role::User,
+            content: "short<script>01234567890123456789</script>".to_string(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+            trust: TrustLevel::Untrusted,
+            trust_spans: Vec::new(),
+        }];
+
+        let (views, _, _) =
+            crate::normalize::normalize_messages_dual_view(&normalizer, &messages).unwrap();
+        assert_eq!(views.html_stripped[0].content.len(), 5);
+
+        let result = scanner()
+            .scan_dual_view(&views, &config)
+            .expect("dual view scan should succeed");
+        assert!(
+            matches!(result.verdict, InboundVerdict::Block(ref b) if b.reason.contains("exceeds max_length")),
+            "max_length must enforce against original forwarded length, got {:?}",
+            result.verdict
+        );
     }
 }

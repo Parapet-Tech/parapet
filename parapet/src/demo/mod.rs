@@ -38,15 +38,18 @@ pub enum DemoJourneyV0 {
     InjectionBenign,
     /// J4: allowed write whose observed bytes are overwritten before observation.
     Mismatch,
+    /// J8: ordinary document whose own `Target` leaves the root; policy must block it.
+    OrdinaryOverreach,
 }
 
 impl DemoJourneyV0 {
     /// Every journey, in manifest order.
-    pub const ALL: [DemoJourneyV0; 4] = [
+    pub const ALL: [DemoJourneyV0; 5] = [
         DemoJourneyV0::BenignWrite,
         DemoJourneyV0::Unauthorized,
         DemoJourneyV0::InjectionBenign,
         DemoJourneyV0::Mismatch,
+        DemoJourneyV0::OrdinaryOverreach,
     ];
 
     /// Manifest `journey` name.
@@ -56,6 +59,7 @@ impl DemoJourneyV0 {
             DemoJourneyV0::Unauthorized => "unauthorized",
             DemoJourneyV0::InjectionBenign => "injection_benign",
             DemoJourneyV0::Mismatch => "mismatch",
+            DemoJourneyV0::OrdinaryOverreach => "ordinary_overreach",
         }
     }
 
@@ -66,6 +70,7 @@ impl DemoJourneyV0 {
             DemoJourneyV0::Unauthorized => "demo_unauthorized_v0",
             DemoJourneyV0::InjectionBenign => "demo_injection_benign_v0",
             DemoJourneyV0::Mismatch => "demo_mismatch_v0",
+            DemoJourneyV0::OrdinaryOverreach => "demo_ordinary_overreach_v0",
         }
     }
 }

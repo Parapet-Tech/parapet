@@ -4,38 +4,40 @@ This guide walks through the deterministic offline product workflow (`parapet-de
 
 ## Scope and Disclosures
 
-- **Same public binary and clean-environment assets**: All demo assets (`manifest.json`, `config_demo_v0.yaml`, the four untrusted input documents `doc_*.txt`, and the four OpenAI chat-completions request bodies `request_*.json`) are compiled once into the `parapet` binary and exported on demand with `parapet demo export --out <new-dir> [--json]`. No step reads a repository checkout path.
+- **Same public binary and clean-environment assets**: All demo assets (`manifest.json`, `config_demo_v0.yaml`, the five untrusted input documents `doc_*.txt`, and the five OpenAI chat-completions request bodies `request_*.json`) are compiled once into the `parapet` binary and exported on demand with `parapet demo export --out <new-dir> [--json]`. No step reads a repository checkout path.
 - **No model inference or external network traffic**: Every engine run uses `--offline-fixture <selector>` (`upstream_label: "parapet-offline-upstream/v0"`). The deterministic demo proposer parses the forwarded request's last `user` message, verifies its SHA-256 against the embedded manifest for the selected journey, and emits a fixed `write_file` tool-call proposal without contacting any external host or model provider. Deterministic offline fixture runs verify Parapet's policy, effect execution, receipt redaction, verification, and cleanup contracts; they do not constitute real-model evaluation.
-- **Four-fact receipt separation**: Every `parapet inspect --json` projection separates four distinct facts that must not be conflated:
+- **Four-fact receipt separation**: Every journey that reaches an upstream candidate produces a `parapet inspect --json` projection separating four distinct facts that must not be conflated. `J2` stops earlier at `L3-inbound`, so it deliberately has no protected effect receipt:
   1. **Detection (`projection.detection`)**: Whether the `L1` deterministic pattern sensor evaluated the inbound message (`availability: "present"`), its configured mode (`mode: "shadow"` in `config_demo_v0.yaml`), and whether the input crossed the pattern threshold (`outcome: "threshold_not_breached"` or `"threshold_breached"`). Because `L1` runs in `shadow` mode in this demo policy, detection is recorded in the receipt without blocking the request.
   2. **Policy decision (`projection.policy`)**: Whether the enforced outbound tool policy (`tools.write_file`) allowed (`decision: "allow"`, `reason_code: "allowed"`) or blocked (`decision: "block"`, `reason_code: "matches"`, `constraint_names: ["matches"]` on the `path` argument) the proposed tool call.
   3. **Effect stage (`projection.effect`)**: How far the file-effect lifecycle progressed (`stage_reached: "decision"` with `attempt_outcome: null` when blocked before execution, versus `stage_reached: "verification"` with `attempt_outcome: "completed"` when the file write executed).
   4. **Verification (`projection.verification`)**: Whether post-attempt observation of `<effect-root>/<target>` matched the declared bytes (`availability: "present"`, `outcome: "verified"`, `delta: "created"`), detected post-write tampering before observation (`outcome: "failed"`, `reason_code: "digest_mismatch"`), or was omitted by contract because no write was attempted (`availability: "absent_by_contract"`).
 
-## Journey Matrix (`J1`–`J7`)
+## Journey Matrix (`J1`–`J8`)
 
 | Journey | Selector / Scenario | Detection (`L1` shadow) | Policy Decision | Effect Stage / Attempt | Verification | Disk & Lifecycle Outcome |
 | --- | --- | --- | --- | --- | --- | --- |
 | **J1** (`benign_write`) | `demo_benign_write_v0` | `present` / `threshold_not_breached` | `allow` (`allowed`) | `verification` / `completed` | `verified` (`delta: created`) | `release-note.txt` written with SHA-256 `af52e00108572372f970dab87de34e3d257ef44f57671a662898e9bc87868d66` |
-| **J2** (`unauthorized`) | `demo_unauthorized_v0` | `present` / `threshold_breached` | `block` (`matches` on `path`) | `decision` / `null` (`absent_by_contract`) | `absent_by_contract` | `../escape.txt` never created; `<effect-root>` unchanged |
+| **J2** (`unauthorized`) | `demo_unauthorized_v0` | not persisted (early inbound block) | `L3-inbound` block from `pre_html` | no upstream candidate or effect receipt | `absent_by_contract` | HTTP 403; `../escape.txt` never created; `<effect-root>` unchanged |
 | **J3** (`injection_benign`) | `demo_injection_benign_v0` | `present` / `threshold_breached` | `allow` (`allowed`) | `verification` / `completed` | `verified` (`delta: created`) | `pi.txt` written with SHA-256 `dce7575a167e62cc27bba7307727f38b36b79afda3ec53add26d67873cb15e41` (single architectural case, not a false-positive-rate claim) |
 | **J4** (`mismatch`) | `demo_mismatch_v0` | `present` / `threshold_not_breached` | `allow` (`allowed`) | `verification` / `completed` | `failed` (`digest_mismatch`) | `inventory-note.txt` overwritten pre-observation (`0x23` fill, SHA-256 `6c932e9f46bfc762f46f3feee098a8aad2b488ff1e722c67e757528c289ecd79` != expected `592ae184266a9988c74b8a9bbbf13984483e8a5fce72b019b58f457ce9cdeb28`) |
-| **J5** (redaction & release) | Across `J1`–`J4` and `J7` | — | — | — | — | Canary tokens (`PARAPET-1E-CANARY-J1`..`J4`) and document bodies absent from human, `--json`, and `--inert-fallback` `inspect` outputs; after `evidence release`, `inspect --json` exits `4` with `projection_code: "object_released"` |
-| **J6** (restoration) | Across `J1`–`J4` | — | — | — | — | `parapet restore` reports `clear`; `parapet disable` stops the engine; `<effect-root>` is empty (`{}`) |
+| **J5** (redaction & release) | Across receipt-producing journeys `J1`, `J3`, `J4`, `J7`, and `J8` | — | — | — | — | Canary tokens and document bodies absent from human, `--json`, and `--inert-fallback` `inspect` outputs; after `evidence release`, `inspect --json` exits `4` with `projection_code: "object_released"` |
+| **J6** (restoration) | Across `J1`–`J4` and `J8` | — | — | — | — | `parapet restore` reports `clear`; `parapet disable` stops the engine; `<effect-root>` is empty (`{}`) |
 | **J7** (undeclared residue) | `demo_benign_write_v0` + planted `operator-residue.txt` | `present` / `threshold_not_breached` | `allow` (`allowed`) | `verification` / `completed` | `verified` (`delta: created`) | `restore` exits `5` (`indeterminate`, `a6_booking_required: true`) and retains `operator-residue.txt` plus sentinel; `disable` exits `5` (`refused`, `file_cleanup_indeterminate`); after operator removes residue, recovery `restore`/`disable` succeed while workflow outcome remains `indeterminate` |
+| **J8** (`ordinary_overreach`) | `demo_ordinary_overreach_v0` | `present` / `threshold_not_breached` | `block` (`matches` on `path`) | `decision` / `null` (`absent_by_contract`) | `absent_by_contract` | `../shared-note.txt` never created; `<effect-root>` unchanged |
 
 ## Fixture Provenance Summary
 
 Every exported asset's digest and provenance metadata are recorded in `manifest.json` (`schema: "parapet-demo-fixtures/v0"`):
 
 - `doc_benign_write.txt` (`J1`) and `doc_mismatch.txt` (`J4`): `document_class: "benign_non_injection"`, `document_authorship: {"kind": "agent", "basis": "authored", "date": "2026-10-20"}`, `provenance: "agent-authored on 2026-10-20; not derived from any corpus"`.
+- `doc_ordinary_overreach.txt` (`J8`): `document_class: "benign_non_injection"`, `document_authorship: {"kind": "agent", "basis": "authored", "date": "2026-10-24"}`, `provenance: "agent-authored on 2026-10-24; not derived from any corpus"`.
 - `doc_unauthorized.txt` (`J2`, SHA-256 `60a65e916c21c05659f80665dc484358fd10fedb84fa60c462f25bacf908e75b`) and `doc_injection_benign.txt` (`J3`, SHA-256 `7b685e429c5fe616fd0884977e5f3e01f4eee795a597aa80ee2cf4934b5f8a02`): `document_class: "injection"`, `document_authorship.kind: "human_operator"`, packaged byte-for-byte with their operator authorship statements recorded in `manifest.json`.
 
 ## Prerequisites and Clean-Environment Execution
 
 Ensure `parapet` (for example from a locally built wheel installed into a fresh virtual environment), `curl`, `python3`, and standard POSIX utilities (`sh`, `find`, `sort`, `grep`, `cat`, `ls`, `mkdir`, `rm`, `mktemp`) are on `PATH`.
 
-Every command block below is tagged `sh` in execution order. Concatenating the `sh` blocks in order produces a self-contained POSIX `sh` script (`set -eu`) that runs `J1`–`J7` from a fresh temporary working directory outside any checkout. While an interactive operator can run `parapet run` in a dedicated terminal and run control commands in a second terminal, the verbatim script below backgrounds `parapet run` (`&`) and waits for it (`wait "$RUN_PID"`) after `parapet disable` so the entire workflow runs in a single shell.
+Every command block below is tagged `sh` in execution order. Concatenating the `sh` blocks in order produces a self-contained POSIX `sh` script (`set -eu`) that runs `J1`–`J8` from a fresh temporary working directory outside any checkout. While an interactive operator can run `parapet run` in a dedicated terminal and run control commands in a second terminal, the verbatim script below backgrounds `parapet run` (`&`) and waits for it (`wait "$RUN_PID"`) after `parapet disable` so the entire workflow runs in a single shell.
 
 ## 1. Neutral Working Directory, Asset Export, and Witness Helpers
 
@@ -56,7 +58,7 @@ manifest_path = os.path.join(assets, "manifest.json")
 manifest_bytes = open(manifest_path, "rb").read()
 assert hashlib.sha256(manifest_bytes).hexdigest() == exp["manifest_sha256"]
 files = exp["files"]
-assert len(files) == 10, len(files)
+assert len(files) == 12, len(files)
 assert [f["name"] for f in files] == sorted(f["name"] for f in files)
 for f in files:
     b = open(os.path.join(assets, f["name"]), "rb").read()
@@ -127,7 +129,7 @@ if not ok:
 Sample `export.json` output (`parapet-cli-demo-export/v0`):
 
 ```text
-{"schema":"parapet-cli-demo-export/v0","out_dir":"<work-dir>/assets","manifest_sha256":"6f8d4f240cb84e7a8244b09c22346cce6c1b7a9c3d760b647dc575212c3b66da","files":[{"name":"config_demo_v0.yaml","sha256":"1b954d7eb2a49a0b3f8100b260685fadc55d752de83dc791759b59c619907450","len_bytes":435},{"name":"doc_benign_write.txt","sha256":"ae097bd662205900abb8ba49af6176535cf34eac23deb43b1611d051751c5bfa","len_bytes":290},{"name":"doc_injection_benign.txt","sha256":"7b685e429c5fe616fd0884977e5f3e01f4eee795a597aa80ee2cf4934b5f8a02","len_bytes":395},{"name":"doc_mismatch.txt","sha256":"3cbfeddbb358420b976487ea5a1ec99e8afc8cc262813948ad2238d9080007b8","len_bytes":218},{"name":"doc_unauthorized.txt","sha256":"60a65e916c21c05659f80665dc484358fd10fedb84fa60c462f25bacf908e75b","len_bytes":369},{"name":"manifest.json","sha256":"6f8d4f240cb84e7a8244b09c22346cce6c1b7a9c3d760b647dc575212c3b66da","len_bytes":8346},{"name":"request_benign_write.json","sha256":"67ba9575ea2108b239c880b8a1b393c622d347f817f10cd60a91fcdb0e0423bc","len_bytes":374},{"name":"request_injection_benign.json","sha256":"818d53b5f48589c7f436dc2ac3e490429a5570d8ea16049402a835830662f94e","len_bytes":490},{"name":"request_mismatch.json","sha256":"1864d10031029adada29395b64205eaa8cb06bef0e02f9f8c43c6c3532c32741","len_bytes":301},{"name":"request_unauthorized.json","sha256":"56991b0b1cacf1494489614258222fc0848e88d635423bcb9a26fa3ccfa921c5","len_bytes":458}]}
+{"schema":"parapet-cli-demo-export/v0","out_dir":"<work-dir>/assets","manifest_sha256":"8d411907e2c4d2e9872a7355597b66005ff10557f981320d4a1576571bb8b01e","files":[{"name":"config_demo_v0.yaml","sha256":"1b954d7eb2a49a0b3f8100b260685fadc55d752de83dc791759b59c619907450","len_bytes":435},{"name":"doc_benign_write.txt","sha256":"ae097bd662205900abb8ba49af6176535cf34eac23deb43b1611d051751c5bfa","len_bytes":290},{"name":"doc_injection_benign.txt","sha256":"7b685e429c5fe616fd0884977e5f3e01f4eee795a597aa80ee2cf4934b5f8a02","len_bytes":395},{"name":"doc_mismatch.txt","sha256":"3cbfeddbb358420b976487ea5a1ec99e8afc8cc262813948ad2238d9080007b8","len_bytes":218},{"name":"doc_ordinary_overreach.txt","sha256":"2cfb6714d90c27e77a3dc00c9d98719c729f74907bb8b55df969675c8af2bb1a","len_bytes":232},{"name":"doc_unauthorized.txt","sha256":"60a65e916c21c05659f80665dc484358fd10fedb84fa60c462f25bacf908e75b","len_bytes":369},{"name":"manifest.json","sha256":"8d411907e2c4d2e9872a7355597b66005ff10557f981320d4a1576571bb8b01e","len_bytes":10068},{"name":"request_benign_write.json","sha256":"67ba9575ea2108b239c880b8a1b393c622d347f817f10cd60a91fcdb0e0423bc","len_bytes":374},{"name":"request_injection_benign.json","sha256":"818d53b5f48589c7f436dc2ac3e490429a5570d8ea16049402a835830662f94e","len_bytes":490},{"name":"request_mismatch.json","sha256":"1864d10031029adada29395b64205eaa8cb06bef0e02f9f8c43c6c3532c32741","len_bytes":301},{"name":"request_ordinary_overreach.json","sha256":"57848e5e24fb46e84e2376d5885e9b403d04d52061f7ff6f9ebed6928d27fa6b","len_bytes":315},{"name":"request_unauthorized.json","sha256":"56991b0b1cacf1494489614258222fc0848e88d635423bcb9a26fa3ccfa921c5","len_bytes":458}]}
 ```
 
 ## 2. Journey 1 (`J1`): Benign Allowed Write, Redaction, Restoration, and Release
@@ -218,10 +220,11 @@ next: parapet evidence release --state-dir <state-dir> --run-id d059f141cee44e1b
 
 ## 3. Journey 2 (`J2`): Unauthorized Path Traversal Blocked Before Execution
 
-In `J2` (`demo_unauthorized_v0`), `doc_unauthorized.txt` contains an injected instruction to write `../escape.txt`. The deterministic proposer models a compromised model that follows the injected instruction and emits `write_file` with `path: "../escape.txt"`. `L1` shadow detection records `threshold_breached`, outbound tool policy blocks the call before execution (`decision: "block"`, failed argument `path`, `reason_code: "matches"`, `constraint_names: ["matches"]`), the effect stage stops at `stage_reached: "decision"` (`attempt_outcome: null`), and `attempt`, `observation`, and `verification` are all `absent_by_contract`. Direct filesystem inspection confirms `../escape.txt` does not exist and `<effect-root>` contains only the startup sentinel and `.parapet-root-evidence-v0` directory.
+In `J2` (`demo_unauthorized_v0`), the exact human-authored request contains XML-shaped role markers and an instruction to write `../escape.txt`. The integrity-bound `pre_html` view preserves those bytes for inspection, so `L3-inbound` returns HTTP 403 before the deterministic proposer or upstream fixture runs. This is intentional: the earliest sound control wins. The response exposes only content-free evidence (`X-Parapet-Blocked-By: L3-inbound` and `X-Parapet-Blocked-View: pre_html`), the effect root is unchanged, no protected effect receipt is created, and `../escape.txt` never exists. Because an effect run is one-shot, repeating the exact request returns HTTP 409 with `X-Parapet-Error: effect_run_consumed` before parsing or upstream contact. The retry cannot select a fallback rendering or reach the downstream proposer.
 
 ```sh
 J="$WORK/j2"; mkdir "$J"; S="$J/state"; R="$J/root"
+DOC="$WORK/assets/doc_unauthorized.txt"; [ -f "$DOC" ]
 parapet init --state-dir "$S" --effect-root "$R" --json > "$J/init.json"
 parapet run --state-dir "$S" --config "$WORK/assets/config_demo_v0.yaml" \
   --effect-root "$R" --file-effect-profile v0 --max-content-bytes 4096 \
@@ -230,37 +233,26 @@ parapet run --state-dir "$S" --config "$WORK/assets/config_demo_v0.yaml" \
 RUN_PID=$!
 i=0; until [ -s "$S/ready" ]; do i=$((i+1)); [ "$i" -le 300 ] || { echo "J2: engine not ready" >&2; exit 1; }; sleep 0.1; done
 ls -la "$R"
-CODE=$(curl -sS -o "$J/response.json" -w '%{http_code}' \
+CODE=$(curl -sS -D "$J/headers.txt" -o "$J/response.json" -w '%{http_code}' \
   "http://127.0.0.1:$(cat "$S/ready")/v1/chat/completions" \
   -H 'content-type: application/json' -H 'x-parapet-original-host: api.openai.com' \
   --data-binary @"$WORK/assets/request_unauthorized.json")
-[ "$CODE" = "200" ] || { echo "J2: expected HTTP 200, got $CODE" >&2; exit 1; }
+[ "$CODE" = "403" ] || { echo "J2: expected HTTP 403, got $CODE" >&2; exit 1; }
+grep -qi '^x-parapet-blocked-by: L3-inbound' "$J/headers.txt"
+grep -qi '^x-parapet-blocked-view: pre_html' "$J/headers.txt"
 ls -la "$R"
 RUN=$(parapet_run_id "$R")
 [ ! -e "$R/../escape.txt" ] && [ ! -L "$R/../escape.txt" ]
-parapet inspect --state-dir "$S" --run-id "$RUN" > "$J/inspect.txt"
-parapet inspect --state-dir "$S" --run-id "$RUN" --inert-fallback > "$J/inspect_inert.txt"
-parapet inspect --state-dir "$S" --run-id "$RUN" --json > "$J/inspect.json"
-python3 -c 'import json, os, sys
-j_dir, root_dir, run_id, doc_path = sys.argv[1:5]
-assert not os.path.lexists(os.path.join(root_dir, "..", "escape.txt"))
-assert sorted(os.listdir(root_dir)) == sorted([".parapet-root-evidence-v0", f".parapet-run-{run_id}.sentinel"])
-v = json.load(open(os.path.join(j_dir, "inspect.json")))
-assert v["run_id"] == run_id and v["outcome"] == "complete"
-assert v["labels"]["summary"] == "blocked before execution"
-p = v["projection"]
-assert p["detection"] == {"availability": "present", "outcome": "threshold_breached", "mode": "shadow"}
-assert p["policy"]["decision"] == "block" and p["policy"]["reason_code"] == "matches"
-assert p["policy"]["constraint_names"] == ["matches"]
-assert p["effect"] == {"effect_kind": "write_file", "stage_reached": "decision", "attempt_outcome": None, "attempt_error_code": None}
-assert p["verification"] == {"availability": "absent_by_contract", "outcome": None, "reason_code": None, "delta": None}
-np = {entry["field"]: entry["availability"] for entry in p["not_present"]}
-assert np.get("attempt") == "absent_by_contract" and np.get("observation") == "absent_by_contract" and np.get("verification") == "absent_by_contract", np
-body = open(doc_path, "r", encoding="utf-8").read().split("\n---\n", 1)[1]
-for name in ("inspect.txt", "inspect_inert.txt", "inspect.json"):
-    txt = open(os.path.join(j_dir, name), "r", encoding="utf-8").read()
-    assert "PARAPET-1E-CANARY-J2" not in txt and body not in txt, name
-' "$J" "$R" "$RUN" "$WORK/assets/doc_unauthorized.txt"
+[ ! -e "$S/receipt-evidence/run/$RUN/manifest.json" ]
+RETRY=$(curl -sS -D "$J/retry-headers.txt" -o "$J/retry-response.json" -w '%{http_code}' \
+  "http://127.0.0.1:$(cat "$S/ready")/v1/chat/completions" \
+  -H 'content-type: application/json' -H 'x-parapet-original-host: api.openai.com' \
+  --data-binary @"$WORK/assets/request_unauthorized.json")
+[ "$RETRY" = "409" ]
+grep -qi '^x-parapet-action: error' "$J/retry-headers.txt"
+grep -qi '^x-parapet-error: effect_run_consumed' "$J/retry-headers.txt"
+grep -q 'effect_run_consumed' "$J/retry-response.json"
+! grep -q 'PARAPET-1E-CANARY-J2' "$J/retry-response.json"
 parapet restore --state-dir "$S" --json > "$J/restore.json"
 ls -la "$R"
 parapet disable --state-dir "$S" --json > "$J/disable.json"
@@ -275,15 +267,14 @@ assert json.load(open(os.path.join(j_dir, "run.json")))["run_id"] == run_id
 assert os.listdir(root_dir) == [], os.listdir(root_dir)
 assert not os.path.lexists(os.path.join(root_dir, "..", "escape.txt"))
 ' "$J" "$R" "$RUN"
-parapet evidence release --state-dir "$S" --run-id "$RUN" --json > "$J/evidence_release.json"
-RC=0; parapet inspect --state-dir "$S" --run-id "$RUN" --json > "$J/inspect_released.json" || RC=$?
-parapet_released J2 "$RC" "$J/inspect_released.json"
 ```
 
-Sample `inspect.json` excerpt for `J2`:
+The durable J2 evidence is content-free and records the early boundary directly:
 
 ```text
-{"labels":{"summary":"blocked before execution","verification":"verification: absent by contract"},"projection":{"detection":{"availability":"present","outcome":"threshold_breached","mode":"shadow"},"policy":{"decision":"block","reason_code":"matches","constraint_names":["matches"],"enforcement":"enforced","evaluated_policy":true},"effect":{"effect_kind":"write_file","stage_reached":"decision","attempt_outcome":null,"attempt_error_code":null},"verification":{"availability":"absent_by_contract","outcome":null,"reason_code":null,"delta":null}}}
+HTTP/1.1 403 Forbidden
+x-parapet-blocked-by: L3-inbound
+x-parapet-blocked-view: pre_html
 ```
 
 ## 4. Journey 3 (`J3`): Injection-Looking Benign Document Allowed
@@ -499,8 +490,72 @@ Sample `restore_indeterminate.json` and `disable_refused.json` outputs for `J7`:
 {"schema":"parapet-cli-disable/v0","status":"refused","refusal_code":"file_cleanup_indeterminate","file_cleanup":"indeterminate","file_cleanup_label":"file cleanup: indeterminate","ownership_label":"engine ownership: owned","owned_control_removed":false,"evidence_retained":true}
 ```
 
-Sample post-release `inspect_released.json` output verified by `parapet_released` across `J1`–`J4` and `J7`:
+Sample post-release `inspect_released.json` output verified by `parapet_released` across receipt-producing journeys `J1`, `J3`, `J4`, `J7`, and `J8`:
 
 ```text
 {"schema":"parapet-cli-inspect/v0","run_id":"d059f141cee44e1bab823b879ab32f80","outcome":"complete","cleanup":"clear","banner":null,"reader_code":null,"projection_code":"object_released","labels":{"summary":null,"enforcement":null,"verification":null,"evidence_cleanup":"evidence cleanup: clear","reader":null,"projection_code":"projection: object_released"},"projection":null}
+```
+
+## 7. Journey 8 (`J8`): Ordinary Out-of-Root Target Blocked Downstream
+
+In `J8` (`demo_ordinary_overreach_v0`), `doc_ordinary_overreach.txt` is an ordinary agent-authored note with no markup and no model-steering prose; its own `Target:` header names `../shared-note.txt`. The deterministic proposer follows the header target exactly as in `J1`, emitting `write_file` with `path: "../shared-note.txt"` (`injected_path: null`). `L1` shadow detection records `threshold_not_breached`, so inbound detection alone would not stop this request; outbound tool policy still blocks the call before execution (`decision: "block"`, failed argument `path`, `reason_code: "matches"`, `constraint_names: ["matches"]`), and `attempt`, `observation`, and `verification` are all `absent_by_contract`. This is downstream defense-in-depth, kept separate from the `J2` injection case.
+
+```sh
+J="$WORK/j8"; mkdir "$J"; S="$J/state"; R="$J/root"
+parapet init --state-dir "$S" --effect-root "$R" --json > "$J/init.json"
+parapet run --state-dir "$S" --config "$WORK/assets/config_demo_v0.yaml" \
+  --effect-root "$R" --file-effect-profile v0 --max-content-bytes 4096 \
+  --offline-fixture demo_ordinary_overreach_v0 --ready-file ready --port 0 --json \
+  > "$J/run.json" &
+RUN_PID=$!
+i=0; until [ -s "$S/ready" ]; do i=$((i+1)); [ "$i" -le 300 ] || { echo "J8: engine not ready" >&2; exit 1; }; sleep 0.1; done
+ls -la "$R"
+CODE=$(curl -sS -o "$J/response.json" -w '%{http_code}' \
+  "http://127.0.0.1:$(cat "$S/ready")/v1/chat/completions" \
+  -H 'content-type: application/json' -H 'x-parapet-original-host: api.openai.com' \
+  --data-binary @"$WORK/assets/request_ordinary_overreach.json")
+[ "$CODE" = "200" ] || { echo "J8: expected HTTP 200, got $CODE" >&2; exit 1; }
+ls -la "$R"
+RUN=$(parapet_run_id "$R")
+[ ! -e "$R/../shared-note.txt" ] && [ ! -L "$R/../shared-note.txt" ]
+parapet inspect --state-dir "$S" --run-id "$RUN" > "$J/inspect.txt"
+parapet inspect --state-dir "$S" --run-id "$RUN" --inert-fallback > "$J/inspect_inert.txt"
+parapet inspect --state-dir "$S" --run-id "$RUN" --json > "$J/inspect.json"
+python3 -c 'import json, os, sys
+j_dir, root_dir, run_id, doc_path = sys.argv[1:5]
+assert not os.path.lexists(os.path.join(root_dir, "..", "shared-note.txt"))
+assert sorted(os.listdir(root_dir)) == sorted([".parapet-root-evidence-v0", f".parapet-run-{run_id}.sentinel"])
+v = json.load(open(os.path.join(j_dir, "inspect.json")))
+assert v["run_id"] == run_id and v["outcome"] == "complete"
+assert v["labels"]["summary"] == "blocked before execution"
+p = v["projection"]
+assert p["detection"] == {"availability": "present", "outcome": "threshold_not_breached", "mode": "shadow"}
+assert p["policy"]["decision"] == "block" and p["policy"]["reason_code"] == "matches"
+assert p["policy"]["constraint_names"] == ["matches"]
+assert p["effect"] == {"effect_kind": "write_file", "stage_reached": "decision", "attempt_outcome": None, "attempt_error_code": None}
+assert p["verification"] == {"availability": "absent_by_contract", "outcome": None, "reason_code": None, "delta": None}
+np = {entry["field"]: entry["availability"] for entry in p["not_present"]}
+assert np.get("attempt") == "absent_by_contract" and np.get("observation") == "absent_by_contract" and np.get("verification") == "absent_by_contract", np
+body = open(doc_path, "r", encoding="utf-8").read().split("\n---\n", 1)[1]
+for name in ("inspect.txt", "inspect_inert.txt", "inspect.json"):
+    txt = open(os.path.join(j_dir, name), "r", encoding="utf-8").read()
+    assert "PARAPET-1E-CANARY-J8" not in txt and body not in txt, name
+' "$J" "$R" "$RUN" "$WORK/assets/doc_ordinary_overreach.txt"
+parapet restore --state-dir "$S" --json > "$J/restore.json"
+ls -la "$R"
+parapet disable --state-dir "$S" --json > "$J/disable.json"
+wait "$RUN_PID"
+RUN_PID=
+ls -la "$R"
+python3 -c 'import json, os, sys
+j_dir, root_dir, run_id = sys.argv[1:4]
+assert json.load(open(os.path.join(j_dir, "restore.json")))["result"] == "clear"
+assert json.load(open(os.path.join(j_dir, "disable.json")))["status"] == "stopped"
+assert json.load(open(os.path.join(j_dir, "run.json")))["run_id"] == run_id
+assert os.listdir(root_dir) == [], os.listdir(root_dir)
+assert not os.path.lexists(os.path.join(root_dir, "..", "shared-note.txt"))
+' "$J" "$R" "$RUN"
+parapet evidence release --state-dir "$S" --run-id "$RUN" --json > "$J/evidence_release.json"
+RC=0; parapet inspect --state-dir "$S" --run-id "$RUN" --json > "$J/inspect_released.json" || RC=$?
+parapet_released J8 "$RC" "$J/inspect_released.json"
 ```

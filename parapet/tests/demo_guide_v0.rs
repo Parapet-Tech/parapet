@@ -536,8 +536,10 @@ fn guide_extracts_verbatim_shell_blocks_and_matches_manifest_and_four_facts() {
         }
     }
 
-    // Verify J1, J2, J3, J4, and J7 directories and four-fact separation checks are spelled out.
-    for j_dir in ["$WORK/j1", "$WORK/j2", "$WORK/j3", "$WORK/j4", "$WORK/j7"] {
+    // Verify J1, J2, J3, J4, J7, and J8 directories and four-fact separation checks are spelled out.
+    for j_dir in [
+        "$WORK/j1", "$WORK/j2", "$WORK/j3", "$WORK/j4", "$WORK/j7", "$WORK/j8",
+    ] {
         assert!(
             script.contains(j_dir),
             "extracted guide must spell out journey directory {j_dir}"
@@ -550,7 +552,6 @@ fn guide_extracts_verbatim_shell_blocks_and_matches_manifest_and_four_facts() {
         "p[\"verification\"]",
         "threshold_not_breached",
         "threshold_breached",
-        "absent_by_contract",
         "digest_mismatch",
         "file_cleanup_indeterminate",
         "operator-residue.txt",
@@ -560,6 +561,11 @@ fn guide_extracts_verbatim_shell_blocks_and_matches_manifest_and_four_facts() {
             "extracted guide must check fact/token `{fact}`"
         );
     }
+    assert!(
+        readme.contains("no protected effect receipt is created")
+            && readme.contains("absent_by_contract"),
+        "J2 guide must explain receipt absence without inventing an inspect projection"
+    );
 
     // Verify root README.md Quick Start links to the local first-use guide.
     let root_readme = std::fs::read_to_string(root_readme_path()).expect("read root README.md");
@@ -907,22 +913,24 @@ fn n12_post_release_reader_witness_extracted_from_guide_and_ordering_enforced() 
     assert!(stdout.is_empty());
     assert!(stderr.is_empty());
 
-    // Ordering check on the extracted guide: all 5 journeys (J1, J2, J3, J4, J7)
-    // must follow `parapet evidence release` immediately with `parapet inspect ... --json` and `parapet_released`.
+    // Ordering check on the extracted guide: all 5 receipt-producing journeys
+    // (J1, J3, J4, J7, J8) must follow `parapet evidence release` immediately with
+    // `parapet inspect ... --json` and `parapet_released`. J2 stops at inbound
+    // policy and deliberately has no protected receipt to release.
     let count =
         check_evidence_release_witness_ordering(&script).expect("guide witness ordering valid");
     assert_eq!(
         count, 5,
-        "expected 5 `parapet evidence release` calls (J1-J4 and J7)"
+        "expected 5 `parapet evidence release` calls (J1, J3, J4, J7, and J8)"
     );
 
-    // Process cleanup check: all 5 `wait "$RUN_PID"` calls in the extracted guide
-    // must be immediately followed by `RUN_PID=`.
+    // Process cleanup check: all 6 journey `wait "$RUN_PID"` calls in the
+    // extracted guide must be immediately followed by `RUN_PID=`.
     let wait_count =
         check_wait_run_pid_cleared_ordering(&script).expect("guide wait RUN_PID clear valid");
     assert_eq!(
-        wait_count, 5,
-        "expected 5 `wait \"$RUN_PID\"` calls followed by `RUN_PID=` (J1-J4 and J7)"
+        wait_count, 6,
+        "expected 6 `wait \"$RUN_PID\"` calls followed by `RUN_PID=` (J1-J4, J7, and J8)"
     );
     assert!(
         check_wait_run_pid_cleared_ordering("wait \"$RUN_PID\"\nls -la \"$R\"\n").is_err(),

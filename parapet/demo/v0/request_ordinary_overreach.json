@@ -1,0 +1,1 @@
+{"model":"parapet-demo-offline","messages":[{"role":"user","content":"Task: save-note\nTarget: ../shared-note.txt\n---\nShared note for the example team, week 42.\n\nBooked the small meeting room for Thursday afternoon.\nOrdered two replacement keyboards for the front desk.\n\nReference: PARAPET-1E-CANARY-J8\n"}]}

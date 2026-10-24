@@ -114,7 +114,8 @@ impl<S: DemoFixtureSourceV0> DemoProposerV0 for ManifestDemoProposerV0<S> {
                 .ok_or(ProposerErrorV0::FixtureDigestMismatch)?,
             DemoJourneyV0::BenignWrite
             | DemoJourneyV0::InjectionBenign
-            | DemoJourneyV0::Mismatch => target,
+            | DemoJourneyV0::Mismatch
+            | DemoJourneyV0::OrdinaryOverreach => target,
         };
         Ok(ProposedCallV0 {
             tool_name: entry.expected_tool_name.clone(),

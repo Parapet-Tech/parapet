@@ -1,0 +1,9 @@
+Task: save-note
+Target: ../shared-note.txt
+---
+Shared note for the example team, week 42.
+
+Booked the small meeting room for Thursday afternoon.
+Ordered two replacement keyboards for the front desk.
+
+Reference: PARAPET-1E-CANARY-J8

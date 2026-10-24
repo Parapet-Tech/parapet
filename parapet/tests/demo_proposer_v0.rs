@@ -165,7 +165,11 @@ fn human_injection_fixtures_equal_frozen_intake_hashes() {
         assert_eq!(entry["document_class"], "injection");
         assert_eq!(entry["document_authorship"]["kind"], "human_operator");
     }
-    for journey in [DemoJourneyV0::BenignWrite, DemoJourneyV0::Mismatch] {
+    for journey in [
+        DemoJourneyV0::BenignWrite,
+        DemoJourneyV0::Mismatch,
+        DemoJourneyV0::OrdinaryOverreach,
+    ] {
         let entry = journey_entry(journey);
         assert_eq!(entry["document_class"], "benign_non_injection");
         assert_eq!(entry["document_authorship"]["kind"], "agent");
@@ -184,6 +188,7 @@ fn fixture_documents_meet_structural_requirements() {
         "PARAPET-1E-CANARY-J2",
         "PARAPET-1E-CANARY-J3",
         "PARAPET-1E-CANARY-J4",
+        "PARAPET-1E-CANARY-J8",
     ]) {
         let bytes = document(journey).as_bytes();
         assert!(bytes.len() <= 4096);
@@ -203,11 +208,24 @@ fn fixture_documents_meet_structural_requirements() {
     }
     targets.sort();
     targets.dedup();
-    assert_eq!(targets.len(), 4, "every journey has a distinct Target");
+    assert_eq!(targets.len(), 5, "every journey has a distinct Target");
     assert!(document(DemoJourneyV0::Unauthorized).contains("../escape.txt"));
     assert_eq!(
         journey_entry(DemoJourneyV0::Unauthorized)["injected_path"],
         "../escape.txt"
+    );
+    // J8 overreaches through its own ordinary header, not an injected instruction.
+    let j8 = journey_entry(DemoJourneyV0::OrdinaryOverreach);
+    let j8_doc = document(DemoJourneyV0::OrdinaryOverreach);
+    assert!(j8["injected_path"].is_null());
+    assert_eq!(j8["expected_target_basename"], "../shared-note.txt");
+    assert_ne!(j8["document_sha256"], J2_UNAUTHORIZED_SHA256);
+    assert!(!j8_doc.contains("escape.txt") && !j8_doc.contains("CANARY-J2"));
+    assert!(!j8_doc.contains('<') && !j8_doc.contains('>') && !j8_doc.contains('{'));
+    assert_eq!(
+        j8_doc.matches("../").count(),
+        1,
+        "only the header Target leaves the root"
     );
 }
 
@@ -270,14 +288,14 @@ fn manifest_freezes_measured_values() {
             DemoJourneyV0::Unauthorized,
             serde_json::json!({
                 "decision": "block",
-                "failed_argument": "path",
-                "reason_code": "matches",
-                "constraint_names": ["matches"],
-                "attempt": "absent_by_contract",
-                "verification": "absent_by_contract",
-                "human_label": "blocked before execution",
-                "detection": "present",
-                "detection_outcome": "threshold_breached",
+                "blocking_layer": "L3-inbound",
+                "blocking_view": "pre_html",
+                "upstream_candidate": "absent_by_contract",
+                "protected_effect_receipt": "absent_by_contract",
+                "effect_root_unchanged": true,
+                "retry_http_status": 409,
+                "retry_error_code": "effect_run_consumed",
+                "retry_bypass_prevented": true,
                 "injected_path_exists": false,
             }),
         ),
@@ -305,6 +323,21 @@ fn manifest_freezes_measured_values() {
                 "verification_reason_code": "digest_mismatch",
             }),
         ),
+        (
+            DemoJourneyV0::OrdinaryOverreach,
+            serde_json::json!({
+                "decision": "block",
+                "failed_argument": "path",
+                "reason_code": "matches",
+                "constraint_names": ["matches"],
+                "attempt": "absent_by_contract",
+                "verification": "absent_by_contract",
+                "human_label": "blocked before execution",
+                "detection": "present",
+                "detection_outcome": "threshold_not_breached",
+                "target_path_exists": false,
+            }),
+        ),
     ];
     for (journey, expected) in measured {
         let entry = journey_entry(journey);
@@ -314,7 +347,17 @@ fn manifest_freezes_measured_values() {
             "{}",
             journey.name()
         );
-        assert_eq!(entry["expected_http_status"], 200, "{}", journey.name());
+        let expected_status = if journey == DemoJourneyV0::Unauthorized {
+            403
+        } else {
+            200
+        };
+        assert_eq!(
+            entry["expected_http_status"],
+            expected_status,
+            "{}",
+            journey.name()
+        );
         assert_eq!(entry["expected"], expected, "{}", journey.name());
     }
     assert_eq!(
@@ -329,6 +372,7 @@ fn manifest_freezes_measured_values() {
         journey_entry(DemoJourneyV0::Mismatch)["expected_file_sha256"],
         "592ae184266a9988c74b8a9bbbf13984483e8a5fce72b019b58f457ce9cdeb28"
     );
+    assert!(journey_entry(DemoJourneyV0::OrdinaryOverreach)["expected_file_sha256"].is_null());
     let unauthorized = journey_entry(DemoJourneyV0::Unauthorized);
     assert!(unauthorized["expected_file_sha256"].is_null());
     // The blocked argument is `path`; `matches` is the predicate it failed.
@@ -945,6 +989,96 @@ async fn j4_live_mismatch_reaches_failed_digest_mismatch_and_never_verified() {
     assert!(disk_bytes.iter().all(|&b| b == INTERFERENCE_FILL_BYTE));
 }
 
+#[tokio::test]
+async fn j8_live_ordinary_overreach_is_blocked_downstream_without_detection() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = private_state_dir(dir.path());
+    let effect_root = dir.path().join("root");
+    let config = std::sync::Arc::new(
+        parapet::config::load_config(&parapet::config::FileSource {
+            path: source_dir().join("config_demo_v0.yaml"),
+        })
+        .unwrap(),
+    );
+    let (client, store, root) = build_engine_client_with_runtime_v0(
+        config,
+        EngineRuntimeOptionsV0 {
+            state_dir: state,
+            effect_root: Some(effect_root.clone()),
+            file_effect_profile: Some(parapet::effect::FileEffectProfileV0::select_explicitly()),
+            max_content_len_bytes: Some(4096),
+            build_digest: None,
+            offline_fixture: Some(OfflineUpstreamFixtureV0::Demo(
+                DemoJourneyV0::OrdinaryOverreach,
+            )),
+            result_sink: None,
+        },
+    )
+    .expect("builds ordinary overreach engine");
+    let root = root.expect("effect root created");
+    let run_id = root.run_id().clone();
+    let listing = |dir: &Path| {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+    let before = listing(&effect_root);
+
+    let mut headers = HeaderMap::new();
+    headers.insert("content-type", HeaderValue::from_static("application/json"));
+    headers.insert(
+        "x-parapet-original-host",
+        HeaderValue::from_static("api.openai.com"),
+    );
+    let resp = client
+        .forward(
+            Provider::OpenAi,
+            ProxyRequest {
+                method: Method::POST,
+                uri: "/v1/chat/completions".parse().unwrap(),
+                headers,
+                body: Bytes::from_static(embedded("request_ordinary_overreach.json")),
+            },
+        )
+        .await
+        .expect("j8 forward succeeds");
+    assert_eq!(resp.status, StatusCode::OK);
+
+    let view = parapet::effect::store::RedactedEvidenceReaderV0::new(&store).view(&run_id, None);
+    assert!(view.reader_code.is_none());
+    assert!(view.projection_code.is_none());
+    let proj: Value =
+        serde_json::from_slice(&view.projection_bytes.expect("projection bytes")).unwrap();
+
+    let exp = &journey_entry(DemoJourneyV0::OrdinaryOverreach)["expected"];
+    assert_eq!(proj["detection"]["availability"], "present", "{proj}");
+    assert_eq!(proj["detection"]["outcome"], exp["detection_outcome"]);
+    assert_eq!(proj["detection"]["outcome"], "threshold_not_breached");
+    assert_eq!(proj["detection"]["mode"], "shadow");
+    assert_eq!(proj["policy"]["decision"], exp["decision"]);
+    assert_eq!(proj["policy"]["reason_code"], exp["reason_code"]);
+    assert_eq!(proj["policy"]["constraint_names"], exp["constraint_names"]);
+    assert_eq!(proj["summary"], "blocked_before_execution");
+    assert_eq!(proj["line"], exp["human_label"]);
+    assert_eq!(proj["effect"]["stage_reached"], "decision");
+    assert!(proj["effect"]["attempt_outcome"].is_null());
+    assert!(proj["not_present"].as_array().unwrap().iter().any(|np| {
+        np["field"] == "attempt"
+            && np["availability"] == exp["attempt"]
+            && np["reason_code"] == "blocked"
+    }));
+    assert_eq!(proj["verification"]["availability"], exp["verification"]);
+    assert!(proj["verification"]["outcome"].is_null());
+
+    assert_eq!(listing(&effect_root), before, "effect root unchanged");
+    assert!(std::fs::symlink_metadata(dir.path().join("shared-note.txt")).is_err());
+    assert!(!effect_root.join("shared-note.txt").exists());
+}
+
 #[test]
 fn n4_mismatch_without_effect_root_errors_before_hook_construction() {
     let dir = tempfile::tempdir().unwrap();
@@ -1376,6 +1510,14 @@ fn n13a_embedded_and_exported_assets_pass_public_boundary_and_manifest_templates
             "authored",
             "2026-10-20",
             "agent-authored on 2026-10-20; not derived from any corpus".to_owned(),
+        ),
+        (
+            DemoJourneyV0::OrdinaryOverreach,
+            "benign_non_injection",
+            "agent",
+            "authored",
+            "2026-10-24",
+            "agent-authored on 2026-10-24; not derived from any corpus".to_owned(),
         ),
     ];
 

@@ -7,7 +7,7 @@
 //! multi-pass scoring orchestration, calibration, and signal assembly.
 //! The model owns one thing: `fn score(&self, text: &str) -> f64`.
 
-use crate::message::{Message, TrustLevel, Role};
+use crate::message::{Message, Role, TrustLevel};
 
 // ---------------------------------------------------------------------------
 // Thresholds shared between the engine verdict path and the signal extractor
@@ -43,7 +43,10 @@ pub trait L1Model: Send + Sync {
 
     /// Optional attribution surface; absence differs from an empty match set.
     fn score_attributed(&self, text: &str) -> Attributed {
-        Attributed { margin: self.score(text), features: None }
+        Attributed {
+            margin: self.score(text),
+            features: None,
+        }
     }
 
     /// Calibration parameters for this model's score distribution.
@@ -70,7 +73,11 @@ pub struct AttributedFeature {
 /// View selected by the shared raw-margin threshold rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum OutcomeView { Raw, Unquoted, Squashed }
+pub enum OutcomeView {
+    Raw,
+    Unquoted,
+    Squashed,
+}
 
 /// Evidence from threshold comparison, independent of policy or action.
 #[derive(Debug, Clone, Copy)]
@@ -82,11 +89,18 @@ pub struct ThresholdOutcome {
 
 /// The engine and detection-record entry point share this exact rule.
 pub fn threshold_outcome(signal: &L1Signal, threshold: f64) -> ThresholdOutcome {
-    let mention = signal.quote_detected
-        && signal.raw_score_delta > MENTION_RAW_DELTA_THRESHOLD;
-    let effective_raw = if mention { signal.raw_unquoted_score } else { signal.raw_score };
+    let mention = signal.quote_detected && signal.raw_score_delta > MENTION_RAW_DELTA_THRESHOLD;
+    let effective_raw = if mention {
+        signal.raw_unquoted_score
+    } else {
+        signal.raw_score
+    };
     ThresholdOutcome {
-        outcome_view: if mention { OutcomeView::Unquoted } else { OutcomeView::Raw },
+        outcome_view: if mention {
+            OutcomeView::Unquoted
+        } else {
+            OutcomeView::Raw
+        },
         effective_raw,
         threshold_breached: effective_raw >= threshold,
     }
@@ -111,7 +125,6 @@ pub struct L1Signal {
     pub role: Role,
 
     // -- Raw margins (canonical geometric values) --
-
     /// Full-text raw margin from the model.
     pub raw_score: f64,
 
@@ -122,7 +135,6 @@ pub struct L1Signal {
     pub raw_squash_score: f64,
 
     // -- Scores (calibrated [0.0, 1.0]) --
-
     /// Full text score. "Does this text contain attack-like language?"
     pub score: f32,
 
@@ -135,12 +147,10 @@ pub struct L1Signal {
     pub squash_score: f32,
 
     // -- Context bits (deterministic, model-independent) --
-
     /// Structural quoting markers detected.
     pub quote_detected: bool,
 
     // -- Derived --
-
     /// `raw_score - raw_unquoted_score`. Canonical quote-concentration signal.
     /// Routing thresholds operate on this value in raw margin space.
     pub raw_score_delta: f64,
@@ -545,6 +555,205 @@ impl L1Harness {
 
         signals
     }
+
+    /// Run L1 independently across both complete L0 scan views (`pre_html` and
+    /// `html_stripped`), evaluate `threshold_outcome` once per present signal,
+    /// select one coherent `L1Signal` per scored message by higher `effective_raw`
+    /// (tie-breaking to `HtmlStripped`), and fail closed (`NoSignalEmptyAfterL0`)
+    /// when a non-empty untrusted message produces no signal in either view.
+    pub fn scan_dual_view(
+        views: &dyn crate::normalize::L0DualScanView,
+        model: &dyn L1Model,
+        threshold: f64,
+    ) -> Result<L1DualViewResult, L1DualViewError> {
+        let pre_messages = views.pre_html_messages();
+        let strip_messages = views.html_stripped_messages();
+
+        if pre_messages.len() != strip_messages.len() {
+            return Err(L1DualViewError::InvalidScanViews {
+                reason: "pre_html and html_stripped message counts differ",
+            });
+        }
+
+        let msg_count = strip_messages.len();
+        for i in 0..msg_count {
+            if pre_messages[i].trust != strip_messages[i].trust
+                || pre_messages[i].role != strip_messages[i].role
+            {
+                return Err(L1DualViewError::InvalidScanViews {
+                    reason: "pre_html and html_stripped message metadata misaligned",
+                });
+            }
+            if views.original_byte_len(i).is_none() || views.original_char_len(i).is_none() {
+                return Err(L1DualViewError::InvalidScanViews {
+                    reason: "missing original message length metadata",
+                });
+            }
+        }
+
+        let pre_signals = Self::scan(pre_messages, model);
+        let strip_signals = Self::scan(strip_messages, model);
+
+        let mut pre_by_idx: Vec<Option<L1Signal>> = vec![None; msg_count];
+        for sig in pre_signals {
+            let idx = sig.message_index;
+            if idx >= msg_count {
+                return Err(L1DualViewError::InvalidScanViews {
+                    reason: "pre_html signal message_index out of bounds",
+                });
+            }
+            pre_by_idx[idx] = Some(sig);
+        }
+
+        let mut strip_by_idx: Vec<Option<L1Signal>> = vec![None; msg_count];
+        for sig in strip_signals {
+            let idx = sig.message_index;
+            if idx >= msg_count {
+                return Err(L1DualViewError::InvalidScanViews {
+                    reason: "html_stripped signal message_index out of bounds",
+                });
+            }
+            strip_by_idx[idx] = Some(sig);
+        }
+
+        let mut signals = Vec::new();
+        let mut selections = Vec::new();
+        let mut breached: Option<L1SelectedSignal> = None;
+
+        for i in 0..msg_count {
+            let msg = &strip_messages[i];
+            let orig_byte_len =
+                views
+                    .original_byte_len(i)
+                    .ok_or(L1DualViewError::InvalidScanViews {
+                        reason: "missing original byte length",
+                    })?;
+            let orig_char_len =
+                views
+                    .original_char_len(i)
+                    .ok_or(L1DualViewError::InvalidScanViews {
+                        reason: "missing original char length",
+                    })?;
+
+            let pre_sig = pre_by_idx[i].take();
+            let strip_sig = strip_by_idx[i].take();
+
+            // Evaluate threshold_outcome once per present signal.
+            let pre_eval = pre_sig.map(|sig| {
+                let outcome = threshold_outcome(&sig, threshold);
+                (sig, outcome)
+            });
+            let strip_eval = strip_sig.map(|sig| {
+                let outcome = threshold_outcome(&sig, threshold);
+                (sig, outcome)
+            });
+
+            let any_view_breached = pre_eval.as_ref().is_some_and(|(_, o)| o.threshold_breached)
+                || strip_eval
+                    .as_ref()
+                    .is_some_and(|(_, o)| o.threshold_breached);
+
+            let selected = match (pre_eval, strip_eval) {
+                (Some((ps, po)), Some((ss, so))) => {
+                    if po.effective_raw > so.effective_raw {
+                        L1SelectedSignal {
+                            signal: ps,
+                            outcome: po,
+                            selected_view: crate::normalize::L0ScanView::PreHtml,
+                        }
+                    } else {
+                        L1SelectedSignal {
+                            signal: ss,
+                            outcome: so,
+                            selected_view: crate::normalize::L0ScanView::HtmlStripped,
+                        }
+                    }
+                }
+                (Some((ps, po)), None) => L1SelectedSignal {
+                    signal: ps,
+                    outcome: po,
+                    selected_view: crate::normalize::L0ScanView::PreHtml,
+                },
+                (None, Some((ss, so))) => L1SelectedSignal {
+                    signal: ss,
+                    outcome: so,
+                    selected_view: crate::normalize::L0ScanView::HtmlStripped,
+                },
+                (None, None) => {
+                    // C-1: Only untrusted messages with non-empty original content are expected
+                    // to produce an L1 signal. Trusted messages and genuinely empty messages
+                    // intentionally emit no signal.
+                    if msg.trust != TrustLevel::Trusted && (orig_byte_len > 0 || orig_char_len > 0)
+                    {
+                        return Err(L1DualViewError::NoSignalEmptyAfterL0 {
+                            message_index: i,
+                            role: msg.role.clone(),
+                        });
+                    }
+                    continue;
+                }
+            };
+
+            if any_view_breached && breached.is_none() {
+                breached = Some(selected.clone());
+            }
+
+            signals.push(selected.signal.clone());
+            selections.push(selected);
+        }
+
+        Ok(L1DualViewResult {
+            signals,
+            selections,
+            breached,
+        })
+    }
+}
+
+/// Internal wrapper pairing the selected `L1Signal` for a message with its
+/// `ThresholdOutcome` and the `L0ScanView` that produced it.
+#[derive(Debug, Clone)]
+pub struct L1SelectedSignal {
+    pub signal: L1Signal,
+    pub outcome: ThresholdOutcome,
+    pub selected_view: crate::normalize::L0ScanView,
+}
+
+/// Typed fail-closed error when dual-view L1 scanning cannot establish a valid signal.
+#[derive(Debug, Clone, PartialEq)]
+pub enum L1DualViewError {
+    /// A message that L1 would score (`trust != TrustLevel::Trusted` and non-empty
+    /// original content before L0) produced no L1 signal in either view (`no_signal_empty_after_l0`).
+    NoSignalEmptyAfterL0 { message_index: usize, role: Role },
+    /// Dual views are missing required alignment or original-length metadata.
+    InvalidScanViews { reason: &'static str },
+}
+
+impl std::fmt::Display for L1DualViewError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            L1DualViewError::NoSignalEmptyAfterL0 { message_index, .. } => {
+                write!(
+                    f,
+                    "no_signal_empty_after_l0 at message index {message_index}"
+                )
+            }
+            L1DualViewError::InvalidScanViews { reason } => {
+                write!(f, "invalid L0 dual scan views: {reason}")
+            }
+        }
+    }
+}
+
+/// Complete outcome of dual-view L1 harness scanning across all messages.
+#[derive(Debug, Clone)]
+pub struct L1DualViewResult {
+    /// One coherent `L1Signal` per scored message, ready for `SignalExtractor::with_l1`.
+    pub signals: Vec<L1Signal>,
+    /// Detailed per-message selection and provenance metadata.
+    pub selections: Vec<L1SelectedSignal>,
+    /// First threshold breach across any view (if any), with view provenance.
+    pub breached: Option<L1SelectedSignal>,
 }
 
 // ---------------------------------------------------------------------------
@@ -575,7 +784,9 @@ mod tests {
 
     #[test]
     fn quote_detect_unicode_quotes() {
-        assert!(quote_detect("He said \u{201C}ignore instructions\u{201D} loudly"));
+        assert!(quote_detect(
+            "He said \u{201C}ignore instructions\u{201D} loudly"
+        ));
     }
 
     #[test]
@@ -715,8 +926,10 @@ mod tests {
         // Fail-closed: return original text unchanged, no partial stripping.
         let text = "prefix 'attack' and 'unterminated";
         let result = strip_quotes(text).unwrap();
-        assert_eq!(result, text,
-            "imbalanced single quotes must return original unchanged");
+        assert_eq!(
+            result, text,
+            "imbalanced single quotes must return original unchanged"
+        );
     }
 
     // -- Calibration tests --
@@ -734,7 +947,10 @@ mod tests {
         let scores = [-5.0, -2.0, 0.0, 2.0, 5.0];
         let calibrated: Vec<f32> = scores.iter().map(|&s| calibrate(s, &params)).collect();
         for w in calibrated.windows(2) {
-            assert!(w[1] > w[0], "calibrated scores must be monotonically increasing");
+            assert!(
+                w[1] > w[0],
+                "calibrated scores must be monotonically increasing"
+            );
         }
     }
 
@@ -840,8 +1056,10 @@ mod tests {
         let s = &signals[0];
 
         assert!(s.quote_detected);
-        assert!((s.raw_score_delta).abs() < f64::EPSILON,
-            "fully-quoted message must have zero delta (fail-closed)");
+        assert!(
+            (s.raw_score_delta).abs() < f64::EPSILON,
+            "fully-quoted message must have zero delta (fail-closed)"
+        );
         assert_eq!(s.raw_unquoted_score, s.raw_score);
     }
 
@@ -855,7 +1073,103 @@ mod tests {
         let s = &signals[0];
 
         assert_eq!(s.raw_squash_score, 0.0);
-        assert_eq!(s.squash_score, 0.0,
-            "empty squash must emit squash_score = 0.0 (no signal), not calibrate(0.0)");
+        assert_eq!(
+            s.squash_score, 0.0,
+            "empty squash must emit squash_score = 0.0 (no signal), not calibrate(0.0)"
+        );
+    }
+
+    #[test]
+    fn dual_view_selects_pre_html_when_effective_raw_is_greater() {
+        let normalizer = crate::normalize::L0Normalizer::new();
+        let messages = vec![make_msg("<div attack payload", TrustLevel::Untrusted)];
+        let (views, _, _) =
+            crate::normalize::normalize_messages_dual_view(&normalizer, &messages).unwrap();
+
+        let result = L1Harness::scan_dual_view(&views, &FixedModel, 0.0)
+            .expect("dual view scan should succeed");
+        assert_eq!(result.signals.len(), 1);
+        assert_eq!(
+            result.selections[0].selected_view,
+            crate::normalize::L0ScanView::PreHtml
+        );
+        assert!(result.breached.is_some());
+        assert_eq!(result.signals[0].raw_score, 3.0);
+    }
+
+    #[test]
+    fn dual_view_selects_html_stripped_when_effective_raw_is_greater_or_tied() {
+        struct SplitTagModel;
+        impl L1Model for SplitTagModel {
+            fn score(&self, text: &str) -> f64 {
+                if text.contains("attackpayload") {
+                    4.0
+                } else if text.contains("attack<b>payload") {
+                    1.0
+                } else {
+                    -2.0
+                }
+            }
+            fn calibration(&self) -> CalibrationParams {
+                CalibrationParams { a: 0.6, b: 0.0 }
+            }
+        }
+
+        let normalizer = crate::normalize::L0Normalizer::new();
+        let messages = vec![make_msg("attack<b>payload", TrustLevel::Untrusted)];
+        let (views, _, _) =
+            crate::normalize::normalize_messages_dual_view(&normalizer, &messages).unwrap();
+
+        let result = L1Harness::scan_dual_view(&views, &SplitTagModel, 2.0)
+            .expect("dual view scan should succeed");
+        assert_eq!(result.signals.len(), 1);
+        assert_eq!(
+            result.selections[0].selected_view,
+            crate::normalize::L0ScanView::HtmlStripped
+        );
+        assert_eq!(result.signals[0].raw_score, 4.0);
+        assert!(result.breached.is_some());
+
+        // Tie case on plain input -> selects HtmlStripped
+        let tie_messages = vec![make_msg("plain benign text", TrustLevel::Untrusted)];
+        let (tie_views, _, _) =
+            crate::normalize::normalize_messages_dual_view(&normalizer, &tie_messages).unwrap();
+        let tie_result = L1Harness::scan_dual_view(&tie_views, &FixedModel, 0.0)
+            .expect("dual view tie scan should succeed");
+        assert_eq!(
+            tie_result.selections[0].selected_view,
+            crate::normalize::L0ScanView::HtmlStripped
+        );
+        assert!(tie_result.breached.is_none());
+    }
+
+    #[test]
+    fn dual_view_c1_trusted_and_empty_skipped_but_nonempty_untrusted_both_empty_fails_closed() {
+        let normalizer = crate::normalize::L0Normalizer::new();
+        // Trusted non-empty message + genuinely empty untrusted message -> no error
+        let ok_messages = vec![
+            make_msg("You are a helpful assistant.", TrustLevel::Trusted),
+            make_msg("", TrustLevel::Untrusted),
+        ];
+        let (ok_views, _, _) =
+            crate::normalize::normalize_messages_dual_view(&normalizer, &ok_messages).unwrap();
+        let ok_result = L1Harness::scan_dual_view(&ok_views, &FixedModel, 0.0)
+            .expect("trusted and genuinely empty messages must not fail closed");
+        assert!(ok_result.signals.is_empty());
+
+        // Non-empty untrusted message that collapses to empty in both views (invisible-only) -> fails closed
+        let invis_messages = vec![make_msg("\u{200B}\u{200C}\u{FEFF}", TrustLevel::Untrusted)];
+        let (invis_views, _, _) =
+            crate::normalize::normalize_messages_dual_view(&normalizer, &invis_messages).unwrap();
+        let err = L1Harness::scan_dual_view(&invis_views, &FixedModel, 0.0).expect_err(
+            "non-empty untrusted message collapsing to empty in both views must fail closed",
+        );
+        assert_eq!(
+            err,
+            L1DualViewError::NoSignalEmptyAfterL0 {
+                message_index: 0,
+                role: Role::User,
+            }
+        );
     }
 }

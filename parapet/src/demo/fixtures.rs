@@ -19,16 +19,18 @@ pub const DEMO_FIXTURES_SCHEMA: &str = "parapet-demo-fixtures/v0";
 pub const MANIFEST_NAME: &str = "manifest.json";
 
 /// Every exported asset, sorted by name.
-pub const EXPORTED_ASSETS: [&str; 10] = [
+pub const EXPORTED_ASSETS: [&str; 12] = [
     "config_demo_v0.yaml",
     "doc_benign_write.txt",
     "doc_injection_benign.txt",
     "doc_mismatch.txt",
+    "doc_ordinary_overreach.txt",
     "doc_unauthorized.txt",
     "manifest.json",
     "request_benign_write.json",
     "request_injection_benign.json",
     "request_mismatch.json",
+    "request_ordinary_overreach.json",
     "request_unauthorized.json",
 ];
 
@@ -200,7 +202,7 @@ fn check_authorship_and_provenance(
         return Err(DemoFixtureErrorV0::ManifestInvalid);
     }
     match journey {
-        DemoJourneyV0::BenignWrite | DemoJourneyV0::Mismatch => {
+        DemoJourneyV0::BenignWrite | DemoJourneyV0::Mismatch | DemoJourneyV0::OrdinaryOverreach => {
             let expected_prov = format!(
                 "agent-authored on {}; not derived from any corpus",
                 auth.date
@@ -332,6 +334,9 @@ impl DemoFixtureSourceV0 for CompiledDemoFixturesV0 {
             "doc_benign_write.txt" => include_bytes!("../../demo/v0/doc_benign_write.txt"),
             "doc_injection_benign.txt" => include_bytes!("../../demo/v0/doc_injection_benign.txt"),
             "doc_mismatch.txt" => include_bytes!("../../demo/v0/doc_mismatch.txt"),
+            "doc_ordinary_overreach.txt" => {
+                include_bytes!("../../demo/v0/doc_ordinary_overreach.txt")
+            }
             "doc_unauthorized.txt" => include_bytes!("../../demo/v0/doc_unauthorized.txt"),
             "request_benign_write.json" => {
                 include_bytes!("../../demo/v0/request_benign_write.json")
@@ -340,6 +345,9 @@ impl DemoFixtureSourceV0 for CompiledDemoFixturesV0 {
                 include_bytes!("../../demo/v0/request_injection_benign.json")
             }
             "request_mismatch.json" => include_bytes!("../../demo/v0/request_mismatch.json"),
+            "request_ordinary_overreach.json" => {
+                include_bytes!("../../demo/v0/request_ordinary_overreach.json")
+            }
             "request_unauthorized.json" => {
                 include_bytes!("../../demo/v0/request_unauthorized.json")
             }

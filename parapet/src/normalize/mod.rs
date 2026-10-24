@@ -7,8 +7,8 @@
 // before constraint evaluation. It is idempotent: normalizing already-normalized
 // content returns the same result.
 
-use aho_corasick::AhoCorasick;
 use crate::message::{Message, TrustLevel};
+use aho_corasick::AhoCorasick;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use unicode_normalization::UnicodeNormalization;
@@ -20,9 +20,21 @@ use unicode_normalization::UnicodeNormalization;
 /// Pure string normalizer. Implementations must be Send + Sync so they can be
 /// shared across async tasks.
 pub trait Normalizer: Send + Sync {
-    /// Normalize a single string. The result must be idempotent:
+    /// Normalize a single string (HTML-stripped scan view). The result must be idempotent:
     /// `normalize(normalize(x)) == normalize(x)` for all `x`.
     fn normalize(&self, input: &str) -> String;
+
+    /// Normalize a single string for the complete pre-HTML scan view (NFKC,
+    /// tag-syntax attribute-delimiter neutralization, single-pass character
+    /// reference decoding, invisible character removal, and mixed-script
+    /// confusable replacement applied; no HTML tag or `<script>`/`<style>`
+    /// interior deletion).
+    ///
+    /// Defaults to `self.normalize(input)` for custom normalizers that do not
+    /// perform HTML stripping.
+    fn normalize_pre_html(&self, input: &str) -> String {
+        self.normalize(input)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -34,11 +46,20 @@ pub trait Normalizer: Send + Sync {
 /// 1. NFKC unicode normalization (fullwidth -> ASCII, combining chars, etc.)
 /// 2. HTML tag stripping (including script/style content removal)
 /// 3. Zero-width / invisible character removal
+/// 4. Mixed-script confusable replacement
 pub struct L0Normalizer;
 
 impl L0Normalizer {
     pub fn new() -> Self {
         Self
+    }
+
+    /// Normalize `input` for the pre-HTML scan view (NFKC, tag-syntax
+    /// attribute-delimiter neutralization, single-pass character reference
+    /// decoding, invisible removal, and mixed-script confusable replacement;
+    /// no HTML tag or script/style deletion).
+    pub fn normalize_pre_html(&self, input: &str) -> String {
+        normalize_pre_html_core(input)
     }
 }
 
@@ -52,6 +73,18 @@ impl Normalizer for L0Normalizer {
     fn normalize(&self, input: &str) -> String {
         normalize_core(input)
     }
+
+    fn normalize_pre_html(&self, input: &str) -> String {
+        normalize_pre_html_core(input)
+    }
+}
+
+/// Private pre-HTML L0 stage order: NFKC, tag-syntax attribute-delimiter
+/// neutralization, single-pass character reference decoding, invisible removal,
+/// and mixed-script confusable replacement without HTML tag or
+/// `<script>`/`<style>` stripping.
+fn normalize_pre_html_core(input: &str) -> String {
+    normalize_stage_with_mappings(input, false).0
 }
 
 /// Private L0 stage order shared by `L0Normalizer::normalize` and
@@ -224,7 +257,13 @@ fn match_dangerous_open_tag(chars: &[char], start: usize, len: usize) -> Option<
 
     if name == "script" || name == "style" {
         // Verify the tag name is followed by whitespace, '>', or '/' (not just a prefix)
-        if j < len && (chars[j] == '>' || chars[j] == ' ' || chars[j] == '/' || chars[j] == '\t' || chars[j] == '\n') {
+        if j < len
+            && (chars[j] == '>'
+                || chars[j] == ' '
+                || chars[j] == '/'
+                || chars[j] == '\t'
+                || chars[j] == '\n')
+        {
             Some(name)
         } else if j >= len {
             // Tag name extends to end of input (malformed) -- treat as dangerous
@@ -638,6 +677,675 @@ pub fn normalize_messages_with_spans_and_evidence(
     evidence
 }
 
+/// Remap trust spans from pre-normalization to post-`normalize_pre_html` byte offsets.
+pub fn remap_trust_spans_pre_html(
+    normalizer: &dyn Normalizer,
+    original: &str,
+    spans: &mut [crate::trust::TrustSpan],
+) {
+    if spans.is_empty() || original.is_empty() {
+        return;
+    }
+
+    let mut boundaries: Vec<usize> = Vec::new();
+    for span in spans.iter() {
+        boundaries.push(span.start);
+        boundaries.push(span.end);
+    }
+    boundaries.sort_unstable();
+    boundaries.dedup();
+
+    let mut boundary_map: HashMap<usize, usize> = HashMap::new();
+    for &boundary in &boundaries {
+        let clamped = clamp_to_char_boundary(original, boundary);
+        let prefix = &original[..clamped];
+        let normalized_prefix = normalizer.normalize_pre_html(prefix);
+        boundary_map.insert(boundary, normalized_prefix.len());
+    }
+
+    for span in spans.iter_mut() {
+        let new_start = boundary_map.get(&span.start).copied().unwrap_or(span.start);
+        let new_end = boundary_map.get(&span.end).copied().unwrap_or(span.end);
+        if new_start <= new_end {
+            span.start = new_start;
+            span.end = new_end;
+        } else {
+            span.start = new_end;
+            span.end = new_start;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dual-view L0 scan surface
+// ---------------------------------------------------------------------------
+
+/// Identifies which L0 detector scan view produced a finding or signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum L0ScanView {
+    /// Pre-HTML-strip L0 view: NFKC, invisible removal, mixed-script confusable
+    /// replacement, trust-span remapping, and role-marker neutralization,
+    /// without HTML tag or `<script>`/`<style>` deletion.
+    PreHtml,
+    /// Existing HTML-stripped L0 view.
+    HtmlStripped,
+}
+
+impl L0ScanView {
+    /// Stable content-free label for logs and response evidence.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PreHtml => "pre_html",
+            Self::HtmlStripped => "html_stripped",
+        }
+    }
+}
+
+/// Original parsed message length and span metadata preserved alongside L0 scan views.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct L0OriginalMessageMeta {
+    /// Original parsed message content byte length before L0 normalization.
+    pub original_byte_len: usize,
+    /// Original parsed message content character count before L0 normalization.
+    pub original_char_len: usize,
+    /// Original character counts for each untrusted `TrustSpan` on the message.
+    pub original_untrusted_span_char_lens: Vec<usize>,
+}
+
+/// Complete, positionally aligned L0 dual-view scan surface for L1 and L3.
+pub trait L0DualScanView: Send + Sync {
+    /// Complete message slice for the `pre_html` view.
+    fn pre_html_messages(&self) -> &[Message];
+
+    /// Complete message slice for the `html_stripped` view.
+    fn html_stripped_messages(&self) -> &[Message];
+
+    /// Convenience accessor for either view's complete message slice.
+    fn messages_for_view(&self, view: L0ScanView) -> &[Message] {
+        match view {
+            L0ScanView::PreHtml => self.pre_html_messages(),
+            L0ScanView::HtmlStripped => self.html_stripped_messages(),
+        }
+    }
+
+    /// Original parsed byte length of message `message_index` before L0 normalization.
+    fn original_byte_len(&self, message_index: usize) -> Option<usize>;
+
+    /// Original parsed character length of message `message_index` before L0 normalization.
+    fn original_char_len(&self, message_index: usize) -> Option<usize>;
+
+    /// Original parsed character length of untrusted span `untrusted_span_index` on message `message_index`.
+    fn original_untrusted_span_char_len(
+        &self,
+        message_index: usize,
+        untrusted_span_index: usize,
+    ) -> Option<usize>;
+
+    /// Total original parsed character length across all untrusted spans on message `message_index`.
+    fn original_total_untrusted_span_char_len(&self, message_index: usize) -> Option<usize>;
+
+    /// Per-character byte offset mappings from original message content to `view` content.
+    fn offset_mappings(&self, view: L0ScanView, message_index: usize) -> Option<&[OffsetMapping]>;
+
+    /// Map a byte range `[new_start, new_end)` in `view` message `message_index` back to
+    /// its `[old_start, old_end)` byte range in the original parsed message content.
+    fn map_range_to_original(
+        &self,
+        view: L0ScanView,
+        message_index: usize,
+        new_start: usize,
+        new_end: usize,
+    ) -> Option<(usize, usize)> {
+        let view_msg = self.messages_for_view(view).get(message_index)?;
+        let orig_byte_len = self.original_byte_len(message_index)?;
+        let mappings = self.offset_mappings(view, message_index)?;
+        map_normalized_range_to_original(
+            &view_msg.content,
+            orig_byte_len,
+            mappings,
+            new_start,
+            new_end,
+        )
+    }
+}
+
+/// Concrete dual-view L0 scan surface holding both complete message views,
+/// source-offset mappings, and original parsed content lengths.
+#[derive(Debug, Clone)]
+pub struct L0ScanViews {
+    pub pre_html: Vec<Message>,
+    pub html_stripped: Vec<Message>,
+    pub pre_html_mappings: Vec<Vec<OffsetMapping>>,
+    pub html_stripped_mappings: Vec<Vec<OffsetMapping>>,
+    pub original_meta: Vec<L0OriginalMessageMeta>,
+}
+
+impl L0ScanViews {
+    /// Construct passthrough dual views when L0 sanitize mode is disabled.
+    pub fn passthrough(messages: &[Message]) -> Self {
+        let mut pre_html_mappings = Vec::with_capacity(messages.len());
+        let mut html_stripped_mappings = Vec::with_capacity(messages.len());
+        let mut original_meta = Vec::with_capacity(messages.len());
+
+        for msg in messages {
+            let id_map = identity_offset_mappings(&msg.content);
+            pre_html_mappings.push(id_map.clone());
+            html_stripped_mappings.push(id_map);
+            original_meta.push(extract_original_meta(msg));
+        }
+
+        Self {
+            pre_html: messages.to_vec(),
+            html_stripped: messages.to_vec(),
+            pre_html_mappings,
+            html_stripped_mappings,
+            original_meta,
+        }
+    }
+}
+
+impl L0DualScanView for L0ScanViews {
+    fn pre_html_messages(&self) -> &[Message] {
+        &self.pre_html
+    }
+
+    fn html_stripped_messages(&self) -> &[Message] {
+        &self.html_stripped
+    }
+
+    fn original_byte_len(&self, message_index: usize) -> Option<usize> {
+        self.original_meta
+            .get(message_index)
+            .map(|m| m.original_byte_len)
+    }
+
+    fn original_char_len(&self, message_index: usize) -> Option<usize> {
+        self.original_meta
+            .get(message_index)
+            .map(|m| m.original_char_len)
+    }
+
+    fn original_untrusted_span_char_len(
+        &self,
+        message_index: usize,
+        untrusted_span_index: usize,
+    ) -> Option<usize> {
+        self.original_meta
+            .get(message_index)?
+            .original_untrusted_span_char_lens
+            .get(untrusted_span_index)
+            .copied()
+    }
+
+    fn original_total_untrusted_span_char_len(&self, message_index: usize) -> Option<usize> {
+        let meta = self.original_meta.get(message_index)?;
+        Some(meta.original_untrusted_span_char_lens.iter().sum())
+    }
+
+    fn offset_mappings(&self, view: L0ScanView, message_index: usize) -> Option<&[OffsetMapping]> {
+        match view {
+            L0ScanView::PreHtml => self.pre_html_mappings.get(message_index).map(Vec::as_slice),
+            L0ScanView::HtmlStripped => self
+                .html_stripped_mappings
+                .get(message_index)
+                .map(Vec::as_slice),
+        }
+    }
+}
+
+fn extract_original_meta(msg: &Message) -> L0OriginalMessageMeta {
+    let original_byte_len = msg.content.len();
+    let original_char_len = msg.content.chars().count();
+    let original_untrusted_span_char_lens = msg
+        .untrusted_ranges()
+        .iter()
+        .map(|span| {
+            msg.content
+                .get(span.start..span.end)
+                .map(|s| s.chars().count())
+                .unwrap_or(0)
+        })
+        .collect();
+    L0OriginalMessageMeta {
+        original_byte_len,
+        original_char_len,
+        original_untrusted_span_char_lens,
+    }
+}
+
+fn identity_offset_mappings(input: &str) -> Vec<OffsetMapping> {
+    input
+        .char_indices()
+        .map(|(byte_idx, ch)| {
+            let end = byte_idx + ch.len_utf8();
+            OffsetMapping {
+                old_start: byte_idx,
+                old_end: end,
+                new_start: byte_idx,
+                new_end: end,
+            }
+        })
+        .collect()
+}
+
+fn nfkc_with_orig_spans(input: &str) -> Vec<(char, usize, usize)> {
+    let full_nfkc: String = input.nfkc().collect();
+    let mut per_char = Vec::with_capacity(full_nfkc.len());
+    for (byte_idx, ch) in input.char_indices() {
+        let old_start = byte_idx;
+        let old_end = byte_idx + ch.len_utf8();
+        for nc in ch.nfkc() {
+            per_char.push((nc, old_start, old_end));
+        }
+    }
+    if per_char.iter().map(|(c, _, _)| *c).eq(full_nfkc.chars()) {
+        return per_char;
+    }
+
+    // Fallback when canonical composition or reordering spans adjacent input scalars:
+    // partition input at non-interacting NFKC split boundaries where
+    // `nfkc(prefix) + nfkc(suffix) == nfkc(input)` so every composed output scalar
+    // spans all contributing source scalars.
+    let full_nfkc_chars: Vec<char> = full_nfkc.chars().collect();
+    let orig_chars: Vec<(usize, usize)> = input
+        .char_indices()
+        .map(|(b, ch)| (b, b + ch.len_utf8()))
+        .collect();
+
+    let mut splits: Vec<(usize, usize)> = Vec::with_capacity(orig_chars.len() + 1);
+    splits.push((0, 0));
+    let mut prev_m = 0usize;
+    for (k_minus_1, &(_, b_k)) in orig_chars
+        .iter()
+        .enumerate()
+        .take(orig_chars.len().saturating_sub(1))
+    {
+        let k = k_minus_1 + 1;
+        let prefix_chars: Vec<char> = input[..b_k].nfkc().collect();
+        let m = prefix_chars.len();
+        if m >= prev_m
+            && m <= full_nfkc_chars.len()
+            && full_nfkc_chars[..m] == prefix_chars[..]
+            && input[b_k..].nfkc().eq(full_nfkc_chars[m..].iter().copied())
+        {
+            splits.push((k, m));
+            prev_m = m;
+        }
+    }
+    splits.push((orig_chars.len(), full_nfkc_chars.len()));
+
+    let mut out = Vec::with_capacity(full_nfkc_chars.len());
+    for window in splits.windows(2) {
+        let (k_start, m_start) = window[0];
+        let (k_end, m_end) = window[1];
+        if m_start >= m_end {
+            continue;
+        }
+        let old_start = orig_chars.get(k_start).map(|(s, _)| *s).unwrap_or(0);
+        let old_end = orig_chars
+            .get(k_end.saturating_sub(1))
+            .map(|(_, e)| *e)
+            .unwrap_or(input.len())
+            .max(old_start);
+        for &nc in &full_nfkc_chars[m_start..m_end] {
+            out.push((nc, old_start, old_end));
+        }
+    }
+    out
+}
+
+/// Replace only attribute-value quote delimiters inside tag syntax recognized
+/// by the HTML-strip stage. Quotes in prose, tag names, unquoted values, and
+/// quoted value content are preserved. Replacements are one ASCII byte so the
+/// existing source mapping remains exact.
+fn neutralize_tag_attribute_delimiters(tagged: &mut [(char, usize, usize)]) {
+    let syntax: Vec<char> = tagged.iter().map(|(ch, _, _)| *ch).collect();
+    let len = syntax.len();
+    let mut i = 0;
+
+    while i < len {
+        if syntax[i] != '<' {
+            i += 1;
+            continue;
+        }
+
+        let end = skip_tag(&syntax, i, len);
+        let mut j = i + 1;
+        while j < end {
+            if syntax[j] != '=' {
+                j += 1;
+                continue;
+            }
+
+            j += 1;
+            while j < end && syntax[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j >= end || !matches!(syntax[j], '\'' | '"') {
+                continue;
+            }
+
+            let delimiter = syntax[j];
+            tagged[j].0 = ' ';
+            j += 1;
+            while j < end && syntax[j] != delimiter {
+                j += 1;
+            }
+            if j < end {
+                tagged[j].0 = ' ';
+                j += 1;
+            }
+        }
+        i = end;
+    }
+}
+
+fn decode_named_char_ref(name: &str) -> Option<char> {
+    match name {
+        "amp" => Some('&'),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        "nbsp" => Some('\u{00A0}'),
+        "Tab" => Some('\t'),
+        "NewLine" => Some('\n'),
+        _ => None,
+    }
+}
+
+/// Decode one complete character reference at `start`. Unknown, malformed,
+/// invalid-scalar, and unterminated references remain literal.
+fn decode_char_ref_at(chars: &[char], start: usize) -> Option<(char, usize)> {
+    if chars.get(start) != Some(&'&') || start + 2 >= chars.len() {
+        return None;
+    }
+
+    if chars[start + 1] == '#' {
+        let (radix, digits_start) = if matches!(chars.get(start + 2), Some('x' | 'X')) {
+            (16, start + 3)
+        } else {
+            (10, start + 2)
+        };
+        let mut end = digits_start;
+        let mut value = 0u32;
+        while end < chars.len() && chars[end] != ';' {
+            let digit = chars[end].to_digit(radix)?;
+            value = value.checked_mul(radix)?.checked_add(digit)?;
+            end += 1;
+        }
+        if end == digits_start || chars.get(end) != Some(&';') {
+            return None;
+        }
+        Some((char::from_u32(value)?, end + 1))
+    } else if chars[start + 1].is_ascii_alphabetic() {
+        let name_start = start + 1;
+        let mut end = name_start;
+        while end < chars.len() && chars[end] != ';' {
+            if !chars[end].is_ascii_alphanumeric() {
+                return None;
+            }
+            end += 1;
+        }
+        if end == name_start || chars.get(end) != Some(&';') {
+            return None;
+        }
+        let name: String = chars[name_start..end].iter().collect();
+        Some((decode_named_char_ref(&name)?, end + 1))
+    } else {
+        None
+    }
+}
+
+/// Decode character references once, carrying the complete consumed source
+/// range onto the decoded scalar. Decoded output is never rescanned.
+fn decode_char_refs_with_orig_spans(
+    tagged: Vec<(char, usize, usize)>,
+) -> Vec<(char, usize, usize)> {
+    let chars: Vec<char> = tagged.iter().map(|(ch, _, _)| *ch).collect();
+    let mut decoded = Vec::with_capacity(tagged.len());
+    let mut i = 0;
+
+    while i < tagged.len() {
+        if let Some((ch, end)) = decode_char_ref_at(&chars, i) {
+            decoded.push((ch, tagged[i].1, tagged[end - 1].2));
+            i = end;
+        } else {
+            decoded.push(tagged[i]);
+            i += 1;
+        }
+    }
+
+    decoded
+}
+
+fn normalize_stage_with_mappings(
+    input: &str,
+    strip_html_stage: bool,
+) -> (String, Vec<OffsetMapping>) {
+    let nfkc_tagged = nfkc_with_orig_spans(input);
+
+    let stage2: Vec<(char, usize, usize)> = if strip_html_stage {
+        let chars_only: Vec<char> = nfkc_tagged.iter().map(|(c, _, _)| *c).collect();
+        let len = chars_only.len();
+        let mut kept = Vec::with_capacity(len);
+        let mut i = 0;
+        while i < len {
+            if chars_only[i] == '<' {
+                if let Some(tag_name) = match_dangerous_open_tag(&chars_only, i, len) {
+                    i = skip_to_closing_tag(&chars_only, i, len, &tag_name);
+                } else {
+                    i = skip_tag(&chars_only, i, len);
+                }
+            } else {
+                kept.push(nfkc_tagged[i]);
+                i += 1;
+            }
+        }
+        kept
+    } else {
+        let mut pre_html = nfkc_tagged;
+        neutralize_tag_attribute_delimiters(&mut pre_html);
+        decode_char_refs_with_orig_spans(pre_html)
+    };
+
+    let stage3: Vec<(char, usize, usize)> = stage2
+        .into_iter()
+        .filter(|(c, _, _)| !is_invisible(*c))
+        .collect();
+
+    let stage3_str: String = stage3.iter().map(|(c, _, _)| *c).collect();
+    let replaced = replace_mixed_script_confusables(&stage3_str);
+
+    let mut mappings = Vec::with_capacity(stage3.len());
+    let mut new_byte_pos = 0usize;
+    for (out_ch, (_, old_start, old_end)) in replaced.chars().zip(stage3.into_iter()) {
+        let new_start = new_byte_pos;
+        let new_end = new_start + out_ch.len_utf8();
+        new_byte_pos = new_end;
+        mappings.push(OffsetMapping {
+            old_start,
+            old_end,
+            new_start,
+            new_end,
+        });
+    }
+
+    (replaced, mappings)
+}
+
+/// Error returned when `normalize_messages_dual_view` cannot construct verified
+/// source-offset mappings for the injected normalizer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum L0DualViewBuildError {
+    /// The injected `Normalizer` produced output that diverges from the built-in
+    /// L0 stage pipeline whose exact byte-offset mappings are known.
+    UnsupportedCustomNormalizer {
+        view: L0ScanView,
+        message_index: usize,
+    },
+}
+
+impl std::fmt::Display for L0DualViewBuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            L0DualViewBuildError::UnsupportedCustomNormalizer {
+                view,
+                message_index,
+            } => {
+                write!(
+                    f,
+                    "injected Normalizer output diverged from built-in L0 {view:?} stage at message {message_index}; refusing to fabricate source offsets"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for L0DualViewBuildError {}
+
+fn map_normalized_range_to_original(
+    view_content: &str,
+    original_byte_len: usize,
+    mappings: &[OffsetMapping],
+    new_start: usize,
+    new_end: usize,
+) -> Option<(usize, usize)> {
+    if new_start > new_end || new_end > view_content.len() {
+        return None;
+    }
+    if view_content.is_empty() {
+        if new_start == 0 && new_end == 0 {
+            return Some((0, 0));
+        }
+        return None;
+    }
+    // Verify mappings cover the non-empty view content.
+    let last_mapped_end = mappings.last().map(|m| m.new_end)?;
+    if last_mapped_end != view_content.len() {
+        return None;
+    }
+
+    if new_start == new_end {
+        if new_start == 0 {
+            let pos = mappings.first()?.old_start;
+            return (pos <= original_byte_len).then_some((pos, pos));
+        }
+        if let Some(seg) = mappings.iter().find(|m| m.new_start == new_start) {
+            return (seg.old_start <= original_byte_len).then_some((seg.old_start, seg.old_start));
+        }
+        if let Some(seg) = mappings.iter().find(|m| m.new_end == new_start) {
+            return (seg.old_end <= original_byte_len).then_some((seg.old_end, seg.old_end));
+        }
+        return None;
+    }
+
+    let first = mappings
+        .iter()
+        .find(|m| m.new_start <= new_start && new_start < m.new_end)?;
+    let last = mappings
+        .iter()
+        .rfind(|m| m.new_start < new_end && new_end <= m.new_end)?;
+
+    let old_start = first.old_start;
+    let old_end = last.old_end;
+    if old_start > old_end || old_end > original_byte_len {
+        return None;
+    }
+    Some((old_start, old_end))
+}
+
+/// Build both complete L0 scan views (`pre_html` and `html_stripped`),
+/// remap trust spans independently on each view, run role-marker neutralization
+/// on both views, and return `L0ScanViews`, per-message `L0MessageEvidence`,
+/// and role-marker replacements (from the `html_stripped` view for logging parity).
+///
+/// Fails closed with `L0DualViewBuildError::UnsupportedCustomNormalizer` if the
+/// injected normalizer's output differs from the built-in L0 stage output whose
+/// source byte-offset mappings are known.
+pub fn normalize_messages_dual_view(
+    normalizer: &dyn Normalizer,
+    messages: &[Message],
+) -> Result<
+    (
+        L0ScanViews,
+        Vec<L0MessageEvidence>,
+        Vec<RoleMarkerReplacement>,
+    ),
+    L0DualViewBuildError,
+> {
+    let mut pre_html = messages.to_vec();
+    let mut html_stripped = messages.to_vec();
+    let mut pre_html_mappings = Vec::with_capacity(messages.len());
+    let mut html_stripped_mappings = Vec::with_capacity(messages.len());
+    let mut original_meta = Vec::with_capacity(messages.len());
+    let mut evidence = Vec::with_capacity(messages.len());
+
+    for (message_index, orig_msg) in messages.iter().enumerate() {
+        let original = &orig_msg.content;
+        original_meta.push(extract_original_meta(orig_msg));
+
+        let (stage_stripped, ev) = normalize_with_evidence(original);
+        evidence.push(L0MessageEvidence {
+            message_index,
+            evidence: ev,
+        });
+
+        let (stage_pre_html, stage_pre_map) = normalize_stage_with_mappings(original, false);
+        let (stage_strip_str, stage_strip_map) = normalize_stage_with_mappings(original, true);
+        debug_assert_eq!(stage_stripped, stage_strip_str);
+
+        let norm_pre = normalizer.normalize_pre_html(original);
+        if norm_pre != stage_pre_html {
+            return Err(L0DualViewBuildError::UnsupportedCustomNormalizer {
+                view: L0ScanView::PreHtml,
+                message_index,
+            });
+        }
+
+        let norm_strip = normalizer.normalize(original);
+        if norm_strip != stage_strip_str {
+            return Err(L0DualViewBuildError::UnsupportedCustomNormalizer {
+                view: L0ScanView::HtmlStripped,
+                message_index,
+            });
+        }
+
+        pre_html[message_index].content = norm_pre;
+        if !pre_html[message_index].trust_spans.is_empty() {
+            remap_trust_spans_pre_html(
+                normalizer,
+                original,
+                &mut pre_html[message_index].trust_spans,
+            );
+        }
+        pre_html_mappings.push(stage_pre_map);
+
+        html_stripped[message_index].content = norm_strip;
+        if !html_stripped[message_index].trust_spans.is_empty() {
+            remap_trust_spans(
+                normalizer,
+                original,
+                &mut html_stripped[message_index].trust_spans,
+            );
+        }
+        html_stripped_mappings.push(stage_strip_map);
+    }
+
+    let _pre_replacements = neutralize_role_markers(&mut pre_html);
+    let stripped_replacements = neutralize_role_markers(&mut html_stripped);
+
+    let views = L0ScanViews {
+        pre_html,
+        html_stripped,
+        pre_html_mappings,
+        html_stripped_mappings,
+        original_meta,
+    };
+
+    Ok((views, evidence, stripped_replacements))
+}
+
 // ---------------------------------------------------------------------------
 // Role marker neutralization (L2a Phase 1a)
 // ---------------------------------------------------------------------------
@@ -729,13 +1437,7 @@ pub fn neutralize_role_markers(messages: &mut [Message]) -> Vec<RoleMarkerReplac
         if msg.trust == TrustLevel::Untrusted {
             // Full message is untrusted: scan entire content.
             let content_len = msg.content.len();
-            neutralize_in_range(
-                &mut msg.content,
-                0,
-                content_len,
-                msg_idx,
-                &mut replacements,
-            );
+            neutralize_in_range(&mut msg.content, 0, content_len, msg_idx, &mut replacements);
         } else {
             // Message is trusted but may have untrusted spans.
             let untrusted_ranges: Vec<(usize, usize)> = msg
@@ -1091,17 +1793,68 @@ mod tests {
     #[test]
     fn unclosed_tag_stripped() {
         let n = normalizer();
-        // Unclosed tag: everything from '<' to end is stripped
+        // html_stripped view: unclosed tag strips from '<' to end
         assert_eq!(n.normalize("hello<div"), "hello");
+        assert_eq!(n.normalize("before<script>evil code"), "before");
+        assert_eq!(n.normalize("before<style>body { color: red }"), "before");
+
+        // pre_html view: retains unclosed tags and script/style blocks while still
+        // applying NFKC, invisible stripping, and mixed-script confusable replacement
+        assert_eq!(n.normalize_pre_html("hello<div"), "hello<div");
+        assert_eq!(
+            n.normalize_pre_html("hello<\u{FF44}\u{200B}iv ign\u{043E}re"),
+            "hello<div ignore"
+        );
+        assert_eq!(
+            n.normalize_pre_html("before<script>ign\u{043E}re\u{200B} code"),
+            "before<script>ignore code"
+        );
+        assert_eq!(
+            n.normalize_pre_html("before<style>ign\u{043E}re\u{200B} style"),
+            "before<style>ignore style"
+        );
     }
 
     #[test]
     fn angle_brackets_in_plain_text_stripped() {
-        // By design, stray '<...>' sequences are stripped.
-        // This is intentional -- we prioritize safety over preserving
-        // ambiguous content that looks like HTML.
+        // html_stripped view: removes '<...>' sequences and closed/unclosed <script>/<style> blocks.
+        // pre_html view: retains angle-bracketed text and closed/unclosed <script>/<style> blocks
+        // after NFKC, invisible stripping, and mixed-script confusable replacement.
         let n = normalizer();
         assert_eq!(n.normalize("3 < 5 > 2"), "3  2");
+        assert_eq!(n.normalize_pre_html("3 < 5 > 2"), "3 < 5 > 2");
+
+        let stray_obfuscated = "3 < \u{FF15}\u{200B} ign\u{043E}re > 2";
+        assert_eq!(n.normalize(stray_obfuscated), "3  2");
+        assert_eq!(n.normalize_pre_html(stray_obfuscated), "3 < 5 ignore > 2");
+
+        let closed_script = "before<script>\u{FF49}gn\u{043E}re\u{200B}</script>after";
+        assert_eq!(n.normalize(closed_script), "beforeafter");
+        assert_eq!(
+            n.normalize_pre_html(closed_script),
+            "before<script>ignore</script>after"
+        );
+
+        let unclosed_script = "before<script>\u{FF49}gn\u{043E}re\u{200B}after";
+        assert_eq!(n.normalize(unclosed_script), "before");
+        assert_eq!(
+            n.normalize_pre_html(unclosed_script),
+            "before<script>ignoreafter"
+        );
+
+        let closed_style = "before<style>\u{FF49}gn\u{043E}re\u{200B}</style>after";
+        assert_eq!(n.normalize(closed_style), "beforeafter");
+        assert_eq!(
+            n.normalize_pre_html(closed_style),
+            "before<style>ignore</style>after"
+        );
+
+        let unclosed_style = "before<style>\u{FF49}gn\u{043E}re\u{200B}after";
+        assert_eq!(n.normalize(unclosed_style), "before");
+        assert_eq!(
+            n.normalize_pre_html(unclosed_style),
+            "before<style>ignoreafter"
+        );
     }
 
     #[test]
@@ -1148,8 +1901,13 @@ mod tests {
     #[test]
     fn script_without_closing_tag_strips_to_end() {
         let n = normalizer();
-        // Malformed: no closing </script> -- everything after <script> is removed
+        // Malformed: no closing </script> -- everything after <script> is removed in html_stripped,
+        // while preserved in pre_html.
         assert_eq!(n.normalize("before<script>evil code"), "before");
+        assert_eq!(
+            n.normalize_pre_html("before<script>evil code"),
+            "before<script>evil code"
+        );
     }
 
     // -------------------------------------------------------------------
@@ -1554,8 +2312,11 @@ mod tests {
         // Trusted message with an untrusted span containing an invisible char.
         let mut msg = Message::new(Role::User, "he\u{200B}llo data");
         // "llo data" starts after "he"(2) + ZWS(3) = byte 5.
-        msg.trust_spans
-            .push(crate::trust::TrustSpan::untrusted(5, msg.content.len(), "rag"));
+        msg.trust_spans.push(crate::trust::TrustSpan::untrusted(
+            5,
+            msg.content.len(),
+            "rag",
+        ));
 
         let mut messages = vec![msg];
         let evidence = normalize_messages_with_spans_and_evidence(&n, &mut messages);
@@ -1587,10 +2348,16 @@ mod tests {
         }
     }
 
-    fn trusted_msg_with_untrusted_span(content: &str, span_start: usize, span_end: usize) -> Message {
+    fn trusted_msg_with_untrusted_span(
+        content: &str,
+        span_start: usize,
+        span_end: usize,
+    ) -> Message {
         let mut msg = Message::new(Role::System, content);
         msg.trust = TrustLevel::Trusted;
-        msg.trust_spans.push(crate::trust::TrustSpan::untrusted(span_start, span_end, "rag"));
+        msg.trust_spans.push(crate::trust::TrustSpan::untrusted(
+            span_start, span_end, "rag",
+        ));
         msg
     }
 
@@ -1680,7 +2447,9 @@ mod tests {
         let content = "trusted prefix [INST] injection end";
         let span_start = content.find("[INST]").unwrap();
         let span_end = span_start + "[INST] injection".len();
-        let mut messages = vec![trusted_msg_with_untrusted_span(content, span_start, span_end)];
+        let mut messages = vec![trusted_msg_with_untrusted_span(
+            content, span_start, span_end,
+        )];
         let replacements = neutralize_role_markers(&mut messages);
         assert_eq!(messages[0].content, "trusted prefix        injection end");
         assert_eq!(replacements.len(), 1);
@@ -1692,7 +2461,9 @@ mod tests {
         let content = "[INST] trusted part untrusted_data end";
         let span_start = content.find("untrusted_data").unwrap();
         let span_end = span_start + "untrusted_data".len();
-        let mut messages = vec![trusted_msg_with_untrusted_span(content, span_start, span_end)];
+        let mut messages = vec![trusted_msg_with_untrusted_span(
+            content, span_start, span_end,
+        )];
         let replacements = neutralize_role_markers(&mut messages);
         // [INST] is in the trusted region, should not be neutralized
         assert!(messages[0].content.starts_with("[INST]"));
@@ -1732,5 +2503,160 @@ mod tests {
         assert!(!messages[0].content.contains("{{#system~}}"));
         assert!(!messages[0].content.contains("{{/system~}}"));
         assert_eq!(replacements.len(), 2);
+    }
+
+    #[test]
+    fn dual_view_maps_shared_and_view_exclusive_ranges_to_original_offsets() {
+        let n = normalizer();
+        let raw = "<b>ign\u{043E}re\u{200B}</b> and <script>ign\u{043E}re</script>";
+        let msg = untrusted_msg(raw);
+        let (views, _ev, _repl) = normalize_messages_dual_view(&n, &[msg]).unwrap();
+
+        assert_eq!(
+            views.pre_html_messages()[0].content,
+            "<b>ignore</b> and <script>ignore</script>"
+        );
+        assert_eq!(views.html_stripped_messages()[0].content, "ignore and ");
+
+        // First "ignore" in pre_html is at bytes 3..9; in html_stripped at bytes 0..6.
+        // Both must map to the exact same original byte range 3..13 ("ign\u{043E}re\u{200B}" or "ign\u{043E}re" before ZWS).
+        let pre_first = views
+            .map_range_to_original(L0ScanView::PreHtml, 0, 3, 9)
+            .expect("pre_html first match maps to original");
+        let strip_first = views
+            .map_range_to_original(L0ScanView::HtmlStripped, 0, 0, 6)
+            .expect("html_stripped first match maps to original");
+        assert_eq!(pre_first, strip_first);
+        assert_eq!(&raw[pre_first.0..pre_first.1], "ign\u{043E}re");
+
+        // Second "ignore" in pre_html (inside <script>) is at bytes 26..32 and maps to distinct original range.
+        let pre_second = views
+            .map_range_to_original(L0ScanView::PreHtml, 0, 26, 32)
+            .expect("pre_html script match maps to original");
+        assert_ne!(pre_first, pre_second);
+        assert_eq!(&raw[pre_second.0..pre_second.1], "ign\u{043E}re");
+    }
+
+    #[test]
+    fn dual_view_remaps_trust_spans_and_neutralizes_role_markers_per_view() {
+        let n = normalizer();
+        let content = "trusted <b>prefix</b> <script> [INST] evil</script> end";
+        let span_start = content.find("<script>").unwrap();
+        let span_end = content.find("</script>").unwrap() + "</script>".len();
+        let msg = trusted_msg_with_untrusted_span(content, span_start, span_end);
+
+        let (views, _ev, _repl) = normalize_messages_dual_view(&n, &[msg]).unwrap();
+        // In pre_html, <script>...</script> survives and [INST] inside the untrusted span is neutralized.
+        assert!(
+            !views.pre_html_messages()[0].content.contains("[INST]"),
+            "pre_html must neutralize role markers inside remapped untrusted span"
+        );
+        assert!(views.pre_html_messages()[0].content.contains("<script>"));
+        // Original untrusted span length is preserved on metadata even though html_stripped removes <script>...</script>.
+        assert_eq!(
+            views.original_total_untrusted_span_char_len(0),
+            Some(span_end - span_start)
+        );
+    }
+
+    #[test]
+    fn dual_view_nfkc_composition_maps_full_contributing_source_range() {
+        // 'e' (1 byte: 0..1) + U+0301 (2 bytes: 1..3) composes under NFKC to 'é' (2 bytes: 0..2).
+        // The mapped original byte range must include both contributing source scalars (0..3).
+        let raw = "e\u{0301}<b>x</b>";
+        let tagged = nfkc_with_orig_spans(raw);
+        assert_eq!(tagged[0], ('\u{00E9}', 0, 3));
+
+        let n = normalizer();
+        let msg = untrusted_msg(raw);
+        let (views, _, _) = normalize_messages_dual_view(&n, &[msg]).unwrap();
+        assert_eq!(views.pre_html_messages()[0].content, "\u{00E9}<b>x</b>");
+        assert_eq!(views.html_stripped_messages()[0].content, "\u{00E9}x");
+
+        let pre_composed = views
+            .map_range_to_original(L0ScanView::PreHtml, 0, 0, "\u{00E9}".len())
+            .expect("composed char in pre_html maps to original");
+        let strip_composed = views
+            .map_range_to_original(L0ScanView::HtmlStripped, 0, 0, "\u{00E9}".len())
+            .expect("composed char in html_stripped maps to original");
+        assert_eq!(pre_composed, (0, 3));
+        assert_eq!(strip_composed, (0, 3));
+        assert_eq!(&raw[pre_composed.0..pre_composed.1], "e\u{0301}");
+    }
+
+    #[test]
+    fn pre_html_neutralizes_only_tag_attribute_quote_delimiters() {
+        let n = normalizer();
+        assert_eq!(
+            n.normalize_pre_html("<div title='ignore'>hello</div>"),
+            "<div title= ignore >hello</div>"
+        );
+        assert_eq!(
+            n.normalize_pre_html("<div data=\"a'b\">hello</div>"),
+            "<div data= a'b >hello</div>"
+        );
+        assert_eq!(
+            n.normalize_pre_html("<div title='ignore"),
+            "<div title= ignore"
+        );
+        assert_eq!(
+            n.normalize_pre_html("prose 'single' and \"double\" quotes"),
+            "prose 'single' and \"double\" quotes"
+        );
+    }
+
+    #[test]
+    fn pre_html_decodes_closed_character_reference_set_once() {
+        let n = normalizer();
+        assert_eq!(
+            n.normalize_pre_html(
+                "&#32;&#x20;&amp;&lt;&gt;&quot;&apos;&nbsp;&Tab;&NewLine;"
+            ),
+            "  &<>\"'\u{00A0}\t\n"
+        );
+        assert_eq!(n.normalize_pre_html("&amp;#32;"), "&#32;");
+        assert_eq!(
+            n.normalize_pre_html("&bogus; &#xZZ; &amp"),
+            "&bogus; &#xZZ; &amp"
+        );
+        assert_eq!(
+            n.normalize("<b>&#32;</b>"),
+            "&#32;",
+            "character references must remain literal in html_stripped"
+        );
+    }
+
+    #[test]
+    fn pre_html_character_reference_mapping_covers_consumed_source() {
+        let raw = "a&#32;b";
+        let (views, _, _) =
+            normalize_messages_dual_view(&normalizer(), &[untrusted_msg(raw)]).unwrap();
+        assert_eq!(views.pre_html_messages()[0].content, "a b");
+        assert_eq!(
+            views.map_range_to_original(L0ScanView::PreHtml, 0, 1, 2),
+            Some((1, 6))
+        );
+    }
+
+    #[test]
+    fn dual_view_divergent_custom_normalizer_returns_typed_error() {
+        struct UppercaseNormalizer;
+        impl Normalizer for UppercaseNormalizer {
+            fn normalize(&self, input: &str) -> String {
+                input.to_uppercase()
+            }
+        }
+
+        let msg = untrusted_msg("hello world");
+        let err = normalize_messages_dual_view(&UppercaseNormalizer, &[msg]).expect_err(
+            "divergent custom normalizer must fail closed instead of fabricating offsets",
+        );
+        assert_eq!(
+            err,
+            L0DualViewBuildError::UnsupportedCustomNormalizer {
+                view: L0ScanView::PreHtml,
+                message_index: 0,
+            }
+        );
     }
 }

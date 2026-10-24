@@ -13,7 +13,7 @@ use parapet::effect::store::manifest::ObjectStateV0;
 use parapet::effect::store::{
     ProtectedEvidenceReaderV0, ProtectedEvidenceStoreV0, ReaderErrorV0, TerminalOutcomeV0,
 };
-use parapet::effect::{RunIdV0, StageKindV0};
+use parapet::effect::{RunIdV0, StageKindV0, StoreFailureV0};
 use parapet::engine::demo::export::DEMO_EXPORT_SCHEMA;
 use parapet::engine::demo::{
     sha256_hex, CompiledDemoFixturesV0, DemoFixtureSourceV0, DemoJourneyV0, EXPORTED_ASSETS,
@@ -910,7 +910,11 @@ fn wait_for_ready_port(ready_path: &Path, child: &mut ChildGuard, label: &str) -
     );
 }
 
-fn post_loopback_chat_completion(port: u16, request_path: &Path, label: &str) -> (u16, String) {
+fn post_loopback_chat_completion(
+    port: u16,
+    request_path: &Path,
+    label: &str,
+) -> (u16, BTreeMap<String, String>, String) {
     check_path_outside_checkout(request_path, &format!("{label} request_path"))
         .unwrap_or_else(|e| panic!("{e}"));
     let body_bytes =
@@ -939,11 +943,24 @@ fn post_loopback_chat_completion(port: u16, request_path: &Path, label: &str) ->
                 panic!("{label}: loopback HTTP POST to {url} failed: {e} (source: {src:?})")
             });
         let status = resp.status().as_u16();
+        let headers = resp
+            .headers()
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_owned(),
+                    value
+                        .to_str()
+                        .expect("response header must be ASCII")
+                        .to_owned(),
+                )
+            })
+            .collect();
         let text = resp
             .text()
             .await
             .unwrap_or_else(|e| panic!("{label}: read loopback response body: {e}"));
-        (status, text)
+        (status, headers, text)
     })
 }
 
@@ -1249,12 +1266,15 @@ fn assert_journey_inspect_surfaces(
             assert_eq!(proj["detection"]["mode"], "shadow");
         }
         DemoJourneyV0::Unauthorized => {
+            panic!("J2 stops before a protected receipt and uses its dedicated assertions")
+        }
+        DemoJourneyV0::OrdinaryOverreach => {
             assert_eq!(inspect_val["labels"]["summary"], "blocked before execution");
             assert_eq!(proj["line"], "blocked before execution");
             assert_eq!(proj["summary"], "blocked_before_execution");
             assert!(
                 inspect_human_stdout.contains("summary_label: blocked before execution\n"),
-                "J2 human inspect must display 'blocked before execution'"
+                "J8 human inspect must display 'blocked before execution'"
             );
             assert_eq!(proj["policy"]["decision"], "block");
             assert_eq!(proj["policy"]["reason_code"], exp["reason_code"]);
@@ -1269,7 +1289,7 @@ fn assert_journey_inspect_surfaces(
                     .any(|np| np["field"] == "attempt"
                         && np["availability"] == "absent_by_contract"
                         && np["reason_code"] == "blocked"),
-                "J2 projection not_present must record attempt absent_by_contract (blocked)"
+                "J8 projection not_present must record attempt absent_by_contract (blocked)"
             );
             assert_eq!(proj["verification"]["availability"], "absent_by_contract");
             assert!(proj["verification"]["outcome"].is_null());
@@ -1314,6 +1334,178 @@ fn assert_journey_inspect_surfaces(
             );
         }
     }
+}
+
+fn execute_j2_early_inbound_block(
+    harness: &mut WorkflowHarness,
+    assets_dir: &Path,
+    manifest: &Value,
+) -> Value {
+    let j_label = "J2";
+    let entry = manifest["journeys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["journey"].as_str() == Some(DemoJourneyV0::Unauthorized.name()))
+        .expect("J2 manifest entry")
+        .clone();
+    let j_dir = harness.work_dir.path().join("j2");
+    std::fs::create_dir_all(&j_dir).expect("create J2 dir");
+    let state_dir = j_dir.join("state");
+    let effect_root = j_dir.join("root");
+    let config_path = assets_dir.join(manifest["config"]["path"].as_str().unwrap());
+    let request_path = assets_dir.join(entry["request_path"].as_str().unwrap());
+    let state_str = state_dir.to_str().unwrap();
+    let root_str = effect_root.to_str().unwrap();
+    let config_str = config_path.to_str().unwrap();
+
+    let init_cmd = harness.run_parapet(
+        "J2_init",
+        &[
+            "init",
+            "--state-dir",
+            state_str,
+            "--effect-root",
+            root_str,
+            "--json",
+        ],
+        &[&state_dir, &effect_root],
+    );
+    assert_eq!(init_cmd.exit_code, 0);
+    assert!(init_cmd.stderr.is_empty());
+
+    let run_args = [
+        "run",
+        "--state-dir",
+        state_str,
+        "--config",
+        config_str,
+        "--effect-root",
+        root_str,
+        "--file-effect-profile",
+        "v0",
+        "--max-content-bytes",
+        "4096",
+        "--offline-fixture",
+        DemoJourneyV0::Unauthorized.selector(),
+        "--ready-file",
+        "ready",
+        "--port",
+        "0",
+        "--json",
+    ];
+    let mut run_child = harness.spawn_parapet_run(
+        "J2_run",
+        &run_args,
+        &[&state_dir, &config_path, &effect_root],
+    );
+    let port = wait_for_ready_port(&state_dir.join("ready"), &mut run_child, j_label);
+    let run_id = discover_sentinel_run_id(&effect_root).expect("J2 sentinel run_id");
+    let before = snapshot_effect_root(&effect_root);
+
+    let (http_status, response_headers, response_body) =
+        post_loopback_chat_completion(port, &request_path, "J2_http_post");
+    assert_eq!(
+        http_status, 403,
+        "J2 must stop at the earliest sound control"
+    );
+    assert_eq!(
+        response_headers
+            .get("x-parapet-blocked-by")
+            .map(String::as_str),
+        Some("L3-inbound")
+    );
+    assert_eq!(
+        response_headers
+            .get("x-parapet-blocked-view")
+            .map(String::as_str),
+        Some("pre_html")
+    );
+    assert!(response_body.contains("request blocked by content policy"));
+    assert!(!response_body.contains(entry["canary"].as_str().unwrap()));
+    assert_eq!(snapshot_effect_root(&effect_root), before);
+    assert!(std::fs::symlink_metadata(effect_root.parent().unwrap().join("escape.txt")).is_err());
+
+    // The fixed effect run is one-shot. A repeated exact request is rejected
+    // before parsing or upstream contact, so it cannot select an alternate
+    // rendering or bypass the first request's early block.
+    let (retry_status, retry_headers, retry_body) =
+        post_loopback_chat_completion(port, &request_path, "J2_http_post_retry");
+    assert_eq!(retry_status, 409);
+    assert_eq!(
+        retry_headers.get("x-parapet-action").map(String::as_str),
+        Some("error")
+    );
+    assert_eq!(
+        retry_headers.get("x-parapet-error").map(String::as_str),
+        Some("effect_run_consumed")
+    );
+    assert!(retry_body.contains("effect_run_consumed"));
+    assert!(!retry_body.contains(entry["canary"].as_str().unwrap()));
+    assert_eq!(snapshot_effect_root(&effect_root), before);
+
+    // The envelope only creates a protected run after an upstream candidate is
+    // formed. Its absence proves that no proposal/effect receipt was created.
+    let store = ProtectedEvidenceStoreV0::open(&state_dir.join("receipt-evidence"))
+        .expect("open J2 protected store");
+    let parsed_run_id = RunIdV0::parse(&run_id).expect("valid J2 run id");
+    assert_eq!(
+        store.manifest(&parsed_run_id),
+        Err(StoreFailureV0::ManifestMissing)
+    );
+
+    let restore_cmd = harness.run_parapet(
+        "J2_restore",
+        &["restore", "--state-dir", state_str, "--json"],
+        &[&state_dir],
+    );
+    assert_eq!(restore_cmd.exit_code, 0);
+    let restore_val: Value = serde_json::from_str(&restore_cmd.stdout).unwrap();
+    assert_eq!(restore_val["result"], "clear");
+
+    let disable_cmd = harness.run_parapet(
+        "J2_disable",
+        &["disable", "--state-dir", state_str, "--json"],
+        &[&state_dir],
+    );
+    assert_eq!(disable_cmd.exit_code, 0);
+    let disable_val: Value = serde_json::from_str(&disable_cmd.stdout).unwrap();
+    assert_eq!(disable_val["status"], "stopped");
+
+    let run_out = run_child
+        .0
+        .take()
+        .expect("J2 run child")
+        .wait_with_output()
+        .expect("wait for J2 run");
+    let run_rec = harness.record_output("J2_run_exit", &run_args, run_out);
+    assert_eq!(run_rec.exit_code, 0);
+    assert!(run_rec.stderr.is_empty());
+    assert!(snapshot_effect_root(&effect_root).entries.is_empty());
+
+    let summary = json!({
+        "journey": j_label,
+        "selector": DemoJourneyV0::Unauthorized.selector(),
+        "run_id": run_id,
+        "http_status": http_status,
+        "blocking_layer": response_headers["x-parapet-blocked-by"],
+        "blocking_view": response_headers["x-parapet-blocked-view"],
+        "upstream_candidate": "absent_by_contract",
+        "protected_effect_receipt": "absent_by_contract",
+        "effect_root_unchanged": true,
+        "escape_exists": false,
+        "retry_http_status": retry_status,
+        "retry_error_code": retry_headers["x-parapet-error"],
+        "retry_bypass_prevented": true,
+        "restore_result": restore_val["result"],
+        "disable_status": disable_val["status"],
+    });
+    std::fs::write(
+        j_dir.join("summary.json"),
+        serde_json::to_vec_pretty(&summary).unwrap(),
+    )
+    .unwrap();
+    summary
 }
 
 // ---------------------------------------------------------------------------
@@ -1416,7 +1608,7 @@ fn execute_standard_journey(
     );
 
     // 4. Plain loopback HTTP POST with exported request bytes
-    let (http_status, resp_body) =
+    let (http_status, _response_headers, resp_body) =
         post_loopback_chat_completion(port, &request_path, &format!("{j_label}_http_post"));
     let expected_http_status = entry["expected_http_status"].as_u64().unwrap() as u16;
     assert_eq!(
@@ -1443,6 +1635,13 @@ fn execute_standard_journey(
 
     let target_basename = entry["expected_target_basename"].as_str().unwrap();
     let target_path = effect_root.join(target_basename);
+    if journey == DemoJourneyV0::OrdinaryOverreach {
+        assert_eq!(target_basename, "../shared-note.txt");
+        assert!(
+            std::fs::symlink_metadata(&target_path).is_err(),
+            "{j_label}: ../shared-note.txt must NEVER exist"
+        );
+    }
     let observed_file_sha256: Option<String>;
 
     match journey {
@@ -1483,6 +1682,17 @@ fn execute_standard_journey(
             assert!(
                 !effect_root.join("escape.txt").exists(),
                 "J2: escape.txt must not exist inside effect_root"
+            );
+            observed_file_sha256 = None;
+        }
+        DemoJourneyV0::OrdinaryOverreach => {
+            assert_eq!(
+                snap_after_request, snap_before,
+                "J8: effect_root listing after blocked request must equal post-init/post-start listing"
+            );
+            assert!(
+                !effect_root.join("shared-note.txt").exists(),
+                "J8: shared-note.txt must not exist inside effect_root"
             );
             observed_file_sha256 = None;
         }
@@ -1852,7 +2062,7 @@ fn execute_j7_undeclared_residue_journey(
     let port = wait_for_ready_port(&state_dir.join("ready"), &mut run_child, j_label);
 
     let snap_before = snapshot_effect_root(&effect_root);
-    let (http_status, _) = post_loopback_chat_completion(port, &request_path, "J7_http_post");
+    let (http_status, _, _) = post_loopback_chat_completion(port, &request_path, "J7_http_post");
     assert_eq!(http_status, 200);
 
     let run_id = discover_sentinel_run_id(&effect_root).expect("J7 sentinel run_id");
@@ -2194,7 +2404,7 @@ fn execute_black_box_n1_and_n2(
         let run_id = discover_sentinel_run_id(&effect_root).expect("sentinel run_id");
         let snap_before = snapshot_effect_root(&effect_root);
 
-        let (http_status, resp_body) =
+        let (http_status, _, resp_body) =
             post_loopback_chat_completion(port, &req_path, &format!("{label}_http_post"));
         assert_eq!(http_status, want_n1_status, "{label}: HTTP status mismatch");
         assert_eq!(resp_body, want_n1_body, "{label}: HTTP body mismatch");
@@ -2685,7 +2895,7 @@ fn n13b_cli_output_boundary_scanner_controls_and_neutral_cwd_outputs() {
 }
 
 #[test]
-fn j1_to_j7_and_n1_n2_black_box_workflow() {
+fn j1_to_j8_and_n1_n2_black_box_workflow() {
     let mut harness = WorkflowHarness::new();
 
     let (assets_dir, manifest, export_cmd) = harness.export_and_verify_assets();
@@ -2702,13 +2912,7 @@ fn j1_to_j7_and_n1_n2_black_box_workflow() {
         DemoJourneyV0::BenignWrite,
         "J1",
     );
-    let j2_summary = execute_standard_journey(
-        &mut harness,
-        &assets_dir,
-        &manifest,
-        DemoJourneyV0::Unauthorized,
-        "J2",
-    );
+    let j2_summary = execute_j2_early_inbound_block(&mut harness, &assets_dir, &manifest);
     let j3_summary = execute_standard_journey(
         &mut harness,
         &assets_dir,
@@ -2722,6 +2926,13 @@ fn j1_to_j7_and_n1_n2_black_box_workflow() {
         &manifest,
         DemoJourneyV0::Mismatch,
         "J4",
+    );
+    let j8_summary = execute_standard_journey(
+        &mut harness,
+        &assets_dir,
+        &manifest,
+        DemoJourneyV0::OrdinaryOverreach,
+        "J8",
     );
     let j7_summary = execute_j7_undeclared_residue_journey(&mut harness, &assets_dir, &manifest);
     let n1_n2_summary = execute_black_box_n1_and_n2(&mut harness, &assets_dir, &manifest);
@@ -2740,6 +2951,7 @@ fn j1_to_j7_and_n1_n2_black_box_workflow() {
             "J3": j3_summary,
             "J4": j4_summary,
             "J7": j7_summary,
+            "J8": j8_summary,
         },
         "negative_controls": n1_n2_summary,
     });
