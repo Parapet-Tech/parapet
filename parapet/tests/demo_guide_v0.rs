@@ -88,6 +88,10 @@ fn root_readme_path() -> PathBuf {
     repo_root_dir().join("README.md")
 }
 
+fn local_first_use_guide_path() -> PathBuf {
+    repo_root_dir().join("docs/local-first-use.md")
+}
+
 fn manifest_json() -> Value {
     serde_json::from_slice(CompiledDemoFixturesV0.manifest_bytes()).expect("parse manifest.json")
 }
@@ -557,17 +561,25 @@ fn guide_extracts_verbatim_shell_blocks_and_matches_manifest_and_four_facts() {
         );
     }
 
-    // Verify root README.md links to parapet/demo/v0/README.md under Rust CLI acceptance.
+    // Verify root README.md links to the detailed guide, which in turn links to the demo guide
+    // under Rust CLI acceptance.
     let root_readme = std::fs::read_to_string(root_readme_path()).expect("read root README.md");
-    let (_, after_heading) = root_readme
-        .split_once("#### Rust CLI acceptance (disposable offline fixture)")
-        .expect("Rust CLI acceptance heading in root README.md");
-    let (section_body, _) = after_heading
-        .split_once("#### Installed Python SDK verification")
-        .expect("Installed Python SDK verification heading in root README.md");
     assert!(
-        section_body.contains("(parapet/demo/v0/README.md)"),
-        "root README.md must link to parapet/demo/v0/README.md under Rust CLI acceptance"
+        root_readme.contains("(docs/local-first-use.md)"),
+        "root README.md must link to docs/local-first-use.md"
+    );
+
+    let local_first_use = std::fs::read_to_string(local_first_use_guide_path())
+        .expect("read docs/local-first-use.md");
+    let (_, after_heading) = local_first_use
+        .split_once("## Rust CLI acceptance with the offline fixture")
+        .expect("Rust CLI acceptance heading in docs/local-first-use.md");
+    let (section_body, _) = after_heading
+        .split_once("## Installed Python SDK verification")
+        .expect("Installed Python SDK verification heading in docs/local-first-use.md");
+    assert!(
+        section_body.contains("(../parapet/demo/v0/README.md)"),
+        "docs/local-first-use.md must link to parapet/demo/v0/README.md under Rust CLI acceptance"
     );
 }
 
@@ -950,5 +962,12 @@ fn n13c_public_boundary_scanner_controls_and_guide_surfaces() {
     assert!(
         root_hits.is_empty(),
         "N13(c) public-boundary scan failed on root README.md: {root_hits:?}"
+    );
+
+    let local_first_use = std::fs::read_to_string(local_first_use_guide_path()).unwrap();
+    let local_first_use_hits = scanner.scan_text(&local_first_use);
+    assert!(
+        local_first_use_hits.is_empty(),
+        "N13(c) public-boundary scan failed on docs/local-first-use.md: {local_first_use_hits:?}"
     );
 }
