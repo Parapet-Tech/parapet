@@ -88,6 +88,34 @@ warned sensitive evidence export. It writes exact canonical
 character spans, and must never be used on secret or regulated input without
 appropriate custody.
 
+Human `parapet scan` output (without `--json`) puts the verdict first and prints
+the same fields in the same order whether the input is clean or flagged:
+
+```text
+verdict: clean
+detection_outcome: threshold_not_breached
+effective_raw: <score>
+threshold: <threshold>
+mode: shadow|block
+record_schema_version: l1-detection-record/v0
+record_digest: <64-hex-sha256>
+model_id: <model_id>
+model_digest: <64-hex-sha256>
+input_digest: <64-hex-sha256>
+input_len_bytes: <bytes>
+attribution_status: present|absent_by_contract|errored
+feature_count_matched: <count>|none
+```
+
+A flagged input prints `verdict: flagged` and
+`detection_outcome: threshold_breached` on the first two lines. The verdict
+comes from the raw score comparison `effective_raw >= threshold`. Human
+`effective_raw` and `threshold` are rounded to at most 8 decimal places; when
+both round to the same digits, the score line adds
+`(raw_relation: effective_raw < threshold)`, `==`, or `>` to show the raw
+relation. Both verdicts exit 0. `--json` and `--record-json` bytes are
+unchanged and keep the raw numbers.
+
 ## Protected runtime and evidence lifecycle
 
 Run the protected lifecycle in this exact order:
@@ -125,12 +153,26 @@ every request after the first non-streaming one with HTTP 409
 Run-creating commands (`parapet run`, `parapet accept`, and `parapet-engine`)
 never accept a caller-supplied run ID. The engine generates the only run
 identity; `<run-id>` above is that generated 32-character lowercase hex value.
-`parapet run` reports it when it exits after `parapet disable`: `"run_id"` in
-JSON output and `run_id: <run-id>` in human output (`"run_id": null` and
-`run_id: not_applicable` for a run without `--effect-root`). Use that
-CLI-reported value for post-disable `inspect` and `evidence release` steps.
-While the engine is live, the same identity is witnessed by the
-`<new-effect-root>/.parapet-run-<run-id>.sentinel` file created at startup.
+
+In human mode (without `--json`), `parapet run` prints a startup status to
+stdout once the engine is ready and before it starts serving, so you learn the
+port, run ID, and mode without reading files from the state directory:
+
+```text
+status: ready
+port: <port>
+run_id: <run-id>
+mode: protected
+next: send one request, then parapet restore --state-dir <state-dir>
+```
+
+A run without `--effect-root` prints `run_id: not_applicable` and
+`mode: proxy`. The startup status never contains the control token or any
+path. When the engine exits after `parapet disable`, human output starts with
+`status: stopped` and repeats the port and run ID. In JSON mode, stdout stays
+the single `parapet-cli-run/v0` line printed at exit (`"run_id"`, or
+`"run_id": null` without `--effect-root`). Use the reported run ID for
+`inspect` and `evidence release`.
 
 `parapet disable` never performs `restore` itself. It is an observational
 shutdown gate that refuses to stop an owned effect-enabled engine until file
@@ -138,7 +180,36 @@ cleanup is already `clear` (after `parapet restore`) or `not_applicable`.
 Stopping the engine retains protected receipt evidence, so post-restore and
 post-disable `parapet inspect` continue to succeed until you optionally run
 `parapet evidence release`. After release, `parapet inspect` reports
-`reader: object_released`.
+`projection: object_released`.
+
+### Reading lifecycle output
+
+Human `restore`, `disable`, `inspect`, and `evidence release` output reports
+three separate things on separate lines:
+
+- `original decision:` the receipt summary the engine recorded, such as
+  `allowed; effect verified` or `blocked before execution`. Cleanup never
+  changes it. It reads `not recorded` before the engine has recorded a request,
+  `not settled (...)` while the run is still open, and
+  `not available (object_released)` after `evidence release`.
+- `file cleanup:` the current state of the file effect in the effect root, as
+  reported by the live owning engine (`clear`, `not run (restore required)`,
+  `indeterminate`, and so on). `inspect` and `evidence release` print
+  `file cleanup: not recorded in protected evidence` because only the live
+  engine tracks it.
+- `evidence cleanup:` the state of the protected receipt evidence
+  (`not started`, `clear` after release, and so on).
+
+When the next valid command is known, the last line names it with a
+`<state-dir>` placeholder, for example
+`next: parapet disable --state-dir <state-dir>` after a clear restore or
+`next: parapet restore --state-dir <state-dir>` when `disable` refuses because
+file cleanup has not run. An `indeterminate` file cleanup (for example,
+undeclared files in the effect root) prints
+`next: remove undeclared files from the effect root, then parapet restore --state-dir <state-dir>`.
+Human output does not echo paths or the control token. JSON output for these
+commands is unchanged, including the `a6_booking_required` field of
+`parapet-cli-restore/v0`.
 
 ## Rust CLI acceptance with the offline fixture
 

@@ -1730,7 +1730,7 @@ fn execute_standard_journey(
     assert!(inspect_released_human.stderr.is_empty());
     assert!(inspect_released_human
         .stdout
-        .contains("evidence_cleanup_state: clear\n"));
+        .contains("evidence cleanup: clear\n"));
     assert!(inspect_released_human
         .stdout
         .contains("projection: object_released\n"));

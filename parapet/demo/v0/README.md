@@ -197,8 +197,10 @@ Sample human `parapet inspect` output for `J1`:
 ```text
 run_id: d059f141cee44e1bab823b879ab32f80
 terminal_outcome: complete
-evidence_cleanup_state: not_started
-projection_of: 3667c81d4abc09841d5bfe297a9d66ce687950130eb918c1595e64a96491a5a5
+original decision: allowed; effect verified
+file cleanup: not recorded in protected evidence
+evidence cleanup: not started
+receipt_row_digest: 3667c81d4abc09841d5bfe297a9d66ce687950130eb918c1595e64a96491a5a5
 receipt_line: allowed; effect verified
 summary_label: allowed; effect verified
 enforcement_label: enforcement: enforced
@@ -211,6 +213,7 @@ target.text: release-note.txt
 target.digest: 627eef5b33bf0f839d76c88b542d8ff7202f1c638df645b1b34cccfd95c9536e
 target.len_bytes: 16
 target.truncated: false
+next: parapet evidence release --state-dir <state-dir> --run-id d059f141cee44e1bab823b879ab32f80 (optional)
 ```
 
 ## 3. Journey 2 (`J2`): Unauthorized Path Traversal Blocked Before Execution

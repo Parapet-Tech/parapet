@@ -25,10 +25,13 @@ use crate::cli::control::{
 };
 #[cfg(not(windows))]
 use crate::cli::render::{
-    availability_code, enforcement_code, enforcement_label, evidence_cleanup_result_label,
-    file_cleanup_lifecycle_label, projection_verification_label, render_inspect_human,
-    splice_inspect_json, store_failure_code, store_failure_label, summary_code, summary_label,
-    verification_error_code, verification_outcome_code,
+    availability_code, enforcement_code, enforcement_label, evidence_cleanup_lifecycle_label,
+    evidence_cleanup_result_label, evidence_cleanup_view_label, file_cleanup_lifecycle_label,
+    join_lines, next_step_line, original_decision_line, projection_verification_label,
+    render_inspect_human, render_run_startup_human, splice_inspect_json, store_failure_code,
+    store_failure_label, summary_code, summary_label, verification_error_code,
+    verification_outcome_code, LifecycleHumanV0, NextStepV0, ORIGINAL_DECISION_NO_RUN,
+    ORIGINAL_DECISION_UNKNOWN,
 };
 #[cfg(not(windows))]
 use crate::effect::store::{
@@ -767,23 +770,118 @@ fn run_scan(args: ScanArgs, json_mode: bool) -> i32 {
         };
         emit_json_line(&out);
     } else {
+        // Verdict first; clean and flagged results print the same 13 fields in the
+        // same order. The verdict comes only from the record's raw-f64 outcome.
+        let verdict = match record.detection_outcome {
+            DetectionOutcome::ThresholdBreached => "flagged",
+            DetectionOutcome::ThresholdNotBreached => "clean",
+        };
+        let (effective_raw, threshold) =
+            format_scan_score_threshold_human(record.effective_raw, record.threshold);
+        let features = record
+            .feature_count_matched
+            .map_or_else(|| "none".to_owned(), |n| n.to_string());
+        println!("verdict: {verdict}");
+        println!("detection_outcome: {outcome_str}");
+        println!("effective_raw: {effective_raw}");
+        println!("threshold: {threshold}");
+        println!("mode: {mode_str}");
         println!("record_schema_version: {}", record.schema_version);
         println!("record_digest: {digest}");
         println!("model_id: {}", record.model_id);
         println!("model_digest: {}", record.model_digest);
-        println!("mode: {mode_str}");
-        println!("detection_outcome: {outcome_str}");
-        println!("effective_raw: {}", record.effective_raw);
-        println!("threshold: {}", record.threshold);
         println!("input_digest: {}", record.input_digest);
         println!("input_len_bytes: {}", record.input_len_bytes);
         println!("attribution_status: {attr_str}");
-        match record.feature_count_matched {
-            Some(n) => println!("feature_count_matched: {n}"),
-            None => println!("feature_count_matched: none"),
-        }
+        println!("feature_count_matched: {features}");
     }
     0
+}
+
+/// Display-only human rendering of a finite scan `f64`: the exact binary64
+/// value rounded to 8 decimal places with ties to even, trailing zeros and any
+/// terminal decimal point trimmed, and zero always shown as `0`. Total on
+/// non-finite inputs, which the scan path rejects before rendering.
+fn format_scan_f64_human(v: f64) -> String {
+    const SCALE: u128 = 100_000_000;
+    if v.is_nan() {
+        return "non_finite_nan".to_owned();
+    }
+    if v == f64::INFINITY {
+        return "non_finite_pos_inf".to_owned();
+    }
+    if v == f64::NEG_INFINITY {
+        return "non_finite_neg_inf".to_owned();
+    }
+
+    // |v| = m * 2^e exactly, so |v| * 10^8 = (m * 5^8) * 2^(e + 8).
+    let bits = v.abs().to_bits();
+    let exp_bits = ((bits >> 52) & 0x7ff) as i32;
+    let frac_bits = bits & 0x000f_ffff_ffff_ffff;
+    let (m, e) = if exp_bits == 0 {
+        (frac_bits, -1074)
+    } else {
+        ((1_u64 << 52) | frac_bits, exp_bits - 1075)
+    };
+    let n = u128::from(m) * 390_625;
+    let shift = e + 8;
+    let q = if shift >= 0 {
+        if shift > 55 {
+            // |v| >= 2^47 is already an integer; std formatting is exact here.
+            let s = format!("{v:.8}");
+            return s.trim_end_matches(".00000000").to_owned();
+        }
+        n << shift
+    } else {
+        let k = (-shift) as u32;
+        if k >= 128 {
+            0
+        } else {
+            let q = n >> k;
+            let half = (n >> (k - 1)) & 1;
+            let sticky = n & ((1_u128 << (k - 1)) - 1);
+            if half == 1 && (sticky != 0 || q & 1 == 1) {
+                q + 1
+            } else {
+                q
+            }
+        }
+    };
+
+    if q == 0 {
+        return "0".to_owned();
+    }
+    let sign = if v.is_sign_negative() { "-" } else { "" };
+    let int_part = q / SCALE;
+    let frac_part = q % SCALE;
+    if frac_part == 0 {
+        return format!("{sign}{int_part}");
+    }
+    let frac = format!("{frac_part:08}");
+    format!("{sign}{int_part}.{}", frac.trim_end_matches('0'))
+}
+
+/// Human `effective_raw` and `threshold` values. When both round to the same
+/// digits, the score carries the raw relation that decided the verdict.
+fn format_scan_score_threshold_human(effective_raw: f64, threshold: f64) -> (String, String) {
+    use std::cmp::Ordering;
+
+    let score = format_scan_f64_human(effective_raw);
+    let thresh = format_scan_f64_human(threshold);
+    if score != thresh {
+        return (score, thresh);
+    }
+    // IEEE comparison, so -0.0 == 0.0 matches `effective_raw >= threshold`.
+    let relation = match effective_raw.partial_cmp(&threshold) {
+        Some(Ordering::Less) => "<",
+        Some(Ordering::Equal) => "==",
+        Some(Ordering::Greater) => ">",
+        None => return (score, thresh),
+    };
+    (
+        format!("{score} (raw_relation: effective_raw {relation} threshold)"),
+        thresh,
+    )
 }
 
 #[cfg(windows)]
@@ -1229,6 +1327,17 @@ fn run_engine_cmd(args: RunArgs, json_mode: bool) -> i32 {
             );
         }
 
+        // Readiness is durable (control plane bound, ready file written): tell
+        // the human operator the port, run ID, and mode before serve blocks.
+        // JSON stdout stays the single `parapet-cli-run/v0` line at exit.
+        if !json_mode {
+            let startup =
+                render_run_startup_human(bound_port, run_id.as_ref().map(RunIdV0::as_str));
+            let mut stdout = std::io::stdout().lock();
+            let _ = stdout.write_all(startup.as_bytes());
+            let _ = stdout.flush();
+        }
+
         let serve_res = axum::serve(listener, app)
             .with_graceful_shutdown(async move {
                 let _ = shutdown_rx.changed().await;
@@ -1267,6 +1376,7 @@ fn run_engine_cmd(args: RunArgs, json_mode: bool) -> i32 {
             };
             emit_json_line(&out);
         } else {
+            println!("status: stopped");
             println!("port: {bound_port}");
             println!(
                 "run_id: {}",
@@ -1790,29 +1900,29 @@ fn run_restore(args: RestoreArgs, json_mode: bool) -> i32 {
         );
     }
 
-    let result_code = if matches!(
-        check_state_dir_ownership(&args.state_dir),
-        OwnershipCheck::Owned(_)
-    ) {
-        match send_control_request(&args.state_dir, "restore") {
-            Ok(val) => val
-                .get("file_cleanup")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("engine_unavailable")
-                .to_owned(),
-            Err(_) => "engine_unavailable".to_owned(),
-        }
-    } else {
-        "engine_unavailable".to_owned()
+    let (result_code, run) = match check_state_dir_ownership(&args.state_dir) {
+        OwnershipCheck::Owned(owner) => match send_control_request(&args.state_dir, "restore") {
+            Ok(val) => (
+                val.get("file_cleanup")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("engine_unavailable")
+                    .to_owned(),
+                KnownRunV0::from_owner(owner.run_id),
+            ),
+            Err(_) => ("engine_unavailable".to_owned(), KnownRunV0::Unknown),
+        },
+        _ => ("engine_unavailable".to_owned(), KnownRunV0::Unknown),
     };
 
     let label = file_cleanup_lifecycle_label(&result_code)
         .unwrap_or("cleanup: not run (owning engine unavailable)");
+    // JSON v0 field retained for compatibility; human output states the next step instead.
     let a6_booking_required = result_code == "indeterminate";
-    let exit_code = match result_code.as_str() {
-        "clear" | "not_applicable" => 0,
-        "indeterminate" => 5,
-        _ => 4,
+    let (exit_code, next) = match result_code.as_str() {
+        "clear" | "not_applicable" => (0, NextStepV0::Disable),
+        "indeterminate" => (5, NextStepV0::ReviewEffectRoot),
+        "fail" => (4, NextStepV0::Restore),
+        _ => (4, NextStepV0::Inspect),
     };
 
     if json_mode {
@@ -1825,13 +1935,104 @@ fn run_restore(args: RestoreArgs, json_mode: bool) -> i32 {
         };
         emit_json_line(&out);
     } else {
-        println!("{label}");
-        println!("a6_booking_required: {a6_booking_required}");
-        println!(
-            "protected evidence: retained (use 'parapet evidence release' to release store objects)"
-        );
+        let observed = observe_run(&args.state_dir, &run);
+        let mut lines = observed
+            .lifecycle(file_cleanup_human_line(&result_code))
+            .lines();
+        lines.push(next_step_line(next, run.run_id()));
+        let _ = std::io::stdout().write_all(join_lines(&lines).as_bytes());
+        let _ = std::io::stdout().flush();
     }
     exit_code
+}
+
+/// What a lifecycle command knows about the engine's file-effect run.
+#[cfg(not(windows))]
+enum KnownRunV0 {
+    /// The owning engine reported this engine-generated run ID.
+    Run(String),
+    /// The owning engine has no file-effect capability, hence no run.
+    NoRun,
+    /// No owning engine answered, so the run is not identified.
+    Unknown,
+}
+
+#[cfg(not(windows))]
+impl KnownRunV0 {
+    fn from_owner(run_id: Option<String>) -> Self {
+        run_id.map_or(Self::NoRun, Self::Run)
+    }
+
+    fn run_id(&self) -> Option<&str> {
+        match self {
+            Self::Run(run) => Some(run),
+            Self::NoRun | Self::Unknown => None,
+        }
+    }
+}
+
+/// Read-only observation of a run's original decision and evidence cleanup.
+#[cfg(not(windows))]
+struct ObservedRunV0<'a> {
+    run_id: Option<&'a str>,
+    decision: String,
+    evidence_cleanup: &'static str,
+}
+
+#[cfg(not(windows))]
+impl<'a> ObservedRunV0<'a> {
+    fn lifecycle<'b>(&'b self, file_cleanup: &'b str) -> LifecycleHumanV0<'b> {
+        LifecycleHumanV0 {
+            run_id: self.run_id,
+            decision: &self.decision,
+            file_cleanup,
+            evidence_cleanup: self.evidence_cleanup,
+        }
+    }
+}
+
+/// Observe a run through the redacted reader (the same authority as `inspect`).
+#[cfg(not(windows))]
+fn observe_run<'a>(state_dir: &std::path::Path, run: &'a KnownRunV0) -> ObservedRunV0<'a> {
+    let unknown_evidence =
+        evidence_cleanup_lifecycle_label("unknown").unwrap_or("evidence cleanup: unknown");
+    let parsed = match run {
+        KnownRunV0::Run(raw) => RunIdV0::parse(raw),
+        KnownRunV0::NoRun => {
+            return ObservedRunV0 {
+                run_id: None,
+                decision: ORIGINAL_DECISION_NO_RUN.to_owned(),
+                evidence_cleanup: evidence_cleanup_lifecycle_label("not_applicable")
+                    .unwrap_or("evidence cleanup: not applicable"),
+            };
+        }
+        KnownRunV0::Unknown => None,
+    };
+    let Some(run_id) = parsed else {
+        return ObservedRunV0 {
+            run_id: None,
+            decision: ORIGINAL_DECISION_UNKNOWN.to_owned(),
+            evidence_cleanup: unknown_evidence,
+        };
+    };
+    let observed_run_id = run.run_id();
+    let Ok(store) = ProtectedEvidenceStoreV0::open(&state_dir.join("receipt-evidence")) else {
+        return ObservedRunV0 {
+            run_id: observed_run_id,
+            decision: "original decision: not available (evidence store unavailable)".to_owned(),
+            evidence_cleanup: unknown_evidence,
+        };
+    };
+    let view = RedactedEvidenceReaderV0::new(&store).view(&run_id, None);
+    ObservedRunV0 {
+        run_id: observed_run_id,
+        decision: original_decision_line(
+            view.projection_bytes.as_deref(),
+            view.reader_code,
+            view.projection_code,
+        ),
+        evidence_cleanup: evidence_cleanup_view_label(view.cleanup, view.reader_code),
+    }
 }
 
 #[cfg(windows)]
@@ -1887,12 +2088,21 @@ fn run_evidence_release(args: EvidenceReleaseArgs, json_mode: bool) -> i32 {
             } else {
                 println!("run_id: {}", run_id.as_str());
                 println!("{sf_lbl}");
-                println!("control_evidence_retained: true");
+                println!("control evidence retained: true");
             }
             return 4;
         }
     };
 
+    // The original decision is read before release removes the projection object.
+    let decision = (!json_mode).then(|| {
+        let view = RedactedEvidenceReaderV0::new(&store).view(&run_id, None);
+        original_decision_line(
+            view.projection_bytes.as_deref(),
+            view.reader_code,
+            view.projection_code,
+        )
+    });
     let cleanup_res = store.cleanup_run(&run_id);
     let (res_str, exit_code) = match cleanup_res {
         CleanupResultV0::Clear => ("clear", 0),
@@ -1920,13 +2130,36 @@ fn run_evidence_release(args: EvidenceReleaseArgs, json_mode: bool) -> i32 {
         };
         emit_json_line(&out);
     } else {
-        println!("run_id: {}", run_id.as_str());
-        println!("{lbl}");
-        println!(
+        let next = match cleanup_res {
+            CleanupResultV0::Clear => Some(NextStepV0::Inspect),
+            CleanupResultV0::Fail
+            | CleanupResultV0::Indeterminate
+            | CleanupResultV0::Refused(CleanupRefusalV0::LockFailed) => {
+                Some(NextStepV0::EvidenceRelease)
+            }
+            CleanupResultV0::Refused(CleanupRefusalV0::TerminalUnsettled) => {
+                Some(NextStepV0::Inspect)
+            }
+            CleanupResultV0::Refused(CleanupRefusalV0::ManifestUnusable) => None,
+        };
+        let mut lines = LifecycleHumanV0 {
+            run_id: Some(run_id.as_str()),
+            decision: decision.as_deref().unwrap_or(ORIGINAL_DECISION_UNKNOWN),
+            file_cleanup: file_cleanup_lifecycle_label("not_recorded")
+                .unwrap_or("file cleanup: not recorded in protected evidence"),
+            evidence_cleanup: lbl,
+        }
+        .lines();
+        lines.push(format!(
             "control evidence retained: lock, run/{}/manifest.json, run/{}/terminal/*.json",
             run_id.as_str(),
             run_id.as_str()
-        );
+        ));
+        if let Some(step) = next {
+            lines.push(next_step_line(step, Some(run_id.as_str())));
+        }
+        let _ = std::io::stdout().write_all(join_lines(&lines).as_bytes());
+        let _ = std::io::stdout().flush();
     }
     exit_code
 }
@@ -1954,179 +2187,319 @@ fn run_disable(args: DisableArgs, json_mode: bool) -> i32 {
         );
     }
 
-    match check_state_dir_ownership(&args.state_dir) {
+    let outcome = evaluate_disable(&args.state_dir);
+    if json_mode {
+        emit_json_line(&CliDisableJsonV0 {
+            schema: "parapet-cli-disable/v0",
+            status: outcome.status,
+            refusal_code: outcome.refusal_code,
+            file_cleanup: outcome.file_cleanup,
+            file_cleanup_label: outcome.file_cleanup_label,
+            ownership_label: outcome.ownership_label,
+            owned_control_removed: outcome.owned_control_removed,
+            evidence_retained: true,
+        });
+    } else {
+        let mut lines = vec![
+            format!("status: {}", outcome.status),
+            outcome.ownership_label.to_owned(),
+        ];
+        if let Some(stop_lbl) = outcome.stop_label {
+            lines.push(stop_lbl.to_owned());
+        }
+        let observed = observe_run(&args.state_dir, &outcome.run);
+        let file_cleanup = outcome.file_cleanup.map_or(
+            "file cleanup: not observed (engine not owned)",
+            file_cleanup_human_line,
+        );
+        lines.extend(observed.lifecycle(file_cleanup).lines());
+        if let Some(step) = outcome.next {
+            lines.push(next_step_line(step, outcome.run.run_id()));
+        }
+        let _ = std::io::stdout().write_all(join_lines(&lines).as_bytes());
+        let _ = std::io::stdout().flush();
+    }
+    outcome.exit_code
+}
+
+/// Settled result of `parapet disable`, rendered as JSON v0 or human lines.
+#[cfg(not(windows))]
+struct DisableOutcomeV0 {
+    status: &'static str,
+    refusal_code: Option<&'static str>,
+    file_cleanup: Option<&'static str>,
+    file_cleanup_label: Option<&'static str>,
+    ownership_label: &'static str,
+    owned_control_removed: bool,
+    stop_label: Option<&'static str>,
+    run: KnownRunV0,
+    next: Option<NextStepV0>,
+    exit_code: i32,
+}
+
+#[cfg(not(windows))]
+fn evaluate_disable(state_dir: &std::path::Path) -> DisableOutcomeV0 {
+    let unavailable = || DisableOutcomeV0 {
+        status: "refused",
+        refusal_code: Some("engine_unavailable"),
+        file_cleanup: Some("engine_unavailable"),
+        file_cleanup_label: Some("cleanup: not run (owning engine unavailable)"),
+        ownership_label: "engine ownership: unavailable",
+        owned_control_removed: false,
+        stop_label: None,
+        run: KnownRunV0::Unknown,
+        next: Some(NextStepV0::Inspect),
+        exit_code: 4,
+    };
+    let owner = match check_state_dir_ownership(state_dir) {
         OwnershipCheck::NotOwned => {
-            let ownership_lbl = "engine ownership: not owned; no stop attempted";
-            if json_mode {
-                let out = CliDisableJsonV0 {
-                    schema: "parapet-cli-disable/v0",
-                    status: "refused",
-                    refusal_code: Some("not_owned"),
-                    file_cleanup: None,
-                    file_cleanup_label: None,
-                    ownership_label: ownership_lbl,
-                    owned_control_removed: false,
-                    evidence_retained: true,
-                };
-                emit_json_line(&out);
-            } else {
-                println!("status: refused");
-                println!("{ownership_lbl}");
-                println!(
-                    "protected evidence: retained (use 'parapet evidence release' to release store objects)"
-                );
-            }
-            4
-        }
-        OwnershipCheck::Unavailable => {
-            let ownership_lbl = "engine ownership: unavailable";
-            let cleanup_lbl = "cleanup: not run (owning engine unavailable)";
-            if json_mode {
-                let out = CliDisableJsonV0 {
-                    schema: "parapet-cli-disable/v0",
-                    status: "refused",
-                    refusal_code: Some("engine_unavailable"),
-                    file_cleanup: Some("engine_unavailable"),
-                    file_cleanup_label: Some(cleanup_lbl),
-                    ownership_label: ownership_lbl,
-                    owned_control_removed: false,
-                    evidence_retained: true,
-                };
-                emit_json_line(&out);
-            } else {
-                println!("status: refused");
-                println!("{ownership_lbl}");
-                println!("{cleanup_lbl}");
-                println!(
-                    "protected evidence: retained (use 'parapet evidence release' to release store objects)"
-                );
-            }
-            4
-        }
-        OwnershipCheck::Owned(owner) => {
-            let ownership_lbl = "engine ownership: owned";
-            let Ok(resp) = send_control_request(&args.state_dir, "disable") else {
-                let cleanup_lbl = "cleanup: not run (owning engine unavailable)";
-                if json_mode {
-                    let out = CliDisableJsonV0 {
-                        schema: "parapet-cli-disable/v0",
-                        status: "refused",
-                        refusal_code: Some("engine_unavailable"),
-                        file_cleanup: Some("engine_unavailable"),
-                        file_cleanup_label: Some(cleanup_lbl),
-                        ownership_label: "engine ownership: unavailable",
-                        owned_control_removed: false,
-                        evidence_retained: true,
-                    };
-                    emit_json_line(&out);
-                } else {
-                    println!("status: refused");
-                    println!("engine ownership: unavailable");
-                    println!("{cleanup_lbl}");
-                    println!(
-                        "protected evidence: retained (use 'parapet evidence release' to release store objects)"
-                    );
-                }
-                return 4;
+            return DisableOutcomeV0 {
+                status: "refused",
+                refusal_code: Some("not_owned"),
+                file_cleanup: None,
+                file_cleanup_label: None,
+                ownership_label: "engine ownership: not owned; no stop attempted",
+                owned_control_removed: false,
+                stop_label: None,
+                run: KnownRunV0::Unknown,
+                next: None,
+                exit_code: 4,
             };
-
-            let stop_approved = resp
-                .get("stop_approved")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
-            let file_cleanup_raw = resp
-                .get("file_cleanup")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("not_run");
-            let file_cleanup = match file_cleanup_raw {
-                "clear" => "clear",
-                "not_applicable" => "not_applicable",
-                "fail" => "fail",
-                "indeterminate" => "indeterminate",
-                _ => "not_run",
-            };
-            let cleanup_lbl = file_cleanup_lifecycle_label(file_cleanup)
-                .unwrap_or("file cleanup: not run (restore required)");
-
-            if stop_approved {
-                // Rev 9 L4: `stopped` and control removal only after confirmed exit;
-                // a bounded wait that times out preserves every owned control.
-                if !wait_for_owned_shutdown(&args.state_dir, owner.pid, CONTROL_TIMEOUT) {
-                    let stop_lbl =
-                        "engine stop: exit not confirmed within 5000 ms; owned controls preserved";
-                    if json_mode {
-                        let out = CliDisableJsonV0 {
-                            schema: "parapet-cli-disable/v0",
-                            status: "refused",
-                            refusal_code: Some("stop_unconfirmed"),
-                            file_cleanup: Some(file_cleanup),
-                            file_cleanup_label: Some(cleanup_lbl),
-                            ownership_label: ownership_lbl,
-                            owned_control_removed: false,
-                            evidence_retained: true,
-                        };
-                        emit_json_line(&out);
-                    } else {
-                        println!("status: refused");
-                        println!("{ownership_lbl}");
-                        println!("{cleanup_lbl}");
-                        println!("{stop_lbl}");
-                        println!(
-                            "protected evidence: retained (use 'parapet evidence release' to release store objects)"
-                        );
-                    }
-                    return 4;
-                }
-                remove_owned_transient_files(&args.state_dir);
-                if json_mode {
-                    let out = CliDisableJsonV0 {
-                        schema: "parapet-cli-disable/v0",
-                        status: "stopped",
-                        refusal_code: None,
-                        file_cleanup: Some(file_cleanup),
-                        file_cleanup_label: Some(cleanup_lbl),
-                        ownership_label: ownership_lbl,
-                        owned_control_removed: true,
-                        evidence_retained: true,
-                    };
-                    emit_json_line(&out);
-                } else {
-                    println!("status: stopped");
-                    println!("{ownership_lbl}");
-                    println!("{cleanup_lbl}");
-                    println!(
-                        "protected evidence: retained (use 'parapet evidence release' to release store objects)"
-                    );
-                }
-                0
-            } else {
-                let (refusal_code, exit_code) = match file_cleanup {
-                    "fail" => ("file_cleanup_fail", 4),
-                    "indeterminate" => ("file_cleanup_indeterminate", 5),
-                    _ => ("file_cleanup_not_run", 4),
-                };
-                if json_mode {
-                    let out = CliDisableJsonV0 {
-                        schema: "parapet-cli-disable/v0",
-                        status: "refused",
-                        refusal_code: Some(refusal_code),
-                        file_cleanup: Some(file_cleanup),
-                        file_cleanup_label: Some(cleanup_lbl),
-                        ownership_label: ownership_lbl,
-                        owned_control_removed: false,
-                        evidence_retained: true,
-                    };
-                    emit_json_line(&out);
-                } else {
-                    println!("status: refused");
-                    println!("{ownership_lbl}");
-                    println!("{cleanup_lbl}");
-                    println!(
-                        "protected evidence: retained (use 'parapet evidence release' to release store objects)"
-                    );
-                }
-                exit_code
-            }
         }
+        OwnershipCheck::Unavailable => return unavailable(),
+        OwnershipCheck::Owned(owner) => owner,
+    };
+    let Ok(resp) = send_control_request(state_dir, "disable") else {
+        return unavailable();
+    };
+
+    let stop_approved = resp
+        .get("stop_approved")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let file_cleanup = match resp
+        .get("file_cleanup")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("not_run")
+    {
+        "clear" => "clear",
+        "not_applicable" => "not_applicable",
+        "fail" => "fail",
+        "indeterminate" => "indeterminate",
+        _ => "not_run",
+    };
+    let cleanup_lbl = file_cleanup_lifecycle_label(file_cleanup)
+        .unwrap_or("file cleanup: not run (restore required)");
+    let owned =
+        |status, refusal_code, removed, stop_label, run, next, exit_code| DisableOutcomeV0 {
+            status,
+            refusal_code,
+            file_cleanup: Some(file_cleanup),
+            file_cleanup_label: Some(cleanup_lbl),
+            ownership_label: "engine ownership: owned",
+            owned_control_removed: removed,
+            stop_label,
+            run,
+            next,
+            exit_code,
+        };
+    let run = KnownRunV0::from_owner(owner.run_id.clone());
+
+    if !stop_approved {
+        let (refusal_code, next, exit_code) = match file_cleanup {
+            "fail" => ("file_cleanup_fail", NextStepV0::Restore, 4),
+            "indeterminate" => (
+                "file_cleanup_indeterminate",
+                NextStepV0::ReviewEffectRoot,
+                5,
+            ),
+            _ => ("file_cleanup_not_run", NextStepV0::Restore, 4),
+        };
+        return owned(
+            "refused",
+            Some(refusal_code),
+            false,
+            None,
+            run,
+            Some(next),
+            exit_code,
+        );
+    }
+    // Rev 9 L4: `stopped` and control removal only after confirmed exit;
+    // a bounded wait that times out preserves every owned control.
+    if !wait_for_owned_shutdown(state_dir, owner.pid, CONTROL_TIMEOUT) {
+        return owned(
+            "refused",
+            Some("stop_unconfirmed"),
+            false,
+            Some("engine stop: exit not confirmed within 5000 ms; owned controls preserved"),
+            run,
+            Some(NextStepV0::Disable),
+            4,
+        );
+    }
+    remove_owned_transient_files(state_dir);
+    let next = match run {
+        KnownRunV0::Run(_) => NextStepV0::Inspect,
+        KnownRunV0::NoRun | KnownRunV0::Unknown => NextStepV0::Done,
+    };
+    owned("stopped", None, true, None, run, Some(next), 0)
+}
+
+/// Human file-cleanup line: the lifecycle label, always prefixed `file cleanup:`
+/// so it never reads as protected-evidence cleanup.
+#[cfg(not(windows))]
+fn file_cleanup_human_line(code: &str) -> &'static str {
+    match code {
+        "engine_unavailable" => "file cleanup: not run (owning engine unavailable)",
+        other => file_cleanup_lifecycle_label(other).unwrap_or("file cleanup: unknown"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_scan_f64_human, format_scan_score_threshold_human};
+
+    fn assert_formats(cases: &[(&str, u64, &str)]) {
+        for &(id, bits, expected) in cases {
+            assert_eq!(
+                format_scan_f64_human(f64::from_bits(bits)),
+                expected,
+                "{id} ({bits:#018x})"
+            );
+        }
+    }
+
+    #[test]
+    fn scan_f64_human_long_tail_values() {
+        assert_formats(&[
+            ("LT-ALPHA-CLEAN", 0xbfe4_ab58_e41c_ca90, "-0.64591641"),
+            ("LT-ALPHA-FLAGGED", 0x3ff9_7277_e1e3_e03a, "1.59044636"),
+            ("LT-CLI-FLAGGED-PROMPT", 0x4004_7520_3178_c8e8, "2.55719031"),
+            ("LT-BINARY-01-02", 0x3fd3_3333_3333_3334, "0.3"),
+            ("LT-TRAILING-ZERO", 0x3ff3_c083_12b3_4fbd, "1.2345"),
+            ("LT-TERM-DOT-ZERO", 0x0000_0000_0000_0000, "0"),
+            ("LT-TERM-DOT-ONE", 0x3ff0_0000_0000_0000, "1"),
+            ("LT-TERM-DOT-NEG-TWO", 0xc000_0000_0022_5c18, "-2"),
+        ]);
+        assert_eq!((0.1_f64 + 0.2_f64).to_bits(), 0x3fd3_3333_3333_3334);
+        assert_eq!(
+            (-0.645_916_409_999_999_9_f64).to_bits(),
+            0xbfe4_ab58_e41c_ca90
+        );
+        assert_eq!(2.557_190_309_999_999_3_f64.to_bits(), 0x4004_7520_3178_c8e8);
+    }
+
+    #[test]
+    fn scan_f64_human_rounds_half_ties_to_even() {
+        assert_formats(&[
+            (
+                "HT-EVEN-DOWN",
+                0x42a0_0000_0000_0001,
+                "8796093022208.00195312",
+            ),
+            ("HT-ODD-UP", 0x42a0_0000_0000_0003, "8796093022208.00585938"),
+            ("HT-SMALL-EVEN-DOWN", 0x3f60_0000_0000_0000, "0.00195312"),
+            ("HT-SMALL-ODD-UP", 0x3f78_0000_0000_0000, "0.00585938"),
+            ("HT-DEC-BELOW", 0x3e5a_d7f2_9abc_af48, "0.00000002"),
+            ("HT-DEC-ABOVE", 0x3e62_ca5d_05ea_7ab3, "0.00000004"),
+            (
+                "HT-NEG-ODD-UP",
+                0xc2a0_0000_0000_0003,
+                "-8796093022208.00585938",
+            ),
+        ]);
+        assert_eq!(0.000_000_025_f64.to_bits(), 0x3e5a_d7f2_9abc_af48);
+        assert_eq!(0.000_000_035_f64.to_bits(), 0x3e62_ca5d_05ea_7ab3);
+    }
+
+    #[test]
+    fn scan_f64_human_never_emits_negative_zero() {
+        assert_formats(&[
+            ("NZ-IEEE-NEG-ZERO", 0x8000_0000_0000_0000, "0"),
+            ("NZ-IEEE-POS-ZERO", 0x0000_0000_0000_0000, "0"),
+            ("NZ-TINY-NEG", 0xbe11_2e0b_e826_d695, "0"),
+            ("NZ-TINY-POS", 0x3e11_2e0b_e826_d695, "0"),
+        ]);
+        assert_eq!((-1e-9_f64).to_bits(), 0xbe11_2e0b_e826_d695);
+        // Smallest subnormal and an integer beyond the exact-shift range.
+        assert_eq!(format_scan_f64_human(f64::from_bits(1)), "0");
+        assert_eq!(format_scan_f64_human(-1e20), "-100000000000000000000");
+    }
+
+    #[test]
+    fn scan_f64_human_is_total_on_non_finite_values() {
+        assert_formats(&[
+            ("NF-UNIT-NAN", 0x7ff8_0000_0000_0000, "non_finite_nan"),
+            (
+                "NF-UNIT-POS-INF",
+                0x7ff0_0000_0000_0000,
+                "non_finite_pos_inf",
+            ),
+            (
+                "NF-UNIT-NEG-INF",
+                0xfff0_0000_0000_0000,
+                "non_finite_neg_inf",
+            ),
+        ]);
+    }
+
+    #[test]
+    fn scan_score_threshold_human_states_raw_relation_on_collision() {
+        let s = f64::from_bits(0xbfe5_34bf_44a3_f3e6);
+        let cases: &[(&str, f64, f64, &str, &str)] = &[
+            (
+                "COL-CLEAN-LT",
+                s,
+                f64::from_bits(0xbfe5_34bf_441a_8386),
+                "-0.66268886 (raw_relation: effective_raw < threshold)",
+                "-0.66268886",
+            ),
+            (
+                "COL-FLAGGED-GT",
+                s,
+                f64::from_bits(0xbfe5_34bf_452d_6445),
+                "-0.66268886 (raw_relation: effective_raw > threshold)",
+                "-0.66268886",
+            ),
+            (
+                "COL-FLAGGED-EQ",
+                s,
+                s,
+                "-0.66268886 (raw_relation: effective_raw == threshold)",
+                "-0.66268886",
+            ),
+            (
+                "COL-ZERO-SIGN-EQ",
+                -0.0,
+                0.0,
+                "0 (raw_relation: effective_raw == threshold)",
+                "0",
+            ),
+            (
+                "COL-ZERO-LT",
+                -1e-9,
+                0.0,
+                "0 (raw_relation: effective_raw < threshold)",
+                "0",
+            ),
+            (
+                "NO-COLLISION-CLEAN",
+                -0.645_916_409_999_999_9,
+                0.0,
+                "-0.64591641",
+                "0",
+            ),
+            ("NO-COLLISION-FLAGGED", 1.590_446_36, 0.0, "1.59044636", "0"),
+        ];
+        for &(id, score, threshold, want_score, want_threshold) in cases {
+            assert_eq!(
+                format_scan_score_threshold_human(score, threshold),
+                (want_score.to_owned(), want_threshold.to_owned()),
+                "{id}"
+            );
+        }
+        assert_eq!((-0.662_688_859_f64).to_bits(), 0xbfe5_34bf_441a_8386);
+        assert_eq!((-0.662_688_861_f64).to_bits(), 0xbfe5_34bf_452d_6445);
     }
 }

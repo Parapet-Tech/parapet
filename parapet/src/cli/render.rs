@@ -192,6 +192,7 @@ pub fn file_cleanup_lifecycle_label(state: &str) -> Option<&'static str> {
         "not_applicable" => Some("file cleanup: not applicable"),
         "not_run" => Some("file cleanup: not run (restore required)"),
         "engine_unavailable" => Some("cleanup: not run (owning engine unavailable)"),
+        "not_recorded" => Some("file cleanup: not recorded in protected evidence"),
         _ => None,
     }
 }
@@ -276,6 +277,156 @@ pub fn evidence_cleanup_lifecycle_label(state: &str) -> Option<&'static str> {
         "not_applicable" => Some("evidence cleanup: not applicable"),
         "not_started" => Some("evidence cleanup: not started"),
         "in_progress" => Some("evidence cleanup: in progress"),
+        "unknown" => Some("evidence cleanup: unknown (not changed by this command)"),
+        _ => None,
+    }
+}
+
+/// The next valid operator command after a lifecycle step. Commands name the
+/// state directory by placeholder only, so human output never echoes a path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NextStepV0 {
+    /// Send the one file-effect request, then restore.
+    RequestThenRestore,
+    /// Stop a proxy-only engine.
+    StopProxy,
+    Restore,
+    Disable,
+    Inspect,
+    EvidenceRelease,
+    /// Indeterminate file cleanup: undeclared residue needs operator review.
+    ReviewEffectRoot,
+    Done,
+}
+
+/// Frozen human `next:` line for a `NextStepV0`; `<run-id>` when the run is unknown.
+pub fn next_step_line(step: NextStepV0, run_id: Option<&str>) -> String {
+    let run = run_id.unwrap_or("<run-id>");
+    match step {
+        NextStepV0::RequestThenRestore => {
+            "next: send one request, then parapet restore --state-dir <state-dir>".to_owned()
+        }
+        NextStepV0::StopProxy => "next: parapet disable --state-dir <state-dir>".to_owned(),
+        NextStepV0::Restore => "next: parapet restore --state-dir <state-dir>".to_owned(),
+        NextStepV0::Disable => "next: parapet disable --state-dir <state-dir>".to_owned(),
+        NextStepV0::Inspect => {
+            format!("next: parapet inspect --state-dir <state-dir> --run-id {run}")
+        }
+        NextStepV0::EvidenceRelease => format!(
+            "next: parapet evidence release --state-dir <state-dir> --run-id {run} (optional)"
+        ),
+        NextStepV0::ReviewEffectRoot => "next: remove undeclared files from the effect root, then parapet restore --state-dir <state-dir>".to_owned(),
+        NextStepV0::Done => "next: none".to_owned(),
+    }
+}
+
+/// Human startup status for `parapet run`, flushed once the engine is ready.
+/// Carries only the loopback port, the engine-generated run ID, and the mode.
+pub fn render_run_startup_human(port: u16, run_id: Option<&str>) -> String {
+    let (mode, next) = match run_id {
+        Some(_) => ("protected", NextStepV0::RequestThenRestore),
+        None => ("proxy", NextStepV0::StopProxy),
+    };
+    format!(
+        "status: ready\nport: {port}\nrun_id: {}\nmode: {mode}\n{}\n",
+        run_id.unwrap_or("not_applicable"),
+        next_step_line(next, run_id)
+    )
+}
+
+/// Human `original decision:` line: the receipt summary a cleanup never changes.
+#[cfg(not(windows))]
+pub fn original_decision_line(
+    projection_bytes: Option<&[u8]>,
+    reader_code: Option<ReaderErrorV0>,
+    projection_code: Option<ReaderErrorV0>,
+) -> String {
+    // A reader error withholds authority, so no projection field is shown.
+    if reader_code.is_none() {
+        if let Some(projection) =
+            projection_bytes.and_then(|b| serde_json::from_slice::<Projection>(b).ok())
+        {
+            return format!("original decision: {}", summary_label(projection.summary));
+        }
+    }
+    match reader_code.or(projection_code) {
+        // No manifest: the engine has not recorded a request for this run.
+        Some(ReaderErrorV0::RunManifestMissing) => "original decision: not recorded".to_owned(),
+        // The run is open: its terminal decision has not been published.
+        Some(code @ (ReaderErrorV0::TerminalMissing | ReaderErrorV0::TerminalPending)) => {
+            format!("original decision: not settled ({})", code.as_str())
+        }
+        Some(code) => format!("original decision: not available ({})", code.as_str()),
+        None => "original decision: not available".to_owned(),
+    }
+}
+
+/// Human `evidence cleanup:` line for a redacted run view.
+#[cfg(not(windows))]
+pub fn evidence_cleanup_view_label(
+    cleanup: Option<CleanupStateV0>,
+    reader_code: Option<ReaderErrorV0>,
+) -> &'static str {
+    match (cleanup, reader_code) {
+        (Some(state), _) => evidence_cleanup_state_label(state),
+        (None, Some(ReaderErrorV0::RunManifestMissing)) => "evidence cleanup: not applicable",
+        (None, _) => "evidence cleanup: unknown (not changed by this command)",
+    }
+}
+
+/// `original decision:` line when the engine has no file-effect run.
+pub const ORIGINAL_DECISION_NO_RUN: &str = "original decision: not applicable (no file-effect run)";
+
+/// `original decision:` line when no run could be identified.
+pub const ORIGINAL_DECISION_UNKNOWN: &str = "original decision: unknown (run not identified)";
+
+/// Lifecycle block shared by human `restore`, `disable`, `inspect`, and
+/// `evidence release`: the original decision, the current file-effect cleanup,
+/// and the protected-evidence cleanup are always three separate lines.
+pub struct LifecycleHumanV0<'a> {
+    pub run_id: Option<&'a str>,
+    pub decision: &'a str,
+    pub file_cleanup: &'a str,
+    pub evidence_cleanup: &'a str,
+}
+
+impl LifecycleHumanV0<'_> {
+    pub fn lines(&self) -> Vec<String> {
+        let mut lines = Vec::with_capacity(4);
+        if let Some(run) = self.run_id {
+            lines.push(format!("run_id: {run}"));
+        }
+        lines.push(self.decision.to_owned());
+        lines.push(self.file_cleanup.to_owned());
+        lines.push(self.evidence_cleanup.to_owned());
+        lines
+    }
+}
+
+/// Join human lines with a trailing newline.
+pub fn join_lines(lines: &[String]) -> String {
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
+}
+
+/// Next step after `parapet inspect`, when one is known.
+#[cfg(not(windows))]
+pub fn inspect_next_step(
+    outcome: Option<TerminalOutcomeV0>,
+    cleanup: Option<CleanupStateV0>,
+    reader_code: Option<ReaderErrorV0>,
+) -> Option<NextStepV0> {
+    match (cleanup, reader_code) {
+        (Some(CleanupStateV0::Clear), _) => Some(NextStepV0::Done),
+        (Some(CleanupStateV0::NotStarted), None)
+            if outcome == Some(TerminalOutcomeV0::Complete) =>
+        {
+            Some(NextStepV0::EvidenceRelease)
+        }
+        (Some(CleanupStateV0::Fail | CleanupStateV0::Indeterminate), _) => {
+            Some(NextStepV0::EvidenceRelease)
+        }
         _ => None,
     }
 }
@@ -406,7 +557,7 @@ pub fn render_inert_plaintext(s: &str) -> String {
 /// Render a parsed `Projection` into human-readable lines per Section 5.3 / F71.
 pub fn render_projection_human_lines(projection: &Projection, inert_fallback: bool) -> Vec<String> {
     let mut lines = Vec::new();
-    lines.push(format!("projection_of: {}", projection.projection_of));
+    lines.push(format!("receipt_row_digest: {}", projection.projection_of));
     lines.push(format!("receipt_line: {}", projection.line));
     lines.push(format!(
         "summary_label: {}",
@@ -480,15 +631,16 @@ pub fn render_inspect_human(
         Some(TerminalOutcomeV0::StorageIncomplete) => "storage_incomplete",
         None => "none",
     };
-    let cleanup_str = match cleanup {
-        Some(state) => evidence_cleanup_state_code(state),
-        None => "none",
-    };
-    let mut lines = vec![
-        format!("run_id: {run_id}"),
-        format!("terminal_outcome: {outcome_str}"),
-        format!("evidence_cleanup_state: {cleanup_str}"),
-    ];
+    let decision = original_decision_line(projection_bytes, reader_code, projection_code);
+    let evidence_cleanup = evidence_cleanup_view_label(cleanup, reader_code);
+    let mut lines = LifecycleHumanV0 {
+        run_id: Some(run_id),
+        decision: &decision,
+        file_cleanup: "file cleanup: not recorded in protected evidence",
+        evidence_cleanup,
+    }
+    .lines();
+    lines.insert(1, format!("terminal_outcome: {outcome_str}"));
     if let Some(b) = banner {
         lines.push(format!("banner: {b}"));
     }
@@ -498,19 +650,17 @@ pub fn render_inspect_human(
     if let Some(code) = projection_code {
         lines.push(projection_error_label(code).to_owned());
     }
-    if reader_code.is_some() {
-        let mut out = lines.join("\n");
-        out.push('\n');
-        return out;
-    }
-    if let Some(bytes) = projection_bytes {
-        if let Ok(projection) = serde_json::from_slice::<Projection>(bytes) {
-            lines.extend(render_projection_human_lines(&projection, inert_fallback));
+    if reader_code.is_none() {
+        if let Some(bytes) = projection_bytes {
+            if let Ok(projection) = serde_json::from_slice::<Projection>(bytes) {
+                lines.extend(render_projection_human_lines(&projection, inert_fallback));
+            }
         }
     }
-    let mut out = lines.join("\n");
-    out.push('\n');
-    out
+    if let Some(step) = inspect_next_step(outcome, cleanup, reader_code) {
+        lines.push(next_step_line(step, Some(run_id)));
+    }
+    join_lines(&lines)
 }
 
 #[derive(Serialize)]
