@@ -1,0 +1,1096 @@
+{
+  "version": 1,
+  "n": 8,
+  "cases": [
+    {
+      "id": "adjacent_untrusted_labels",
+      "messages": [
+        {
+          "content": "red blue",
+          "segments": [
+            {
+              "start": 0,
+              "end": 4,
+              "label": "repository",
+              "treatment": "untrusted"
+            },
+            {
+              "start": 4,
+              "end": 8,
+              "label": "configured_agent",
+              "treatment": "untrusted"
+            }
+          ],
+          "expected_units": [
+            {
+              "start": 0,
+              "end": 8,
+              "treatment": "untrusted"
+            }
+          ],
+          "expected_windows": []
+        }
+      ],
+      "expected_aggregate": null
+    },
+    {
+      "id": "exempt_between_two",
+      "messages": [
+        {
+          "content": "red safe blue",
+          "segments": [
+            {
+              "start": 0,
+              "end": 4,
+              "label": "repository",
+              "treatment": "untrusted"
+            },
+            {
+              "start": 4,
+              "end": 9,
+              "label": "vendor_static",
+              "treatment": "exempt"
+            },
+            {
+              "start": 9,
+              "end": 13,
+              "label": "repository",
+              "treatment": "untrusted"
+            }
+          ],
+          "expected_units": [
+            {
+              "start": 0,
+              "end": 4,
+              "treatment": "untrusted"
+            },
+            {
+              "start": 4,
+              "end": 9,
+              "treatment": "exempt"
+            },
+            {
+              "start": 9,
+              "end": 13,
+              "treatment": "untrusted"
+            }
+          ],
+          "expected_windows": [
+            {
+              "boundary": 4,
+              "start": 0,
+              "end": 8,
+              "bytes": "red safe"
+            },
+            {
+              "boundary": 9,
+              "start": 4,
+              "end": 13,
+              "bytes": "safe blue"
+            }
+          ]
+        }
+      ],
+      "expected_aggregate": {
+        "bytes": "red \nblue",
+        "map": [
+          {
+            "agg_start": 0,
+            "agg_end": 4,
+            "message_index": 0,
+            "orig_start": 0,
+            "orig_end": 4
+          },
+          {
+            "agg_start": 5,
+            "agg_end": 9,
+            "message_index": 0,
+            "orig_start": 9,
+            "orig_end": 13
+          }
+        ],
+        "separator_positions": [
+          4
+        ]
+      }
+    },
+    {
+      "id": "all_exempt",
+      "messages": [
+        {
+          "content": "safe text",
+          "segments": [
+            {
+              "start": 0,
+              "end": 5,
+              "label": "repository",
+              "treatment": "exempt"
+            },
+            {
+              "start": 5,
+              "end": 9,
+              "label": "configured_agent",
+              "treatment": "exempt"
+            }
+          ],
+          "expected_units": [
+            {
+              "start": 0,
+              "end": 9,
+              "treatment": "exempt"
+            }
+          ],
+          "expected_windows": []
+        }
+      ],
+      "expected_aggregate": null
+    },
+    {
+      "id": "all_untrusted_single",
+      "messages": [
+        {
+          "content": "plain text",
+          "segments": [
+            {
+              "start": 0,
+              "end": 10,
+              "label": "repository",
+              "treatment": "untrusted"
+            }
+          ],
+          "expected_units": [
+            {
+              "start": 0,
+              "end": 10,
+              "treatment": "untrusted"
+            }
+          ],
+          "expected_windows": []
+        }
+      ],
+      "expected_aggregate": null
+    },
+    {
+      "id": "label_swap_a",
+      "messages": [
+        {
+          "content": "red blue safe",
+          "segments": [
+            {
+              "start": 0,
+              "end": 4,
+              "label": "configured_agent",
+              "treatment": "untrusted"
+            },
+            {
+              "start": 4,
+              "end": 9,
+              "label": "repository",
+              "treatment": "untrusted"
+            },
+            {
+              "start": 9,
+              "end": 13,
+              "label": "vendor_static",
+              "treatment": "exempt"
+            }
+          ],
+          "expected_units": [
+            {
+              "start": 0,
+              "end": 9,
+              "treatment": "untrusted"
+            },
+            {
+              "start": 9,
+              "end": 13,
+              "treatment": "exempt"
+            }
+          ],
+          "expected_windows": [
+            {
+              "boundary": 9,
+              "start": 0,
+              "end": 13,
+              "bytes": "red blue safe"
+            }
+          ]
+        }
+      ],
+      "expected_aggregate": null,
+      "twin_group": "label_swap"
+    },
+    {
+      "id": "label_swap_b",
+      "messages": [
+        {
+          "content": "red blue safe",
+          "segments": [
+            {
+              "start": 0,
+              "end": 4,
+              "label": "repository",
+              "treatment": "untrusted"
+            },
+            {
+              "start": 4,
+              "end": 9,
+              "label": "configured_agent",
+              "treatment": "untrusted"
+            },
+            {
+              "start": 9,
+              "end": 13,
+              "label": "vendor_static",
+              "treatment": "exempt"
+            }
+          ],
+          "expected_units": [
+            {
+              "start": 0,
+              "end": 9,
+              "treatment": "untrusted"
+            },
+            {
+              "start": 9,
+              "end": 13,
+              "treatment": "exempt"
+            }
+          ],
+          "expected_windows": [
+            {
+              "boundary": 9,
+              "start": 0,
+              "end": 13,
+              "bytes": "red blue safe"
+            }
+          ]
+        }
+      ],
+      "expected_aggregate": null,
+      "twin_group": "label_swap"
+    },
+    {
+      "id": "ascii_fewer_than_n",
+      "messages": [
+        {
+          "content": "one two three four",
+          "segments": [
+            {
+              "start": 0,
+              "end": 8,
+              "label": "repository",
+              "treatment": "untrusted"
+            },
+            {
+              "start": 8,
+              "end": 18,
+              "label": "repository",
+              "treatment": "exempt"
+            }
+          ],
+          "expected_units": [
+            {
+              "start": 0,
+              "end": 8,
+              "treatment": "untrusted"
+            },
+            {
+              "start": 8,
+              "end": 18,
+              "treatment": "exempt"
+            }
+          ],
+          "expected_windows": [
+            {
+              "boundary": 8,
+              "start": 0,
+              "end": 18,
+              "bytes": "one two three four"
+            }
+          ]
+        }
+      ],
+      "expected_aggregate": null
+    },
+    {
+      "id": "multibyte_cjk_arabic_zwj",
+      "messages": [
+        {
+          "content": "猫 مرحبا 👩‍💻 好",
+          "segments": [
+            {
+              "start": 0,
+              "end": 15,
+              "label": "repository",
+              "treatment": "untrusted"
+            },
+            {
+              "start": 15,
+              "end": 30,
+              "label": "repository",
+              "treatment": "exempt"
+            }
+          ],
+          "content_base64": "54yrINmF2LHYrdio2Kcg8J+RqeKAjfCfkrsg5aW9",
+          "expected_units": [
+            {
+              "start": 0,
+              "end": 15,
+              "treatment": "untrusted"
+            },
+            {
+              "start": 15,
+              "end": 30,
+              "treatment": "exempt"
+            }
+          ],
+          "expected_windows": [
+            {
+              "boundary": 15,
+              "start": 0,
+              "end": 30,
+              "bytes": "猫 مرحبا 👩‍💻 好"
+            }
+          ]
+        }
+      ],
+      "expected_aggregate": null
+    },
+    {
+      "id": "inside_word",
+      "messages": [
+        {
+          "content": "hello world",
+          "segments": [
+            {
+              "start": 0,
+              "end": 3,
+              "label": "repository",
+              "treatment": "untrusted"
+            },
+            {
+              "start": 3,
+              "end": 11,
+              "label": "repository",
+              "treatment": "exempt"
+            }
+          ],
+          "expected_units": [
+            {
+              "start": 0,
+              "end": 3,
+              "treatment": "untrusted"
+            },
+            {
+              "start": 3,
+              "end": 11,
+              "treatment": "exempt"
+            }
+          ],
+          "expected_windows": [
+            {
+              "boundary": 3,
+              "start": 0,
+              "end": 11,
+              "bytes": "hello world"
+            }
+          ]
+        }
+      ],
+      "expected_aggregate": null
+    },
+    {
+      "id": "boundary_before_whitespace",
+      "messages": [
+        {
+          "content": "one two",
+          "segments": [
+            {
+              "start": 0,
+              "end": 3,
+              "label": "repository",
+              "treatment": "untrusted"
+            },
+            {
+              "start": 3,
+              "end": 7,
+              "label": "repository",
+              "treatment": "exempt"
+            }
+          ],
+          "expected_units": [
+            {
+              "start": 0,
+              "end": 3,
+              "treatment": "untrusted"
+            },
+            {
+              "start": 3,
+              "end": 7,
+              "treatment": "exempt"
+            }
+          ],
+          "expected_windows": [
+            {
+              "boundary": 3,
+              "start": 0,
+              "end": 7,
+              "bytes": "one two"
+            }
+          ]
+        }
+      ],
+      "expected_aggregate": null
+    },
+    {
+      "id": "boundary_after_whitespace",
+      "messages": [
+        {
+          "content": "one two",
+          "segments": [
+            {
+              "start": 0,
+              "end": 4,
+              "label": "repository",
+              "treatment": "untrusted"
+            },
+            {
+              "start": 4,
+              "end": 7,
+              "label": "repository",
+              "treatment": "exempt"
+            }
+          ],
+          "expected_units": [
+            {
+              "start": 0,
+              "end": 4,
+              "treatment": "untrusted"
+            },
+            {
+              "start": 4,
+              "end": 7,
+              "treatment": "exempt"
+            }
+          ],
+          "expected_windows": [
+            {
+              "boundary": 4,
+              "start": 0,
+              "end": 7,
+              "bytes": "one two"
+            }
+          ]
+        }
+      ],
+      "expected_aggregate": null
+    },
+    {
+      "id": "whitespace_both_sides",
+      "messages": [
+        {
+          "content": "  one \t\n two  ",
+          "segments": [
+            {
+              "start": 0,
+              "end": 7,
+              "label": "repository",
+              "treatment": "untrusted"
+            },
+            {
+              "start": 7,
+              "end": 14,
+              "label": "repository",
+              "treatment": "exempt"
+            }
+          ],
+          "expected_units": [
+            {
+              "start": 0,
+              "end": 7,
+              "treatment": "untrusted"
+            },
+            {
+              "start": 7,
+              "end": 14,
+              "treatment": "exempt"
+            }
+          ],
+          "expected_windows": [
+            {
+              "boundary": 7,
+              "start": 2,
+              "end": 12,
+              "bytes": "one \t\n two"
+            }
+          ]
+        }
+      ],
+      "expected_aggregate": null
+    },
+    {
+      "id": "exactly_n",
+      "messages": [
+        {
+          "content": "a b c d e f g h i j k l m n o p",
+          "segments": [
+            {
+              "start": 0,
+              "end": 16,
+              "label": "repository",
+              "treatment": "untrusted"
+            },
+            {
+              "start": 16,
+              "end": 31,
+              "label": "repository",
+              "treatment": "exempt"
+            }
+          ],
+          "expected_units": [
+            {
+              "start": 0,
+              "end": 16,
+              "treatment": "untrusted"
+            },
+            {
+              "start": 16,
+              "end": 31,
+              "treatment": "exempt"
+            }
+          ],
+          "expected_windows": [
+            {
+              "boundary": 16,
+              "start": 0,
+              "end": 31,
+              "bytes": "a b c d e f g h i j k l m n o p"
+            }
+          ]
+        }
+      ],
+      "expected_aggregate": null
+    },
+    {
+      "id": "n_plus_one",
+      "messages": [
+        {
+          "content": "a b c d e f g h i j k l m n o p q r",
+          "segments": [
+            {
+              "start": 0,
+              "end": 18,
+              "label": "repository",
+              "treatment": "untrusted"
+            },
+            {
+              "start": 18,
+              "end": 35,
+              "label": "repository",
+              "treatment": "exempt"
+            }
+          ],
+          "expected_units": [
+            {
+              "start": 0,
+              "end": 18,
+              "treatment": "untrusted"
+            },
+            {
+              "start": 18,
+              "end": 35,
+              "treatment": "exempt"
+            }
+          ],
+          "expected_windows": [
+            {
+              "boundary": 18,
+              "start": 2,
+              "end": 33,
+              "bytes": "b c d e f g h i j k l m n o p q"
+            }
+          ]
+        }
+      ],
+      "expected_aggregate": null
+    },
+    {
+      "id": "left_whitespace_only",
+      "messages": [
+        {
+          "content": " \t word tail",
+          "segments": [
+            {
+              "start": 0,
+              "end": 3,
+              "label": "repository",
+              "treatment": "untrusted"
+            },
+            {
+              "start": 3,
+              "end": 12,
+              "label": "repository",
+              "treatment": "exempt"
+            }
+          ],
+          "expected_units": [
+            {
+              "start": 0,
+              "end": 3,
+              "treatment": "untrusted"
+            },
+            {
+              "start": 3,
+              "end": 12,
+              "treatment": "exempt"
+            }
+          ],
+          "expected_windows": [
+            {
+              "boundary": 3,
+              "start": 3,
+              "end": 12,
+              "bytes": "word tail"
+            }
+          ]
+        }
+      ],
+      "expected_aggregate": null
+    },
+    {
+      "id": "right_whitespace_only",
+      "messages": [
+        {
+          "content": "head word \n ",
+          "segments": [
+            {
+              "start": 0,
+              "end": 9,
+              "label": "repository",
+              "treatment": "exempt"
+            },
+            {
+              "start": 9,
+              "end": 12,
+              "label": "repository",
+              "treatment": "untrusted"
+            }
+          ],
+          "expected_units": [
+            {
+              "start": 0,
+              "end": 9,
+              "treatment": "exempt"
+            },
+            {
+              "start": 9,
+              "end": 12,
+              "treatment": "untrusted"
+            }
+          ],
+          "expected_windows": [
+            {
+              "boundary": 9,
+              "start": 0,
+              "end": 9,
+              "bytes": "head word"
+            }
+          ]
+        }
+      ],
+      "expected_aggregate": null
+    },
+    {
+      "id": "both_whitespace_only",
+      "messages": [
+        {
+          "content": " \t\n ",
+          "segments": [
+            {
+              "start": 0,
+              "end": 2,
+              "label": "repository",
+              "treatment": "untrusted"
+            },
+            {
+              "start": 2,
+              "end": 4,
+              "label": "repository",
+              "treatment": "exempt"
+            }
+          ],
+          "expected_units": [
+            {
+              "start": 0,
+              "end": 2,
+              "treatment": "untrusted"
+            },
+            {
+              "start": 2,
+              "end": 4,
+              "treatment": "exempt"
+            }
+          ],
+          "expected_windows": [
+            {
+              "boundary": 2,
+              "start": 2,
+              "end": 2,
+              "bytes": ""
+            }
+          ]
+        }
+      ],
+      "expected_aggregate": null
+    },
+    {
+      "id": "three_untrusted_units",
+      "messages": [
+        {
+          "content": "A B C",
+          "segments": [
+            {
+              "start": 0,
+              "end": 1,
+              "label": "repository",
+              "treatment": "untrusted"
+            },
+            {
+              "start": 1,
+              "end": 2,
+              "label": "repository",
+              "treatment": "exempt"
+            },
+            {
+              "start": 2,
+              "end": 3,
+              "label": "repository",
+              "treatment": "untrusted"
+            },
+            {
+              "start": 3,
+              "end": 4,
+              "label": "repository",
+              "treatment": "exempt"
+            },
+            {
+              "start": 4,
+              "end": 5,
+              "label": "repository",
+              "treatment": "untrusted"
+            }
+          ],
+          "expected_units": [
+            {
+              "start": 0,
+              "end": 1,
+              "treatment": "untrusted"
+            },
+            {
+              "start": 1,
+              "end": 2,
+              "treatment": "exempt"
+            },
+            {
+              "start": 2,
+              "end": 3,
+              "treatment": "untrusted"
+            },
+            {
+              "start": 3,
+              "end": 4,
+              "treatment": "exempt"
+            },
+            {
+              "start": 4,
+              "end": 5,
+              "treatment": "untrusted"
+            }
+          ],
+          "expected_windows": [
+            {
+              "boundary": 1,
+              "start": 0,
+              "end": 1,
+              "bytes": "A"
+            },
+            {
+              "boundary": 2,
+              "start": 2,
+              "end": 3,
+              "bytes": "B"
+            },
+            {
+              "boundary": 3,
+              "start": 2,
+              "end": 3,
+              "bytes": "B"
+            },
+            {
+              "boundary": 4,
+              "start": 4,
+              "end": 5,
+              "bytes": "C"
+            }
+          ]
+        }
+      ],
+      "expected_aggregate": {
+        "bytes": "A\nB\nC",
+        "map": [
+          {
+            "agg_start": 0,
+            "agg_end": 1,
+            "message_index": 0,
+            "orig_start": 0,
+            "orig_end": 1
+          },
+          {
+            "agg_start": 2,
+            "agg_end": 3,
+            "message_index": 0,
+            "orig_start": 2,
+            "orig_end": 3
+          },
+          {
+            "agg_start": 4,
+            "agg_end": 5,
+            "message_index": 0,
+            "orig_start": 4,
+            "orig_end": 5
+          }
+        ],
+        "separator_positions": [
+          1,
+          3
+        ]
+      }
+    },
+    {
+      "id": "multi_message",
+      "messages": [
+        {
+          "content": "first",
+          "segments": [
+            {
+              "start": 0,
+              "end": 5,
+              "label": "repository",
+              "treatment": "untrusted"
+            }
+          ],
+          "expected_units": [
+            {
+              "start": 0,
+              "end": 5,
+              "treatment": "untrusted"
+            }
+          ],
+          "expected_windows": []
+        },
+        {
+          "content": "safe second",
+          "segments": [
+            {
+              "start": 0,
+              "end": 5,
+              "label": "repository",
+              "treatment": "exempt"
+            },
+            {
+              "start": 5,
+              "end": 11,
+              "label": "repository",
+              "treatment": "untrusted"
+            }
+          ],
+          "expected_units": [
+            {
+              "start": 0,
+              "end": 5,
+              "treatment": "exempt"
+            },
+            {
+              "start": 5,
+              "end": 11,
+              "treatment": "untrusted"
+            }
+          ],
+          "expected_windows": [
+            {
+              "boundary": 5,
+              "start": 0,
+              "end": 11,
+              "bytes": "safe second"
+            }
+          ]
+        }
+      ],
+      "expected_aggregate": {
+        "bytes": "first\nsecond",
+        "map": [
+          {
+            "agg_start": 0,
+            "agg_end": 5,
+            "message_index": 0,
+            "orig_start": 0,
+            "orig_end": 5
+          },
+          {
+            "agg_start": 6,
+            "agg_end": 12,
+            "message_index": 1,
+            "orig_start": 5,
+            "orig_end": 11
+          }
+        ],
+        "separator_positions": [
+          5
+        ]
+      }
+    },
+    {
+      "id": "split_markup",
+      "messages": [
+        {
+          "content": "note <b>word</b> tail",
+          "segments": [
+            {
+              "start": 0,
+              "end": 6,
+              "label": "repository",
+              "treatment": "untrusted"
+            },
+            {
+              "start": 6,
+              "end": 21,
+              "label": "repository",
+              "treatment": "exempt"
+            }
+          ],
+          "expected_units": [
+            {
+              "start": 0,
+              "end": 6,
+              "treatment": "untrusted"
+            },
+            {
+              "start": 6,
+              "end": 21,
+              "treatment": "exempt"
+            }
+          ],
+          "expected_windows": [
+            {
+              "boundary": 6,
+              "start": 0,
+              "end": 21,
+              "bytes": "note <b>word</b> tail"
+            }
+          ]
+        }
+      ],
+      "expected_aggregate": null,
+      "l0_expectation": "pending_gate1"
+    },
+    {
+      "id": "token_spans_three_units",
+      "messages": [
+        {
+          "content": "xxYYzz tail",
+          "segments": [
+            {
+              "start": 0,
+              "end": 2,
+              "label": "repository",
+              "treatment": "untrusted"
+            },
+            {
+              "start": 2,
+              "end": 4,
+              "label": "vendor_static",
+              "treatment": "exempt"
+            },
+            {
+              "start": 4,
+              "end": 6,
+              "label": "configured_agent",
+              "treatment": "untrusted"
+            },
+            {
+              "start": 6,
+              "end": 11,
+              "label": "vendor_static",
+              "treatment": "exempt"
+            }
+          ],
+          "expected_units": [
+            {
+              "start": 0,
+              "end": 2,
+              "treatment": "untrusted"
+            },
+            {
+              "start": 2,
+              "end": 4,
+              "treatment": "exempt"
+            },
+            {
+              "start": 4,
+              "end": 6,
+              "treatment": "untrusted"
+            },
+            {
+              "start": 6,
+              "end": 11,
+              "treatment": "exempt"
+            }
+          ],
+          "expected_windows": [
+            {
+              "boundary": 2,
+              "start": 0,
+              "end": 6,
+              "bytes": "xxYYzz"
+            },
+            {
+              "boundary": 4,
+              "start": 0,
+              "end": 6,
+              "bytes": "xxYYzz"
+            },
+            {
+              "boundary": 6,
+              "start": 0,
+              "end": 11,
+              "bytes": "xxYYzz tail"
+            }
+          ]
+        }
+      ],
+      "expected_aggregate": {
+        "bytes": "xx\nzz",
+        "map": [
+          {
+            "agg_start": 0,
+            "agg_end": 2,
+            "message_index": 0,
+            "orig_start": 0,
+            "orig_end": 2
+          },
+          {
+            "agg_start": 3,
+            "agg_end": 5,
+            "message_index": 0,
+            "orig_start": 4,
+            "orig_end": 6
+          }
+        ],
+        "separator_positions": [
+          2
+        ]
+      }
+    }
+  ]
+}

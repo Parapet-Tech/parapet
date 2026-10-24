@@ -6664,6 +6664,7 @@ mod rev9_r4 {
                 "pub mod model_fetch;",
                 "pub mod model_path;",
                 "pub mod normalize;",
+                "pub mod provenance;",
                 "pub mod provider;",
                 "pub mod proxy;",
                 "pub mod receipt;",
