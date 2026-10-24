@@ -4462,6 +4462,8 @@ fn update_session_after_request(
 
 const MAX_STREAM_REDACTION_BUFFER_CHARS: usize = 64 * 1024;
 const MAX_SSE_RAW_LINE_CHARS: usize = 64 * 1024;
+const MAX_PENDING_DELTA_SLOTS: usize = 256;
+const MAX_DEFERRED_SSE_EVENTS: usize = 16;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StreamRedactionMode {
@@ -4474,6 +4476,22 @@ enum StreamRedactionMode {
 enum SseLineState {
     Normal,
     DiscardingOverlongLine,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SseProtocol {
+    Undetermined,
+    OpenAi,
+    Anthropic,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AnthropicBlockState {
+    Idle,
+    TextOpen { index: Option<u64> },
+    ToolUseOpen { index: Option<u64> },
+    BlockClosed,
+    MessageEnded,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -4494,22 +4512,46 @@ enum SseL5aAction {
     OpenAiContentDelta {
         content: String,
         has_finish: bool,
+        has_role: bool,
     },
     OpenAiEmptyDeltaNoFinish {
         has_role: bool,
     },
+    OpenAiFinishChunk {
+        choice_index: u64,
+    },
+    OpenAiToolCallsDelta {
+        has_finish: bool,
+        choice_index: u64,
+    },
+    OpenAiEmptyChoices,
+    OpenAiMultiChoiceNonContent,
+    AnthropicMessageStart,
     AnthropicTextDelta {
         text: String,
+        block_index: Option<u64>,
     },
-    AnthropicTextBlockStartEmpty,
+    AnthropicInputJsonDelta {
+        block_index: Option<u64>,
+    },
+    AnthropicTextBlockStartEmpty {
+        block_index: Option<u64>,
+    },
     AnthropicTextBlockStartWithInitialText {
         initial_text: String,
         stripped_start_json: serde_json::Value,
-        block_index: serde_json::Value,
+        block_index_val: serde_json::Value,
+        block_index: Option<u64>,
     },
-    AnthropicContentBlockStop,
-    NonFlushPassthrough,
-    FlushAndPassthrough,
+    AnthropicToolUseBlockStart {
+        block_index: Option<u64>,
+    },
+    AnthropicContentBlockStop {
+        block_index: Option<u64>,
+    },
+    AnthropicMessageEnd,
+    AnthropicPing,
+    ErrorEvent,
     MalformedOrAmbiguous,
 }
 
@@ -4517,13 +4559,28 @@ struct StreamingRedactionState {
     input: Pin<Box<dyn Stream<Item = Bytes> + Send>>,
     mode: StreamRedactionMode,
     sse_line_state: SseLineState,
+    sse_protocol: SseProtocol,
+    openai_content_finished: bool,
+    openai_done_seen: bool,
+    anthropic_block_state: AnthropicBlockState,
     raw_buffer: String,
     pending_event_line: Option<String>,
     pending_deltas: std::collections::VecDeque<PendingDelta>,
+    buffered_chars: usize,
+    content_suppressed: bool,
+    stream_failed_closed: bool,
     deferred_events: Vec<(Option<String>, String)>,
     out_queue: std::collections::VecDeque<Bytes>,
     swallow_next_blank: bool,
     eof: bool,
+}
+
+fn has_sensitive_regex(config: &Config) -> bool {
+    config
+        .policy
+        .sensitive_patterns
+        .iter()
+        .any(|p| !p.pattern.is_empty())
 }
 
 fn apply_streaming_redaction(
@@ -4541,14 +4598,22 @@ fn apply_streaming_redaction(
         .max()
         .unwrap_or(0);
     let effective_window = base_window.max(min_canary_window);
+    let sensitive_regex_enabled = has_sensitive_regex(&config);
 
     let init_state = StreamingRedactionState {
         input: Box::pin(input) as Pin<Box<dyn Stream<Item = Bytes> + Send>>,
         mode: StreamRedactionMode::Undetermined,
         sse_line_state: SseLineState::Normal,
+        sse_protocol: SseProtocol::Undetermined,
+        openai_content_finished: false,
+        openai_done_seen: false,
+        anthropic_block_state: AnthropicBlockState::Idle,
         raw_buffer: String::new(),
         pending_event_line: None,
         pending_deltas: std::collections::VecDeque::new(),
+        buffered_chars: 0,
+        content_suppressed: false,
+        stream_failed_closed: false,
         deferred_events: Vec::new(),
         out_queue: std::collections::VecDeque::new(),
         swallow_next_blank: false,
@@ -4569,7 +4634,29 @@ fn apply_streaming_redaction(
 
                 match state.input.next().await {
                     Some(chunk) => {
+                        if state.stream_failed_closed {
+                            state.raw_buffer.clear();
+                            continue;
+                        }
+                        if state.mode == StreamRedactionMode::PlainText && state.content_suppressed
+                        {
+                            state.raw_buffer.clear();
+                            continue;
+                        }
+
                         let chunk_str = String::from_utf8_lossy(&chunk);
+                        if state.mode == StreamRedactionMode::PlainText {
+                            let new_total = state
+                                .raw_buffer
+                                .chars()
+                                .count()
+                                .saturating_add(chunk_str.chars().count());
+                            if new_total > MAX_STREAM_REDACTION_BUFFER_CHARS {
+                                state.raw_buffer.clear();
+                                state.content_suppressed = true;
+                                continue;
+                            }
+                        }
                         state.raw_buffer.push_str(&chunk_str);
 
                         if state.mode == StreamRedactionMode::Undetermined {
@@ -4598,22 +4685,31 @@ fn apply_streaming_redaction(
 
                         match state.mode {
                             StreamRedactionMode::PlainText => {
-                                let scan = scanner.scan_and_redact(&state.raw_buffer, &config);
-                                let active_right_edge = !scan.redactions.is_empty()
-                                    && scan.content.ends_with("[REDACTED]")
-                                    && state.raw_buffer.chars().count()
-                                        < MAX_STREAM_REDACTION_BUFFER_CHARS;
-                                if !active_right_edge {
-                                    let redacted = scan.content;
-                                    let redacted_len = redacted.chars().count();
-                                    let hold = effective_window
-                                        .max(longest_canary_prefix_at_end(&redacted, &config));
-                                    if redacted_len > hold {
-                                        let cut = redacted_len - hold;
-                                        let emit = head_chars(&redacted, cut);
-                                        state.raw_buffer = tail_chars(&redacted, hold);
-                                        if !emit.is_empty() {
-                                            state.out_queue.push_back(Bytes::from(emit));
+                                if state.raw_buffer.chars().count()
+                                    > MAX_STREAM_REDACTION_BUFFER_CHARS
+                                {
+                                    state.raw_buffer.clear();
+                                    state.content_suppressed = true;
+                                    continue;
+                                }
+                                if !sensitive_regex_enabled {
+                                    let scan = scanner.scan_and_redact(&state.raw_buffer, &config);
+                                    let active_right_edge = !scan.redactions.is_empty()
+                                        && scan.content.ends_with("[REDACTED]")
+                                        && state.raw_buffer.chars().count()
+                                            < MAX_STREAM_REDACTION_BUFFER_CHARS;
+                                    if !active_right_edge {
+                                        let redacted = scan.content;
+                                        let redacted_len = redacted.chars().count();
+                                        let hold = effective_window
+                                            .max(longest_canary_prefix_at_end(&redacted, &config));
+                                        if redacted_len > hold {
+                                            let cut = redacted_len - hold;
+                                            let emit = head_chars(&redacted, cut);
+                                            state.raw_buffer = tail_chars(&redacted, hold);
+                                            if !emit.is_empty() {
+                                                state.out_queue.push_back(Bytes::from(emit));
+                                            }
                                         }
                                     }
                                 }
@@ -4624,6 +4720,7 @@ fn apply_streaming_redaction(
                                     scanner.as_ref(),
                                     &config,
                                     effective_window,
+                                    sensitive_regex_enabled,
                                 );
                             }
                             StreamRedactionMode::Undetermined => {}
@@ -4645,7 +4742,13 @@ fn apply_streaming_redaction(
 
                         match state.mode {
                             StreamRedactionMode::PlainText => {
-                                if !state.raw_buffer.is_empty() {
+                                if state.content_suppressed
+                                    || state.raw_buffer.chars().count()
+                                        > MAX_STREAM_REDACTION_BUFFER_CHARS
+                                {
+                                    state.raw_buffer.clear();
+                                    state.content_suppressed = true;
+                                } else if !state.raw_buffer.is_empty() {
                                     let redacted =
                                         scanner.scan_and_redact(&state.raw_buffer, &config).content;
                                     state.raw_buffer.clear();
@@ -4658,8 +4761,16 @@ fn apply_streaming_redaction(
                                 if state.sse_line_state == SseLineState::DiscardingOverlongLine
                                     || !state.raw_buffer.trim().is_empty()
                                     || state.pending_event_line.take().is_some()
+                                    || state.stream_failed_closed
+                                    || !state.pending_deltas.is_empty()
+                                    || matches!(
+                                        state.anthropic_block_state,
+                                        AnthropicBlockState::TextOpen { .. }
+                                            | AnthropicBlockState::ToolUseOpen { .. }
+                                    )
                                 {
-                                    // Overlong/incomplete trailing SSE line or unpaired event: fails closed.
+                                    // Overlong/incomplete trailing SSE line, unpaired event:, or
+                                    // unterminated content segment without logical terminal boundary fails closed.
                                     state.raw_buffer.clear();
                                     fail_closed_sse_state(&mut state);
                                 } else {
@@ -4682,7 +4793,10 @@ fn apply_streaming_redaction(
 fn fail_closed_sse_state(state: &mut StreamingRedactionState) {
     state.pending_event_line = None;
     state.pending_deltas.clear();
+    state.buffered_chars = 0;
     state.deferred_events.clear();
+    state.content_suppressed = true;
+    state.stream_failed_closed = true;
     state.swallow_next_blank = true;
 }
 
@@ -4691,8 +4805,13 @@ fn drain_sse_redaction_lines(
     scanner: &dyn OutputScanner,
     config: &Config,
     effective_window: usize,
+    sensitive_regex_enabled: bool,
 ) {
     loop {
+        if state.stream_failed_closed {
+            state.raw_buffer.clear();
+            return;
+        }
         if state.sse_line_state == SseLineState::DiscardingOverlongLine {
             if let Some(newline_pos) = state.raw_buffer.find('\n') {
                 state.raw_buffer.drain(..=newline_pos);
@@ -4712,7 +4831,14 @@ fn drain_sse_redaction_lines(
             }
             let line = state.raw_buffer[..newline_pos].to_string();
             state.raw_buffer.drain(..=newline_pos);
-            process_sse_redaction_line(state, &line, scanner, config, effective_window);
+            process_sse_redaction_line(
+                state,
+                &line,
+                scanner,
+                config,
+                effective_window,
+                sensitive_regex_enabled,
+            );
         } else {
             if state.raw_buffer.chars().count() > MAX_SSE_RAW_LINE_CHARS {
                 state.raw_buffer.clear();
@@ -4730,7 +4856,12 @@ fn process_sse_redaction_line(
     scanner: &dyn OutputScanner,
     config: &Config,
     effective_window: usize,
+    sensitive_regex_enabled: bool,
 ) {
+    if state.stream_failed_closed {
+        return;
+    }
+
     let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
     let trimmed = line.trim();
 
@@ -4755,10 +4886,7 @@ fn process_sse_redaction_line(
     if trimmed.starts_with("event:") {
         if state.pending_event_line.is_some() {
             // Two consecutive event: lines without data: is malformed SSE framing.
-            state.pending_event_line = None;
-            state.pending_deltas.clear();
-            state.deferred_events.clear();
-            state.swallow_next_blank = true;
+            fail_closed_sse_state(state);
             return;
         }
         state.pending_event_line = Some(line.to_string());
@@ -4773,6 +4901,16 @@ fn process_sse_redaction_line(
         let data_trimmed = raw_data.trim();
 
         if data_trimmed == "[DONE]" {
+            if event_line.is_some()
+                || state.sse_protocol == SseProtocol::Anthropic
+                || state.openai_done_seen
+            {
+                fail_closed_sse_state(state);
+                return;
+            }
+            state.sse_protocol = SseProtocol::OpenAi;
+            state.openai_content_finished = true;
+            state.openai_done_seen = true;
             flush_sse_pending(state, scanner, config);
             emit_passthrough_sse_event(state, event_line, line, scanner, config);
             return;
@@ -4783,9 +4921,7 @@ fn process_sse_redaction_line(
             Ok(v) if v.is_object() => v,
             _ => {
                 // Fail closed on malformed/non-object JSON in SSE data line.
-                state.pending_deltas.clear();
-                state.deferred_events.clear();
-                state.swallow_next_blank = true;
+                fail_closed_sse_state(state);
                 return;
             }
         };
@@ -4794,18 +4930,27 @@ fn process_sse_redaction_line(
             SseL5aAction::OpenAiContentDelta {
                 content,
                 has_finish,
+                has_role,
             } => {
+                if state.sse_protocol == SseProtocol::Anthropic
+                    || state.openai_done_seen
+                    || state.openai_content_finished
+                    || !state.deferred_events.is_empty()
+                {
+                    fail_closed_sse_state(state);
+                    return;
+                }
+                state.sse_protocol = SseProtocol::OpenAi;
+
                 if content.is_empty() {
-                    let has_role = json
-                        .get("choices")
-                        .and_then(|c| c.get(0))
-                        .and_then(|c| c.get("delta"))
-                        .and_then(|d| d.get("role"))
-                        .is_some_and(|v| v.is_string());
                     if has_finish {
+                        state.openai_content_finished = true;
                         flush_sse_pending(state, scanner, config);
                         emit_passthrough_sse_event(state, event_line, line, scanner, config);
-                    } else if state.pending_deltas.is_empty() && has_role {
+                    } else if state.pending_deltas.is_empty()
+                        && has_role
+                        && !state.content_suppressed
+                    {
                         emit_passthrough_sse_event(state, event_line, line, scanner, config);
                     } else {
                         state.swallow_next_blank = true;
@@ -4813,51 +4958,172 @@ fn process_sse_redaction_line(
                     return;
                 }
 
-                state.pending_deltas.push_back(PendingDelta {
-                    text: content,
-                    event_line,
-                    template: json,
-                    kind: DeltaKind::OpenAi,
-                });
-                state.swallow_next_blank = true;
-
-                if has_finish {
-                    flush_sse_pending(state, scanner, config);
-                } else {
-                    emit_window_ready_deltas(state, scanner, config, effective_window);
-                }
+                push_sse_content_delta(
+                    state,
+                    PendingDelta {
+                        text: content,
+                        event_line,
+                        template: json,
+                        kind: DeltaKind::OpenAi,
+                    },
+                    has_finish,
+                    scanner,
+                    config,
+                    effective_window,
+                    sensitive_regex_enabled,
+                );
             }
             SseL5aAction::OpenAiEmptyDeltaNoFinish { has_role } => {
-                if has_role || state.pending_deltas.is_empty() {
+                if state.sse_protocol == SseProtocol::Anthropic
+                    || state.openai_done_seen
+                    || state.openai_content_finished
+                {
+                    fail_closed_sse_state(state);
+                    return;
+                }
+                state.sse_protocol = SseProtocol::OpenAi;
+                if (has_role || state.pending_deltas.is_empty())
+                    && state.deferred_events.is_empty()
+                    && !state.content_suppressed
+                {
                     emit_passthrough_sse_event(state, event_line, line, scanner, config);
                 } else {
                     state.swallow_next_blank = true;
                 }
             }
-            SseL5aAction::AnthropicTextDelta { text } => {
-                if text.is_empty() && state.pending_deltas.is_empty() {
-                    emit_passthrough_sse_event(state, event_line, line, scanner, config);
+            SseL5aAction::OpenAiFinishChunk { choice_index } => {
+                if state.sse_protocol == SseProtocol::Anthropic || state.openai_done_seen {
+                    fail_closed_sse_state(state);
                     return;
                 }
-                if !text.is_empty() {
-                    state.pending_deltas.push_back(PendingDelta {
-                        text,
-                        event_line,
-                        template: json,
-                        kind: DeltaKind::Anthropic,
-                    });
+                state.sse_protocol = SseProtocol::OpenAi;
+                if choice_index == 0 {
+                    if state.openai_content_finished {
+                        fail_closed_sse_state(state);
+                        return;
+                    }
+                    state.openai_content_finished = true;
+                    flush_sse_pending(state, scanner, config);
+                    emit_passthrough_sse_event(state, event_line, line, scanner, config);
+                } else {
+                    if !state.pending_deltas.is_empty() || state.content_suppressed {
+                        fail_closed_sse_state(state);
+                        return;
+                    }
+                    emit_passthrough_sse_event(state, event_line, line, scanner, config);
                 }
-                state.swallow_next_blank = true;
-                emit_window_ready_deltas(state, scanner, config, effective_window);
             }
-            SseL5aAction::AnthropicTextBlockStartEmpty => {
+            SseL5aAction::OpenAiToolCallsDelta {
+                has_finish,
+                choice_index,
+            } => {
+                if state.sse_protocol == SseProtocol::Anthropic || state.openai_done_seen {
+                    fail_closed_sse_state(state);
+                    return;
+                }
+                state.sse_protocol = SseProtocol::OpenAi;
+                if has_finish {
+                    if choice_index == 0 {
+                        if state.openai_content_finished {
+                            fail_closed_sse_state(state);
+                            return;
+                        }
+                        state.openai_content_finished = true;
+                    }
+                    flush_sse_pending(state, scanner, config);
+                    emit_passthrough_sse_event(state, event_line, line, scanner, config);
+                } else if state.pending_deltas.is_empty()
+                    && state.deferred_events.is_empty()
+                    && !state.content_suppressed
+                {
+                    emit_passthrough_sse_event(state, event_line, line, scanner, config);
+                } else {
+                    if state.deferred_events.len() >= MAX_DEFERRED_SSE_EVENTS {
+                        fail_closed_sse_state(state);
+                        return;
+                    }
+                    state.deferred_events.push((event_line, line.to_string()));
+                    state.swallow_next_blank = true;
+                }
+            }
+            SseL5aAction::OpenAiEmptyChoices => {
+                if state.sse_protocol == SseProtocol::Anthropic || state.openai_done_seen {
+                    fail_closed_sse_state(state);
+                    return;
+                }
+                state.sse_protocol = SseProtocol::OpenAi;
+                state.openai_content_finished = true;
+                if state.pending_deltas.is_empty()
+                    && state.deferred_events.is_empty()
+                    && !state.content_suppressed
+                {
+                    emit_passthrough_sse_event(state, event_line, line, scanner, config);
+                } else {
+                    if state.deferred_events.len() >= MAX_DEFERRED_SSE_EVENTS {
+                        fail_closed_sse_state(state);
+                        return;
+                    }
+                    state.deferred_events.push((event_line, line.to_string()));
+                    state.swallow_next_blank = true;
+                }
+            }
+            SseL5aAction::OpenAiMultiChoiceNonContent => {
+                if state.sse_protocol == SseProtocol::Anthropic
+                    || state.openai_done_seen
+                    || !state.pending_deltas.is_empty()
+                    || state.content_suppressed
+                {
+                    fail_closed_sse_state(state);
+                    return;
+                }
+                state.sse_protocol = SseProtocol::OpenAi;
+                emit_passthrough_sse_event(state, event_line, line, scanner, config);
+            }
+            SseL5aAction::AnthropicMessageStart => {
+                if state.sse_protocol == SseProtocol::OpenAi
+                    || state.anthropic_block_state != AnthropicBlockState::Idle
+                    || !state.pending_deltas.is_empty()
+                {
+                    fail_closed_sse_state(state);
+                    return;
+                }
+                state.sse_protocol = SseProtocol::Anthropic;
+                emit_passthrough_sse_event(state, event_line, line, scanner, config);
+            }
+            SseL5aAction::AnthropicTextBlockStartEmpty { block_index } => {
+                if state.sse_protocol == SseProtocol::OpenAi
+                    || !matches!(
+                        state.anthropic_block_state,
+                        AnthropicBlockState::Idle | AnthropicBlockState::BlockClosed
+                    )
+                    || !state.pending_deltas.is_empty()
+                {
+                    fail_closed_sse_state(state);
+                    return;
+                }
+                state.sse_protocol = SseProtocol::Anthropic;
+                state.anthropic_block_state = AnthropicBlockState::TextOpen { index: block_index };
                 emit_passthrough_sse_event(state, event_line, line, scanner, config);
             }
             SseL5aAction::AnthropicTextBlockStartWithInitialText {
                 initial_text,
                 stripped_start_json,
+                block_index_val,
                 block_index,
             } => {
+                if state.sse_protocol == SseProtocol::OpenAi
+                    || !matches!(
+                        state.anthropic_block_state,
+                        AnthropicBlockState::Idle | AnthropicBlockState::BlockClosed
+                    )
+                    || !state.pending_deltas.is_empty()
+                {
+                    fail_closed_sse_state(state);
+                    return;
+                }
+                state.sse_protocol = SseProtocol::Anthropic;
+                state.anthropic_block_state = AnthropicBlockState::TextOpen { index: block_index };
+
                 let stripped_line = format!(
                     "data: {}",
                     serde_json::to_string(&stripped_start_json).unwrap_or_default()
@@ -4865,41 +5131,196 @@ fn process_sse_redaction_line(
                 emit_passthrough_sse_event(state, event_line, &stripped_line, scanner, config);
                 let synth_template = serde_json::json!({
                     "type": "content_block_delta",
-                    "index": block_index,
+                    "index": block_index_val,
                     "delta": {
                         "type": "text_delta",
                         "text": ""
                     }
                 });
-                state.pending_deltas.push_back(PendingDelta {
-                    text: initial_text,
-                    event_line: Some("event: content_block_delta".to_string()),
-                    template: synth_template,
-                    kind: DeltaKind::Anthropic,
-                });
-                state.swallow_next_blank = true;
-                emit_window_ready_deltas(state, scanner, config, effective_window);
+                push_sse_content_delta(
+                    state,
+                    PendingDelta {
+                        text: initial_text,
+                        event_line: Some("event: content_block_delta".to_string()),
+                        template: synth_template,
+                        kind: DeltaKind::Anthropic,
+                    },
+                    false,
+                    scanner,
+                    config,
+                    effective_window,
+                    sensitive_regex_enabled,
+                );
             }
-            SseL5aAction::AnthropicContentBlockStop => {
-                if has_active_boundary_candidate(&state.pending_deltas, scanner, config) {
-                    state.deferred_events.push((event_line, line.to_string()));
-                    state.swallow_next_blank = true;
-                } else {
-                    flush_sse_pending(state, scanner, config);
-                    emit_passthrough_sse_event(state, event_line, line, scanner, config);
+            SseL5aAction::AnthropicToolUseBlockStart { block_index } => {
+                if state.sse_protocol == SseProtocol::OpenAi
+                    || !matches!(
+                        state.anthropic_block_state,
+                        AnthropicBlockState::Idle | AnthropicBlockState::BlockClosed
+                    )
+                    || !state.pending_deltas.is_empty()
+                {
+                    fail_closed_sse_state(state);
+                    return;
                 }
-            }
-            SseL5aAction::NonFlushPassthrough => {
+                state.sse_protocol = SseProtocol::Anthropic;
+                state.anthropic_block_state =
+                    AnthropicBlockState::ToolUseOpen { index: block_index };
                 emit_passthrough_sse_event(state, event_line, line, scanner, config);
             }
-            SseL5aAction::FlushAndPassthrough => {
-                flush_sse_pending(state, scanner, config);
+            SseL5aAction::AnthropicTextDelta { text, block_index } => {
+                if state.sse_protocol == SseProtocol::OpenAi {
+                    fail_closed_sse_state(state);
+                    return;
+                }
+                state.sse_protocol = SseProtocol::Anthropic;
+                match state.anthropic_block_state {
+                    AnthropicBlockState::Idle => {
+                        state.anthropic_block_state =
+                            AnthropicBlockState::TextOpen { index: block_index };
+                    }
+                    AnthropicBlockState::TextOpen { index } => {
+                        if let (Some(expected), Some(actual)) = (index, block_index) {
+                            if expected != actual {
+                                fail_closed_sse_state(state);
+                                return;
+                            }
+                        }
+                    }
+                    AnthropicBlockState::ToolUseOpen { .. }
+                    | AnthropicBlockState::BlockClosed
+                    | AnthropicBlockState::MessageEnded => {
+                        fail_closed_sse_state(state);
+                        return;
+                    }
+                }
+
+                if text.is_empty() {
+                    if state.pending_deltas.is_empty() && !state.content_suppressed {
+                        emit_passthrough_sse_event(state, event_line, line, scanner, config);
+                    } else {
+                        state.swallow_next_blank = true;
+                    }
+                    return;
+                }
+                push_sse_content_delta(
+                    state,
+                    PendingDelta {
+                        text,
+                        event_line,
+                        template: json,
+                        kind: DeltaKind::Anthropic,
+                    },
+                    false,
+                    scanner,
+                    config,
+                    effective_window,
+                    sensitive_regex_enabled,
+                );
+            }
+            SseL5aAction::AnthropicInputJsonDelta { block_index } => {
+                if state.sse_protocol == SseProtocol::OpenAi || !state.pending_deltas.is_empty() {
+                    fail_closed_sse_state(state);
+                    return;
+                }
+                state.sse_protocol = SseProtocol::Anthropic;
+                match state.anthropic_block_state {
+                    AnthropicBlockState::Idle => {
+                        state.anthropic_block_state =
+                            AnthropicBlockState::ToolUseOpen { index: block_index };
+                    }
+                    AnthropicBlockState::ToolUseOpen { index } => {
+                        if let (Some(expected), Some(actual)) = (index, block_index) {
+                            if expected != actual {
+                                fail_closed_sse_state(state);
+                                return;
+                            }
+                        }
+                    }
+                    AnthropicBlockState::TextOpen { .. }
+                    | AnthropicBlockState::BlockClosed
+                    | AnthropicBlockState::MessageEnded => {
+                        fail_closed_sse_state(state);
+                        return;
+                    }
+                }
+                emit_passthrough_sse_event(state, event_line, line, scanner, config);
+            }
+            SseL5aAction::AnthropicContentBlockStop { block_index } => {
+                if state.sse_protocol == SseProtocol::OpenAi {
+                    fail_closed_sse_state(state);
+                    return;
+                }
+                state.sse_protocol = SseProtocol::Anthropic;
+                match state.anthropic_block_state {
+                    AnthropicBlockState::TextOpen { index } => {
+                        if let (Some(expected), Some(actual)) = (index, block_index) {
+                            if expected != actual {
+                                fail_closed_sse_state(state);
+                                return;
+                            }
+                        }
+                        state.anthropic_block_state = AnthropicBlockState::BlockClosed;
+                        flush_sse_pending(state, scanner, config);
+                        emit_passthrough_sse_event(state, event_line, line, scanner, config);
+                    }
+                    AnthropicBlockState::ToolUseOpen { index } => {
+                        if let (Some(expected), Some(actual)) = (index, block_index) {
+                            if expected != actual {
+                                fail_closed_sse_state(state);
+                                return;
+                            }
+                        }
+                        state.anthropic_block_state = AnthropicBlockState::BlockClosed;
+                        emit_passthrough_sse_event(state, event_line, line, scanner, config);
+                    }
+                    AnthropicBlockState::Idle
+                    | AnthropicBlockState::BlockClosed
+                    | AnthropicBlockState::MessageEnded => {
+                        fail_closed_sse_state(state);
+                    }
+                }
+            }
+            SseL5aAction::AnthropicMessageEnd => {
+                if state.sse_protocol == SseProtocol::OpenAi
+                    || matches!(
+                        state.anthropic_block_state,
+                        AnthropicBlockState::TextOpen { .. }
+                            | AnthropicBlockState::ToolUseOpen { .. }
+                    )
+                    || !state.pending_deltas.is_empty()
+                {
+                    fail_closed_sse_state(state);
+                    return;
+                }
+                state.sse_protocol = SseProtocol::Anthropic;
+                state.anthropic_block_state = AnthropicBlockState::MessageEnded;
+                emit_passthrough_sse_event(state, event_line, line, scanner, config);
+            }
+            SseL5aAction::AnthropicPing => {
+                if state.sse_protocol == SseProtocol::OpenAi {
+                    fail_closed_sse_state(state);
+                    return;
+                }
+                state.sse_protocol = SseProtocol::Anthropic;
+                emit_passthrough_sse_event(state, event_line, line, scanner, config);
+            }
+            SseL5aAction::ErrorEvent => {
+                if !state.pending_deltas.is_empty()
+                    || matches!(
+                        state.anthropic_block_state,
+                        AnthropicBlockState::TextOpen { .. }
+                    )
+                {
+                    state.pending_deltas.clear();
+                    state.buffered_chars = 0;
+                    state.deferred_events.clear();
+                    state.content_suppressed = true;
+                }
                 emit_passthrough_sse_event(state, event_line, line, scanner, config);
             }
             SseL5aAction::MalformedOrAmbiguous => {
-                state.pending_deltas.clear();
-                state.deferred_events.clear();
-                state.swallow_next_blank = true;
+                fail_closed_sse_state(state);
             }
         }
         return;
@@ -4907,9 +5328,7 @@ fn process_sse_redaction_line(
 
     if trimmed.starts_with("id:") || trimmed.starts_with("retry:") {
         if state.pending_event_line.take().is_some() {
-            state.pending_deltas.clear();
-            state.deferred_events.clear();
-            state.swallow_next_blank = true;
+            fail_closed_sse_state(state);
             return;
         }
         let redacted = scanner.scan_and_redact(line, config).content;
@@ -4921,10 +5340,109 @@ fn process_sse_redaction_line(
     }
 
     // Unknown/malformed line in SSE mode: fail closed.
-    state.pending_event_line = None;
-    state.pending_deltas.clear();
-    state.deferred_events.clear();
+    fail_closed_sse_state(state);
+}
+
+fn push_sse_content_delta(
+    state: &mut StreamingRedactionState,
+    delta: PendingDelta,
+    has_finish: bool,
+    scanner: &dyn OutputScanner,
+    config: &Config,
+    effective_window: usize,
+    sensitive_regex_enabled: bool,
+) {
+    if state.content_suppressed {
+        state.pending_deltas.clear();
+        state.buffered_chars = 0;
+        if has_finish && delta.kind == DeltaKind::OpenAi {
+            state.openai_content_finished = true;
+            emit_stripped_openai_finish_from_delta(state, &delta, scanner, config);
+        } else {
+            state.swallow_next_blank = true;
+        }
+        return;
+    }
+
+    let delta_chars = delta.text.chars().count();
+    let new_buffered = state.buffered_chars.saturating_add(delta_chars);
+    if new_buffered > MAX_STREAM_REDACTION_BUFFER_CHARS {
+        state.pending_deltas.clear();
+        state.buffered_chars = 0;
+        state.content_suppressed = true;
+        if has_finish && delta.kind == DeltaKind::OpenAi {
+            state.openai_content_finished = true;
+            emit_stripped_openai_finish_from_delta(state, &delta, scanner, config);
+        } else {
+            state.swallow_next_blank = true;
+        }
+        return;
+    }
+
+    state.buffered_chars = new_buffered;
+    if state.pending_deltas.len() >= MAX_PENDING_DELTA_SLOTS {
+        if let Some(back) = state.pending_deltas.back_mut() {
+            back.text.push_str(&delta.text);
+            if has_finish && delta.kind == DeltaKind::OpenAi {
+                if let Some(finish) = delta
+                    .template
+                    .get("choices")
+                    .and_then(|c| c.get(0))
+                    .and_then(|c| c.get("finish_reason"))
+                    .cloned()
+                {
+                    if let Some(choice) = back
+                        .template
+                        .get_mut("choices")
+                        .and_then(|c| c.get_mut(0))
+                        .and_then(|c| c.as_object_mut())
+                    {
+                        choice.insert("finish_reason".to_string(), finish);
+                    }
+                }
+            }
+        }
+    } else {
+        state.pending_deltas.push_back(delta);
+    }
     state.swallow_next_blank = true;
+
+    if has_finish {
+        state.openai_content_finished = true;
+        flush_sse_pending(state, scanner, config);
+    } else if !sensitive_regex_enabled {
+        emit_window_ready_deltas(state, scanner, config, effective_window);
+    }
+}
+
+fn emit_stripped_openai_finish_from_delta(
+    state: &mut StreamingRedactionState,
+    delta: &PendingDelta,
+    scanner: &dyn OutputScanner,
+    config: &Config,
+) {
+    flush_sse_pending(state, scanner, config);
+    let mut stripped = delta.template.clone();
+    if let Some(delta_obj) = stripped
+        .get_mut("choices")
+        .and_then(|c| c.get_mut(0))
+        .and_then(|c| c.get_mut("delta"))
+        .and_then(|d| d.as_object_mut())
+    {
+        delta_obj.clear();
+    }
+    let line = format!(
+        "data: {}",
+        serde_json::to_string(&stripped).unwrap_or_default()
+    );
+    emit_passthrough_sse_event(state, delta.event_line.clone(), &line, scanner, config);
+}
+
+fn parse_optional_block_index(json: &serde_json::Value) -> Result<Option<u64>, ()> {
+    match json.get("index") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(v) => v.as_u64().map(Some).ok_or(()),
+    }
 }
 
 fn classify_sse_json_for_l5a(event_line: Option<&str>, json: &serde_json::Value) -> SseL5aAction {
@@ -4936,7 +5454,7 @@ fn classify_sse_json_for_l5a(event_line: Option<&str>, json: &serde_json::Value)
             return SseL5aAction::MalformedOrAmbiguous;
         };
         if choices.is_empty() {
-            return SseL5aAction::FlushAndPassthrough;
+            return SseL5aAction::OpenAiEmptyChoices;
         }
         if choices.len() > 1 {
             for choice in choices {
@@ -4957,7 +5475,7 @@ fn classify_sse_json_for_l5a(event_line: Option<&str>, json: &serde_json::Value)
                     }
                 }
             }
-            return SseL5aAction::FlushAndPassthrough;
+            return SseL5aAction::OpenAiMultiChoiceNonContent;
         }
 
         let Some(choice_obj) = choices[0].as_object() else {
@@ -4965,6 +5483,13 @@ fn classify_sse_json_for_l5a(event_line: Option<&str>, json: &serde_json::Value)
         };
         if choice_obj.contains_key("message") || choice_obj.contains_key("text") {
             return SseL5aAction::MalformedOrAmbiguous;
+        }
+        let choice_index = match choice_obj.get("index") {
+            None | Some(serde_json::Value::Null) => 0,
+            Some(v) => match v.as_u64() {
+                Some(idx) => idx,
+                None => return SseL5aAction::MalformedOrAmbiguous,
+            },
         };
         if choice_obj
             .get("finish_reason")
@@ -4979,7 +5504,7 @@ fn classify_sse_json_for_l5a(event_line: Option<&str>, json: &serde_json::Value)
         match choice_obj.get("delta") {
             None | Some(serde_json::Value::Null) => {
                 if has_finish {
-                    SseL5aAction::FlushAndPassthrough
+                    SseL5aAction::OpenAiFinishChunk { choice_index }
                 } else {
                     SseL5aAction::OpenAiEmptyDeltaNoFinish { has_role: false }
                 }
@@ -5005,10 +5530,16 @@ fn classify_sse_json_for_l5a(event_line: Option<&str>, json: &serde_json::Value)
                         }
                         match delta_obj.get("content") {
                             None | Some(serde_json::Value::Null) => {
-                                return SseL5aAction::FlushAndPassthrough;
+                                return SseL5aAction::OpenAiToolCallsDelta {
+                                    has_finish,
+                                    choice_index,
+                                };
                             }
                             Some(serde_json::Value::String(s)) if s.is_empty() => {
-                                return SseL5aAction::FlushAndPassthrough;
+                                return SseL5aAction::OpenAiToolCallsDelta {
+                                    has_finish,
+                                    choice_index,
+                                };
                             }
                             _ => return SseL5aAction::MalformedOrAmbiguous,
                         }
@@ -5018,15 +5549,21 @@ fn classify_sse_json_for_l5a(event_line: Option<&str>, json: &serde_json::Value)
                 match delta_obj.get("content") {
                     None | Some(serde_json::Value::Null) => {
                         if has_finish {
-                            SseL5aAction::FlushAndPassthrough
+                            SseL5aAction::OpenAiFinishChunk { choice_index }
                         } else {
                             SseL5aAction::OpenAiEmptyDeltaNoFinish { has_role }
                         }
                     }
-                    Some(serde_json::Value::String(s)) => SseL5aAction::OpenAiContentDelta {
-                        content: s.clone(),
-                        has_finish,
-                    },
+                    Some(serde_json::Value::String(s)) => {
+                        if !s.is_empty() && choice_index != 0 {
+                            return SseL5aAction::MalformedOrAmbiguous;
+                        }
+                        SseL5aAction::OpenAiContentDelta {
+                            content: s.clone(),
+                            has_finish,
+                            has_role,
+                        }
+                    }
                     Some(_) => SseL5aAction::MalformedOrAmbiguous,
                 }
             }
@@ -5050,6 +5587,9 @@ fn classify_sse_json_for_l5a(event_line: Option<&str>, json: &serde_json::Value)
 
         match ev_name.or(json_type) {
             Some("content_block_delta") => {
+                let Ok(block_index) = parse_optional_block_index(json) else {
+                    return SseL5aAction::MalformedOrAmbiguous;
+                };
                 let Some(delta_obj) = json.get("delta").and_then(|d| d.as_object()) else {
                     return SseL5aAction::MalformedOrAmbiguous;
                 };
@@ -5060,18 +5600,22 @@ fn classify_sse_json_for_l5a(event_line: Option<&str>, json: &serde_json::Value)
                         };
                         SseL5aAction::AnthropicTextDelta {
                             text: text.to_string(),
+                            block_index,
                         }
                     }
                     Some("input_json_delta") => {
                         if !delta_obj.get("partial_json").is_some_and(|v| v.is_string()) {
                             return SseL5aAction::MalformedOrAmbiguous;
                         }
-                        SseL5aAction::FlushAndPassthrough
+                        SseL5aAction::AnthropicInputJsonDelta { block_index }
                     }
                     _ => SseL5aAction::MalformedOrAmbiguous,
                 }
             }
             Some("content_block_start") => {
+                let Ok(block_index) = parse_optional_block_index(json) else {
+                    return SseL5aAction::MalformedOrAmbiguous;
+                };
                 let Some(cb_obj) = json.get("content_block").and_then(|c| c.as_object()) else {
                     return SseL5aAction::MalformedOrAmbiguous;
                 };
@@ -5081,45 +5625,50 @@ fn classify_sse_json_for_l5a(event_line: Option<&str>, json: &serde_json::Value)
                             return SseL5aAction::MalformedOrAmbiguous;
                         };
                         if text.is_empty() {
-                            SseL5aAction::AnthropicTextBlockStartEmpty
+                            SseL5aAction::AnthropicTextBlockStartEmpty { block_index }
                         } else {
                             let mut stripped = json.clone();
                             stripped["content_block"]["text"] =
                                 serde_json::Value::String(String::new());
-                            let block_index = json
+                            let block_index_val = json
                                 .get("index")
                                 .cloned()
                                 .unwrap_or_else(|| serde_json::Value::from(0));
                             SseL5aAction::AnthropicTextBlockStartWithInitialText {
                                 initial_text: text.to_string(),
                                 stripped_start_json: stripped,
+                                block_index_val,
                                 block_index,
                             }
                         }
                     }
-                    Some("tool_use") => SseL5aAction::FlushAndPassthrough,
+                    Some("tool_use") => SseL5aAction::AnthropicToolUseBlockStart { block_index },
                     _ => SseL5aAction::MalformedOrAmbiguous,
                 }
             }
-            Some("content_block_stop") => SseL5aAction::AnthropicContentBlockStop,
+            Some("content_block_stop") => {
+                let Ok(block_index) = parse_optional_block_index(json) else {
+                    return SseL5aAction::MalformedOrAmbiguous;
+                };
+                SseL5aAction::AnthropicContentBlockStop { block_index }
+            }
             Some("message_start") => {
                 if let Some(content) = json.get("message").and_then(|m| m.get("content")) {
                     if !content.as_array().is_some_and(|a| a.is_empty()) {
                         return SseL5aAction::MalformedOrAmbiguous;
                     }
                 }
-                SseL5aAction::NonFlushPassthrough
+                SseL5aAction::AnthropicMessageStart
             }
-            Some("ping") => SseL5aAction::NonFlushPassthrough,
-            Some("message_delta") | Some("message_stop") | Some("error") => {
-                SseL5aAction::FlushAndPassthrough
-            }
+            Some("ping") => SseL5aAction::AnthropicPing,
+            Some("message_delta") | Some("message_stop") => SseL5aAction::AnthropicMessageEnd,
+            Some("error") => SseL5aAction::ErrorEvent,
             None => {
                 if json
                     .as_object()
                     .is_some_and(|o| o.len() == 1 && o.contains_key("error"))
                 {
-                    SseL5aAction::FlushAndPassthrough
+                    SseL5aAction::ErrorEvent
                 } else {
                     SseL5aAction::MalformedOrAmbiguous
                 }
@@ -5127,22 +5676,6 @@ fn classify_sse_json_for_l5a(event_line: Option<&str>, json: &serde_json::Value)
             Some(_) => SseL5aAction::MalformedOrAmbiguous,
         }
     }
-}
-
-fn has_active_boundary_candidate(
-    pending_deltas: &std::collections::VecDeque<PendingDelta>,
-    scanner: &dyn OutputScanner,
-    config: &Config,
-) -> bool {
-    if pending_deltas.is_empty() {
-        return false;
-    }
-    let combined: String = pending_deltas.iter().map(|d| d.text.as_str()).collect();
-    let scan = scanner.scan_and_redact(&combined, config);
-    if !scan.redactions.is_empty() && scan.content.ends_with("[REDACTED]") {
-        return true;
-    }
-    longest_canary_prefix_at_end(&scan.content, config) > 0
 }
 
 fn emit_window_ready_deltas(
@@ -5180,6 +5713,7 @@ fn emit_window_ready_deltas(
         .map(|d| d.text.chars().count())
         .sum();
     if total_chars <= hold_chars {
+        state.buffered_chars = total_chars;
         return;
     }
 
@@ -5207,6 +5741,11 @@ fn emit_window_ready_deltas(
             releasable = 0;
         }
     }
+    state.buffered_chars = state
+        .pending_deltas
+        .iter()
+        .map(|d| d.text.chars().count())
+        .sum();
 }
 
 fn flush_sse_pending(
@@ -5214,7 +5753,10 @@ fn flush_sse_pending(
     scanner: &dyn OutputScanner,
     config: &Config,
 ) {
-    if !state.pending_deltas.is_empty() {
+    if state.content_suppressed {
+        state.pending_deltas.clear();
+        state.buffered_chars = 0;
+    } else if !state.pending_deltas.is_empty() {
         let combined: String = state
             .pending_deltas
             .iter()
@@ -5231,6 +5773,7 @@ fn flush_sse_pending(
                     .push_back(Bytes::from(format_pending_delta(&delta)));
             }
         }
+        state.buffered_chars = 0;
     }
 
     let deferred = std::mem::take(&mut state.deferred_events);

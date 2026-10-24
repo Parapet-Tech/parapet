@@ -5401,3 +5401,289 @@ async fn streaming_l5a_overlong_or_incomplete_sse_line_bounded_fail_closed() {
         "incomplete trailing SSE line without newline at EOF must fail closed: {out_incomplete_eof}"
     );
 }
+
+#[tokio::test]
+async fn streaming_l5a_sensitive_regex_exceeding_window_below_cap_redacts_without_prefix_leak() {
+    let mut regex_cfg = base_config_with_sensitive(r"BEGIN_SECRET_[A-Z0-9]+_END_SECRET");
+    regex_cfg.policy.layers.l5a = Some(LayerConfig {
+        mode: "redact".to_string(),
+        block_action: None,
+        window_chars: Some(64),
+    });
+    let config = Arc::new(regex_cfg);
+    let scanner: Arc<dyn OutputScanner> = Arc::new(L5aScanner);
+
+    // 4,096 'A' chars exceeds both window_override (64) and heuristic default (1,024), while < 64 KiB cap.
+    let body_segment = "A".repeat(64);
+    let segment_count = 64;
+
+    // 1. OpenAI SSE: verify no decoded content is released before terminal boundary, and full match redacts.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(128);
+    let input_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    let mut redacted_stream =
+        apply_streaming_redaction(input_stream, scanner.clone(), config.clone(), Some(64));
+
+    tx.send(Bytes::from(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"Before: \"}}]}\n\n",
+    ))
+    .await
+    .unwrap();
+    tx.send(Bytes::from(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"BEGIN_SECRET_\"}}]}\n\n",
+    ))
+    .await
+    .unwrap();
+    for _ in 0..segment_count {
+        tx.send(Bytes::from(format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{body_segment}\"}}}}]}}\n\n"
+        )))
+        .await
+        .unwrap();
+    }
+
+    // No decoded content chunk may be released before the logical terminal boundary.
+    let early = tokio::time::timeout(
+        std::time::Duration::from_millis(50),
+        redacted_stream.next(),
+    )
+    .await;
+    assert!(
+        early.is_err(),
+        "decoded content must not be released before logical terminal boundary when sensitive regex is enabled"
+    );
+
+    tx.send(Bytes::from(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"_END_SECRET\"}}]}\n\n",
+    ))
+    .await
+    .unwrap();
+    tx.send(Bytes::from(
+        "data: {\"choices\":[{\"delta\":{\"content\":\" :After\"}}]}\n\n",
+    ))
+    .await
+    .unwrap();
+    tx.send(Bytes::from("data: [DONE]\n\n")).await.unwrap();
+    drop(tx);
+
+    let mut openai_out = String::new();
+    while let Some(chunk) = redacted_stream.next().await {
+        openai_out.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    let openai_reassembled = reassemble_openai_sse_deltas(&openai_out);
+    assert_eq!(openai_reassembled, "Before: [REDACTED] :After");
+    assert!(!openai_out.contains("BEGIN_SECRET_"));
+    assert!(!openai_out.contains("AAAA"));
+    assert!(!openai_out.contains("_END_SECRET"));
+
+    // 2. Anthropic SSE: terminal-flushes at content_block_stop with no prefix leak.
+    let mut anth_chunks = vec![
+        Bytes::from("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"content\":[]}}\n\n"),
+        Bytes::from("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n"),
+        Bytes::from("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Before: BEGIN_SECRET_\"}}\n\n"),
+    ];
+    for _ in 0..segment_count {
+        anth_chunks.push(Bytes::from(format!(
+            "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{body_segment}\"}}}}\n\n"
+        )));
+    }
+    anth_chunks.push(Bytes::from(
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"_END_SECRET :After\"}}\n\n",
+    ));
+    anth_chunks.push(Bytes::from(
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+    ));
+    anth_chunks.push(Bytes::from(
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    ));
+
+    let anth_out = collect_stream(apply_streaming_redaction(
+        stream::iter(anth_chunks),
+        scanner.clone(),
+        config.clone(),
+        Some(64),
+    ))
+    .await;
+    assert!(anth_out.contains("Before: [REDACTED] :After"));
+    assert!(!anth_out.contains("BEGIN_SECRET_"));
+    assert!(!anth_out.contains("AAAA"));
+    assert!(!anth_out.contains("_END_SECRET"));
+    assert!(anth_out.contains("event: content_block_stop"));
+    assert!(anth_out.contains("event: message_stop"));
+
+    // 3. Plain-text streaming: buffers to EOF and redacts match exceeding window with no prefix leak.
+    let mut plain_chunks = vec![Bytes::from("Before: BEGIN_SECRET_")];
+    for _ in 0..segment_count {
+        plain_chunks.push(Bytes::from(body_segment.clone()));
+    }
+    plain_chunks.push(Bytes::from("_END_SECRET :After"));
+    let plain_out = collect_stream(apply_streaming_redaction(
+        stream::iter(plain_chunks),
+        scanner,
+        config,
+        Some(64),
+    ))
+    .await;
+    assert_eq!(plain_out, "Before: [REDACTED] :After");
+}
+
+#[tokio::test]
+async fn streaming_l5a_sensitive_regex_over_cap_suppresses_content_and_bounds_memory() {
+    struct BoundedSpyScanner {
+        inner: L5aScanner,
+        max_scanned_chars: std::sync::atomic::AtomicUsize,
+    }
+
+    impl OutputScanner for BoundedSpyScanner {
+        fn scan_and_redact(&self, content: &str, config: &Config) -> crate::layers::l5a::ScanResult {
+            let chars = content.chars().count();
+            self.max_scanned_chars
+                .fetch_max(chars, std::sync::atomic::Ordering::SeqCst);
+            self.inner.scan_and_redact(content, config)
+        }
+    }
+
+    let mut regex_cfg = base_config_with_sensitive(r"BEGIN_SECRET_[A-Z0-9]+_END_SECRET");
+    regex_cfg.policy.layers.l5a = Some(LayerConfig {
+        mode: "redact".to_string(),
+        block_action: None,
+        window_chars: Some(64),
+    });
+    let config = Arc::new(regex_cfg);
+    let spy = Arc::new(BoundedSpyScanner {
+        inner: L5aScanner,
+        max_scanned_chars: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let scanner: Arc<dyn OutputScanner> = spy.clone();
+
+    // Stream > 160 KiB of decoded content (> 2.5x MAX_STREAM_REDACTION_BUFFER_CHARS).
+    let chunk_payload = "A".repeat(8192);
+    let mut openai_chunks = vec![Bytes::from(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"BEGIN_SECRET_\"}}]}\n\n",
+    )];
+    for _ in 0..20 {
+        openai_chunks.push(Bytes::from(format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{chunk_payload}\"}}}}]}}\n\n"
+        )));
+    }
+    openai_chunks.push(Bytes::from(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"_END_SECRET\"}}]}\n\n",
+    ));
+    openai_chunks.push(Bytes::from(
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+    ));
+    openai_chunks.push(Bytes::from("data: [DONE]\n\n"));
+
+    let openai_out = collect_stream(apply_streaming_redaction(
+        stream::iter(openai_chunks),
+        scanner.clone(),
+        config.clone(),
+        Some(64),
+    ))
+    .await;
+    let openai_reassembled = reassemble_openai_sse_deltas(&openai_out);
+    assert!(
+        openai_reassembled.is_empty(),
+        "over-cap SSE segment must emit no decoded content: {openai_reassembled}"
+    );
+    assert!(!openai_out.contains("BEGIN_SECRET_"));
+    assert!(!openai_out.contains("AAAA"));
+    assert!(!openai_out.contains("_END_SECRET"));
+    assert!(
+        openai_out.contains("data: [DONE]"),
+        "bounded structural completion may remain: {openai_out}"
+    );
+    assert!(
+        spy.max_scanned_chars
+            .load(std::sync::atomic::Ordering::SeqCst)
+            <= MAX_STREAM_REDACTION_BUFFER_CHARS,
+        "scanner input must never exceed MAX_STREAM_REDACTION_BUFFER_CHARS"
+    );
+
+    // Plain-text over-cap stream drops content fail-closed and stays bounded.
+    let mut plain_chunks = vec![Bytes::from("BEGIN_SECRET_")];
+    for _ in 0..20 {
+        plain_chunks.push(Bytes::from(chunk_payload.clone()));
+    }
+    plain_chunks.push(Bytes::from("_END_SECRET"));
+    let plain_out = collect_stream(apply_streaming_redaction(
+        stream::iter(plain_chunks),
+        scanner,
+        config,
+        Some(64),
+    ))
+    .await;
+    assert!(
+        plain_out.is_empty(),
+        "over-cap plain-text stream with sensitive regex must emit no content: {plain_out}"
+    );
+    assert!(
+        spy.max_scanned_chars
+            .load(std::sync::atomic::Ordering::SeqCst)
+            <= MAX_STREAM_REDACTION_BUFFER_CHARS,
+        "plain-text scanner input must never exceed MAX_STREAM_REDACTION_BUFFER_CHARS"
+    );
+}
+
+#[tokio::test]
+async fn streaming_l5a_malformed_or_ambiguous_boundary_ordering_fails_closed() {
+    let mut regex_cfg = base_config_with_sensitive(r"BEGIN_SECRET_[A-Z0-9]+_END_SECRET");
+    regex_cfg.policy.layers.l5a = Some(LayerConfig {
+        mode: "redact".to_string(),
+        block_action: None,
+        window_chars: Some(64),
+    });
+    let config = Arc::new(regex_cfg);
+    let scanner: Arc<dyn OutputScanner> = Arc::new(L5aScanner);
+
+    // 1. OpenAI SSE stream truncated at EOF without finish_reason or [DONE] must not release buffered content
+    let truncated_openai = vec![
+        Bytes::from("data: {\"choices\":[{\"delta\":{\"content\":\"BEGIN_SECRET_PARTIAL\"}}]}\n\n"),
+    ];
+    let out_truncated = collect_stream(apply_streaming_redaction(
+        stream::iter(truncated_openai),
+        scanner.clone(),
+        config.clone(),
+        Some(64),
+    ))
+    .await;
+    assert!(
+        out_truncated.is_empty(),
+        "SSE stream truncated before logical terminal boundary must fail closed: {out_truncated}"
+    );
+
+    // 2. Anthropic message_stop without prior content_block_stop must fail closed and withhold buffered content
+    let missing_block_stop = vec![
+        Bytes::from("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n"),
+        Bytes::from("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"BEGIN_SECRET_PARTIAL\"}}\n\n"),
+        Bytes::from("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"),
+    ];
+    let out_missing_stop = collect_stream(apply_streaming_redaction(
+        stream::iter(missing_block_stop),
+        scanner.clone(),
+        config.clone(),
+        Some(64),
+    ))
+    .await;
+    assert!(
+        !out_missing_stop.contains("BEGIN_SECRET_PARTIAL"),
+        "Anthropic message_stop without content_block_stop must fail closed: {out_missing_stop}"
+    );
+
+    // 3. Content delta arriving after finish_reason must fail closed
+    let delta_after_finish = vec![
+        Bytes::from("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"),
+        Bytes::from("data: {\"choices\":[{\"delta\":{\"content\":\"LATE_CONTENT\"}}]}\n\n"),
+        Bytes::from("data: [DONE]\n\n"),
+    ];
+    let out_after_finish = collect_stream(apply_streaming_redaction(
+        stream::iter(delta_after_finish),
+        scanner,
+        config,
+        Some(64),
+    ))
+    .await;
+    assert!(
+        !out_after_finish.contains("LATE_CONTENT"),
+        "content delta after finish_reason must fail closed: {out_after_finish}"
+    );
+}
