@@ -1293,7 +1293,6 @@ impl EngineUpstreamClient {
                     "L5a streaming redaction active"
                 );
                 let diag_ctx = StreamL5aDiagnosticContext {
-                    request_id: Some(ctx.request_id.clone()),
                     contract_hash: Some(ctx.contract_hash.clone()),
                     provider: Some(ctx.provider_str),
                 };
@@ -4622,7 +4621,6 @@ impl StreamL5aSuppressionReason {
 
 #[derive(Clone, Debug, Default)]
 struct StreamL5aDiagnosticContext {
-    request_id: Option<String>,
     contract_hash: Option<String>,
     provider: Option<&'static str>,
 }
@@ -5027,13 +5025,11 @@ fn emit_stream_l5a_suppression_diagnostic(
     let sse_protocol = state.sse_protocol.as_str();
     let sensitive_regex_enabled = state.sensitive_regex_enabled;
 
-    if let (Some(request_id), Some(contract_hash), Some(provider)) = (
-        state.diag_ctx.request_id.as_deref(),
+    if let (Some(contract_hash), Some(provider)) = (
         state.diag_ctx.contract_hash.as_deref(),
         state.diag_ctx.provider,
     ) {
         tracing::warn!(
-            request_id = %request_id,
             contract_hash = %contract_hash,
             provider = provider,
             layer = "L5a",

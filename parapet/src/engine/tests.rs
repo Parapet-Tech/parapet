@@ -6003,6 +6003,10 @@ async fn streaming_l5a_diagnostics_emit_once_per_stream_reason_coded_and_non_sec
             sse_chunks,
         ));
         let engine = engine_with_http_sender(make_cfg(), sender);
+        let hostile_request_id =
+            format!("req-{secret_canary}-{secret_token}-{secret_url}-{secret_path}");
+        let mut req_headers = HeaderMap::new();
+        req_headers.insert("x-request-id", hostile_request_id.parse().unwrap());
         let req_body = serde_json::json!({
             "model": format!("gpt-4o-{secret_canary}-{secret_token}-{secret_url}-{secret_path}"),
             "stream": true,
@@ -6011,7 +6015,7 @@ async fn streaming_l5a_diagnostics_emit_once_per_stream_reason_coded_and_non_sec
         let req = ProxyRequest {
             method: Method::POST,
             uri: Uri::from_static("/v1/chat/completions"),
-            headers: HeaderMap::new(),
+            headers: req_headers,
             body: Bytes::from(serde_json::to_vec(&req_body).unwrap()),
         };
         let resp = engine.forward(Provider::OpenAi, req).await.unwrap();
@@ -6030,6 +6034,14 @@ async fn streaming_l5a_diagnostics_emit_once_per_stream_reason_coded_and_non_sec
         assert!(log.contains("reason_code=\"l5a_stream_decoded_content_over_cap\""));
         assert!(log.contains("detail=\"sse_decoded_content_over_cap\""));
         assert!(log.contains("stream_mode=\"sse\""));
+        assert!(
+            !log.contains("request_id="),
+            "diagnostic log must omit client-controlled request_id field: {log}"
+        );
+        assert!(
+            !log.contains(&hostile_request_id),
+            "diagnostic log must not contain raw x-request-id header material: {log}"
+        );
         assert!(
             !log.contains("model="),
             "diagnostic log must omit client-controlled model field: {log}"
