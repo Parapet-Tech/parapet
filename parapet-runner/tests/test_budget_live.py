@@ -4,6 +4,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 import pytest
 from parapet_runner.budget import CONTAINMENT_LIMIT, ResourceBudget, new_budgeted_executor
@@ -95,3 +96,13 @@ time.sleep(10)
 def test_live_exact_child_exit_and_environment(code):
     result, receipt = run_child(f'import os; assert os.environ["PARAPET_MAX_WORKERS"] == "2"; raise SystemExit({code})')
     assert result.returncode == code and receipt.exit_reason == ('ok' if code == 0 else 'nonzero')
+
+
+def test_live_echo_finishes_before_default_poll_interval():
+    executor = new_budgeted_executor(ResourceBudget(), no_lock=True)
+    start = time.monotonic()
+    result, receipt = executor.run_with_receipt(['/bin/echo', 'hi'])
+    elapsed = time.monotonic() - start
+    assert result.returncode == 0 and result.stdout == 'hi\n'
+    assert receipt.exit_reason == 'ok'
+    assert elapsed < 0.5

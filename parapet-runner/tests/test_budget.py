@@ -22,6 +22,8 @@ class Clock:
         return self.now
     def sleep(self, seconds):
         self.now += seconds
+    def wait(self, child, seconds):
+        self.sleep(seconds)
 
 
 class Host:
@@ -92,6 +94,31 @@ def executor(*, frames=({},), codes=(0,), host=None, lock=None, launcher=None, *
     return BudgetedExecutor(ResourceBudget(**limits), host=host or Host(),
         tree=Tree(frames), lock=lock, lease=LockJobLease(lock), clock=Clock(),
         launcher=launcher or Launcher(Child(codes)), signaler=Signals(), environ={'EXISTING': 'yes'})
+
+
+def test_immediate_child_exit_wakes_before_poll_interval():
+    e = executor(frames=({100: 1}, {}), codes=(None, 0))
+    waits = []
+    def wait(child, seconds):
+        waits.append((child, seconds))
+    def unexpected_sleep(seconds):
+        pytest.fail('immediately exiting child must not sleep')
+    e.clock.wait = wait
+    e.clock.sleep = unexpected_sleep
+    result, receipt = e.run_with_receipt(['cmd'])
+    assert result.returncode == 0 and receipt.exit_reason == 'ok'
+    assert waits == [(e.launcher.child, e.budget.poll_seconds)]
+    assert receipt.wall_seconds == 0
+
+
+def test_exited_child_keeps_sampling_live_descendants():
+    e = executor(frames=({101: 1}, {101: 1}, {}), codes=(0,))
+    def unexpected_wait(child, seconds):
+        pytest.fail('exited child must not cause a busy wait')
+    e.clock.wait = unexpected_wait
+    result, receipt = e.run_with_receipt(['cmd'])
+    assert result.returncode == 0 and receipt.exit_reason == 'ok'
+    assert receipt.wall_seconds == 2 * e.budget.poll_seconds
 
 
 def test_preflight_refuses_and_releases():

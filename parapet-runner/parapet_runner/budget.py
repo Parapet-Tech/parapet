@@ -104,6 +104,7 @@ class JobLockHeld(RuntimeError):
 class Clock(Protocol):
     def monotonic(self) -> float: ...
     def sleep(self, seconds: float) -> None: ...
+    def wait(self, child: Any, seconds: float) -> None: ...
 
 
 class ProcessLauncher(Protocol):
@@ -311,6 +312,11 @@ class SystemClock:
         return time.monotonic()
     def sleep(self, seconds: float) -> None:
         time.sleep(seconds)
+    def wait(self, child: Any, seconds: float) -> None:
+        try:
+            child.wait(timeout=seconds)
+        except subprocess.TimeoutExpired:
+            pass
 
 
 class PosixSignaler:
@@ -481,7 +487,12 @@ class BudgetedExecutor:
                             returncode = EXIT_CODES[reason]
                             break
                         remaining = budget.wall_seconds - elapsed
-                        self.clock.sleep(min(budget.poll_seconds, max(0, remaining)))
+                        interval = min(budget.poll_seconds, max(0, remaining))
+                        if returncode is None:
+                            self.clock.wait(child, interval)
+                        else:
+                            # A reaped child cannot wake us for its live descendants.
+                            self.clock.sleep(interval)
                 except BaseException:
                     receipt.exit_reason = "nonzero"
                     receipt.detail = "Execution interrupted or process probe failed; containment attempted"
