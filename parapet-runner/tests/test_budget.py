@@ -513,3 +513,78 @@ def test_short_cpu_child_accounted_in_job_receipt():
         assert result.returncode == 0
         assert receipt.cpu_user_s + receipt.cpu_sys_s >= 0.04
         assert receipt.cpu_user_s >= 0 and receipt.cpu_sys_s >= 0
+
+@pytest.mark.parametrize('subcmd', ['budget-run', 'run', 'eval'])
+def test_show_config_across_all_budgeted_commands(subcmd, capsys, monkeypatch):
+    monkeypatch.delenv('PARAPET_BUDGET_CONFIG', raising=False)
+    assert main([subcmd, '--max-rss', '512M', '--max-workers', '3', '--show-config']) == 0
+    resolved = json.loads(capsys.readouterr().out)
+    assert resolved['budget']['max_rss_bytes'] == 512 * 1024**2
+    assert resolved['budget']['max_workers'] == 3
+    assert resolved['sources']['max_workers'] == 'CLI flags'
+
+
+@pytest.mark.parametrize('subcmd,flag', [('run', '--curation-manifest'), ('eval', '--dataset')])
+def test_missing_required_execution_flags_exit_two_without_acquiring_lock(subcmd, flag, capsys, monkeypatch):
+    e = executor()
+    monkeypatch.setattr('parapet_runner.runner.executor_from_args', lambda args: e)
+    assert main([subcmd]) == 2
+    err = capsys.readouterr().err
+    assert flag in err and '--show-config' in err
+    assert not e.lease.held and not e.lock.released
+
+
+def test_budget_run_signal_exit_preserves_128_plus_signal(monkeypatch, capsys):
+    e = executor(codes=(-9,))
+    monkeypatch.setattr('parapet_runner.budget.executor_from_args', lambda args: e)
+    assert main(['budget-run', '--', 'cmd']) == 137
+    receipt = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert receipt['exit_reason'] == 'nonzero'
+
+
+def test_cli_eval_writes_budget_receipt_and_holds_lease(monkeypatch):
+    import yaml
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        dataset = base / 'dataset'
+        dataset.mkdir()
+        (dataset / 'split.yaml').write_text(
+            yaml.safe_dump([{'id': '1', 'label': 'malicious', 'content': 'attack text'}]),
+            encoding='utf-8',
+        )
+        eval_cfg = base / 'eval_config.yaml'
+        eval_cfg.write_text(yaml.safe_dump({'layers': {'L1': {'mode': 'block', 'threshold': 0.0}}}), encoding='utf-8')
+        out_dir = base / 'out'
+        lock_path = base / 'job.lock'
+        e = executor(lock=FileHostLock(lock_path))
+        other = executor(lock=FileHostLock(lock_path))
+
+        def run_eval(args, *, cwd=None):
+            # Verify lease is held while child runs and blocks second job
+            assert e.lease.held
+            assert other.run(['contending']).returncode == 124
+            out_idx = list(args).index('--output') + 1
+            Path(args[out_idx]).write_text(json.dumps({
+                'layers': [{'layer': 'l1', 'tp': 1, 'fp': 0, 'fn_count': 0, 'tn': 0,
+                            'precision': 1.0, 'recall': 1.0, 'f1': 1.0, 'total': 1}]
+            }), encoding='utf-8')
+            e.receipts.append(BudgetReceipt(budget=e.budget, peak_rss_bytes=4096, peak_processes=1))
+            from parapet_runner.baseline import CommandResult
+            return CommandResult(tuple(args), 0, '', '')
+
+        e.run = run_eval
+        monkeypatch.setattr('parapet_runner.runner.executor_from_args', lambda args: e)
+        rc = main([
+            'eval',
+            '--dataset', str(dataset),
+            '--output-dir', str(out_dir),
+            '--workspace-root', str(base),
+            '--eval-config', str(eval_cfg),
+            '--parapet-eval-bin', str(base / 'parapet-eval'),
+        ])
+        assert rc == 0
+        assert not e.lease.held
+        receipt_path = out_dir / 'budget_receipt.json'
+        assert receipt_path.exists()
+        receipt = BudgetReceipt.model_validate_json(receipt_path.read_text(encoding='utf-8'))
+        assert receipt.exit_reason == 'ok'

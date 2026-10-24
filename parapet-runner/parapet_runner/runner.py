@@ -1284,10 +1284,32 @@ def _parse_thresholds(raw: str) -> list[float]:
     return [float(value) for value in values]
 
 
+def _require_flags(
+    command: str,
+    args: argparse.Namespace,
+    required: Sequence[tuple[str, str]],
+) -> None:
+    missing = [flag for attr, flag in required if getattr(args, attr, None) is None]
+    if missing:
+        raise BudgetConfigError(
+            f"{command}: missing required arguments: {', '.join(missing)}; "
+            "supply them or pass --show-config"
+        )
+
+
 def _cli_run(args: argparse.Namespace) -> int:
     executor = executor_from_args(args)
     if args.show_config:
         return 0
+    _require_flags(
+        "run",
+        args,
+        (
+            ("curation_manifest", "--curation-manifest"),
+            ("train_config", "--train-config"),
+            ("output_dir", "--output-dir"),
+        ),
+    )
     with executor.job("parapet-runner") as job_receipt:
         curation_manifest_path = Path(args.curation_manifest).resolve()
         train_config_path = Path(args.train_config).resolve()
@@ -1427,9 +1449,9 @@ def _build_parser() -> argparse.ArgumentParser:
     guarded = subparsers.add_parser("budget-run", help="Run a command under a host budget")
     add_budget_flags(guarded, allow_no_lock=True)
     guarded.add_argument("child_command", nargs=argparse.REMAINDER)
-    run.add_argument("--curation-manifest", type=Path, required=True)
-    run.add_argument("--train-config", type=Path, required=True)
-    run.add_argument("--output-dir", type=Path, required=True)
+    run.add_argument("--curation-manifest", type=Path)
+    run.add_argument("--train-config", type=Path)
+    run.add_argument("--output-dir", type=Path)
     run.add_argument("--run-id", type=str)
     run.add_argument("--run-manifest-path", type=Path)
     run.add_argument("--workspace-root", type=Path)
@@ -1519,9 +1541,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     eval_cmd = subparsers.add_parser("eval", help="Run parapet-eval against a dataset directory")
-    eval_cmd.add_argument("--dataset", type=Path, required=True, help="Directory of YAML eval/staged files")
+    eval_cmd.add_argument("--dataset", type=Path, help="Directory of YAML eval/staged files")
     add_budget_flags(eval_cmd)
-    eval_cmd.add_argument("--output-dir", type=Path, required=True, help="Where to write results")
+    eval_cmd.add_argument("--output-dir", type=Path, help="Where to write results")
     eval_cmd.add_argument("--workspace-root", type=Path)
     eval_cmd.add_argument("--parapet-eval-bin", type=Path, default=Path("parapet/target/release/parapet-eval.exe"))
     eval_cmd.add_argument("--eval-config", type=Path, default=Path("schema/eval/eval_config_l1_only.yaml"))
@@ -1590,6 +1612,7 @@ def _cli_eval(args: argparse.Namespace) -> int:
     executor = executor_from_args(args)
     if args.show_config:
         return 0
+    _require_flags("eval", args, (("dataset", "--dataset"), ("output_dir", "--output-dir")))
     with executor.job("parapet-runner") as job_receipt:
         workspace_root = (
             Path(args.workspace_root).resolve()
