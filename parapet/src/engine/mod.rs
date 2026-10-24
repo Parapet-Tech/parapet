@@ -37,8 +37,8 @@ use crate::provider::{adapter_for, ProviderAdapter, ProviderType};
 use crate::proxy::{ProxyError, ProxyRequest, ProxyResponse, Provider, UpstreamClient};
 use crate::routing::{L0Evidence, NoopOrthogonalSensorRouter, OrthogonalSensorRouter, RoutingEvidenceContext};
 use crate::stream::{
-    AnthropicChunkClassifier, OpenAiChunkClassifier, StreamProcessor, ToolCallBlockMode,
-    ToolCallValidator, ValidationResult,
+    classify_initial_sse_str, decode_utf8_chunk, AnthropicChunkClassifier, InitialSseMode,
+    OpenAiChunkClassifier, StreamProcessor, ToolCallBlockMode, ToolCallValidator, ValidationResult,
 };
 use crate::signal::combiner::{DefaultVerdictCombiner, VerdictCombiner};
 use crate::signal::extractor::{DefaultSignalExtractor, SignalExtractor};
@@ -1263,6 +1263,8 @@ impl EngineUpstreamClient {
             HttpBody::Stream(s) => stream_body(s),
         };
 
+        let known_sse = !compressed_stream && is_event_stream_response(&upstream.headers);
+
         #[cfg(not(windows))]
         let processor = match (&self.envelope, capture) {
             (Some(envelope), Some(capture)) => StreamProcessor::with_envelope(
@@ -1272,9 +1274,11 @@ impl EngineUpstreamClient {
                 envelope.stream_session(capture, receipt_provider(provider)),
             ),
             _ => StreamProcessor::new(classifier, validator, block_mode),
-        };
+        }
+        .with_known_sse(known_sse);
         #[cfg(windows)]
-        let processor = StreamProcessor::new(classifier, validator, block_mode);
+        let processor =
+            StreamProcessor::new(classifier, validator, block_mode).with_known_sse(known_sse);
         let processed_stream = processor.process(stream);
 
         let redacted_stream = if let Some(layer) = &self.deps.config.policy.layers.l5a {
@@ -1288,11 +1292,12 @@ impl EngineUpstreamClient {
                     mode = "streaming",
                     "L5a streaming redaction active"
                 );
-                apply_streaming_redaction(
+                apply_streaming_redaction_with_mode(
                     processed_stream,
                     self.deps.output_scanner.clone(),
                     self.deps.config.clone(),
                     layer.window_chars,
+                    known_sse,
                 )
             } else {
                 Box::pin(processed_stream) as Pin<Box<dyn Stream<Item = Bytes> + Send>>
@@ -4339,6 +4344,17 @@ fn accepts_event_stream(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
+fn is_event_stream_response(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(reqwest::header::CONTENT_TYPE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .any(|v| {
+            let media_type = v.split(';').next().unwrap_or("").trim();
+            media_type.eq_ignore_ascii_case("text/event-stream")
+        })
+}
+
 fn force_identity_encoding_for_streaming(headers: &mut HeaderMap) {
     headers.insert(
         reqwest::header::ACCEPT_ENCODING,
@@ -4558,6 +4574,8 @@ enum SseL5aAction {
 struct StreamingRedactionState {
     input: Pin<Box<dyn Stream<Item = Bytes> + Send>>,
     mode: StreamRedactionMode,
+    utf8_tail: Vec<u8>,
+    bom_stripped: bool,
     sse_line_state: SseLineState,
     sse_protocol: SseProtocol,
     openai_content_finished: bool,
@@ -4583,11 +4601,22 @@ fn has_sensitive_regex(config: &Config) -> bool {
         .any(|p| !p.pattern.is_empty())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn apply_streaming_redaction(
     input: impl Stream<Item = Bytes> + Send + 'static,
     scanner: Arc<dyn OutputScanner>,
     config: Arc<Config>,
     window_override: Option<usize>,
+) -> Pin<Box<dyn Stream<Item = Bytes> + Send>> {
+    apply_streaming_redaction_with_mode(input, scanner, config, window_override, false)
+}
+
+fn apply_streaming_redaction_with_mode(
+    input: impl Stream<Item = Bytes> + Send + 'static,
+    scanner: Arc<dyn OutputScanner>,
+    config: Arc<Config>,
+    window_override: Option<usize>,
+    known_sse: bool,
 ) -> Pin<Box<dyn Stream<Item = Bytes> + Send>> {
     let base_window = window_override.unwrap_or_else(|| compute_redaction_window(&config));
     let min_canary_window = config
@@ -4602,7 +4631,13 @@ fn apply_streaming_redaction(
 
     let init_state = StreamingRedactionState {
         input: Box::pin(input) as Pin<Box<dyn Stream<Item = Bytes> + Send>>,
-        mode: StreamRedactionMode::Undetermined,
+        mode: if known_sse {
+            StreamRedactionMode::Sse
+        } else {
+            StreamRedactionMode::Undetermined
+        },
+        utf8_tail: Vec::new(),
+        bom_stripped: false,
         sse_line_state: SseLineState::Normal,
         sse_protocol: SseProtocol::Undetermined,
         openai_content_finished: false,
@@ -4636,15 +4671,20 @@ fn apply_streaming_redaction(
                     Some(chunk) => {
                         if state.stream_failed_closed {
                             state.raw_buffer.clear();
+                            state.utf8_tail.clear();
                             continue;
                         }
                         if state.mode == StreamRedactionMode::PlainText && state.content_suppressed
                         {
                             state.raw_buffer.clear();
+                            state.utf8_tail.clear();
                             continue;
                         }
 
-                        let chunk_str = String::from_utf8_lossy(&chunk);
+                        let chunk_str = decode_utf8_chunk(&mut state.utf8_tail, &chunk);
+                        if chunk_str.is_empty() {
+                            continue;
+                        }
                         if state.mode == StreamRedactionMode::PlainText {
                             let new_total = state
                                 .raw_buffer
@@ -4660,26 +4700,14 @@ fn apply_streaming_redaction(
                         state.raw_buffer.push_str(&chunk_str);
 
                         if state.mode == StreamRedactionMode::Undetermined {
-                            let trimmed = state.raw_buffer.trim_start();
-                            if trimmed.is_empty() {
-                                if state.raw_buffer.chars().count() <= MAX_SSE_RAW_LINE_CHARS {
-                                    continue;
+                            match classify_initial_sse_str(&state.raw_buffer, false) {
+                                InitialSseMode::NeedMore => continue,
+                                InitialSseMode::Sse => {
+                                    state.mode = StreamRedactionMode::Sse;
                                 }
-                                state.mode = StreamRedactionMode::PlainText;
-                            } else if trimmed.starts_with("data:")
-                                || trimmed.starts_with("event:")
-                                || trimmed.starts_with(':')
-                            {
-                                state.mode = StreamRedactionMode::Sse;
-                            } else if !trimmed.contains('\n')
-                                && ("data:".starts_with(trimmed) || "event:".starts_with(trimmed))
-                            {
-                                if state.raw_buffer.chars().count() <= MAX_SSE_RAW_LINE_CHARS {
-                                    continue;
+                                InitialSseMode::NonSse => {
+                                    state.mode = StreamRedactionMode::PlainText;
                                 }
-                                state.mode = StreamRedactionMode::Sse;
-                            } else {
-                                state.mode = StreamRedactionMode::PlainText;
                             }
                         }
 
@@ -4715,6 +4743,13 @@ fn apply_streaming_redaction(
                                 }
                             }
                             StreamRedactionMode::Sse => {
+                                if !state.bom_stripped && !state.raw_buffer.is_empty() {
+                                    if let Some(stripped) = state.raw_buffer.strip_prefix('\u{FEFF}')
+                                    {
+                                        state.raw_buffer = stripped.to_string();
+                                    }
+                                    state.bom_stripped = true;
+                                }
                                 drain_sse_redaction_lines(
                                     &mut state,
                                     scanner.as_ref(),
@@ -4728,16 +4763,31 @@ fn apply_streaming_redaction(
                     }
                     None => {
                         state.eof = true;
-                        if state.mode == StreamRedactionMode::Undetermined {
-                            let trimmed = state.raw_buffer.trim_start();
-                            state.mode = if trimmed.starts_with("data:")
-                                || trimmed.starts_with("event:")
-                                || trimmed.starts_with(':')
+                        if !state.utf8_tail.is_empty() {
+                            let tail = std::mem::take(&mut state.utf8_tail);
+                            if !state.stream_failed_closed
+                                && !(state.mode == StreamRedactionMode::PlainText
+                                    && state.content_suppressed)
                             {
-                                StreamRedactionMode::Sse
-                            } else {
-                                StreamRedactionMode::PlainText
+                                state.raw_buffer.push_str(&String::from_utf8_lossy(&tail));
+                            }
+                        }
+                        if state.mode == StreamRedactionMode::Undetermined {
+                            state.mode = match classify_initial_sse_str(&state.raw_buffer, true) {
+                                InitialSseMode::Sse => StreamRedactionMode::Sse,
+                                InitialSseMode::NonSse | InitialSseMode::NeedMore => {
+                                    StreamRedactionMode::PlainText
+                                }
                             };
+                        }
+                        if state.mode == StreamRedactionMode::Sse
+                            && !state.bom_stripped
+                            && !state.raw_buffer.is_empty()
+                        {
+                            if let Some(stripped) = state.raw_buffer.strip_prefix('\u{FEFF}') {
+                                state.raw_buffer = stripped.to_string();
+                            }
+                            state.bom_stripped = true;
                         }
 
                         match state.mode {
@@ -4866,6 +4916,10 @@ fn process_sse_redaction_line(
     let trimmed = line.trim();
 
     if trimmed.is_empty() {
+        if state.pending_event_line.take().is_some() {
+            fail_closed_sse_state(state);
+            return;
+        }
         if state.swallow_next_blank {
             state.swallow_next_blank = false;
         } else {
@@ -4875,6 +4929,10 @@ fn process_sse_redaction_line(
     }
 
     if trimmed.starts_with(':') {
+        if state.content_suppressed {
+            state.swallow_next_blank = true;
+            return;
+        }
         state.swallow_next_blank = false;
         let redacted = scanner.scan_and_redact(line, config).content;
         state
@@ -5327,8 +5385,8 @@ fn process_sse_redaction_line(
     }
 
     if trimmed.starts_with("id:") || trimmed.starts_with("retry:") {
-        if state.pending_event_line.take().is_some() {
-            fail_closed_sse_state(state);
+        if state.content_suppressed {
+            state.swallow_next_blank = true;
             return;
         }
         let redacted = scanner.scan_and_redact(line, config).content;

@@ -17,6 +17,7 @@ mod processor;
 mod types;
 
 pub use classifier::{AnthropicChunkClassifier, ChunkClassifier, OpenAiChunkClassifier};
+pub(crate) use classifier::{classify_initial_sse_str, decode_utf8_chunk, InitialSseMode};
 pub use processor::StreamProcessor;
 pub use types::{
     ToolCallBlockMode, ToolCallValidator, ValidationResult, MAX_TOOL_CALL_BUFFER_BYTES,

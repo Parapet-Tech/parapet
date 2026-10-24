@@ -1053,6 +1053,58 @@ mod parse_tests {
     fn is_sse_handles_invalid_utf8() {
         assert!(!is_sse_content(&[0xFF, 0xFE, 0x00]));
     }
+
+    #[test]
+    fn is_sse_detects_id_retry_comment_and_bom_prefixes() {
+        assert!(is_sse_content(b"id: 1\ndata: {\"test\": true}\n\n"));
+        assert!(is_sse_content(b"retry: 1500\ndata: {\"test\": true}\n\n"));
+        assert!(is_sse_content(b": keepalive\nid: 1\n"));
+        assert!(is_sse_content(b"\xEF\xBB\xBFid: 1\n"));
+        assert!(is_sse_content(b"\xEF\xBB\xBFretry: 500\n"));
+        assert!(is_sse_content(b"\xEF\xBB\xBFdata: {\"test\": true}\n"));
+    }
+}
+
+#[tokio::test]
+async fn sse_leading_id_retry_comment_bom_and_split_prefixes_validate_tool_calls() {
+    let validator = Arc::new(BlockAllValidator::new("policy denied"));
+
+    // Split UTF-8 BOM + split id: + split retry: + comment + Anthropic event/data with blocked tool_use
+    let chunks: Vec<Bytes> = vec![
+        Bytes::from_static(b"\xEF\xBB"),
+        Bytes::from_static(b"\xBF"),
+        Bytes::from_static(b"i"),
+        Bytes::from_static(b"d: evt-1\r\n"),
+        Bytes::from_static(b"re"),
+        Bytes::from_static(b"try: 1000\n"),
+        Bytes::from_static(b": keepalive\n\n"),
+        Bytes::from_static(b"ev"),
+        Bytes::from_static(
+            b"ent: content_block_start\nid: evt-2\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"exec_cmd\",\"input\":{}}}\n\n",
+        ),
+        Bytes::from_static(
+            b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"cmd\\\":\\\"rm -rf /\\\"}\"}}\n\n",
+        ),
+        Bytes::from_static(
+            b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        ),
+    ];
+
+    let processor = StreamProcessor::new(
+        Arc::new(AnthropicChunkClassifier),
+        validator,
+        ToolCallBlockMode::Rewrite,
+    );
+
+    let output = collect_output(processor.process(tokio_stream::iter(chunks))).await;
+    assert!(
+        output.contains("Tool 'exec_cmd' was blocked"),
+        "expected tool call rewrite after leading BOM/id/retry/comment/split prefix: {output}"
+    );
+    assert!(
+        !output.contains("rm -rf"),
+        "blocked tool arguments must not leak when stream starts with BOM/id/retry: {output}"
+    );
 }
 
 // ---------------------------------------------------------------------------

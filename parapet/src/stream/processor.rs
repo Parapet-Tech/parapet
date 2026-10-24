@@ -8,7 +8,9 @@
 // byte stream with text passed through immediately and tool calls
 // released after validation.
 
-use super::classifier::{is_sse_content, parse_sse_line, ChunkClassifier};
+use super::classifier::{
+    classify_initial_sse_bytes, decode_utf8_chunk, parse_sse_line, ChunkClassifier, InitialSseMode,
+};
 use super::types::{
     ChunkType, StreamError, ToolCallBlockMode, ToolCallBuffer, ToolCallValidator, ValidationResult,
     TOOL_CALL_DELTA_TIMEOUT_SECS,
@@ -34,6 +36,7 @@ pub struct StreamProcessor {
     classifier: Arc<dyn ChunkClassifier>,
     validator: Arc<dyn ToolCallValidator>,
     block_mode: ToolCallBlockMode,
+    known_sse: bool,
     /// Opt-in runtime envelope session; `None` for every existing constructor.
     #[cfg(not(windows))]
     envelope: std::sync::Mutex<Option<StreamEnvelopeSessionV0>>,
@@ -50,6 +53,7 @@ impl StreamProcessor {
             classifier,
             validator,
             block_mode,
+            known_sse: false,
             #[cfg(not(windows))]
             envelope: std::sync::Mutex::new(None),
         }
@@ -70,6 +74,13 @@ impl StreamProcessor {
         processor
     }
 
+    /// Bind SSE parsing directly when the upstream response is known to be an
+    /// uncompressed `text/event-stream`.
+    pub fn with_known_sse(mut self, known_sse: bool) -> Self {
+        self.known_sse = known_sse;
+        self
+    }
+
     /// Process an input byte stream, producing an output byte stream.
     ///
     /// Text content is passed through immediately. Tool call deltas are
@@ -86,29 +97,30 @@ impl StreamProcessor {
         let (tx, rx) = mpsc::channel::<Bytes>(64);
 
         let block_mode = self.block_mode;
+        let known_sse = self.known_sse;
 
         #[cfg(not(windows))]
         if let Some(session) = self.envelope.lock().expect("envelope slot").take() {
-            tokio::spawn(envelope_task(input, session, block_mode, tx));
+            tokio::spawn(envelope_task(input, session, block_mode, known_sse, tx));
             return ReceiverStream::new(rx);
         }
 
         tokio::spawn(async move {
-            // Accumulate the first chunk to detect SSE vs non-SSE
-            let first_chunk = match input.next().await {
-                Some(chunk) => chunk,
-                None => return, // Empty stream
+            let Some((is_sse, initial_chunks)) =
+                resolve_initial_sse_chunks(&mut input, known_sse).await
+            else {
+                return;
             };
 
-            // Check if this is an SSE stream
-            if !is_sse_content(&first_chunk) {
-                // Non-SSE: pass through everything
-                if tx.send(first_chunk).await.is_err() {
-                    return;
+            if !is_sse {
+                for chunk in initial_chunks {
+                    if tx.send(chunk).await.is_err() {
+                        return;
+                    }
                 }
                 while let Some(chunk) = input.next().await {
                     if tx.send(chunk).await.is_err() {
-                        break; // Client disconnected
+                        break;
                     }
                 }
                 return;
@@ -116,9 +128,18 @@ impl StreamProcessor {
 
             // SSE stream processing state
             let mut state = ProcessingState::new();
+            let mut utf8_tail = Vec::new();
+            let mut bom_stripped = false;
 
-            // Process first chunk
-            state.line_buffer.push_str(&String::from_utf8_lossy(&first_chunk));
+            // Process initial chunk(s)
+            for chunk in initial_chunks {
+                push_decoded_sse_chunk(
+                    &mut state.line_buffer,
+                    &mut utf8_tail,
+                    &mut bom_stripped,
+                    &chunk,
+                );
+            }
 
             // Drain and process complete lines
             if drain_lines(
@@ -128,8 +149,8 @@ impl StreamProcessor {
                 block_mode,
                 &tx,
             )
-                .await
-                .is_err()
+            .await
+            .is_err()
             {
                 return;
             }
@@ -151,9 +172,12 @@ impl StreamProcessor {
                     }
                 }
 
-                state
-                    .line_buffer
-                    .push_str(&String::from_utf8_lossy(&chunk));
+                push_decoded_sse_chunk(
+                    &mut state.line_buffer,
+                    &mut utf8_tail,
+                    &mut bom_stripped,
+                    &chunk,
+                );
 
                 if drain_lines(
                     &mut state,
@@ -162,10 +186,21 @@ impl StreamProcessor {
                     block_mode,
                     &tx,
                 )
-                    .await
-                    .is_err()
+                .await
+                .is_err()
                 {
                     return;
+                }
+            }
+
+            if !utf8_tail.is_empty() {
+                state
+                    .line_buffer
+                    .push_str(&String::from_utf8_lossy(&utf8_tail));
+                if !bom_stripped && !state.line_buffer.is_empty() {
+                    if let Some(stripped) = state.line_buffer.strip_prefix('\u{FEFF}') {
+                        state.line_buffer = stripped.to_string();
+                    }
                 }
             }
 
@@ -185,6 +220,54 @@ impl StreamProcessor {
         });
 
         ReceiverStream::new(rx)
+    }
+}
+
+async fn resolve_initial_sse_chunks(
+    input: &mut (impl Stream<Item = Bytes> + Unpin),
+    known_sse: bool,
+) -> Option<(bool, Vec<Bytes>)> {
+    let first_chunk = input.next().await?;
+    if known_sse {
+        return Some((true, vec![first_chunk]));
+    }
+    let mut pending_chunks = vec![first_chunk];
+    let mut raw_bytes = pending_chunks[0].to_vec();
+    loop {
+        match classify_initial_sse_bytes(&raw_bytes, false) {
+            InitialSseMode::Sse => return Some((true, pending_chunks)),
+            InitialSseMode::NonSse => return Some((false, pending_chunks)),
+            InitialSseMode::NeedMore => match input.next().await {
+                Some(next_chunk) => {
+                    raw_bytes.extend_from_slice(&next_chunk);
+                    pending_chunks.push(next_chunk);
+                }
+                None => {
+                    let is_sse =
+                        classify_initial_sse_bytes(&raw_bytes, true) == InitialSseMode::Sse;
+                    return Some((is_sse, pending_chunks));
+                }
+            },
+        }
+    }
+}
+
+fn push_decoded_sse_chunk(
+    line_buffer: &mut String,
+    utf8_tail: &mut Vec<u8>,
+    bom_stripped: &mut bool,
+    chunk: &[u8],
+) {
+    let decoded = decode_utf8_chunk(utf8_tail, chunk);
+    if decoded.is_empty() {
+        return;
+    }
+    line_buffer.push_str(&decoded);
+    if !*bom_stripped && !line_buffer.is_empty() {
+        if let Some(stripped) = line_buffer.strip_prefix('\u{FEFF}') {
+            *line_buffer = stripped.to_string();
+        }
+        *bom_stripped = true;
     }
 }
 
@@ -233,8 +316,11 @@ async fn drain_lines(
 ) -> Result<(), ()> {
     loop {
         if let Some(newline_pos) = state.line_buffer.find('\n') {
-            let line = state.line_buffer[..newline_pos].to_string();
-            state.line_buffer = state.line_buffer[newline_pos + 1..].to_string();
+            let line = state.line_buffer[..newline_pos]
+                .strip_suffix('\r')
+                .unwrap_or(&state.line_buffer[..newline_pos])
+                .to_string();
+            state.line_buffer.drain(..=newline_pos);
 
             process_single_line(line.as_str(), state, classifier, validator, block_mode, tx)
                 .await?;
@@ -273,6 +359,13 @@ async fn process_single_line(
     // whether to pass through or buffer.
     if trimmed.starts_with("event:") {
         state.pending_event_line = Some(line.to_string());
+        return Ok(());
+    }
+
+    if trimmed.starts_with(':') || trimmed.starts_with("id:") || trimmed.starts_with("retry:") {
+        if tx.send(Bytes::from(format!("{line}\n"))).await.is_err() {
+            return Err(());
+        }
         return Ok(());
     }
 
@@ -902,18 +995,24 @@ async fn envelope_task(
     mut input: impl Stream<Item = Bytes> + Unpin + Send + 'static,
     mut session: StreamEnvelopeSessionV0,
     block_mode: ToolCallBlockMode,
+    known_sse: bool,
     tx: mpsc::Sender<Bytes>,
 ) {
-    let Some(first_chunk) = input.next().await else {
+    let Some((is_sse, initial_chunks)) = resolve_initial_sse_chunks(&mut input, known_sse).await
+    else {
         session.finish();
         return;
     };
-    if !is_sse_content(&first_chunk) {
-        if tx.send(first_chunk).await.is_ok() {
-            while let Some(chunk) = input.next().await {
-                if tx.send(chunk).await.is_err() {
-                    break;
-                }
+    if !is_sse {
+        for chunk in initial_chunks {
+            if tx.send(chunk).await.is_err() {
+                session.finish();
+                return;
+            }
+        }
+        while let Some(chunk) = input.next().await {
+            if tx.send(chunk).await.is_err() {
+                break;
             }
         }
         session.finish();
@@ -927,12 +1026,23 @@ async fn envelope_task(
         decided: HashMap::new(),
         last_delta_time: Instant::now(),
     };
+    let mut utf8_tail = Vec::new();
+    let mut bom_stripped = false;
+    let mut initial_iter = initial_chunks.into_iter();
     let timeout = Duration::from_secs(TOOL_CALL_DELTA_TIMEOUT_SECS);
-    let mut chunk = Some(first_chunk);
+    let mut chunk = initial_iter.next();
     while let Some(bytes) = chunk.take() {
-        state.line_buffer.push_str(&String::from_utf8_lossy(&bytes));
+        push_decoded_sse_chunk(
+            &mut state.line_buffer,
+            &mut utf8_tail,
+            &mut bom_stripped,
+            &bytes,
+        );
         while let Some(pos) = state.line_buffer.find('\n') {
-            let line = state.line_buffer[..pos].to_string();
+            let line = state.line_buffer[..pos]
+                .strip_suffix('\r')
+                .unwrap_or(&state.line_buffer[..pos])
+                .to_string();
             state.line_buffer.drain(..=pos);
             match envelope_line(line, &mut state, &mut session, block_mode, &tx).await {
                 Ok(false) => {}
@@ -963,6 +1073,10 @@ async fn envelope_task(
                 }
             }
         }
+        if let Some(next_initial) = initial_iter.next() {
+            chunk = Some(next_initial);
+            continue;
+        }
         // While a call is open, the next chunk races the delta deadline so a
         // stalled provider cannot hold the candidate open indefinitely.
         chunk = if session.has_open() {
@@ -986,6 +1100,16 @@ async fn envelope_task(
         } else {
             input.next().await
         };
+    }
+    if !utf8_tail.is_empty() {
+        state
+            .line_buffer
+            .push_str(&String::from_utf8_lossy(&utf8_tail));
+        if !bom_stripped && !state.line_buffer.is_empty() {
+            if let Some(stripped) = state.line_buffer.strip_prefix('\u{FEFF}') {
+                state.line_buffer = stripped.to_string();
+            }
+        }
     }
     if !state.line_buffer.trim().is_empty() {
         let line = std::mem::take(&mut state.line_buffer);

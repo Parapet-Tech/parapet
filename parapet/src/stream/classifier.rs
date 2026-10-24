@@ -227,15 +227,106 @@ pub fn parse_sse_line(line: &str) -> Option<SseChunk> {
     None
 }
 
+/// Maximum characters buffered while determining initial SSE vs non-SSE mode.
+pub(crate) const MAX_INITIAL_SSE_PROBE_CHARS: usize = 64 * 1024;
+
+/// Tri-state result when probing initial stream bytes for SSE framing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InitialSseMode {
+    Sse,
+    NonSse,
+    NeedMore,
+}
+
+/// Classify accumulated UTF-8 text from the start of a stream as SSE, NonSse,
+/// or NeedMore (when a leading BOM, whitespace/blank lines, or split SSE field
+/// prefix has not yet completed).
+pub(crate) fn classify_initial_sse_str(buffer: &str, eof: bool) -> InitialSseMode {
+    let without_bom = buffer.strip_prefix('\u{FEFF}').unwrap_or(buffer);
+    let trimmed = without_bom.trim_start_matches([' ', '\t', '\n', '\r']);
+    if trimmed.is_empty() {
+        if !eof && buffer.chars().count() <= MAX_INITIAL_SSE_PROBE_CHARS {
+            return InitialSseMode::NeedMore;
+        }
+        return InitialSseMode::NonSse;
+    }
+
+    if trimmed.starts_with("data:")
+        || trimmed.starts_with("event:")
+        || trimmed.starts_with("id:")
+        || trimmed.starts_with("retry:")
+        || trimmed.starts_with(':')
+    {
+        return InitialSseMode::Sse;
+    }
+
+    if !eof
+        && !trimmed.contains('\n')
+        && !trimmed.contains('\r')
+        && ["data:", "event:", "id:", "retry:"]
+            .iter()
+            .any(|prefix| prefix.starts_with(trimmed))
+        && buffer.chars().count() <= MAX_INITIAL_SSE_PROBE_CHARS
+    {
+        return InitialSseMode::NeedMore;
+    }
+
+    InitialSseMode::NonSse
+}
+
+/// Classify raw initial bytes from a stream as SSE, NonSse, or NeedMore.
+/// Handles multi-byte UTF-8 sequences (such as a 3-byte UTF-8 BOM) split across chunks.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn classify_initial_sse_bytes(bytes: &[u8], eof: bool) -> InitialSseMode {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => classify_initial_sse_str(text, eof),
+        Err(err) => {
+            if !eof && err.error_len().is_none() {
+                let valid_prefix = std::str::from_utf8(&bytes[..err.valid_up_to()]).unwrap_or("");
+                match classify_initial_sse_str(valid_prefix, false) {
+                    InitialSseMode::NeedMore => InitialSseMode::NeedMore,
+                    decided => decided,
+                }
+            } else {
+                InitialSseMode::NonSse
+            }
+        }
+    }
+}
+
+/// Decode a transport chunk into UTF-8, holding back up to 3 trailing bytes
+/// when a multi-byte UTF-8 codepoint (such as a UTF-8 BOM) is split across chunks.
+pub(crate) fn decode_utf8_chunk(utf8_tail: &mut Vec<u8>, chunk: &[u8]) -> String {
+    let combined: std::borrow::Cow<[u8]> = if utf8_tail.is_empty() {
+        std::borrow::Cow::Borrowed(chunk)
+    } else {
+        let mut v = std::mem::take(utf8_tail);
+        v.extend_from_slice(chunk);
+        std::borrow::Cow::Owned(v)
+    };
+    let bytes = combined.as_ref();
+    let check_start = bytes.len().saturating_sub(3);
+    let mut incomplete_len = 0;
+    for idx in check_start..bytes.len() {
+        if let Err(err) = std::str::from_utf8(&bytes[idx..]) {
+            if err.valid_up_to() == 0 && err.error_len().is_none() {
+                incomplete_len = bytes.len() - idx;
+                break;
+            }
+        }
+    }
+    let valid_end = bytes.len() - incomplete_len;
+    if incomplete_len > 0 {
+        utf8_tail.extend_from_slice(&bytes[valid_end..]);
+    }
+    String::from_utf8_lossy(&bytes[..valid_end]).into_owned()
+}
+
 /// Detect whether a response body looks like an SSE stream.
 ///
-/// SSE streams start with lines like `data:` or `event:`.
+/// SSE streams start with lines like `data:`, `event:`, `id:`, `retry:`, or `:`.
 /// Non-SSE responses (JSON error bodies, HTML) do not.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn is_sse_content(first_bytes: &[u8]) -> bool {
-    let text = match std::str::from_utf8(first_bytes) {
-        Ok(t) => t,
-        Err(_) => return false,
-    };
-    let trimmed = text.trim_start();
-    trimmed.starts_with("data:") || trimmed.starts_with("event:")
+    classify_initial_sse_bytes(first_bytes, true) == InitialSseMode::Sse
 }

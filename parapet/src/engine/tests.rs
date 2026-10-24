@@ -5687,3 +5687,129 @@ async fn streaming_l5a_malformed_or_ambiguous_boundary_ordering_fails_closed() {
         "content delta after finish_reason must fail closed: {out_after_finish}"
     );
 }
+
+#[tokio::test]
+async fn streaming_l5a_leading_id_retry_comment_bom_and_split_prefixes_redact_across_deltas() {
+    let make_cfg = || {
+        let mut cfg = base_config_with_sensitive(r"PLAYGROUND_TEST_TOKEN_\d{2}");
+        cfg.policy.layers.l5a = Some(LayerConfig {
+            mode: "redact".to_string(),
+            block_action: None,
+            window_chars: Some(64),
+        });
+        cfg
+    };
+    let config = Arc::new(make_cfg());
+    let scanner: Arc<dyn OutputScanner> = Arc::new(L5aScanner);
+    let fragments = ["PLAY", "GROUND", "_TEST", "_TOKEN", "_", "4", "2"];
+
+    // 1. Direct apply_streaming_redaction: leading `id:` before first `data:` line
+    let mut id_chunks = vec![Bytes::from("id: chatcmpl-1\n")];
+    for frag in fragments {
+        id_chunks.push(Bytes::from(format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{frag}\"}}}}]}}\n\n"
+        )));
+    }
+    id_chunks.push(Bytes::from("data: [DONE]\n\n"));
+    let out_id = collect_stream(apply_streaming_redaction(
+        stream::iter(id_chunks),
+        scanner.clone(),
+        config.clone(),
+        Some(64),
+    ))
+    .await;
+    assert_eq!(reassemble_openai_sse_deltas(&out_id), "[REDACTED]");
+    assert!(!out_id.contains(CROSS_DELTA_TOKEN));
+    for frag in ["PLAY", "GROUND", "_TEST", "_TOKEN"] {
+        assert!(!out_id.contains(frag), "leaked fragment {frag}: {out_id}");
+    }
+
+    // 2. Direct apply_streaming_redaction: leading `retry:` before first `data:` line
+    let mut retry_chunks = vec![Bytes::from("retry: 1500\n\n")];
+    for frag in fragments {
+        retry_chunks.push(Bytes::from(format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{frag}\"}}}}]}}\n\n"
+        )));
+    }
+    retry_chunks.push(Bytes::from("data: [DONE]\n\n"));
+    let out_retry = collect_stream(apply_streaming_redaction(
+        stream::iter(retry_chunks),
+        scanner.clone(),
+        config.clone(),
+        Some(64),
+    ))
+    .await;
+    assert_eq!(reassemble_openai_sse_deltas(&out_retry), "[REDACTED]");
+    assert!(!out_retry.contains(CROSS_DELTA_TOKEN));
+    for frag in ["PLAY", "GROUND", "_TEST", "_TOKEN"] {
+        assert!(
+            !out_retry.contains(frag),
+            "leaked fragment {frag}: {out_retry}"
+        );
+    }
+
+    // 3. Direct apply_streaming_redaction: split UTF-8 BOM + split `id:` + split `retry:` + split comment + split `data:`
+    let mut split_chunks: Vec<Bytes> = vec![
+        Bytes::from_static(b"\xEF\xBB"),
+        Bytes::from_static(b"\xBF"),
+        Bytes::from_static(b"i"),
+        Bytes::from_static(b"d: evt-0\r\n"),
+        Bytes::from_static(b"re"),
+        Bytes::from_static(b"try: 500\n"),
+        Bytes::from_static(b": keep"),
+        Bytes::from_static(b"-alive\n\n"),
+        Bytes::from_static(b"da"),
+        Bytes::from_static(b"ta: {\"choices\":[{\"delta\":{\"content\":\"PLAY\"}}]}\n\n"),
+    ];
+    for frag in &fragments[1..] {
+        split_chunks.push(Bytes::from(format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{frag}\"}}}}]}}\n\n"
+        )));
+    }
+    split_chunks.push(Bytes::from("data: [DONE]\n\n"));
+    let out_split = collect_stream(apply_streaming_redaction(
+        stream::iter(split_chunks.clone()),
+        scanner,
+        config,
+        Some(64),
+    ))
+    .await;
+    assert_eq!(reassemble_openai_sse_deltas(&out_split), "[REDACTED]");
+    assert!(!out_split.contains(CROSS_DELTA_TOKEN));
+    for frag in ["PLAY", "GROUND", "_TEST", "_TOKEN"] {
+        assert!(
+            !out_split.contains(frag),
+            "leaked fragment {frag}: {out_split}"
+        );
+    }
+
+    // 4. Full EngineUpstreamClient::forward with text/event-stream and leading id:/retry:/BOM/comment
+    let mut resp_headers = HeaderMap::new();
+    resp_headers.insert(
+        "content-type",
+        "text/event-stream; charset=utf-8".parse().unwrap(),
+    );
+    let sender = Arc::new(RecordingHttpSender::with_stream_response(
+        resp_headers,
+        split_chunks,
+    ));
+    let engine = engine_with_http_sender(make_cfg(), sender);
+    let resp = engine
+        .forward(
+            Provider::OpenAi,
+            openai_request_with_stream(true, HeaderMap::new()),
+        )
+        .await
+        .unwrap();
+    let body = collect_proxy_body(resp).await;
+    let body_text = String::from_utf8_lossy(&body);
+    let reassembled = reassemble_openai_sse_deltas(&body_text);
+    assert_eq!(reassembled, "[REDACTED]");
+    assert!(!body_text.contains(CROSS_DELTA_TOKEN));
+    for frag in ["PLAY", "GROUND", "_TEST", "_TOKEN"] {
+        assert!(
+            !body_text.contains(frag),
+            "engine forward leaked fragment {frag}: {body_text}"
+        );
+    }
+}
