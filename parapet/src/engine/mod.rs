@@ -1256,11 +1256,15 @@ impl UpstreamClient for EngineUpstreamClient {
 
         // Reverse proxy header hygiene:
         // - x-parapet-original-host: internal routing header, not for upstream.
+        // - x-parapet-provenance / x-guard-trust*: internal trust/provenance metadata,
+        //   must never be forwarded to upstream providers.
         // - Host: strip client's Host header (points at 127.0.0.1:9800). reqwest
         //   sets the correct Host from the upstream URL. This is standard reverse
         //   proxy behavior (RFC 7230 §5.4).
         let mut fwd_headers = request.headers.clone();
         fwd_headers.remove("x-parapet-original-host");
+        fwd_headers.remove(crate::provenance::PROVENANCE_HEADER);
+        crate::proxy::strip_guard_trust_headers(&mut fwd_headers);
         fwd_headers.remove(reqwest::header::HOST);
         if stream {
             force_identity_encoding_for_streaming(&mut fwd_headers);

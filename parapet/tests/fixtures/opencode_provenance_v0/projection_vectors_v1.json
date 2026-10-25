@@ -992,7 +992,67 @@
         }
       ],
       "expected_aggregate": null,
-      "l0_expectation": "pending_gate1"
+      "l0_expectation": {
+        "gate": "carrier gate 1, frozen L0 manifest 9f087f84 (rebound bb98b026); normalize ed06eca0 (3ef704e7 adds labels only)",
+        "rule": "derive L0 views from each joined projection input; never concatenate per-unit views",
+        "inputs": [
+          {
+            "input": "unit",
+            "message_index": 0,
+            "orig_start": 0,
+            "orig_end": 6,
+            "bytes": "note <",
+            "pre_html": "note <",
+            "html_stripped": "note "
+          },
+          {
+            "input": "boundary_window",
+            "message_index": 0,
+            "boundary": 6,
+            "orig_start": 0,
+            "orig_end": 21,
+            "bytes": "note <b>word</b> tail",
+            "pre_html": "note <b>word</b> tail",
+            "pre_html_map": [
+              [
+                0,
+                21,
+                0,
+                21
+              ]
+            ],
+            "html_stripped": "note word tail",
+            "html_stripped_map": [
+              [
+                0,
+                5,
+                0,
+                5
+              ],
+              [
+                8,
+                12,
+                5,
+                9
+              ],
+              [
+                16,
+                21,
+                9,
+                14
+              ]
+            ],
+            "boundary_in_view": {
+              "pre_html": 6,
+              "html_stripped": 5
+            },
+            "end_in_view": {
+              "pre_html": 21,
+              "html_stripped": 14
+            }
+          }
+        ]
+      }
     },
     {
       "id": "token_spans_three_units",

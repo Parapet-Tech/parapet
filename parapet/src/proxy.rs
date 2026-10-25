@@ -349,10 +349,306 @@ pub fn strip_guard_trust_headers(headers: &mut HeaderMap) {
 // Shared application state
 // ---------------------------------------------------------------------------
 
+use crate::provenance::{
+    admit, extract_carrier_header, CarrierAdmission, CarrierError, CarrierVerifier, ProfileMode,
+    ProviderContentDecoder, SessionManager, VerificationOutcome, VerifiedCarrier,
+};
+use crate::provider::ProviderType;
+
 /// Shared state injected into axum handlers.
 #[derive(Clone)]
 pub struct AppState {
-    pub upstream: Arc<dyn UpstreamClient>,
+    upstream: Arc<dyn UpstreamClient>,
+    admission: Arc<dyn CarrierAdmissionPolicy>,
+    verified_next_stage: Option<Arc<dyn VerifiedCarrierNextStage>>,
+}
+
+impl AppState {
+    /// Construct [`AppState`], panicking if `admission.mode()` is
+    /// [`ProfileMode::RequiredOpenCode`] and `verified_next_stage` is `None`.
+    pub fn new(
+        upstream: Arc<dyn UpstreamClient>,
+        admission: Arc<dyn CarrierAdmissionPolicy>,
+        verified_next_stage: Option<Arc<dyn VerifiedCarrierNextStage>>,
+    ) -> Self {
+        assert!(
+            admission.mode() != ProfileMode::RequiredOpenCode || verified_next_stage.is_some(),
+            "RequiredOpenCode admission policy requires a VerifiedCarrierNextStage"
+        );
+        Self {
+            upstream,
+            admission,
+            verified_next_stage,
+        }
+    }
+
+    pub fn upstream(&self) -> &Arc<dyn UpstreamClient> {
+        &self.upstream
+    }
+
+    pub fn admission(&self) -> &Arc<dyn CarrierAdmissionPolicy> {
+        &self.admission
+    }
+
+    pub fn verified_next_stage(&self) -> Option<&Arc<dyn VerifiedCarrierNextStage>> {
+        self.verified_next_stage.as_ref()
+    }
+}
+
+/// Request-level admission decision before L0/trust/L1 and before any upstream attempt.
+#[derive(Debug)]
+pub enum RequestAdmissionDecision {
+    /// Ordinary mode: proceed through the existing whole-message pipeline.
+    WholeMessage,
+    /// RequiredOpenCode mode: carrier verified; pass [`VerifiedCarrier`] to the next slice.
+    Verified(VerifiedCarrier),
+    /// RequiredOpenCode mode: carrier missing or invalid; fail closed with zero upstream calls.
+    Reject(CarrierError),
+}
+
+/// Injected request-admission interface owned by the proxy/engine boundary.
+pub trait CarrierAdmissionPolicy: Send + Sync {
+    /// Configured profile mode.
+    fn mode(&self) -> ProfileMode;
+
+    /// Admit an inbound request after route binding and header extraction.
+    fn admit_request(&self, envelope: Option<&[u8]>, body: &[u8]) -> RequestAdmissionDecision;
+
+    /// Build a content-free [`CarrierError`] for transport/route pre-verifier rejections.
+    fn fail(&self, outcome: VerificationOutcome) -> CarrierError;
+}
+
+/// Default ordinary-mode admission policy: preserves current whole-message behavior.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct OrdinaryAdmissionPolicy;
+
+impl CarrierAdmissionPolicy for OrdinaryAdmissionPolicy {
+    fn mode(&self) -> ProfileMode {
+        ProfileMode::Ordinary
+    }
+
+    fn admit_request(&self, _envelope: Option<&[u8]>, _body: &[u8]) -> RequestAdmissionDecision {
+        RequestAdmissionDecision::WholeMessage
+    }
+
+    fn fail(&self, outcome: VerificationOutcome) -> CarrierError {
+        CarrierError {
+            outcome,
+            segment_index: None,
+            supported_profile: String::new(),
+            supported_schema_version: 0,
+        }
+    }
+}
+
+/// Verifier-backed request admission policy for [`ProfileMode::Ordinary`] or [`ProfileMode::RequiredOpenCode`].
+///
+/// Under [`ProfileMode::RequiredOpenCode`], request bodies are verified against the
+/// OpenAI [`ProviderContentDecoder`].
+pub struct CarrierRequestAdmitter {
+    mode: ProfileMode,
+    verifier: CarrierVerifier,
+    supported_profile: String,
+    supported_schema_version: u32,
+    openai_decoder: ProviderContentDecoder,
+}
+
+impl CarrierRequestAdmitter {
+    pub fn new(mode: ProfileMode, verifier: CarrierVerifier) -> Self {
+        // `CarrierVerifier::verify(None, b"")` short-circuits on its first line
+        // (`envelope.ok_or_else(|| self.fail(O::Absent, None))?`), returning only
+        // the public `profile_id` and `schema_version` without parsing, reading
+        // the clock, invoking the authenticator, or mutating the replay ledger.
+        let (supported_profile, supported_schema_version) = match verifier.verify(None, b"") {
+            Err(e) => (e.supported_profile, e.supported_schema_version),
+            Ok(_) => ("opencode".to_string(), 1),
+        };
+        Self::with_identity(mode, verifier, supported_profile, supported_schema_version)
+    }
+
+    fn with_identity(
+        mode: ProfileMode,
+        verifier: CarrierVerifier,
+        supported_profile: impl Into<String>,
+        supported_schema_version: u32,
+    ) -> Self {
+        Self {
+            mode,
+            verifier,
+            supported_profile: supported_profile.into(),
+            supported_schema_version,
+            openai_decoder: ProviderContentDecoder::new(ProviderType::OpenAi),
+        }
+    }
+
+    pub fn required_opencode(verifier: CarrierVerifier) -> Self {
+        Self::new(ProfileMode::RequiredOpenCode, verifier)
+    }
+}
+
+impl CarrierAdmissionPolicy for CarrierRequestAdmitter {
+    fn mode(&self) -> ProfileMode {
+        self.mode
+    }
+
+    fn admit_request(&self, envelope: Option<&[u8]>, body: &[u8]) -> RequestAdmissionDecision {
+        match admit(self.mode, &self.verifier, envelope, body) {
+            CarrierAdmission::WholeMessage => RequestAdmissionDecision::WholeMessage,
+            CarrierAdmission::Projected(verified) => {
+                use crate::provenance::MessageContentDecoder as _;
+                match self.openai_decoder.decode(body) {
+                    Some(decoded) => {
+                        let expected: Vec<String> =
+                            decoded.into_iter().map(|m| m.content).collect();
+                        if verified.messages == expected {
+                            RequestAdmissionDecision::Verified(verified)
+                        } else {
+                            RequestAdmissionDecision::Reject(
+                                self.fail(VerificationOutcome::MapOutOfRange),
+                            )
+                        }
+                    }
+                    None => RequestAdmissionDecision::Reject(
+                        self.fail(VerificationOutcome::MapOutOfRange),
+                    ),
+                }
+            }
+            CarrierAdmission::Reject(err) => RequestAdmissionDecision::Reject(err),
+        }
+    }
+
+    fn fail(&self, outcome: VerificationOutcome) -> CarrierError {
+        CarrierError {
+            outcome,
+            segment_index: None,
+            supported_profile: self.supported_profile.clone(),
+            supported_schema_version: self.supported_schema_version,
+        }
+    }
+}
+
+/// [`SessionManager`]-backed request admission policy for [`ProfileMode::Ordinary`] or [`ProfileMode::RequiredOpenCode`].
+///
+/// Under [`ProfileMode::RequiredOpenCode`], absence of an active session fails closed with
+/// [`VerificationOutcome::SessionMismatch`].
+pub struct SessionRequestAdmitter {
+    mode: ProfileMode,
+    sessions: Arc<SessionManager>,
+    supported_profile: String,
+    supported_schema_version: u32,
+    openai_decoder: ProviderContentDecoder,
+}
+
+impl SessionRequestAdmitter {
+    pub fn new(
+        mode: ProfileMode,
+        sessions: Arc<SessionManager>,
+        supported_profile: impl Into<String>,
+        supported_schema_version: u32,
+    ) -> Self {
+        Self {
+            mode,
+            sessions,
+            supported_profile: supported_profile.into(),
+            supported_schema_version,
+            openai_decoder: ProviderContentDecoder::new(ProviderType::OpenAi),
+        }
+    }
+}
+
+impl CarrierAdmissionPolicy for SessionRequestAdmitter {
+    fn mode(&self) -> ProfileMode {
+        self.mode
+    }
+
+    fn admit_request(&self, envelope: Option<&[u8]>, body: &[u8]) -> RequestAdmissionDecision {
+        match self.mode {
+            ProfileMode::Ordinary => RequestAdmissionDecision::WholeMessage,
+            ProfileMode::RequiredOpenCode => match self.sessions.verify(envelope, body) {
+                None => RequestAdmissionDecision::Reject(
+                    self.fail(VerificationOutcome::SessionMismatch),
+                ),
+                Some(Err(err)) => RequestAdmissionDecision::Reject(err),
+                Some(Ok(verified)) => {
+                    use crate::provenance::MessageContentDecoder as _;
+                    match self.openai_decoder.decode(body) {
+                        Some(decoded) => {
+                            let expected: Vec<String> =
+                                decoded.into_iter().map(|m| m.content).collect();
+                            if verified.messages == expected {
+                                RequestAdmissionDecision::Verified(verified)
+                            } else {
+                                RequestAdmissionDecision::Reject(
+                                    self.fail(VerificationOutcome::MapOutOfRange),
+                                )
+                            }
+                        }
+                        None => RequestAdmissionDecision::Reject(
+                            self.fail(VerificationOutcome::MapOutOfRange),
+                        ),
+                    }
+                }
+            },
+        }
+    }
+
+    fn fail(&self, outcome: VerificationOutcome) -> CarrierError {
+        CarrierError {
+            outcome,
+            segment_index: None,
+            supported_profile: self.supported_profile.clone(),
+            supported_schema_version: self.supported_schema_version,
+        }
+    }
+}
+
+/// Injected next-stage seam receiving a [`VerifiedCarrier`] on successful required-profile admission.
+#[async_trait::async_trait]
+pub trait VerifiedCarrierNextStage: Send + Sync {
+    async fn handle_verified(
+        &self,
+        provider: Provider,
+        request: ProxyRequest,
+        verified: VerifiedCarrier,
+    ) -> Result<ProxyResponse, ProxyError>;
+}
+
+fn carrier_rejection_response(err: &CarrierError) -> Response<Body> {
+    let outcome_str = err.outcome.as_str();
+    tracing::warn!(
+        status = StatusCode::FORBIDDEN.as_u16(),
+        error_type = "parapet_carrier_rejected",
+        outcome = outcome_str,
+        segment_index = ?err.segment_index,
+        supported_profile = %err.supported_profile,
+        supported_schema_version = err.supported_schema_version,
+        "provenance carrier rejected"
+    );
+    let payload = serde_json::json!({
+        "error": {
+            "type": "parapet_carrier_rejected",
+            "code": outcome_str,
+            "outcome": outcome_str,
+            "segment_index": err.segment_index,
+            "supported_profile": err.supported_profile,
+            "supported_schema_version": err.supported_schema_version,
+            "message": err.to_string(),
+        }
+    });
+    let bytes = serde_json::to_vec(&payload).unwrap_or_default();
+    let mut resp = Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .body(Body::from(bytes))
+        .unwrap();
+    resp.headers_mut()
+        .insert("content-type", HeaderValue::from_static("application/json"));
+    resp.headers_mut()
+        .insert("x-parapet-error", HeaderValue::from_static(outcome_str));
+    resp.headers_mut().insert(
+        "x-parapet-blocked-by",
+        HeaderValue::from_static("provenance"),
+    );
+    resp
 }
 
 // ---------------------------------------------------------------------------
@@ -366,21 +662,32 @@ pub async fn heartbeat() -> StatusCode {
 
 /// Proxy handler for provider paths.
 ///
-/// Validates the request, detects the provider, forwards via the injected
-/// upstream client, strips guard-trust headers, and returns the response.
+/// Validates the request, detects the provider, extracts the provenance carrier,
+/// enforces request admission, forwards via the injected upstream client (preserving
+/// `x-guard-trust*` for whole-message trust parsing while stripping the carrier header)
+/// or verified-carrier next-stage seam (with sanitized upstream headers), strips
+/// guard-trust headers on responses, and returns the response.
 pub async fn proxy_handler(
     State(state): State<AppState>,
     request: Request<Body>,
 ) -> impl IntoResponse {
     let method = request.method().clone();
     let uri = request.uri().clone();
-    let headers = request.headers().clone();
+    let inbound_headers = request.headers().clone();
+    let extraction = extract_carrier_header(&inbound_headers);
+    let sanitized_headers = extraction.upstream_headers;
+    let carrier = extraction.carrier;
     let path = uri.path();
 
     // Classify path before reading body or forwarding
     let provider = match classify_path(path) {
         PathClass::Supported(p) => p,
         PathClass::NonCanonical => {
+            if state.admission.mode() == ProfileMode::RequiredOpenCode {
+                return carrier_rejection_response(
+                    &state.admission.fail(VerificationOutcome::SchemaMismatch),
+                );
+            }
             return path_refusal_response(
                 path,
                 StatusCode::BAD_REQUEST,
@@ -389,6 +696,11 @@ pub async fn proxy_handler(
             );
         }
         PathClass::KnownUnsupported => {
+            if state.admission.mode() == ProfileMode::RequiredOpenCode {
+                return carrier_rejection_response(
+                    &state.admission.fail(VerificationOutcome::SchemaMismatch),
+                );
+            }
             return path_refusal_response(
                 path,
                 StatusCode::NOT_IMPLEMENTED,
@@ -397,6 +709,11 @@ pub async fn proxy_handler(
             );
         }
         PathClass::Unknown => {
+            if state.admission.mode() == ProfileMode::RequiredOpenCode {
+                return carrier_rejection_response(
+                    &state.admission.fail(VerificationOutcome::SchemaMismatch),
+                );
+            }
             return path_refusal_response(
                 path,
                 StatusCode::NOT_FOUND,
@@ -408,6 +725,15 @@ pub async fn proxy_handler(
 
     if method != Method::POST {
         return method_not_allowed_response(path, &method);
+    }
+
+    // RequiredOpenCode binds exclusively to exact POST /v1/chat/completions with OpenAI decoder.
+    if state.admission.mode() == ProfileMode::RequiredOpenCode
+        && (provider != Provider::OpenAi || path != "/v1/chat/completions")
+    {
+        return carrier_rejection_response(
+            &state.admission.fail(VerificationOutcome::SchemaMismatch),
+        );
     }
 
     // Read body
@@ -422,6 +748,25 @@ pub async fn proxy_handler(
         }
     };
 
+    let verified_carrier = match state.admission.mode() {
+        ProfileMode::Ordinary => None,
+        ProfileMode::RequiredOpenCode => {
+            let envelope = match carrier.envelope() {
+                Ok(env) => env,
+                Err(outcome) => {
+                    return carrier_rejection_response(&state.admission.fail(outcome));
+                }
+            };
+            match state.admission.admit_request(envelope, &body) {
+                RequestAdmissionDecision::WholeMessage => None,
+                RequestAdmissionDecision::Verified(verified) => Some(verified),
+                RequestAdmissionDecision::Reject(err) => {
+                    return carrier_rejection_response(&err);
+                }
+            }
+        }
+    };
+
     // Validate body
     if body.is_empty() {
         return ProxyError::EmptyBody.into_response();
@@ -433,15 +778,36 @@ pub async fn proxy_handler(
         .into_response();
     }
 
-    let proxy_req = ProxyRequest {
-        method,
-        uri,
-        headers,
-        body,
+    let upstream_result = match verified_carrier {
+        Some(verified) => {
+            let next_stage = state
+                .verified_next_stage
+                .as_ref()
+                .expect("AppState invariant: RequiredOpenCode requires VerifiedCarrierNextStage");
+            let proxy_req = ProxyRequest {
+                method,
+                uri,
+                headers: sanitized_headers,
+                body,
+            };
+            next_stage
+                .handle_verified(provider, proxy_req, verified)
+                .await
+        }
+        None => {
+            let mut whole_message_headers = inbound_headers;
+            whole_message_headers.remove(crate::provenance::PROVENANCE_HEADER);
+            let proxy_req = ProxyRequest {
+                method,
+                uri,
+                headers: whole_message_headers,
+                body,
+            };
+            state.upstream.forward(provider, proxy_req).await
+        }
     };
 
-    // Forward to upstream
-    match state.upstream.forward(provider, proxy_req).await {
+    match upstream_result {
         Ok(mut resp) => {
             strip_guard_trust_headers(&mut resp.headers);
 
@@ -463,7 +829,22 @@ pub async fn proxy_handler(
 ///
 /// The upstream client is injected — no side effects, no hard-coded clients.
 pub fn build_router(upstream: Arc<dyn UpstreamClient>) -> Router {
-    let state = AppState { upstream };
+    build_router_with_admission(upstream, Arc::new(OrdinaryAdmissionPolicy), None)
+}
+
+/// Build the axum router with an injected [`CarrierAdmissionPolicy`] and
+/// optional [`VerifiedCarrierNextStage`] seam.
+///
+/// # Panics
+///
+/// Panics if `admission.mode()` is [`ProfileMode::RequiredOpenCode`] and
+/// `verified_next_stage` is `None`.
+pub fn build_router_with_admission(
+    upstream: Arc<dyn UpstreamClient>,
+    admission: Arc<dyn CarrierAdmissionPolicy>,
+    verified_next_stage: Option<Arc<dyn VerifiedCarrierNextStage>>,
+) -> Router {
+    let state = AppState::new(upstream, admission, verified_next_stage);
 
     Router::new()
         .route("/v1/heartbeat", get(heartbeat))
