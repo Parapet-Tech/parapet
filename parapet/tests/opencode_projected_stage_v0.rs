@@ -21,7 +21,7 @@ use parapet::constraint::DslConstraintEvaluator;
 use parapet::engine::{
     derive_projected_views, scan_projected_l3, DefaultProviderRegistry, EngineDeps,
     EngineUpstreamClient, HttpError, HttpRequest, HttpResponse, HttpSender, L0ViewDeriver,
-    L1ViewScorer, ProjectedEngineStage, ProjectedL3Match, UpstreamResolver,
+    L1ViewScorer, ProjectedEngineStage, ProjectedL3Match, ProjectedL3Source, UpstreamResolver,
 };
 use parapet::layers::l1_harness::{CalibrationParams, L1Model};
 use parapet::layers::l3_inbound::{
@@ -29,7 +29,7 @@ use parapet::layers::l3_inbound::{
     MatchAdmission, MatchSource, PatternMatch,
 };
 use parapet::layers::l5a::L5aScanner;
-use parapet::message::{Message, Role};
+use parapet::message::{Message, Role, ToolCall};
 use parapet::normalize::{L0DualScanView, L0Normalizer, Normalizer};
 use parapet::provenance::*;
 use parapet::provider::ProviderType;
@@ -211,12 +211,20 @@ fn rig_with_scanner(
     normalizer: Arc<dyn Normalizer>,
     inbound_scanner: Arc<dyn InboundScanner>,
 ) -> Rig {
-    let config = Arc::new(
-        load_config(&StringSource {
-            content: yaml.to_string(),
-        })
-        .unwrap(),
-    );
+    let config = load_config(&StringSource {
+        content: yaml.to_string(),
+    })
+    .unwrap();
+    rig_with_config(config, model, normalizer, inbound_scanner)
+}
+
+fn rig_with_config(
+    config: Config,
+    model: Option<Arc<dyn L1Model>>,
+    normalizer: Arc<dyn Normalizer>,
+    inbound_scanner: Arc<dyn InboundScanner>,
+) -> Rig {
+    let config = Arc::new(config);
     let sender = Arc::new(CapturingHttpSender::default());
     let deps = EngineDeps {
         config,
@@ -300,18 +308,37 @@ fn app(rig: &Rig) -> axum::Router {
 type Msg<'a> = (&'a str, Vec<(&'a str, Source)>);
 
 fn signed_request(messages: &[Msg<'_>]) -> Request<Body> {
-    let wire: Vec<Value> = messages
+    signed_request_with(messages, |_, _| {})
+}
+
+/// Wire messages for `messages`, each passed to `extend` with its index
+/// before signing (for fields outside `content`, such as tool calls).
+fn wire_messages(messages: &[Msg<'_>], mut extend: impl FnMut(usize, &mut Value)) -> Vec<Value> {
+    messages
         .iter()
-        .map(|(role, parts)| {
+        .enumerate()
+        .map(|(mi, (role, parts))| {
             let content: String = parts.iter().map(|(t, _)| *t).collect();
-            if *role == "tool" {
+            let mut wire = if *role == "tool" {
                 json!({"role": role, "content": content, "tool_call_id": "call_1"})
             } else {
                 json!({"role": role, "content": content})
-            }
+            };
+            extend(mi, &mut wire);
+            wire
         })
-        .collect();
-    let body = serde_json::to_vec(&json!({"model": "gpt-4o-mini", "messages": wire})).unwrap();
+        .collect()
+}
+
+fn chat_body(wire: Vec<Value>) -> Vec<u8> {
+    serde_json::to_vec(&json!({"model": "gpt-4o-mini", "messages": wire})).unwrap()
+}
+
+fn signed_request_with(
+    messages: &[Msg<'_>],
+    extend: impl FnMut(usize, &mut Value),
+) -> Request<Body> {
+    let body = chat_body(wire_messages(messages, extend));
 
     let mut segments = Vec::new();
     for (mi, (_, parts)) in messages.iter().enumerate() {
@@ -663,6 +690,11 @@ fn projected_parts(parts: &[(&str, Source)]) -> Vec<ProjectedInput> {
     project(&[MessageGeometry::new(&content, &ranges)])
 }
 
+/// The single parsed message `projected_parts` geometry is cut from.
+fn one_user() -> Vec<Message> {
+    vec![Message::new(Role::User, "")]
+}
+
 fn l3_config() -> Config {
     load_config(&StringSource {
         content: L3_ONLY_YAML.to_string(),
@@ -790,7 +822,8 @@ fn evidence_counts_only_non_exempt_matches_with_projected_input_attribution() {
         (VENDOR_L3_WHOLE, Source::VendorStatic),
         (" Please review the change.", Source::User),
     ]);
-    let result = scan_projected_l3(&scanner, &normalizer, &vendor_only, &config).unwrap();
+    let result =
+        scan_projected_l3(&scanner, &normalizer, &vendor_only, &one_user(), &config).unwrap();
     assert_eq!(result.block, None);
     assert!(result.matches.is_empty(), "{:?}", result.matches);
 
@@ -802,13 +835,15 @@ fn evidence_counts_only_non_exempt_matches_with_projected_input_attribution() {
         .iter()
         .position(|i| i.kind == ProjectionKind::Boundary)
         .unwrap();
-    let result = scan_projected_l3(&scanner, &normalizer, &straddle, &config).unwrap();
+    let result = scan_projected_l3(&scanner, &normalizer, &straddle, &one_user(), &config).unwrap();
     assert_eq!(result.block, None);
     assert_eq!(
         result.matches,
         vec![ProjectedL3Match {
-            projected_input_index: boundary,
-            kind: ProjectionKind::Boundary,
+            source: ProjectedL3Source::Projected {
+                projected_input_index: boundary,
+                kind: ProjectionKind::Boundary,
+            },
             pattern_index: 0,
             action: PatternAction::Evidence,
         }]
@@ -916,7 +951,8 @@ fn zero_length_l3_matches_never_count_or_block_on_projected_basis() {
         let config = zero_length_config(action.clone());
         for parts in zero_length_layouts() {
             let inputs = projected_parts(&parts);
-            let result = scan_projected_l3(&scanner, &normalizer, &inputs, &config).unwrap();
+            let result =
+                scan_projected_l3(&scanner, &normalizer, &inputs, &one_user(), &config).unwrap();
             assert_eq!(result.block, None, "{action:?} {parts:?}");
             assert!(result.matches.is_empty(), "{action:?} {parts:?}");
         }
@@ -942,7 +978,8 @@ fn non_empty_untrusted_and_straddling_matches_still_block_beside_zero_length_pat
     ];
     for parts in blocking {
         let inputs = projected_parts(&parts);
-        let result = scan_projected_l3(&scanner, &normalizer, &inputs, &config).unwrap();
+        let result =
+            scan_projected_l3(&scanner, &normalizer, &inputs, &one_user(), &config).unwrap();
         assert!(result.block.is_some(), "{parts:?}");
     }
 }
@@ -960,15 +997,229 @@ fn projected_l3_block_is_attributed_to_a_projected_input_not_a_message() {
         &DefaultInboundScanner::new(),
         &L0Normalizer::new(),
         &inputs,
+        &one_user(),
+        &l3_config(),
+    )
+    .unwrap();
+    let Some(ProjectedL3Source::Projected {
+        projected_input_index,
+        kind,
+    }) = result.block.map(|b| b.source)
+    else {
+        panic!("expected a projected-input block");
+    };
+    assert_eq!(kind, ProjectionKind::Unit);
+    assert_eq!(inputs[projected_input_index].kind, ProjectionKind::Unit);
+}
+
+// ---------------------------------------------------------------------------
+// Tool-call arguments and per-tool result policy (R-W4a-1/2)
+// ---------------------------------------------------------------------------
+
+/// Benign carrier messages and an assistant turn with no content bytes, so a
+/// trigger can only live in that turn's tool-call arguments.
+fn tool_call_messages() -> Vec<Msg<'static>> {
+    vec![
+        benign_system("Repository rule: keep tests green.\n"),
+        ("user", vec![("Please review the change.", Source::User)]),
+        ("assistant", vec![]),
+    ]
+}
+
+/// Puts the L3 trigger into the assistant turn's tool-call arguments.
+fn with_tool_call_trigger(mi: usize, wire: &mut Value) {
+    if mi == 2 {
+        let arguments = json!({"cmd": format!("please {L3_TRIGGER}")}).to_string();
+        wire["tool_calls"] = json!([{
+            "id": "call_9",
+            "type": "function",
+            "function": {"name": "run", "arguments": arguments}
+        }]);
+    }
+}
+
+fn unsigned_request(body: Vec<u8>) -> Request<Body> {
+    Request::builder()
+        .method(Method::POST)
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn l3_pattern_only_in_tool_call_arguments_blocks_with_zero_upstream() {
+    let rig = rig_with(L3_ONLY_YAML, None, Arc::new(L0Normalizer::new()));
+    let req = signed_request_with(&tool_call_messages(), with_tool_call_trigger);
+    let resp = app(&rig).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(header(&resp, "x-parapet-blocked-by"), Some("L3-inbound"));
+    assert_eq!(header(&resp, "x-parapet-blocked-view"), None);
+    assert_eq!(rig.sender.calls(), 0);
+
+    // Control: the same carrier without the tool-call trigger forwards.
+    let rig = rig_with(L3_ONLY_YAML, None, Arc::new(L0Normalizer::new()));
+    let resp = app(&rig)
+        .oneshot(signed_request(&tool_call_messages()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(rig.sender.calls(), 1);
+
+    // Ordinary semantics are unchanged.
+    let rig = rig_with(L3_ONLY_YAML, None, Arc::new(L0Normalizer::new()));
+    let body = chat_body(wire_messages(&tool_call_messages(), with_tool_call_trigger));
+    let resp = build_router(rig.engine.clone())
+        .oneshot(unsigned_request(body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(header(&resp, "x-parapet-blocked-by"), Some("L3-inbound"));
+    assert_eq!(rig.sender.calls(), 0);
+}
+
+fn evidence_l3_config() -> Config {
+    let mut config = l3_config();
+    config.policy.block_patterns[0].action = PatternAction::Evidence;
+    config.policy.block_patterns[0].category = Some("exfil".to_string());
+    config
+}
+
+#[tokio::test]
+async fn evidence_pattern_in_tool_call_arguments_contributes_evidence() {
+    let rig = rig_with_config(
+        evidence_l3_config(),
+        None,
+        Arc::new(L0Normalizer::new()),
+        Arc::new(DefaultInboundScanner::new()),
+    );
+    let req = signed_request_with(&tool_call_messages(), with_tool_call_trigger);
+    let resp = app(&rig).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(rig.sender.calls(), 1);
+    assert_eq!(header(&resp, "x-parapet-evidence-count"), Some("1"));
+    assert_eq!(
+        header(&resp, "x-parapet-evidence-categories"),
+        Some("exfil")
+    );
+}
+
+#[test]
+fn tool_call_matches_are_attributed_by_message_index_not_projected_input() {
+    let inputs = projected_parts(&[(" Please review the change.", Source::User)]);
+    let mut assistant = Message::new(Role::Assistant, "");
+    assistant.tool_calls = vec![ToolCall {
+        id: "call_9".to_string(),
+        name: "run".to_string(),
+        arguments: json!({"cmd": format!("please {L3_TRIGGER}")}),
+    }];
+    let messages = vec![Message::new(Role::User, ""), assistant];
+
+    let result = scan_projected_l3(
+        &DefaultInboundScanner::new(),
+        &L0Normalizer::new(),
+        &inputs,
+        &messages,
+        &evidence_l3_config(),
+    )
+    .unwrap();
+    assert_eq!(result.block, None);
+    assert_eq!(
+        result.matches,
+        vec![ProjectedL3Match {
+            source: ProjectedL3Source::ToolCallArgument { message_index: 1 },
+            pattern_index: 0,
+            action: PatternAction::Evidence,
+        }]
+    );
+
+    let result = scan_projected_l3(
+        &DefaultInboundScanner::new(),
+        &L0Normalizer::new(),
+        &inputs,
+        &messages,
         &l3_config(),
     )
     .unwrap();
     let block = result.block.unwrap();
-    assert_eq!(block.kind, ProjectionKind::Unit);
     assert_eq!(
-        inputs[block.projected_input_index].kind,
-        ProjectionKind::Unit
+        block.source,
+        ProjectedL3Source::ToolCallArgument { message_index: 1 }
     );
+    assert_eq!(block.scan_view, None);
+}
+
+/// Global policy admits the tool result; only `web_fetch`'s policy rejects it.
+const TOOL_POLICY_YAML: &str = r#"
+parapet: v1
+use_default_block_patterns: false
+use_default_sensitive_patterns: false
+untrusted_content_policy:
+  max_length: 200
+tools:
+  web_fetch:
+    allowed: true
+    result_policy:
+      max_length: 10
+layers:
+  L0: { mode: sanitize }
+  L3_inbound: { mode: block }
+"#;
+
+const TOOL_RESULT_TEXT: &str = "Fetched page: the build is green today.";
+
+fn tool_result_messages() -> Vec<Msg<'static>> {
+    vec![
+        benign_system("Repository rule: keep tests green.\n"),
+        ("user", vec![("Please review the change.", Source::User)]),
+        ("tool", vec![(TOOL_RESULT_TEXT, Source::ToolResult)]),
+    ]
+}
+
+/// Names the tool that produced the tool-result turn.
+fn named_tool(name: &'static str) -> impl FnMut(usize, &mut Value) {
+    move |mi, wire| {
+        if mi == 2 {
+            wire["name"] = json!(name);
+        }
+    }
+}
+
+#[tokio::test]
+async fn named_tool_result_over_tool_max_length_blocks_on_both_paths() {
+    assert!(TOOL_RESULT_TEXT.len() > 10 && TOOL_RESULT_TEXT.len() < 200);
+    for (tool, expected) in [
+        ("web_fetch", StatusCode::FORBIDDEN),
+        ("other_tool", StatusCode::OK),
+    ] {
+        // RequiredOpenCode projected basis.
+        let rig = rig_with(TOOL_POLICY_YAML, None, Arc::new(L0Normalizer::new()));
+        let req = signed_request_with(&tool_result_messages(), named_tool(tool));
+        let resp = app(&rig).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), expected, "projected {tool}");
+        let blocked = expected == StatusCode::FORBIDDEN;
+        assert_eq!(
+            rig.sender.calls(),
+            usize::from(!blocked),
+            "projected {tool}"
+        );
+        if blocked {
+            assert_eq!(header(&resp, "x-parapet-blocked-by"), Some("L3-inbound"));
+        }
+
+        // Ordinary whole-message basis.
+        let rig = rig_with(TOOL_POLICY_YAML, None, Arc::new(L0Normalizer::new()));
+        let body = chat_body(wire_messages(&tool_result_messages(), named_tool(tool)));
+        let resp = build_router(rig.engine.clone())
+            .oneshot(unsigned_request(body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), expected, "ordinary {tool}");
+        assert_eq!(rig.sender.calls(), usize::from(!blocked), "ordinary {tool}");
+        if blocked {
+            assert_eq!(header(&resp, "x-parapet-blocked-by"), Some("L3-inbound"));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1071,6 +1322,7 @@ fn corrupted_projection_regions_fail_l3_closed() {
                 &DefaultInboundScanner::new(),
                 &L0Normalizer::new(),
                 &inputs,
+                &one_user(),
                 &l3_config(),
             )
             .unwrap_err();

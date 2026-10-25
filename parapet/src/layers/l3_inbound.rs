@@ -142,6 +142,22 @@ pub trait InboundScanner: Send + Sync {
     ) -> Result<InboundResult, InboundDualScanError> {
         Err(InboundDualScanError::UnsupportedScanner)
     }
+
+    /// Only the C-2 tool-call argument pass of [`Self::scan_dual_view`] over
+    /// `messages`, unchanged and with no admission exemption. Used where
+    /// content is scanned on another basis (verified-carrier projection),
+    /// whose inputs carry no tool calls. Every match and block is attributed
+    /// to a message index with a [`MatchSource::ToolCallArgument`] source.
+    ///
+    /// Custom scanners must explicitly override this method; the default fails
+    /// closed with `InboundDualScanError::UnsupportedScanner`.
+    fn scan_tool_call_arguments(
+        &self,
+        _messages: &[Message],
+        _config: &Config,
+    ) -> Result<InboundResult, InboundDualScanError> {
+        Err(InboundDualScanError::UnsupportedScanner)
+    }
 }
 
 /// Decides whether a content match counts, given its verified original byte
@@ -192,6 +208,9 @@ fn find_admitted(
             return Ok(Some((orig_start, orig_end)));
         }
         // Retry from the next char so a rejected match hides no later one.
+        // A rejected match's other same-start extents (for example a longer
+        // alternation branch) are not retried; whole-message scanning reports
+        // only the leftmost-first match too, so this is no worse than ordinary.
         let step = content[m.start()..]
             .chars()
             .next()
@@ -487,6 +506,32 @@ impl InboundScanner for DefaultInboundScanner {
         self.scan_dual_view_admitted(views, config, &AdmitAll)
     }
 
+    fn scan_tool_call_arguments(
+        &self,
+        messages: &[Message],
+        config: &Config,
+    ) -> Result<InboundResult, InboundDualScanError> {
+        const MAX_MATCHES: usize = 256;
+        let mut matched_patterns = Vec::new();
+        let mut seen = HashSet::new();
+        let mut first_block = None;
+        for (idx, msg) in messages.iter().enumerate() {
+            scan_tool_call_args(
+                idx,
+                msg,
+                config,
+                MAX_MATCHES,
+                &mut matched_patterns,
+                &mut seen,
+                &mut first_block,
+            );
+        }
+        Ok(InboundResult {
+            verdict: first_block.map_or(InboundVerdict::Allow, InboundVerdict::Block),
+            matched_patterns,
+        })
+    }
+
     fn scan_dual_view_admitted(
         &self,
         views: &dyn crate::normalize::L0DualScanView,
@@ -561,48 +606,15 @@ impl InboundScanner for DefaultInboundScanner {
             }
 
             // C-2: Tool-call arguments are not an L0 scan view; scan once here and never duplicate in pre_html.
-            for tc in &msg.tool_calls {
-                for s in json_string_values(&tc.arguments) {
-                    for (pat_idx, pattern) in config.policy.block_patterns.iter().enumerate() {
-                        let can_collect = matched_patterns.len() < MAX_MATCHES;
-                        let need_block_check =
-                            first_block.is_none() && pattern.action == PatternAction::Block;
-                        if !can_collect && !need_block_check {
-                            continue;
-                        }
-                        if let Some(ref gate) = pattern.trust_gate {
-                            if *gate == TrustLevel::Untrusted && msg.trust != TrustLevel::Untrusted
-                            {
-                                continue;
-                            }
-                        }
-                        if pattern.is_match(&s) {
-                            if pattern.action == PatternAction::Block && first_block.is_none() {
-                                first_block = Some(InboundBlock {
-                                    reason: format!(
-                                        "block pattern matched in tool_call arguments: {}",
-                                        pattern.pattern
-                                    ),
-                                    message_index: idx,
-                                    role: msg.role.clone(),
-                                    scan_view: None,
-                                });
-                            }
-                            if can_collect && seen_stripped_msg_pat.insert((pat_idx, idx)) {
-                                matched_patterns.push(PatternMatch {
-                                    pattern_index: pat_idx,
-                                    message_index: idx,
-                                    role: msg.role.clone(),
-                                    source: MatchSource::ToolCallArgument {
-                                        tool_call_id: tc.id.clone(),
-                                    },
-                                    action: pattern.action.clone(),
-                                });
-                            }
-                        }
-                    }
-                }
-            }
+            scan_tool_call_args(
+                idx,
+                msg,
+                config,
+                MAX_MATCHES,
+                &mut matched_patterns,
+                &mut seen_stripped_msg_pat,
+                &mut first_block,
+            );
         }
 
         // 2. Pre-HTML view (`pre_html`) content findings in scanner order, deduplicated by
@@ -735,6 +747,61 @@ impl InboundScanner for DefaultInboundScanner {
             verdict: InboundVerdict::Allow,
             matched_patterns,
         })
+    }
+}
+
+/// C-2 tool-call argument pass for message `idx`: every JSON string value of
+/// every tool call, attributed to `idx` with a [`MatchSource::ToolCallArgument`]
+/// source. `seen` deduplicates by `(pattern_index, message_index)`.
+fn scan_tool_call_args(
+    idx: usize,
+    msg: &Message,
+    config: &Config,
+    max_matches: usize,
+    matched_patterns: &mut Vec<PatternMatch>,
+    seen: &mut HashSet<(usize, usize)>,
+    first_block: &mut Option<InboundBlock>,
+) {
+    for tc in &msg.tool_calls {
+        for s in json_string_values(&tc.arguments) {
+            for (pat_idx, pattern) in config.policy.block_patterns.iter().enumerate() {
+                let can_collect = matched_patterns.len() < max_matches;
+                let need_block_check =
+                    first_block.is_none() && pattern.action == PatternAction::Block;
+                if !can_collect && !need_block_check {
+                    continue;
+                }
+                if let Some(ref gate) = pattern.trust_gate {
+                    if *gate == TrustLevel::Untrusted && msg.trust != TrustLevel::Untrusted {
+                        continue;
+                    }
+                }
+                if pattern.is_match(&s) {
+                    if pattern.action == PatternAction::Block && first_block.is_none() {
+                        *first_block = Some(InboundBlock {
+                            reason: format!(
+                                "block pattern matched in tool_call arguments: {}",
+                                pattern.pattern
+                            ),
+                            message_index: idx,
+                            role: msg.role.clone(),
+                            scan_view: None,
+                        });
+                    }
+                    if can_collect && seen.insert((pat_idx, idx)) {
+                        matched_patterns.push(PatternMatch {
+                            pattern_index: pat_idx,
+                            message_index: idx,
+                            role: msg.role.clone(),
+                            source: MatchSource::ToolCallArgument {
+                                tool_call_id: tc.id.clone(),
+                            },
+                            action: pattern.action.clone(),
+                        });
+                    }
+                }
+            }
+        }
     }
 }
 

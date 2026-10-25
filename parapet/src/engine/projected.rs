@@ -8,8 +8,10 @@
 //! bytes are the only bytes neither layer inspects. L0 views are derived from
 //! each whole projected input by the landed dual-view normalizer. An L3
 //! match counts only if it maps back to at least one non-exempt original
-//! byte. Every mapping or invariant failure fails closed with zero upstream
-//! bytes.
+//! byte. Tool-call arguments are not message content, so no projected input
+//! carries them: the unchanged C-2 tool-call pass runs over the parsed
+//! messages with no exemption. Every mapping or invariant failure fails
+//! closed with zero upstream bytes.
 //!
 //! Nothing here is reachable from ordinary startup; the stage is only
 //! entered through an explicitly injected [`VerifiedCarrierNextStage`].
@@ -21,7 +23,7 @@ use async_trait::async_trait;
 use crate::config::{Config, PatternAction};
 use crate::layers::l1_harness::{threshold_outcome, L1Harness, L1Model};
 use crate::layers::l3_inbound::{
-    InboundDualScanError, InboundScanner, InboundVerdict, MatchAdmission,
+    InboundBlock, InboundDualScanError, InboundScanner, InboundVerdict, MatchAdmission, MatchSource,
 };
 use crate::message::{Message, Role, TrustLevel};
 use crate::normalize::{
@@ -42,6 +44,16 @@ fn untrusted_message(text: &str) -> Message {
     msg
 }
 
+/// A projected Unit as an untrusted message that keeps the role and tool
+/// name of the one message it was cut from, so a tool result keeps its
+/// per-tool `result_policy`.
+fn unit_message(text: &str, origin: &Message) -> Message {
+    let mut msg = untrusted_message(text);
+    msg.role = origin.role.clone();
+    msg.tool_name = origin.tool_name.clone();
+    msg
+}
+
 /// Derive complete L0 dual views for each projected text, one message per
 /// text in input order.
 ///
@@ -52,13 +64,24 @@ pub fn derive_projected_views(
     normalizer: &dyn Normalizer,
     texts: &[&str],
 ) -> Result<L0ScanViews, ProjectionScanError> {
-    let messages: Vec<Message> = texts.iter().map(|t| untrusted_message(t)).collect();
+    derive_views(
+        normalizer,
+        texts.iter().map(|t| untrusted_message(t)).collect(),
+    )
+}
+
+/// [`derive_projected_views`] over prepared untrusted messages.
+fn derive_views(
+    normalizer: &dyn Normalizer,
+    messages: Vec<Message>,
+) -> Result<L0ScanViews, ProjectionScanError> {
     let (views, _, _) = normalize_messages_dual_view(normalizer, &messages)
         .map_err(|_| ProjectionScanError::MappingInvariant)?;
-    if views.pre_html.len() != texts.len() || views.html_stripped.len() != texts.len() {
+    if views.pre_html.len() != messages.len() || views.html_stripped.len() != messages.len() {
         return Err(ProjectionScanError::MappingInvariant);
     }
-    for (i, text) in texts.iter().enumerate() {
+    for (i, msg) in messages.iter().enumerate() {
+        let text = &msg.content;
         let mut all_empty = true;
         for view in [L0ScanView::PreHtml, L0ScanView::HtmlStripped] {
             let len = views.messages_for_view(view)[i].content.len();
@@ -162,21 +185,33 @@ impl MatchAdmission for NonExemptAdmission<'_> {
     }
 }
 
-/// One counted L3 match on the projected basis. The index is a projected
-/// input index, never a message index.
+/// Where a projected-basis L3 finding was found. The two index spaces never
+/// mix.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProjectedL3Source {
+    /// Content of a projected input; the index is a projected input index,
+    /// never a message index.
+    Projected {
+        projected_input_index: usize,
+        kind: ProjectionKind,
+    },
+    /// Tool-call arguments of a parsed message; the index is a message index,
+    /// never a projected input index.
+    ToolCallArgument { message_index: usize },
+}
+
+/// One counted L3 match on the projected basis.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProjectedL3Match {
-    pub projected_input_index: usize,
-    pub kind: ProjectionKind,
+    pub source: ProjectedL3Source,
     pub pattern_index: usize,
     pub action: PatternAction,
 }
 
-/// L3 block on the projected basis, attributed to a projected input.
+/// L3 block on the projected basis.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProjectedL3Block {
-    pub projected_input_index: usize,
-    pub kind: ProjectionKind,
+    pub source: ProjectedL3Source,
     pub reason: String,
     /// `None` for the content-length policy.
     pub scan_view: Option<L0ScanView>,
@@ -196,11 +231,19 @@ pub struct ProjectedL3Result {
 ///
 /// Content policy (`max_length`) applies to Unit inputs only: Boundary and
 /// Aggregate inputs re-present Unit bytes, and the aggregate's length is a
-/// join artifact rather than any one message's untrusted content.
+/// join artifact rather than any one message's untrusted content. A Unit is
+/// held to the policy of the message it was cut from (`messages`), so a tool
+/// result keeps its per-tool `result_policy`.
+///
+/// Tool-call arguments of `messages` are then scanned by the scanner's
+/// unchanged tool-call pass, with no exemption, attributed by message index.
+/// A content pattern block takes precedence over a tool-call block, which
+/// takes precedence over the length policy.
 pub fn scan_projected_l3(
     scanner: &dyn InboundScanner,
     normalizer: &dyn Normalizer,
     inputs: &[ProjectedInput],
+    messages: &[Message],
     config: &Config,
 ) -> Result<ProjectedL3Result, InboundDualScanError> {
     // Units first, so the scanner's first length-policy hit beyond the units
@@ -213,8 +256,25 @@ pub fn scan_projected_l3(
         .iter()
         .filter(|i| i.kind == ProjectionKind::Unit)
         .count();
-    let texts: Vec<&str> = order.iter().map(|&i| inputs[i].text.as_str()).collect();
-    let views = derive_projected_views(normalizer, &texts)
+    let scan_messages = order
+        .iter()
+        .map(|&i| {
+            let input = &inputs[i];
+            if input.kind != ProjectionKind::Unit {
+                return Ok(untrusted_message(&input.text));
+            }
+            match input.spans.as_slice() {
+                [span] => messages
+                    .get(span.message_index)
+                    .map(|origin| unit_message(&input.text, origin)),
+                _ => None,
+            }
+            .ok_or(InboundDualScanError::InvalidScanViews {
+                reason: "projected unit has no originating message",
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let views = derive_views(normalizer, scan_messages)
         .map_err(|e| InboundDualScanError::InvalidScanViews { reason: e.as_str() })?;
 
     let admission = NonExemptAdmission {
@@ -231,29 +291,68 @@ pub fn scan_projected_l3(
                 reason: "projected L3 result index out of range",
             })
     };
-    let mut out = ProjectedL3Result::default();
-    for m in &result.matched_patterns {
-        let i = input_at(m.message_index)?;
-        out.matches.push(ProjectedL3Match {
+    let projected_source = |batch_index: usize| -> Result<ProjectedL3Source, InboundDualScanError> {
+        let i = input_at(batch_index)?;
+        Ok(ProjectedL3Source::Projected {
             projected_input_index: i,
             kind: inputs[i].kind,
+        })
+    };
+    let mut out = ProjectedL3Result::default();
+    for m in &result.matched_patterns {
+        out.matches.push(ProjectedL3Match {
+            source: projected_source(m.message_index)?,
             pattern_index: m.pattern_index,
             action: m.action.clone(),
         });
     }
-    if let InboundVerdict::Block(block) = result.verdict {
-        // A view-less content block is the length policy (no tool calls exist
-        // on projected inputs); beyond the units it is not enforced.
-        if block.scan_view.is_some() || block.message_index < unit_count {
-            let i = input_at(block.message_index)?;
-            out.block = Some(ProjectedL3Block {
-                projected_input_index: i,
-                kind: inputs[i].kind,
-                reason: block.reason,
-                scan_view: block.scan_view,
+    // A view-less content block is the length policy (no tool calls exist on
+    // projected inputs); beyond the units it is not enforced.
+    let (pattern_block, length_block) = match result.verdict {
+        InboundVerdict::Block(block) if block.scan_view.is_some() => (Some(block), None),
+        InboundVerdict::Block(block) if block.message_index < unit_count => (None, Some(block)),
+        _ => (None, None),
+    };
+    let content_block = |block: InboundBlock| {
+        Ok::<_, InboundDualScanError>(ProjectedL3Block {
+            source: projected_source(block.message_index)?,
+            reason: block.reason,
+            scan_view: block.scan_view,
+        })
+    };
+
+    let tool_calls = scanner.scan_tool_call_arguments(messages, config)?;
+    for m in &tool_calls.matched_patterns {
+        if !matches!(m.source, MatchSource::ToolCallArgument { .. }) {
+            return Err(InboundDualScanError::InvalidScanViews {
+                reason: "tool-call pass reported a non-tool-call match",
             });
         }
+        out.matches.push(ProjectedL3Match {
+            source: ProjectedL3Source::ToolCallArgument {
+                message_index: m.message_index,
+            },
+            pattern_index: m.pattern_index,
+            action: m.action.clone(),
+        });
     }
+    let tool_call_block = match tool_calls.verdict {
+        InboundVerdict::Block(block) => Some(ProjectedL3Block {
+            source: ProjectedL3Source::ToolCallArgument {
+                message_index: block.message_index,
+            },
+            reason: block.reason,
+            scan_view: None,
+        }),
+        InboundVerdict::Allow => None,
+    };
+
+    out.block = match (pattern_block, tool_call_block, length_block) {
+        (Some(block), _, _) => Some(content_block(block)?),
+        (None, Some(block), _) => Some(block),
+        (None, None, Some(block)) => Some(content_block(block)?),
+        (None, None, None) => None,
+    };
     Ok(out)
 }
 

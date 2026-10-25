@@ -67,7 +67,7 @@ use uuid::Uuid;
 mod projected;
 pub use projected::{
     derive_projected_views, scan_projected_l3, L0ViewDeriver, L1ViewScorer, ProjectedEngineStage,
-    ProjectedL3Block, ProjectedL3Match, ProjectedL3Result,
+    ProjectedL3Block, ProjectedL3Match, ProjectedL3Result, ProjectedL3Source,
 };
 
 // ---------------------------------------------------------------------------
@@ -1051,6 +1051,7 @@ impl EngineUpstreamClient {
                     scanner_ref.as_ref(),
                     normalizer_ref.as_ref(),
                     inputs,
+                    scan_views.html_stripped_messages(),
                     config_ref,
                 )
                 .map(L3Outcome::Projected),
@@ -1532,6 +1533,21 @@ impl EngineUpstreamClient {
         match &result.block {
             Some(block) => {
                 let enforced = layer.mode == "block";
+                let (source, projected_input_index, projected_kind, message_index) =
+                    match &block.source {
+                        projected::ProjectedL3Source::Projected {
+                            projected_input_index,
+                            kind,
+                        } => (
+                            "projected_input",
+                            Some(*projected_input_index),
+                            Some(*kind),
+                            None,
+                        ),
+                        projected::ProjectedL3Source::ToolCallArgument { message_index } => {
+                            ("tool_call_argument", None, None, Some(*message_index))
+                        }
+                    };
                 tracing::info!(
                     request_id = %ctx.request_id,
                     contract_hash = %ctx.contract_hash,
@@ -1540,8 +1556,10 @@ impl EngineUpstreamClient {
                     layer = "L3-inbound",
                     verdict = if enforced { "block" } else { "block_shadow" },
                     basis = "projected",
-                    projected_input_index = block.projected_input_index,
-                    projected_kind = ?block.kind,
+                    source,
+                    projected_input_index = ?projected_input_index,
+                    projected_kind = ?projected_kind,
+                    message_index = ?message_index,
                     inspected_view = block.scan_view.map(|view| view.as_str()).unwrap_or("not_applicable"),
                     reason = %block.reason,
                     matched_patterns = result.matches.len(),
