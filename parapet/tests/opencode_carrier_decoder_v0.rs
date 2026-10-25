@@ -209,6 +209,42 @@ fn bodies_the_adapter_rejects_do_not_decode() {
             ProviderType::Anthropic,
             br#"{"messages": [{"role": "user", "content": 7}]}"#,
         ),
+        (
+            ProviderType::Anthropic,
+            br#"{"system": 7, "messages": [{"role": "user", "content": "x"}]}"#,
+        ),
+        (
+            ProviderType::Anthropic,
+            br#"{"system": {"type": "text", "text": "x"}, "messages": [{"role": "user", "content": "x"}]}"#,
+        ),
+        (
+            ProviderType::Anthropic,
+            br#"{"system": ["x"], "messages": [{"role": "user", "content": "x"}]}"#,
+        ),
+        (
+            ProviderType::Anthropic,
+            br#"{"system": [{"type": "image", "text": "x"}], "messages": [{"role": "user", "content": "x"}]}"#,
+        ),
+        (
+            ProviderType::Anthropic,
+            br#"{"system": [{"type": "text"}], "messages": [{"role": "user", "content": "x"}]}"#,
+        ),
+        (
+            ProviderType::Anthropic,
+            br#"{"system": [{"type": "text", "text": 7}], "messages": [{"role": "user", "content": "x"}]}"#,
+        ),
+        (
+            ProviderType::Anthropic,
+            br#"{"system": [{"type": "text", "text": "x", "extra": 1}], "messages": [{"role": "user", "content": "x"}]}"#,
+        ),
+        (
+            ProviderType::Anthropic,
+            br#"{"system": [{"type": "text", "text": "x", "cache_control": "ephemeral"}], "messages": [{"role": "user", "content": "x"}]}"#,
+        ),
+        (
+            ProviderType::Anthropic,
+            br#"{"system": [{"type": "text", "text": "x", "cache_control": {"type": "other"}}], "messages": [{"role": "user", "content": "x"}]}"#,
+        ),
     ] {
         assert!(adapter_for(provider).parse_request(body).is_err());
         assert_eq!(decode(provider, body), None);
@@ -332,6 +368,10 @@ fn duplicate_json_keys_rejected_before_adapter_and_mapped_to_out_of_range() {
             ProviderType::Anthropic,
             br#"{"model":"synthetic","system":"sys","messages":[{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"read_file","input":{"path":"/tmp/a","options":{"depth":1}}}]},{"role":"user","content":"ok"}]}"#,
         ),
+        (
+            ProviderType::Anthropic,
+            br#"{"model":"synthetic","system":[{"type":"text","text":"sys-a\n","cache_control":{"type":"ephemeral"}},{"type":"text","text":"sys-b","cache_control":{"type":"ephemeral","ttl":"5m"}}],"messages":[{"role":"user","content":"ok"}]}"#,
+        ),
     ];
     for &(provider, body) in green_cases {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -370,6 +410,26 @@ fn duplicate_json_keys_rejected_before_adapter_and_mapped_to_out_of_range() {
             "anthropic top-level duplicate system",
             ProviderType::Anthropic,
             br#"{"system":"safe","system":"evil","messages":[{"role":"user","content":"hi"}]}"#,
+        ),
+        (
+            "anthropic system array block duplicate text",
+            ProviderType::Anthropic,
+            br#"{"system":[{"type":"text","text":"safe","text":"evil","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":"hi"}]}"#,
+        ),
+        (
+            "anthropic system array block duplicate type",
+            ProviderType::Anthropic,
+            br#"{"system":[{"type":"text","type":"text","text":"hi"}],"messages":[{"role":"user","content":"hi"}]}"#,
+        ),
+        (
+            "anthropic system array block duplicate cache_control",
+            ProviderType::Anthropic,
+            br#"{"system":[{"type":"text","text":"hi","cache_control":{"type":"ephemeral"},"cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":"hi"}]}"#,
+        ),
+        (
+            "anthropic system array block cache_control duplicate type",
+            ProviderType::Anthropic,
+            br#"{"system":[{"type":"text","text":"hi","cache_control":{"type":"ephemeral","type":"ephemeral"}}],"messages":[{"role":"user","content":"hi"}]}"#,
         ),
         (
             "openai nested message duplicate content",
@@ -593,6 +653,360 @@ fn vendor_static_requires_system_slot_under_provider_decoder() {
         .unwrap_err();
     assert_eq!(
         (err.outcome, err.segment_index),
+        (VerificationOutcome::VendorDigestMismatch, Some(0))
+    );
+}
+
+// ---------- C-W4c1-1: Anthropic array-system mapping and carrier geometry ----------
+
+#[test]
+fn anthropic_array_system_with_cache_control_decodes_identically_and_unmodified_profile_rejects_unpinned_synthetic_vendor() {
+    use parapet::provider::AnthropicAdapter;
+
+    let vendor_block = "You are a coding agent. Follow the OpenCode tool protocol.\n";
+    let dynamic_env_block = "<env>\nWorking directory: /workspace/project\nPlatform: darwin\n</env>\n";
+    let dynamic_repo_block = "Repository rule: run focused tests before finishing.\n";
+    let user_text = "Inspect src/provider/mod.rs and fix the system array parser.";
+
+    let body_json = json!({
+        "model": "claude-sonnet-4-20250514",
+        "system": [
+            {
+                "type": "text",
+                "text": vendor_block,
+                "cache_control": {"type": "ephemeral"}
+            },
+            {
+                "type": "text",
+                "text": dynamic_env_block,
+                "cache_control": {"type": "ephemeral", "ttl": "5m"}
+            },
+            {
+                "type": "text",
+                "text": dynamic_repo_block,
+                "cache_control": null
+            }
+        ],
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": user_text
+                    }
+                ]
+            }
+        ]
+    });
+    let body = serde_json::to_vec(&body_json).unwrap();
+
+    // 1. Shared deterministic mapping: AnthropicAdapter::parse_system_content,
+    //    AnthropicAdapter::parse_request, and ProviderContentDecoder all produce
+    //    the exact "" concatenation of block text in Message::content.
+    let expected_sys = format!("{vendor_block}{dynamic_env_block}{dynamic_repo_block}");
+    assert_eq!(
+        AnthropicAdapter::parse_system_content(&body_json["system"]).unwrap(),
+        expected_sys
+    );
+    let adapter_msgs = adapter_for(ProviderType::Anthropic)
+        .parse_request(&body)
+        .unwrap();
+    assert_eq!(adapter_msgs.len(), 2);
+    assert_eq!(adapter_msgs[0].content, expected_sys);
+    assert_eq!(adapter_msgs[1].content, user_text);
+
+    let decoded = decode_messages(ProviderType::Anthropic, &body).unwrap();
+    assert_eq!(
+        decoded,
+        vec![
+            DecodedMessage {
+                content: expected_sys.clone(),
+                is_system_slot: true,
+            },
+            DecodedMessage {
+                content: user_text.to_string(),
+                is_system_slot: false,
+            },
+        ]
+    );
+
+    // Empty array or all-empty text blocks emit no system message and do not mark message 0 as system.
+    for empty_sys in [
+        json!([]),
+        json!([{"type": "text", "text": "", "cache_control": {"type": "ephemeral"}}]),
+    ] {
+        let empty_sys_body = serde_json::to_vec(&json!({
+            "system": empty_sys,
+            "messages": [{"role": "user", "content": PINNED_SYSTEM}]
+        }))
+        .unwrap();
+        let empty_decoded = decode_messages(ProviderType::Anthropic, &empty_sys_body).unwrap();
+        assert_eq!(
+            empty_decoded,
+            vec![DecodedMessage {
+                content: PINNED_SYSTEM.to_string(),
+                is_system_slot: false,
+            }]
+        );
+    }
+
+    // 2. Unmodified opencode_2_0_32_profile() ("843a6c51", 11 pinned digests):
+    //    Committed tests do not include OpenCode prompt prose, so against the unmodified
+    //    pinned manifest:
+    //    - unpinned synthetic vendor_static text passes Message::content geometry and
+    //      segment-digest checks, then fails closed at VendorDigestMismatch;
+    //    - non-vendor segments verify under OPENCODE_BUILD ("843a6c51").
+    let v_end = vendor_block.len();
+    let env_end = v_end + dynamic_env_block.len();
+    let repo_end = env_end + dynamic_repo_block.len();
+    assert_eq!(repo_end, expected_sys.len());
+
+    let segments = vec![
+        Segment {
+            message_index: 0,
+            start: 0,
+            end: v_end,
+            source: Source::VendorStatic,
+            sha256: Sha256Digest::of(vendor_block.as_bytes()),
+        },
+        Segment {
+            message_index: 0,
+            start: v_end,
+            end: env_end,
+            source: Source::ConfiguredAgent,
+            sha256: Sha256Digest::of(dynamic_env_block.as_bytes()),
+        },
+        Segment {
+            message_index: 0,
+            start: env_end,
+            end: repo_end,
+            source: Source::Repository,
+            sha256: Sha256Digest::of(dynamic_repo_block.as_bytes()),
+        },
+        Segment {
+            message_index: 1,
+            start: 0,
+            end: user_text.len(),
+            source: Source::User,
+            sha256: Sha256Digest::of(user_text.as_bytes()),
+        },
+    ];
+
+    let make_opencode_env = |body_bytes: &[u8], segs: Vec<Segment>, seq: u64| -> Vec<u8> {
+        let map = SourceMap { segments: segs };
+        serde_json::to_vec(&json!({
+            "schema_version": OPENCODE_SCHEMA_VERSION,
+            "profile": OPENCODE_PROFILE_ID,
+            "build": OPENCODE_BUILD,
+            "session_id": SESSION,
+            "sequence": seq,
+            "issued_at_ms": NOW - 1_000,
+            "expires_at_ms": NOW + 10_000,
+            "request_body_sha256": Sha256Digest::of(body_bytes).to_hex(),
+            "source_map_sha256": map.canonical_digest().to_hex(),
+            "source_map": map,
+            "authenticator": "00",
+        }))
+        .unwrap()
+    };
+
+    let unmodified_verifier = CarrierVerifier::new(CarrierVerifierDeps {
+        profile: opencode_2_0_32_profile(),
+        session_id: SESSION.to_string(),
+        authenticator: Box::new(AcceptAll),
+        clock: Box::new(FixedClock),
+        ledger: Box::new(InMemoryReplayLedger::new()),
+        decoder: Box::new(ProviderContentDecoder::new(ProviderType::Anthropic)),
+    });
+    let env_unpinned = make_opencode_env(&body, segments.clone(), 1);
+    let err_unpinned = unmodified_verifier
+        .verify(Some(&env_unpinned), &body)
+        .unwrap_err();
+    assert_eq!(
+        (err_unpinned.outcome, err_unpinned.segment_index),
+        (VerificationOutcome::VendorDigestMismatch, Some(0))
+    );
+
+    let mut nonvendor_segs = segments;
+    nonvendor_segs[0].source = Source::ConfiguredAgent;
+    let env_nonvendor = make_opencode_env(&body, nonvendor_segs, 2);
+    let verified_nonvendor = unmodified_verifier
+        .verify(Some(&env_nonvendor), &body)
+        .expect("unmodified opencode_2_0_32_profile verifies non-vendor array-system Message::content geometry");
+    assert_eq!(verified_nonvendor.identity.profile, OPENCODE_PROFILE_ID);
+    assert_eq!(verified_nonvendor.identity.build, OPENCODE_BUILD);
+    assert_eq!(
+        verified_nonvendor.messages,
+        vec![expected_sys, user_text.to_string()]
+    );
+}
+
+#[test]
+fn anthropic_array_system_with_cache_control_verifies_vendor_static_geometry_with_synthetic_manifest() {
+    let vendor_block = "You are a coding agent. Follow the OpenCode tool protocol.\n";
+    let dynamic_env_block = "<env>\nWorking directory: /workspace/project\nPlatform: darwin\n</env>\n";
+    let dynamic_repo_block = "Repository rule: run focused tests before finishing.\n";
+    let user_text = "Inspect src/provider/mod.rs and fix the system array parser.";
+
+    let body_json = json!({
+        "model": "claude-sonnet-4-20250514",
+        "system": [
+            {
+                "type": "text",
+                "text": vendor_block,
+                "cache_control": {"type": "ephemeral"}
+            },
+            {
+                "type": "text",
+                "text": dynamic_env_block,
+                "cache_control": {"type": "ephemeral", "ttl": "5m"}
+            },
+            {
+                "type": "text",
+                "text": dynamic_repo_block,
+                "cache_control": null
+            }
+        ],
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": user_text
+                    }
+                ]
+            }
+        ]
+    });
+    let body = serde_json::to_vec(&body_json).unwrap();
+    let expected_sys = format!("{vendor_block}{dynamic_env_block}{dynamic_repo_block}");
+
+    let v_end = vendor_block.len();
+    let env_end = v_end + dynamic_env_block.len();
+    let repo_end = env_end + dynamic_repo_block.len();
+    let segments = vec![
+        Segment {
+            message_index: 0,
+            start: 0,
+            end: v_end,
+            source: Source::VendorStatic,
+            sha256: Sha256Digest::of(vendor_block.as_bytes()),
+        },
+        Segment {
+            message_index: 0,
+            start: v_end,
+            end: env_end,
+            source: Source::ConfiguredAgent,
+            sha256: Sha256Digest::of(dynamic_env_block.as_bytes()),
+        },
+        Segment {
+            message_index: 0,
+            start: env_end,
+            end: repo_end,
+            source: Source::Repository,
+            sha256: Sha256Digest::of(dynamic_repo_block.as_bytes()),
+        },
+        Segment {
+            message_index: 1,
+            start: 0,
+            end: user_text.len(),
+            source: Source::User,
+            sha256: Sha256Digest::of(user_text.as_bytes()),
+        },
+    ];
+
+    // Synthetic manifest geometry test (does not use or mutate opencode_2_0_32_profile()):
+    // proves vendor_static exemption and Message::content offset failure modes on array-form system.
+    let synthetic_manifest = VendorManifest::new([Sha256Digest::of(vendor_block.as_bytes())]);
+    let env_valid = envelope_for_segments(&body, segments.clone());
+    let verified = verifier_with_manifest(ProviderType::Anthropic, synthetic_manifest.clone())
+        .verify(Some(&env_valid), &body)
+        .expect("synthetic-manifest vendor_static geometry over Anthropic array-system Message::content succeeds");
+    assert_eq!(
+        verified.messages,
+        vec![expected_sys.clone(), user_text.to_string()]
+    );
+
+    let projected = project(&geometry_of(&verified));
+    let unit_texts: Vec<&str> = projected
+        .iter()
+        .filter(|i| i.kind == ProjectionKind::Unit)
+        .map(|i| i.text.as_str())
+        .collect();
+    assert_eq!(
+        unit_texts,
+        vec![
+            format!("{dynamic_env_block}{dynamic_repo_block}").as_str(),
+            user_text,
+        ]
+    );
+    assert!(
+        unit_texts
+            .iter()
+            .all(|t| !t.contains("Follow the OpenCode tool protocol")),
+        "attested vendor_static block is exempt from unit projection"
+    );
+
+    // Wrong / raw-wire JSON offsets fail closed (MapOutOfRange).
+    let raw_system_json = serde_json::to_string(&body_json["system"]).unwrap();
+    assert!(raw_system_json.len() > expected_sys.len());
+    let raw_wire_segs = vec![
+        Segment {
+            message_index: 0,
+            start: 0,
+            end: raw_system_json.len(),
+            source: Source::VendorStatic,
+            sha256: Sha256Digest::of(raw_system_json.as_bytes()),
+        },
+        Segment {
+            message_index: 1,
+            start: 0,
+            end: user_text.len(),
+            source: Source::User,
+            sha256: Sha256Digest::of(user_text.as_bytes()),
+        },
+    ];
+    let env_raw_wire = envelope_for_segments(&body, raw_wire_segs);
+    let err_raw_wire = verifier_with_manifest(ProviderType::Anthropic, synthetic_manifest.clone())
+        .verify(Some(&env_raw_wire), &body)
+        .unwrap_err();
+    assert_eq!(
+        (err_raw_wire.outcome, err_raw_wire.segment_index),
+        (VerificationOutcome::MapOutOfRange, Some(0))
+    );
+
+    // Mutated block text fails closed (SegmentDigestMismatch when envelope is re-signed for mutated body
+    // with stale segment digest, and VendorDigestMismatch when vendor block text + segment digest are mutated).
+    let mutated_vendor = "You are a coding agent. Follow the OpenCode tool protocol!\n";
+    let mutated_body = serde_json::to_vec(&json!({
+        "model": "claude-sonnet-4-20250514",
+        "system": [
+            {"type": "text", "text": mutated_vendor, "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": dynamic_env_block, "cache_control": {"type": "ephemeral", "ttl": "5m"}},
+            {"type": "text", "text": dynamic_repo_block, "cache_control": null}
+        ],
+        "messages": [{"role": "user", "content": [{"type": "text", "text": user_text}]}]
+    }))
+    .unwrap();
+    let env_stale_seg = envelope_for_segments(&mutated_body, segments.clone());
+    let err_stale_seg = verifier_with_manifest(ProviderType::Anthropic, synthetic_manifest.clone())
+        .verify(Some(&env_stale_seg), &mutated_body)
+        .unwrap_err();
+    assert_eq!(
+        (err_stale_seg.outcome, err_stale_seg.segment_index),
+        (VerificationOutcome::SegmentDigestMismatch, Some(0))
+    );
+
+    let mut mutated_segs = segments;
+    mutated_segs[0].sha256 = Sha256Digest::of(mutated_vendor.as_bytes());
+    let env_mutated_vendor = envelope_for_segments(&mutated_body, mutated_segs);
+    let err_mutated_vendor = verifier_with_manifest(ProviderType::Anthropic, synthetic_manifest)
+        .verify(Some(&env_mutated_vendor), &mutated_body)
+        .unwrap_err();
+    assert_eq!(
+        (err_mutated_vendor.outcome, err_mutated_vendor.segment_index),
         (VerificationOutcome::VendorDigestMismatch, Some(0))
     );
 }

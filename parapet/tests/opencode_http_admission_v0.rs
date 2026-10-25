@@ -3227,4 +3227,438 @@ mod w4b_control_wire {
             }
         }
     }
+
+    #[tokio::test]
+    async fn w4c2b_anthropic_array_system_session_admission_unmodified_opencode_profile_nonvendor_and_unpinned_vendor_reject() {
+        let trace_capture = ThreadTraceGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join("s_w4c2b_unmod");
+        init_private_state_dir(&state_dir);
+
+        let route = ProvenanceRouteBinding::ANTHROPIC;
+        let sessions = Arc::new(SessionManager::with_entropy(Box::new(
+            ScriptedSessionEntropy::new(),
+        )));
+
+        // Unmodified production opencode_2_0_32_profile() ("843a6c51", 11 pinned digests).
+        // Committed tests do not include OpenCode prompt prose, so against the unmodified
+        // pinned manifest:
+        // - synthetic CANARY_VENDOR claimed as VendorStatic rejects with vendor_digest_mismatch;
+        // - non-vendor array-system blocks (ConfiguredAgent + Repository + User) with
+        //   cache_control and Message::content offsets verify and admit.
+        let unmodified_profile = opencode_2_0_32_profile();
+        let session_handle = ProvenanceSessionControl::with_clock_factory(
+            route,
+            sessions,
+            unmodified_profile,
+            || -> Box<dyn Clock> { Box::new(FixedClock(NOW_MS)) },
+        );
+        let (plane, _listener, _shutdown_rx) = EngineControlPlane::bind_with_provenance_session(
+            &state_dir,
+            45234,
+            CONFIG_HASH,
+            None,
+            Some(session_handle.clone()),
+        )
+        .unwrap();
+        let token = std::fs::read_to_string(state_dir.join("control.token")).unwrap();
+
+        let (start1, _) = send_control_line_in_process(
+            &plane,
+            &format!(
+                r#"{{"schema":"parapet-control/v0","token":"{token}","action":"{CONTROL_ACTION_PROVENANCE_SESSION_START}"}}"#
+            ),
+        );
+        let session_id = start1["session_id"].as_str().unwrap().to_owned();
+        let session_key_hex = start1["session_key_hex"].as_str().unwrap().to_owned();
+        let key = decode_key_hex(&session_key_hex);
+
+        let (engine, probes) = build_engine_with_probes();
+        let next_stage = Arc::new(CapturingNextStage::default());
+        let app = build_router_with_admission(
+            engine,
+            Arc::new(session_handle.request_admitter(ProfileMode::RequiredOpenCode)),
+            Some(next_stage.clone()),
+        );
+
+        let array_body = serde_json::to_vec(&json!({
+            "model": "claude-3-5-sonnet",
+            "system": [
+                {
+                    "type": "text",
+                    "text": CANARY_VENDOR,
+                    "cache_control": {"type": "ephemeral"}
+                },
+                {
+                    "type": "text",
+                    "text": CANARY_REPO,
+                    "cache_control": {"type": "ephemeral", "ttl": "5m"}
+                }
+            ],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": CANARY_USER}
+                    ]
+                }
+            ]
+        }))
+        .unwrap();
+        let v_len = CANARY_VENDOR.len();
+        let s_len = v_len + CANARY_REPO.len();
+        let u_len = CANARY_USER.len();
+
+        let sign_opencode_env =
+            |body_bytes: &[u8], segs: Vec<Segment>, seq: u64| -> (Vec<u8>, String) {
+                let source_map = SourceMap { segments: segs };
+                let mut env = CarrierEnvelope {
+                    schema_version: OPENCODE_SCHEMA_VERSION,
+                    profile: OPENCODE_PROFILE_ID.to_string(),
+                    build: OPENCODE_BUILD.to_string(),
+                    session_id: session_id.clone(),
+                    sequence: seq,
+                    issued_at_ms: NOW_MS - 1_000,
+                    expires_at_ms: NOW_MS + 10_000,
+                    request_body_sha256: Sha256Digest::of(body_bytes),
+                    source_map_sha256: source_map.canonical_digest(),
+                    source_map,
+                    authenticator: Authenticator::from_bytes(vec![0u8; 32]),
+                };
+                let auth = HmacSha256Authenticator::new(key.clone());
+                let tag = auth.tag(&env.signed_payload());
+                let tag_hex = Sha256Digest::from_bytes(tag).to_hex();
+                env.authenticator = Authenticator::from_bytes(tag.to_vec());
+                (serde_json::to_vec(&env).unwrap(), tag_hex)
+            };
+
+        // 1. Unpinned synthetic CANARY_VENDOR claimed as VendorStatic rejects with
+        //    vendor_digest_mismatch against the unmodified 843a6c51 manifest (0 sends).
+        let unpinned_vendor_segs = vec![
+            Segment {
+                message_index: 0,
+                start: 0,
+                end: v_len,
+                source: Source::VendorStatic,
+                sha256: Sha256Digest::of(CANARY_VENDOR.as_bytes()),
+            },
+            Segment {
+                message_index: 0,
+                start: v_len,
+                end: s_len,
+                source: Source::Repository,
+                sha256: Sha256Digest::of(CANARY_REPO.as_bytes()),
+            },
+            Segment {
+                message_index: 1,
+                start: 0,
+                end: u_len,
+                source: Source::User,
+                sha256: Sha256Digest::of(CANARY_USER.as_bytes()),
+            },
+        ];
+        let (env_unpinned, tag_unpinned_hex) =
+            sign_opencode_env(&array_body, unpinned_vendor_segs.clone(), 0);
+        let req_unpinned = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .header(
+                PROVENANCE_HEADER,
+                HeaderValue::from_bytes(&env_unpinned).unwrap(),
+            )
+            .body(Body::from(array_body.clone()))
+            .unwrap();
+        let resp_unpinned = app.clone().oneshot(req_unpinned).await.unwrap();
+        let json_unpinned = assert_carrier_rejection(resp_unpinned, "vendor_digest_mismatch").await;
+        assert_eq!(next_stage.call_count(), 0);
+        assert_eq!(probes.http_calls.load(Ordering::SeqCst), 0);
+
+        // 2. Non-vendor array-system segments verify and admit against unmodified opencode_2_0_32_profile().
+        let mut nonvendor_segs = unpinned_vendor_segs;
+        nonvendor_segs[0].source = Source::ConfiguredAgent;
+        let (env_nonvendor, tag_nonvendor_hex) =
+            sign_opencode_env(&array_body, nonvendor_segs, 1);
+        let req_nonvendor = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .header("authorization", CANARY_AUTH_HEADER)
+            .header("x-guard-trust", CANARY_TRUST_HEADER)
+            .header(
+                PROVENANCE_HEADER,
+                HeaderValue::from_bytes(&env_nonvendor).unwrap(),
+            )
+            .body(Body::from(array_body))
+            .unwrap();
+        let resp_nonvendor = app.oneshot(req_nonvendor).await.unwrap();
+        assert_eq!(resp_nonvendor.status(), StatusCode::OK);
+        assert_eq!(next_stage.call_count(), 1);
+        assert_eq!(probes.http_calls.load(Ordering::SeqCst), 0);
+        let captured = next_stage.take_captured();
+        assert_eq!(captured[0].0, Provider::Anthropic);
+        assert_eq!(captured[0].2.identity.profile, OPENCODE_PROFILE_ID);
+        assert_eq!(captured[0].2.identity.build, OPENCODE_BUILD);
+        assert_eq!(
+            captured[0].2.messages,
+            vec![
+                format!("{CANARY_VENDOR}{CANARY_REPO}"),
+                CANARY_USER.to_string()
+            ]
+        );
+
+        let logs = String::from_utf8(trace_capture.buf.lock().unwrap().clone()).unwrap();
+        for surface in [logs, serde_json::to_string(&json_unpinned).unwrap()] {
+            for needle in [
+                session_key_hex.as_str(),
+                CANARY_W4B_KEY_1_STR,
+                tag_unpinned_hex.as_str(),
+                tag_nonvendor_hex.as_str(),
+                CANARY_VENDOR.trim(),
+                CANARY_REPO.trim(),
+                CANARY_USER,
+            ] {
+                assert!(
+                    !surface.contains(needle),
+                    "W4c2b unmodified-profile surface leaked {needle:?}: {surface}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn w4c2b_anthropic_array_system_session_admission_vendor_static_geometry_with_synthetic_manifest() {
+        let trace_capture = ThreadTraceGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join("s_w4c2b_synth");
+        init_private_state_dir(&state_dir);
+
+        let route = ProvenanceRouteBinding::ANTHROPIC;
+        let sessions = Arc::new(SessionManager::with_entropy(Box::new(
+            ScriptedSessionEntropy::new(),
+        )));
+
+        // Synthetic manifest profile (supported_profile(MAX_VALIDITY_MS) pins CANARY_VENDOR under BUILD_ID):
+        // proves vendor_static + Repository + User Message::content geometry on Anthropic array-form
+        // system blocks and fail-closed offset/digest rejections without mutating opencode_2_0_32_profile().
+        let session_handle = ProvenanceSessionControl::with_clock_factory(
+            route,
+            sessions.clone(),
+            supported_profile(MAX_VALIDITY_MS),
+            || -> Box<dyn Clock> { Box::new(FixedClock(NOW_MS)) },
+        );
+        let (plane, _listener, _shutdown_rx) = EngineControlPlane::bind_with_provenance_session(
+            &state_dir,
+            45235,
+            CONFIG_HASH,
+            None,
+            Some(session_handle.clone()),
+        )
+        .unwrap();
+        let token = std::fs::read_to_string(state_dir.join("control.token")).unwrap();
+
+        let (start1, _) = send_control_line_in_process(
+            &plane,
+            &format!(
+                r#"{{"schema":"parapet-control/v0","token":"{token}","action":"{CONTROL_ACTION_PROVENANCE_SESSION_START}"}}"#
+            ),
+        );
+        let session_id = start1["session_id"].as_str().unwrap().to_owned();
+        let session_key_hex = start1["session_key_hex"].as_str().unwrap().to_owned();
+        let key = decode_key_hex(&session_key_hex);
+
+        let (engine, probes) = build_engine_with_probes();
+        let next_stage = Arc::new(CapturingNextStage::default());
+        let app = build_router_with_admission(
+            engine,
+            Arc::new(session_handle.request_admitter(ProfileMode::RequiredOpenCode)),
+            Some(next_stage.clone()),
+        );
+
+        let array_body_json = json!({
+            "model": "claude-3-5-sonnet",
+            "system": [
+                {
+                    "type": "text",
+                    "text": CANARY_VENDOR,
+                    "cache_control": {"type": "ephemeral"}
+                },
+                {
+                    "type": "text",
+                    "text": CANARY_REPO,
+                    "cache_control": {"type": "ephemeral", "ttl": "5m"}
+                }
+            ],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": CANARY_USER}
+                    ]
+                }
+            ]
+        });
+        let array_body = serde_json::to_vec(&array_body_json).unwrap();
+        let v_len = CANARY_VENDOR.len();
+        let s_len = v_len + CANARY_REPO.len();
+        let u_len = CANARY_USER.len();
+        let valid_segments = vec![
+            Segment {
+                message_index: 0,
+                start: 0,
+                end: v_len,
+                source: Source::VendorStatic,
+                sha256: Sha256Digest::of(CANARY_VENDOR.as_bytes()),
+            },
+            Segment {
+                message_index: 0,
+                start: v_len,
+                end: s_len,
+                source: Source::Repository,
+                sha256: Sha256Digest::of(CANARY_REPO.as_bytes()),
+            },
+            Segment {
+                message_index: 1,
+                start: 0,
+                end: u_len,
+                source: Source::User,
+                sha256: Sha256Digest::of(CANARY_USER.as_bytes()),
+            },
+        ];
+
+        let sign_env = |body_bytes: &[u8], segs: Vec<Segment>, seq: u64| -> (Vec<u8>, String) {
+            let source_map = SourceMap { segments: segs };
+            let mut env = CarrierEnvelope {
+                schema_version: SCHEMA_VERSION_V1,
+                profile: PROFILE_ID.to_string(),
+                build: BUILD_ID.to_string(),
+                session_id: session_id.clone(),
+                sequence: seq,
+                issued_at_ms: NOW_MS - 1_000,
+                expires_at_ms: NOW_MS + 10_000,
+                request_body_sha256: Sha256Digest::of(body_bytes),
+                source_map_sha256: source_map.canonical_digest(),
+                source_map,
+                authenticator: Authenticator::from_bytes(vec![0u8; 32]),
+            };
+            let auth = HmacSha256Authenticator::new(key.clone());
+            let tag = auth.tag(&env.signed_payload());
+            let tag_hex = Sha256Digest::from_bytes(tag).to_hex();
+            env.authenticator = Authenticator::from_bytes(tag.to_vec());
+            (serde_json::to_vec(&env).unwrap(), tag_hex)
+        };
+
+        // 1. Valid Anthropic array-system request with cache_control and Message::content offsets admits
+        //    against the synthetic manifest.
+        let (env0, tag0_hex) = sign_env(&array_body, valid_segments.clone(), 0);
+        let req0 = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .header("authorization", CANARY_AUTH_HEADER)
+            .header("x-guard-trust", CANARY_TRUST_HEADER)
+            .header(PROVENANCE_HEADER, HeaderValue::from_bytes(&env0).unwrap())
+            .body(Body::from(array_body.clone()))
+            .unwrap();
+        let resp0 = app.clone().oneshot(req0).await.unwrap();
+        assert_eq!(resp0.status(), StatusCode::OK);
+        assert_eq!(next_stage.call_count(), 1);
+        let captured = next_stage.take_captured();
+        assert_eq!(captured[0].0, Provider::Anthropic);
+        assert_eq!(captured[0].2.identity.profile, PROFILE_ID);
+        assert_eq!(captured[0].2.identity.build, BUILD_ID);
+        assert_eq!(
+            captured[0].2.messages,
+            vec![
+                format!("{CANARY_VENDOR}{CANARY_REPO}"),
+                CANARY_USER.to_string()
+            ]
+        );
+
+        // 2. Raw-wire JSON offset (spanning serialized JSON of system[] instead of Message::content)
+        //    fails closed with map_out_of_range and 0 sends.
+        let raw_sys = serde_json::to_string(&array_body_json["system"]).unwrap();
+        let raw_segs = vec![
+            Segment {
+                message_index: 0,
+                start: 0,
+                end: raw_sys.len(),
+                source: Source::VendorStatic,
+                sha256: Sha256Digest::of(raw_sys.as_bytes()),
+            },
+            valid_segments[2].clone(),
+        ];
+        let (env1, tag1_hex) = sign_env(&array_body, raw_segs, 1);
+        let req1 = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .header(PROVENANCE_HEADER, HeaderValue::from_bytes(&env1).unwrap())
+            .body(Body::from(array_body.clone()))
+            .unwrap();
+        let resp1 = app.clone().oneshot(req1).await.unwrap();
+        let json1 = assert_carrier_rejection(resp1, "map_out_of_range").await;
+
+        // 3. Mutated block text fails closed with segment_digest_mismatch and vendor_digest_mismatch.
+        let mutated_vendor = "You are a coding agent. Follow protocol!\n";
+        let mutated_body = serde_json::to_vec(&json!({
+            "model": "claude-3-5-sonnet",
+            "system": [
+                {"type": "text", "text": mutated_vendor, "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": CANARY_REPO, "cache_control": {"type": "ephemeral", "ttl": "5m"}}
+            ],
+            "messages": [{"role": "user", "content": [{"type": "text", "text": CANARY_USER}]}]
+        }))
+        .unwrap();
+        let (env2, tag2_hex) = sign_env(&mutated_body, valid_segments.clone(), 2);
+        let req2 = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .header(PROVENANCE_HEADER, HeaderValue::from_bytes(&env2).unwrap())
+            .body(Body::from(mutated_body.clone()))
+            .unwrap();
+        let resp2 = app.clone().oneshot(req2).await.unwrap();
+        let json2 = assert_carrier_rejection(resp2, "segment_digest_mismatch").await;
+
+        let mut rehashed_segs = valid_segments.clone();
+        rehashed_segs[0].sha256 = Sha256Digest::of(mutated_vendor.as_bytes());
+        let (env3, tag3_hex) = sign_env(&mutated_body, rehashed_segs, 3);
+        let req3 = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .header(PROVENANCE_HEADER, HeaderValue::from_bytes(&env3).unwrap())
+            .body(Body::from(mutated_body))
+            .unwrap();
+        let resp3 = app.clone().oneshot(req3).await.unwrap();
+        let json3 = assert_carrier_rejection(resp3, "vendor_digest_mismatch").await;
+        assert_eq!(next_stage.call_count(), 1);
+        assert_eq!(probes.http_calls.load(Ordering::SeqCst), 0);
+
+        let logs = String::from_utf8(trace_capture.buf.lock().unwrap().clone()).unwrap();
+        for surface in [
+            logs,
+            serde_json::to_string(&json1).unwrap(),
+            serde_json::to_string(&json2).unwrap(),
+            serde_json::to_string(&json3).unwrap(),
+        ] {
+            for needle in [
+                session_key_hex.as_str(),
+                CANARY_W4B_KEY_1_STR,
+                tag0_hex.as_str(),
+                tag1_hex.as_str(),
+                tag2_hex.as_str(),
+                tag3_hex.as_str(),
+                CANARY_VENDOR.trim(),
+                CANARY_REPO.trim(),
+                CANARY_USER,
+            ] {
+                assert!(
+                    !surface.contains(needle),
+                    "W4c2b synthetic-manifest surface leaked {needle:?}: {surface}"
+                );
+            }
+        }
+    }
 }

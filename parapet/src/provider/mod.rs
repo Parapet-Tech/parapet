@@ -415,6 +415,141 @@ impl AnthropicAdapter {
             )),
         }
     }
+    /// Validate an optional `cache_control` field on an Anthropic `system[]` block.
+    ///
+    /// Supported shapes:
+    /// - `null`
+    /// - `{"type": "ephemeral"}` with an optional non-empty string `"ttl"` (e.g. `"5m"`, `"1h"`).
+    ///
+    /// Any other value type, missing/unsupported `"type"`, invalid `"ttl"`, or unknown
+    /// object key fails closed with [`ProviderError`].
+    fn validate_system_cache_control(cc: &serde_json::Value) -> Result<(), ProviderError> {
+        match cc {
+            serde_json::Value::Null => Ok(()),
+            serde_json::Value::Object(cc_obj) => {
+                for key in cc_obj.keys() {
+                    if key != "type" && key != "ttl" {
+                        return Err(ProviderError::InvalidFormat(format!(
+                            "system[].cache_control has unsupported field: {key}"
+                        )));
+                    }
+                }
+                match cc_obj.get("type") {
+                    Some(serde_json::Value::String(t)) if t == "ephemeral" => {}
+                    Some(serde_json::Value::String(other)) => {
+                        return Err(ProviderError::InvalidFormat(format!(
+                            "system[].cache_control.type must be \"ephemeral\", got \"{other}\""
+                        )));
+                    }
+                    Some(_) => {
+                        return Err(ProviderError::InvalidFormat(
+                            "system[].cache_control.type must be a string".to_string(),
+                        ));
+                    }
+                    None => {
+                        return Err(ProviderError::MissingField(
+                            "system[].cache_control.type".to_string(),
+                        ));
+                    }
+                }
+                if let Some(ttl_val) = cc_obj.get("ttl") {
+                    match ttl_val {
+                        serde_json::Value::String(ttl) if !ttl.is_empty() => {}
+                        _ => {
+                            return Err(ProviderError::InvalidFormat(
+                                "system[].cache_control.ttl must be a non-empty string".to_string(),
+                            ));
+                        }
+                    }
+                }
+                Ok(())
+            }
+            _ => Err(ProviderError::InvalidFormat(
+                "system[].cache_control must be an object or null".to_string(),
+            )),
+        }
+    }
+
+    /// Shared, deterministic mapping from an Anthropic top-level `system` value
+    /// into [`Message::content`] (gate C-W4c1-1).
+    ///
+    /// Used identically by ordinary whole-message scanning (`AnthropicAdapter::parse_request`)
+    /// and required-profile carrier decoding (`ProviderContentDecoder`).
+    ///
+    /// Supported forms:
+    /// - `Value::Null`: returns `""` (no `Role::System` message emitted).
+    /// - `Value::String(s)`: returns `s` verbatim.
+    /// - `Value::Array(blocks)`: concatenates each block's `"text"` string in array
+    ///   order with `""` (no synthetic separator), matching `messages[].content` and
+    ///   `tool_result` text-block concatenation so carrier segments address contiguous
+    ///   raw block text bytes in `Message::content`. Every element must be an object
+    ///   with `"type": "text"`, a string `"text"` field, and at most an optional
+    ///   `"cache_control"` field (`null` or `{"type": "ephemeral", "ttl"?: "<non-empty string>"}`).
+    ///
+    /// Fails closed with [`ProviderError`] on any other top-level `system` value type,
+    /// non-object array element, missing or non-`"text"` block `"type"`, missing or
+    /// non-string block `"text"`, unknown block key, or malformed `"cache_control"`.
+    pub fn parse_system_content(system_val: &serde_json::Value) -> Result<String, ProviderError> {
+        match system_val {
+            serde_json::Value::String(s) => Ok(s.clone()),
+            serde_json::Value::Null => Ok(String::new()),
+            serde_json::Value::Array(blocks) => {
+                let mut text_parts = Vec::with_capacity(blocks.len());
+                for block in blocks {
+                    let obj = block.as_object().ok_or_else(|| {
+                        ProviderError::InvalidFormat("system[] block must be an object".to_string())
+                    })?;
+
+                    for key in obj.keys() {
+                        if key != "type" && key != "text" && key != "cache_control" {
+                            return Err(ProviderError::InvalidFormat(format!(
+                                "system[] block has unsupported field: {key}"
+                            )));
+                        }
+                    }
+
+                    match obj.get("type") {
+                        Some(serde_json::Value::String(t)) if t == "text" => {}
+                        Some(serde_json::Value::String(other)) => {
+                            return Err(ProviderError::InvalidFormat(format!(
+                                "system[] block type must be \"text\", got \"{other}\""
+                            )));
+                        }
+                        Some(_) => {
+                            return Err(ProviderError::InvalidFormat(
+                                "system[].type must be a string".to_string(),
+                            ));
+                        }
+                        None => {
+                            return Err(ProviderError::MissingField("system[].type".to_string()));
+                        }
+                    }
+
+                    let text = match obj.get("text") {
+                        Some(serde_json::Value::String(s)) => s,
+                        Some(_) => {
+                            return Err(ProviderError::InvalidFormat(
+                                "system[].text must be a string".to_string(),
+                            ));
+                        }
+                        None => {
+                            return Err(ProviderError::MissingField("system[].text".to_string()));
+                        }
+                    };
+
+                    if let Some(cc) = obj.get("cache_control") {
+                        Self::validate_system_cache_control(cc)?;
+                    }
+
+                    text_parts.push(text.as_str());
+                }
+                Ok(text_parts.join(""))
+            }
+            _ => Err(ProviderError::InvalidFormat(
+                "system must be a string, array of text blocks, or null".to_string(),
+            )),
+        }
+    }
 }
 
 /// Internal helper: extracted tool result information from Anthropic content blocks.
@@ -430,13 +565,9 @@ impl ProviderAdapter for AnthropicAdapter {
 
         let mut result = Vec::new();
 
-        // Handle top-level system field
+        // Handle top-level system field via the shared deterministic mapping.
         if let Some(system_val) = root.get("system") {
-            let system_content = match system_val {
-                serde_json::Value::String(s) => s.clone(),
-                serde_json::Value::Null => String::new(),
-                other => other.to_string(),
-            };
+            let system_content = Self::parse_system_content(system_val)?;
             if !system_content.is_empty() {
                 result.push(Message::new(Role::System, system_content));
             }
@@ -1414,5 +1545,187 @@ mod tests {
         assert_eq!(messages[3].role, Role::Tool);
         assert_eq!(messages[3].tool_call_id, Some("toolu_1".to_string()));
         assert_eq!(messages[3].content, "file contents");
+    }
+
+    // ---------------------------------------------------------------
+    // C-W4c1-1: Anthropic top-level system array mapping and fail-closed validation
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn anthropic_system_array_single_and_multi_block_with_cache_control_concatenates_text() {
+        let adapter = AnthropicAdapter::new();
+
+        // Single text block with cache_control matches string system identically.
+        let string_body = json!({
+            "system": "You are a coding agent.\n",
+            "messages": [{"role": "user", "content": "Hello"}]
+        });
+        let single_block_body = json!({
+            "system": [
+                {
+                    "type": "text",
+                    "text": "You are a coding agent.\n",
+                    "cache_control": {"type": "ephemeral"}
+                }
+            ],
+            "messages": [{"role": "user", "content": "Hello"}]
+        });
+        let from_str = adapter
+            .parse_request(string_body.to_string().as_bytes())
+            .unwrap();
+        let from_single = adapter
+            .parse_request(single_block_body.to_string().as_bytes())
+            .unwrap();
+        assert_eq!(from_str.len(), 2);
+        assert_eq!(from_single.len(), 2);
+        assert_eq!(from_single[0].role, Role::System);
+        assert_eq!(from_single[0].trust, TrustLevel::Trusted);
+        assert_eq!(from_single[0].content, from_str[0].content);
+        assert_eq!(from_single[0].content, "You are a coding agent.\n");
+        assert_eq!(from_single[1].role, Role::User);
+        assert_eq!(from_single[1].content, "Hello");
+
+        // Multi-block array with OpenCode-style cache_control variants (ephemeral, ttl, null, omitted)
+        // concatenates block text in exact array order with "".
+        let vendor_part = "You are a coding agent. Follow protocol.\n";
+        let env_part = "<env>\nWorking directory: /workspace\n</env>\n";
+        let repo_part = "Custom instructions: keep diffs minimal.";
+        let multi_block_body = json!({
+            "system": [
+                {
+                    "type": "text",
+                    "text": vendor_part,
+                    "cache_control": {"type": "ephemeral"}
+                },
+                {
+                    "type": "text",
+                    "text": env_part,
+                    "cache_control": {"type": "ephemeral", "ttl": "5m"}
+                },
+                {
+                    "type": "text",
+                    "text": "",
+                    "cache_control": null
+                },
+                {
+                    "type": "text",
+                    "text": repo_part
+                }
+            ],
+            "messages": [{"role": "user", "content": "Run tests"}]
+        });
+        let expected_concat = format!("{vendor_part}{env_part}{repo_part}");
+        assert_eq!(
+            AnthropicAdapter::parse_system_content(&multi_block_body["system"]).unwrap(),
+            expected_concat
+        );
+        let from_multi = adapter
+            .parse_request(multi_block_body.to_string().as_bytes())
+            .unwrap();
+        assert_eq!(from_multi.len(), 2);
+        assert_eq!(from_multi[0].role, Role::System);
+        assert_eq!(from_multi[0].trust, TrustLevel::Trusted);
+        assert_eq!(from_multi[0].content, expected_concat);
+        assert_eq!(
+            &from_multi[0].content[0..vendor_part.len()],
+            vendor_part
+        );
+        assert_eq!(
+            &from_multi[0].content[vendor_part.len()..vendor_part.len() + env_part.len()],
+            env_part
+        );
+        assert_eq!(
+            &from_multi[0].content[vendor_part.len() + env_part.len()..],
+            repo_part
+        );
+        assert_eq!(from_multi[1].role, Role::User);
+        assert_eq!(from_multi[1].content, "Run tests");
+    }
+
+    #[test]
+    fn anthropic_system_null_empty_string_and_empty_blocks_emit_no_system_message() {
+        let adapter = AnthropicAdapter::new();
+        for sys in [
+            json!(null),
+            json!(""),
+            json!([]),
+            json!([{"type": "text", "text": "", "cache_control": {"type": "ephemeral"}}]),
+        ] {
+            assert_eq!(AnthropicAdapter::parse_system_content(&sys).unwrap(), "");
+            let body = json!({
+                "system": sys,
+                "messages": [{"role": "user", "content": "Hi"}]
+            });
+            let msgs = adapter.parse_request(body.to_string().as_bytes()).unwrap();
+            assert_eq!(msgs.len(), 1);
+            assert_eq!(msgs[0].role, Role::User);
+            assert_eq!(msgs[0].content, "Hi");
+        }
+    }
+
+    #[test]
+    fn anthropic_system_malformed_and_unsupported_shapes_fail_closed() {
+        let adapter = AnthropicAdapter::new();
+        let bad_systems = [
+            // Non-string, non-array, non-null top-level system
+            json!(42),
+            json!(true),
+            json!({"type": "text", "text": "bare object not array"}),
+            // Non-object elements in system[]
+            json!(["raw string in array"]),
+            json!([123]),
+            json!([null]),
+            json!([true]),
+            json!([[]]),
+            // Missing or invalid block type
+            json!([{"text": "missing type"}]),
+            json!([{"type": 123, "text": "numeric type"}]),
+            json!([{"type": null, "text": "null type"}]),
+            json!([{"type": "", "text": "empty type"}]),
+            json!([{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "x"}}]),
+            json!([{"type": "tool_use", "id": "t1", "name": "read_file", "input": {}}]),
+            json!([{"type": "tool_result", "tool_use_id": "t1", "content": "x"}]),
+            json!([{"type": "document", "text": "doc"}]),
+            // Missing or non-string text
+            json!([{"type": "text"}]),
+            json!([{"type": "text", "text": null}]),
+            json!([{"type": "text", "text": 99}]),
+            json!([{"type": "text", "text": ["nested"]}]),
+            json!([{"type": "text", "text": {"nested": "obj"}}]),
+            // Unknown fields on system[] block
+            json!([{"type": "text", "text": "ok", "extra": "unscanned"}]),
+            json!([{"type": "text", "text": "ok", "content": "shadow"}]),
+            // Malformed cache_control
+            json!([{"type": "text", "text": "ok", "cache_control": "ephemeral"}]),
+            json!([{"type": "text", "text": "ok", "cache_control": 1}]),
+            json!([{"type": "text", "text": "ok", "cache_control": true}]),
+            json!([{"type": "text", "text": "ok", "cache_control": []}]),
+            json!([{"type": "text", "text": "ok", "cache_control": {}}]),
+            json!([{"type": "text", "text": "ok", "cache_control": {"type": "persistent"}}]),
+            json!([{"type": "text", "text": "ok", "cache_control": {"type": 1}}]),
+            json!([{"type": "text", "text": "ok", "cache_control": {"type": "ephemeral", "ttl": ""}}]),
+            json!([{"type": "text", "text": "ok", "cache_control": {"type": "ephemeral", "ttl": 5}}]),
+            json!([{"type": "text", "text": "ok", "cache_control": {"type": "ephemeral", "extra": true}}]),
+            // Valid first block followed by malformed second block
+            json!([
+                {"type": "text", "text": "valid prefix", "cache_control": {"type": "ephemeral"}},
+                {"type": "image", "text": "rejected"}
+            ]),
+        ];
+
+        for bad_sys in bad_systems {
+            assert!(
+                AnthropicAdapter::parse_system_content(&bad_sys).is_err(),
+                "expected parse_system_content error for {bad_sys}"
+            );
+            let body = json!({
+                "system": bad_sys,
+                "messages": [{"role": "user", "content": "Hi"}]
+            });
+            assert!(
+                adapter.parse_request(body.to_string().as_bytes()).is_err(),
+                "expected parse_request error for {bad_sys}"
+            );
+        }
     }
 }

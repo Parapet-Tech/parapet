@@ -1,14 +1,17 @@
 // Copyright 2026 The Parapet Project
 // SPDX-License-Identifier: Apache-2.0
 
-//! Provider-backed [`MessageContentDecoder`] (W1 / W1b).
+//! Provider-backed [`MessageContentDecoder`] (W1 / W1b / C-W4c1-1).
 //!
 //! The carrier map addresses exactly the bytes whole-message L1 scans today:
-//! each parsed [`crate::message::Message::content`], in adapter order. Duplicate
-//! JSON object keys anywhere in the request body (including nested objects and
-//! tool arguments) are rejected before adapter decoding. System-slot metadata
-//! marks only `role=system` messages for OpenAI and only the top-level `system`
-//! message for Anthropic.
+//! each parsed [`crate::message::Message::content`], in adapter order, using the
+//! single shared [`crate::provider::AnthropicAdapter::parse_system_content`]
+//! mapping for Anthropic top-level `system` strings and `text`-block arrays
+//! (including `cache_control`). Duplicate JSON object keys anywhere in the
+//! request body (including nested objects, `system[]` blocks, `cache_control`,
+//! and tool arguments) are rejected before adapter decoding. System-slot
+//! metadata marks only `role=system` messages for OpenAI and only the top-level
+//! `system` message for Anthropic.
 
 use std::collections::BTreeMap;
 use std::fmt;
