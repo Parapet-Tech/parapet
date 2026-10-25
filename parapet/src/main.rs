@@ -52,6 +52,10 @@ struct Cli {
     /// Explicitly allow plain HTTP (`http://`) upstreams to literal loopback IPs (`127.0.0.0/8` or `[::1]`).
     #[arg(long = "allow-loopback-http-upstream", default_value_t = false)]
     allow_loopback_http_upstream: bool,
+
+    /// Explicitly require verified provenance carriers for one supported profile (requires --state-dir)
+    #[arg(long, value_enum)]
+    provenance_profile: Option<parapet::cli::ProvenanceProfileArg>,
 }
 
 #[tokio::main]
@@ -74,7 +78,11 @@ async fn main() {
     }
 
     #[cfg(windows)]
-    if cli.state_dir.is_some() || cli.effect_root.is_some() || cli.offline_fixture.is_some() {
+    if cli.state_dir.is_some()
+        || cli.effect_root.is_some()
+        || cli.offline_fixture.is_some()
+        || cli.provenance_profile.is_some()
+    {
         tracing::error!("state-dir and effect-root are not supported on Windows");
         std::process::exit(6);
     }
@@ -117,6 +125,7 @@ async fn main() {
             || cli.max_content_bytes.is_some()
             || cli.offline_fixture.is_some()
             || cli.ready_file.is_some()
+            || cli.provenance_profile.is_some()
         {
             tracing::error!("runtime options require --state-dir");
             std::process::exit(2);
@@ -263,14 +272,18 @@ async fn main() {
                         std::process::exit(1);
                     }
                 };
-            let upstream: std::sync::Arc<dyn proxy::UpstreamClient> = std::sync::Arc::new(client);
-            let app = proxy::build_router(upstream);
+            let routing = parapet::cli::activation::build_runtime_routing(
+                cli.provenance_profile,
+                std::sync::Arc::new(client),
+            );
+            let app = routing.router;
             let (plane, unix_listener, mut shutdown_rx) =
-                match parapet::cli::control::EngineControlPlane::bind(
+                match parapet::cli::control::EngineControlPlane::bind_with_provenance_session(
                     &state_dir,
                     bound_port,
                     &contract_hash,
                     root_cap,
+                    routing.provenance_session,
                 ) {
                     Ok(bound) => bound,
                     Err(_) => {

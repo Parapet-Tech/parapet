@@ -5,6 +5,8 @@
 //! (Frozen 1D Brief `81621f3c`, Sections 5–7).
 
 #[cfg(not(windows))]
+pub mod activation;
+#[cfg(not(windows))]
 pub mod control;
 pub mod render;
 
@@ -126,6 +128,14 @@ struct InitArgs {
     effect_root: Option<PathBuf>,
 }
 
+/// Explicit CLI-only provenance carrier profile selector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ProvenanceProfileArg {
+    /// Required OpenCode 2.0.32 carrier admission on exact Anthropic `POST /v1/messages`
+    #[value(name = "opencode")]
+    OpenCode,
+}
+
 #[derive(Args)]
 struct RunArgs {
     /// Initialized state directory path
@@ -168,6 +178,10 @@ struct RunArgs {
     /// Explicitly allow plain HTTP (`http://`) upstreams to literal loopback IPs (`127.0.0.0/8` or `[::1]`).
     #[arg(long = "allow-loopback-http-upstream", default_value_t = false)]
     allow_loopback_http_upstream: bool,
+
+    /// Explicitly require verified provenance carriers for one supported profile
+    #[arg(long, value_enum)]
+    provenance_profile: Option<ProvenanceProfileArg>,
 }
 
 #[derive(Args)]
@@ -1259,16 +1273,21 @@ fn run_engine_cmd(args: RunArgs, json_mode: bool) -> i32 {
         let has_cap = root_cap.is_some();
         // Capture the engine-generated identity before the capability moves into the control plane.
         let run_id = root_cap.as_ref().map(|cap| cap.run_id().clone());
-        let upstream: std::sync::Arc<dyn crate::proxy::UpstreamClient> =
-            std::sync::Arc::new(client);
-        let app = crate::proxy::build_router(upstream);
+        let routing = crate::cli::activation::build_runtime_routing(
+            args.provenance_profile,
+            std::sync::Arc::new(client),
+        );
+        let app = routing.router;
 
-        let Ok((plane, unix_listener, mut shutdown_rx)) = EngineControlPlane::bind(
-            &args.state_dir,
-            bound_port,
-            &contract_hash,
-            root_cap,
-        ) else {
+        let Ok((plane, unix_listener, mut shutdown_rx)) =
+            EngineControlPlane::bind_with_provenance_session(
+                &args.state_dir,
+                bound_port,
+                &contract_hash,
+                root_cap,
+                routing.provenance_session,
+            )
+        else {
             return emit_cli_error(
                 "run",
                 "control_bind_failed",
