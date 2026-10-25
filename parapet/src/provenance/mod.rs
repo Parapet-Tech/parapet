@@ -11,6 +11,7 @@
 pub mod auth;
 pub mod decode;
 pub mod envelope;
+pub mod opencode_profile;
 pub mod projection;
 pub mod receipt;
 pub mod session;
@@ -21,6 +22,7 @@ pub mod verify;
 pub use auth::*;
 pub use decode::*;
 pub use envelope::*;
+pub use opencode_profile::*;
 pub use projection::*;
 pub use receipt::*;
 pub use session::*;
