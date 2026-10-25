@@ -6,6 +6,9 @@ permissions:
 on:
   push:
   pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 7 * * 1"
 
 jobs:
   hygiene:
@@ -20,12 +23,33 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Check commit identity and message hygiene
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "${{ github.event_name }}" = "schedule" ]; then
+            git fetch -q origin '+refs/heads/*:refs/remotes/origin/*' --tags --prune
+            RANGE="--all"
+            EXTRA="--full-blob-scan"
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
             git fetch -q origin "${{ github.base_ref }}"
             RANGE="origin/${{ github.base_ref }}..${{ github.event.pull_request.head.sha }}"
+            EXTRA=""
           elif [ "${{ github.event.before }}" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "${{ github.event.before }}" 2>/dev/null; then
-            RANGE="--all"
+            # A new branch has no usable `before` OID. Scan the commits added
+            # by that branch, not every ref in the repository: `--all` lets an
+            # unrelated branch make this run fail and obscures which push
+            # introduced the rejected object.
+            git fetch -q origin "${{ github.event.repository.default_branch }}"
+            DEFAULT_HEAD="origin/${{ github.event.repository.default_branch }}"
+            if MERGE_BASE="$(git merge-base "$DEFAULT_HEAD" "${{ github.sha }}")"; then
+              RANGE="$MERGE_BASE..${{ github.sha }}"
+            else
+              # Orphan/unrelated histories have no merge base. A single
+              # positive revision scans the pushed head and all its ancestors.
+              RANGE="${{ github.sha }}"
+            fi
+            EXTRA=""
           else
             RANGE="${{ github.event.before }}..${{ github.sha }}"
+            EXTRA=""
           fi
-          python3 scripts/check_public_hygiene.py $RANGE
+          python3 scripts/check_public_hygiene.py $RANGE $EXTRA
+      - name: Test publication controls
+        run: python3 -m unittest scripts.tests.test_publication_controls
