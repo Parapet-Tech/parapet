@@ -32,10 +32,27 @@ pub trait ReplayLedger: Send + Sync {
     fn consume(&self, session_id: &str, sequence: u64, expires_at_ms: u64, now_ms: u64) -> bool;
 }
 
-/// Injected request decoder: exact body bytes to decoded message contents,
-/// in request message order.
+/// One decoded request message content item in adapter order, with the
+/// minimal metadata needed to verify system-slot provenance rules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedMessage {
+    pub content: String,
+    pub is_system_slot: bool,
+}
+
+impl DecodedMessage {
+    pub fn new(content: impl Into<String>, is_system_slot: bool) -> Self {
+        Self {
+            content: content.into(),
+            is_system_slot,
+        }
+    }
+}
+
+/// Injected request decoder: exact body bytes to decoded message contents
+/// and system-slot metadata, in request message order.
 pub trait MessageContentDecoder: Send + Sync {
-    fn decode(&self, body: &[u8]) -> Option<Vec<String>>;
+    fn decode(&self, body: &[u8]) -> Option<Vec<DecodedMessage>>;
 }
 
 /// In-memory [`ReplayLedger`]. Entries expire with their envelope, so the
@@ -272,26 +289,30 @@ impl CarrierVerifier {
 
         // A body that matches its digest but does not decode has no content
         // for the map to address.
-        let messages = d
+        let decoded = d
             .decoder
             .decode(body)
             .ok_or_else(|| self.fail(O::MapOutOfRange, None))?;
 
         let segments = env.source_map.segments;
-        check_geometry(&segments, &messages).map_err(|(o, i)| self.fail(o, i))?;
+        check_geometry(&segments, &decoded).map_err(|(o, i)| self.fail(o, i))?;
 
         for (i, s) in segments.iter().enumerate() {
-            let bytes = &messages[s.message_index].as_bytes()[s.start..s.end];
+            let bytes = &decoded[s.message_index].content.as_bytes()[s.start..s.end];
             if Sha256Digest::of(bytes) != s.sha256 {
                 return Err(self.fail(O::SegmentDigestMismatch, Some(i)));
             }
         }
 
         for (i, s) in segments.iter().enumerate() {
-            if s.source == Source::VendorStatic && !manifest.contains(&s.sha256) {
+            if s.source == Source::VendorStatic
+                && (!decoded[s.message_index].is_system_slot || !manifest.contains(&s.sha256))
+            {
                 return Err(self.fail(O::VendorDigestMismatch, Some(i)));
             }
         }
+
+        let messages = decoded.into_iter().map(|m| m.content).collect();
 
         Ok(VerifiedCarrier {
             identity: CarrierIdentity {
@@ -324,7 +345,7 @@ impl CarrierVerifier {
 /// range.
 fn check_geometry(
     segments: &[Segment],
-    messages: &[String],
+    messages: &[DecodedMessage],
 ) -> Result<(), (VerificationOutcome, Option<usize>)> {
     use VerificationOutcome as O;
 
@@ -333,6 +354,7 @@ fn check_geometry(
     for (i, s) in segments.iter().enumerate() {
         let content = messages
             .get(s.message_index)
+            .map(|m| m.content.as_str())
             .ok_or((O::MapOutOfRange, Some(i)))?;
         if s.start >= s.end
             || s.end > content.len()
@@ -345,10 +367,10 @@ fn check_geometry(
             return Err((O::MapOverlap, Some(i)));
         }
         if s.message_index > msg {
-            let skipped_nonempty = cursor != messages[msg].len()
+            let skipped_nonempty = cursor != messages[msg].content.len()
                 || messages[msg + 1..s.message_index]
                     .iter()
-                    .any(|m| !m.is_empty());
+                    .any(|m| !m.content.is_empty());
             if skipped_nonempty {
                 return Err((O::MapIncomplete, Some(i)));
             }
@@ -366,7 +388,8 @@ fn check_geometry(
 
     let tail_uncovered = match messages.get(msg) {
         Some(current) => {
-            cursor != current.len() || messages[msg + 1..].iter().any(|m| !m.is_empty())
+            cursor != current.content.len()
+                || messages[msg + 1..].iter().any(|m| !m.content.is_empty())
         }
         None => false,
     };

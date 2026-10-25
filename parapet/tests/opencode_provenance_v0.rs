@@ -75,13 +75,18 @@ impl Clock for FixedClock {
 struct JsonDecoder(Arc<AtomicUsize>);
 
 impl MessageContentDecoder for JsonDecoder {
-    fn decode(&self, body: &[u8]) -> Option<Vec<String>> {
+    fn decode(&self, body: &[u8]) -> Option<Vec<DecodedMessage>> {
         self.0.fetch_add(1, Ordering::SeqCst);
         let v: Value = serde_json::from_slice(body).ok()?;
         v["messages"]
             .as_array()?
             .iter()
-            .map(|m| m["content"].as_str().map(str::to_string))
+            .map(|m| {
+                Some(DecodedMessage {
+                    content: m["content"].as_str()?.to_string(),
+                    is_system_slot: m["role"].as_str() == Some("system"),
+                })
+            })
             .collect()
     }
 }
@@ -876,6 +881,30 @@ fn spoofed_vendor_static_fails_closed_rather_than_rescanning() {
         }
         other => panic!("expected vendor mismatch, got {other:?}"),
     }
+}
+
+#[test]
+fn vendor_static_on_non_system_slot_fails_with_vendor_digest_mismatch() {
+    // Message 0 is system; messages 1 and 2 are user (non-system) but carry the pinned VENDOR text.
+    let c = [VENDOR, VENDOR, VENDOR];
+    let body = body_of(&c);
+    let v = VENDOR.len();
+    let env = sign(unsigned(
+        &body,
+        seg_values(
+            &c,
+            &[
+                (0, 0, v, "vendor_static"),
+                (1, 0, v, "vendor_static"),
+                (2, 0, v, "vendor_static"),
+            ],
+        ),
+    ));
+    let err = harness().verifier.verify(Some(&env), &body).unwrap_err();
+    assert_eq!(
+        (err.outcome, err.segment_index),
+        (VerificationOutcome::VendorDigestMismatch, Some(1))
+    );
 }
 
 #[test]
