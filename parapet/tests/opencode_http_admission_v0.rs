@@ -247,21 +247,18 @@ fn valid_chat_body_and_envelope(sequence: u64) -> (Vec<u8>, Vec<u8>, String) {
     (body, env_bytes, tag_hex)
 }
 
-thread_local! {
-    static THREAD_TRACE_BUF: std::cell::RefCell<Option<Arc<Mutex<Vec<u8>>>>> =
-        const { std::cell::RefCell::new(None) };
-}
+static ACTIVE_TRACE_BUFS: std::sync::LazyLock<Mutex<Vec<Arc<Mutex<Vec<u8>>>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
 
 #[derive(Clone, Default)]
 struct GlobalTraceWriter;
 
 impl Write for GlobalTraceWriter {
     fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-        THREAD_TRACE_BUF.with(|slot| {
-            if let Some(buf) = slot.borrow().as_ref() {
-                buf.lock().unwrap().extend_from_slice(data);
-            }
-        });
+        let sinks = ACTIVE_TRACE_BUFS.lock().unwrap().clone();
+        for buf in sinks {
+            buf.lock().unwrap().extend_from_slice(data);
+        }
         Ok(data.len())
     }
 
@@ -299,18 +296,17 @@ impl ThreadTraceGuard {
     fn new() -> Self {
         ensure_global_trace_subscriber();
         let buf = Arc::new(Mutex::new(Vec::new()));
-        THREAD_TRACE_BUF.with(|slot| {
-            *slot.borrow_mut() = Some(buf.clone());
-        });
+        ACTIVE_TRACE_BUFS.lock().unwrap().push(buf.clone());
         Self { buf }
     }
 }
 
 impl Drop for ThreadTraceGuard {
     fn drop(&mut self) {
-        THREAD_TRACE_BUF.with(|slot| {
-            *slot.borrow_mut() = None;
-        });
+        ACTIVE_TRACE_BUFS
+            .lock()
+            .unwrap()
+            .retain(|b| !Arc::ptr_eq(b, &self.buf));
     }
 }
 
@@ -1500,4 +1496,1022 @@ fn ordinary_mode_with_none_next_stage_is_valid_at_construction() {
         )),
         None,
     );
+}
+
+// ---------------------------------------------------------------------------
+// 10. W4b-core: owner-only session grant control wire (`parapet-control/v0`)
+// ---------------------------------------------------------------------------
+
+#[cfg(not(windows))]
+mod w4b_control_wire {
+    use super::*;
+    use parapet::cli::control::{
+        peer_credential_authorized, send_control_request, write_private_file, ControlError,
+        ControlRequestV0, ControlStateMetadataV0, EngineControlPlane, EngineOwnerRecordV0,
+        ProvenanceSessionControl, CONTROL_ACTION_PROVENANCE_SESSION_END,
+        CONTROL_ACTION_PROVENANCE_SESSION_START, CONTROL_ERROR_SESSION_UNAVAILABLE, CONTROL_SCHEMA,
+        CONTROL_STATE_SCHEMA,
+    };
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::path::Path;
+
+    const CANARY_W4B_KEY_1_BYTES: [u8; SESSION_KEY_LEN] = *b"CANARY-W4B-KEY-SESSION-ONE-00001";
+    const CANARY_W4B_KEY_1_STR: &str = "CANARY-W4B-KEY-SESSION-ONE-00001";
+    const CANARY_W4B_KEY_2_BYTES: [u8; SESSION_KEY_LEN] = *b"CANARY-W4B-KEY-SESSION-TWO-00002";
+    const CANARY_W4B_KEY_2_STR: &str = "CANARY-W4B-KEY-SESSION-TWO-00002";
+    const CONFIG_HASH: &str =
+        "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    struct ScriptedSessionEntropy {
+        call: AtomicUsize,
+    }
+
+    impl ScriptedSessionEntropy {
+        fn new() -> Self {
+            Self {
+                call: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl EntropySource for ScriptedSessionEntropy {
+        fn fill(&self, buf: &mut [u8]) -> Result<(), EntropyError> {
+            let idx = self.call.fetch_add(1, Ordering::SeqCst);
+            match idx {
+                // Session 1: key (32 bytes), id (16 bytes)
+                0 => buf.copy_from_slice(&CANARY_W4B_KEY_1_BYTES),
+                1 => buf.fill(0xa1),
+                // Session 2: key (32 bytes), id (16 bytes)
+                2 => buf.copy_from_slice(&CANARY_W4B_KEY_2_BYTES),
+                3 => buf.fill(0xb2),
+                other => {
+                    for (i, b) in buf.iter_mut().enumerate() {
+                        *b = (other as u8).wrapping_mul(17).wrapping_add(i as u8 + 1);
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+
+    struct FailingSessionEntropy;
+
+    impl EntropySource for FailingSessionEntropy {
+        fn fill(&self, _buf: &mut [u8]) -> Result<(), EntropyError> {
+            Err(EntropyError)
+        }
+    }
+
+    fn init_private_state_dir(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let meta = ControlStateMetadataV0 {
+            schema: CONTROL_STATE_SCHEMA.to_owned(),
+            effect_root_must_be_new: true,
+        };
+        write_private_file(dir, "control.json", &serde_json::to_vec(&meta).unwrap()).unwrap();
+    }
+
+    fn supported_profile(max_validity_ms: u64) -> SupportedProfile {
+        let mut builds = BTreeMap::new();
+        builds.insert(
+            BUILD_ID.to_string(),
+            VendorManifest::new([Sha256Digest::of(CANARY_VENDOR.as_bytes())]),
+        );
+        SupportedProfile {
+            schema_version: SCHEMA_VERSION_V1,
+            profile_id: PROFILE_ID.to_string(),
+            builds,
+            max_validity_ms,
+        }
+    }
+
+    fn decode_key_hex(hex: &str) -> SessionKey {
+        assert_eq!(hex.len(), SESSION_KEY_LEN * 2);
+        assert!(hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+        let mut bytes = [0u8; SESSION_KEY_LEN];
+        for (i, slot) in bytes.iter_mut().enumerate() {
+            *slot = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap();
+        }
+        SessionKey::from_bytes(bytes)
+    }
+
+    fn sign_chat_for_session_at(
+        session_id: &str,
+        key: &SessionKey,
+        sequence: u64,
+        issued_at_ms: u64,
+        expires_at_ms: u64,
+    ) -> (Vec<u8>, Vec<u8>, String) {
+        let sys_content = format!("{CANARY_VENDOR}{CANARY_REPO}");
+        let body = serde_json::to_vec(&json!({
+            "model": "gpt-4o-mini",
+            "messages": [
+                {"role": "system", "content": sys_content},
+                {"role": "user", "content": CANARY_USER}
+            ]
+        }))
+        .unwrap();
+
+        let v_len = CANARY_VENDOR.len();
+        let s_len = sys_content.len();
+        let u_len = CANARY_USER.len();
+        let source_map = SourceMap {
+            segments: vec![
+                Segment {
+                    message_index: 0,
+                    start: 0,
+                    end: v_len,
+                    source: Source::VendorStatic,
+                    sha256: Sha256Digest::of(CANARY_VENDOR.as_bytes()),
+                },
+                Segment {
+                    message_index: 0,
+                    start: v_len,
+                    end: s_len,
+                    source: Source::Repository,
+                    sha256: Sha256Digest::of(CANARY_REPO.as_bytes()),
+                },
+                Segment {
+                    message_index: 1,
+                    start: 0,
+                    end: u_len,
+                    source: Source::User,
+                    sha256: Sha256Digest::of(CANARY_USER.as_bytes()),
+                },
+            ],
+        };
+
+        let mut env = CarrierEnvelope {
+            schema_version: SCHEMA_VERSION_V1,
+            profile: PROFILE_ID.to_string(),
+            build: BUILD_ID.to_string(),
+            session_id: session_id.to_string(),
+            sequence,
+            issued_at_ms,
+            expires_at_ms,
+            request_body_sha256: Sha256Digest::of(&body),
+            source_map_sha256: source_map.canonical_digest(),
+            source_map,
+            authenticator: Authenticator::from_bytes(vec![0u8; 32]),
+        };
+        let auth = HmacSha256Authenticator::new(key.clone());
+        let tag = auth.tag(&env.signed_payload());
+        let tag_hex = Sha256Digest::from_bytes(tag).to_hex();
+        env.authenticator = Authenticator::from_bytes(tag.to_vec());
+        let env_bytes = serde_json::to_vec(&env).unwrap();
+        (body, env_bytes, tag_hex)
+    }
+
+    fn send_control_line_in_process(plane: &EngineControlPlane, line: &str) -> (Value, bool) {
+        let (bytes, stop) = plane.handle_request_line(line);
+        let text = std::str::from_utf8(&bytes).expect("utf8 control response");
+        assert!(text.ends_with('\n'), "control response must end with \\n");
+        assert_eq!(text.matches('\n').count(), 1, "single-line JSON response");
+        let val: Value = serde_json::from_str(text.trim()).expect("valid JSON control response");
+        (val, stop)
+    }
+
+    #[tokio::test]
+    async fn w4b_no_handle_and_failed_start_return_session_unavailable_and_preserve_ordinary_actions(
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let state_no_handle = temp.path().join("state_no_handle");
+        init_private_state_dir(&state_no_handle);
+
+        let (plane, _listener, _shutdown_rx) =
+            EngineControlPlane::bind(&state_no_handle, 45201, CONFIG_HASH, None).unwrap();
+        assert!(plane.provenance_session().is_none());
+
+        let token = std::fs::read_to_string(state_no_handle.join("control.token")).unwrap();
+        let pid = std::process::id();
+
+        // Ordinary actions preserve exact wire bytes and behavior.
+        let (status_bytes, status_stop) = plane.handle_request_line(&format!(
+            r#"{{"schema":"parapet-control/v0","token":"{token}","action":"status"}}"#
+        ));
+        assert!(!status_stop);
+        assert_eq!(
+            std::str::from_utf8(&status_bytes).unwrap(),
+            format!(
+                "{{\"schema\":\"parapet-control/v0\",\"ok\":true,\"pid\":{pid},\"file_capability\":\"not_applicable\",\"file_cleanup\":\"not_applicable\",\"evidence_retained\":true}}\n"
+            )
+        );
+
+        let (restore_bytes, restore_stop) = plane.handle_request_line(&format!(
+            r#"{{"schema":"parapet-control/v0","token":"{token}","action":"restore"}}"#
+        ));
+        assert!(!restore_stop);
+        assert_eq!(
+            std::str::from_utf8(&restore_bytes).unwrap(),
+            "{\"schema\":\"parapet-control/v0\",\"ok\":true,\"file_cleanup\":\"not_applicable\",\"evidence_retained\":true}\n"
+        );
+
+        // No handle configured => both actions return stable content-free session_unavailable.
+        let expected_unavailable = format!(
+            "{{\"schema\":\"{CONTROL_SCHEMA}\",\"ok\":false,\"error_code\":\"{CONTROL_ERROR_SESSION_UNAVAILABLE}\"}}\n"
+        );
+        for action in [
+            CONTROL_ACTION_PROVENANCE_SESSION_START,
+            CONTROL_ACTION_PROVENANCE_SESSION_END,
+        ] {
+            let (bytes, stop) = plane.handle_request_line(&format!(
+                r#"{{"schema":"parapet-control/v0","token":"{token}","action":"{action}"}}"#
+            ));
+            assert!(!stop);
+            assert_eq!(std::str::from_utf8(&bytes).unwrap(), expected_unavailable);
+        }
+
+        let (disable_bytes, disable_stop) = plane.handle_request_line(&format!(
+            r#"{{"schema":"parapet-control/v0","token":"{token}","action":"disable"}}"#
+        ));
+        assert!(disable_stop);
+        assert_eq!(
+            std::str::from_utf8(&disable_bytes).unwrap(),
+            "{\"schema\":\"parapet-control/v0\",\"ok\":true,\"stop_approved\":true,\"file_cleanup\":\"not_applicable\",\"evidence_retained\":true}\n"
+        );
+
+        // Configured handle with failing entropy or invalid max_validity_ms also fails closed
+        // with session_unavailable and leaves no active session.
+        let state_fail = temp.path().join("state_fail");
+        init_private_state_dir(&state_fail);
+        let failing_sessions = Arc::new(SessionManager::with_entropy(Box::new(
+            FailingSessionEntropy,
+        )));
+        let fail_handle =
+            ProvenanceSessionControl::new(failing_sessions.clone(), supported_profile(60_000));
+        let (fail_plane, _fail_listener, _fail_rx) =
+            EngineControlPlane::bind_with_provenance_session(
+                &state_fail,
+                45202,
+                CONFIG_HASH,
+                None,
+                Some(fail_handle),
+            )
+            .unwrap();
+        let fail_token = std::fs::read_to_string(state_fail.join("control.token")).unwrap();
+        let (fail_bytes, fail_stop) = fail_plane.handle_request_line(&format!(
+            r#"{{"schema":"parapet-control/v0","token":"{fail_token}","action":"provenance_session_start"}}"#
+        ));
+        assert!(!fail_stop);
+        assert_eq!(
+            std::str::from_utf8(&fail_bytes).unwrap(),
+            expected_unavailable
+        );
+        assert!(!failing_sessions.is_active());
+
+        let state_zero = temp.path().join("state_zero_validity");
+        init_private_state_dir(&state_zero);
+        let zero_sessions = Arc::new(SessionManager::new());
+        let zero_handle =
+            ProvenanceSessionControl::new(zero_sessions.clone(), supported_profile(0));
+        let (zero_plane, _zero_listener, _zero_rx) =
+            EngineControlPlane::bind_with_provenance_session(
+                &state_zero,
+                45203,
+                CONFIG_HASH,
+                None,
+                Some(zero_handle),
+            )
+            .unwrap();
+        let zero_token = std::fs::read_to_string(state_zero.join("control.token")).unwrap();
+        let (zero_bytes, zero_stop) = zero_plane.handle_request_line(&format!(
+            r#"{{"schema":"parapet-control/v0","token":"{zero_token}","action":"provenance_session_start"}}"#
+        ));
+        assert!(!zero_stop);
+        assert_eq!(
+            std::str::from_utf8(&zero_bytes).unwrap(),
+            expected_unavailable
+        );
+        assert!(!zero_sessions.is_active());
+    }
+
+    #[tokio::test]
+    async fn w4b_session_grant_lifecycle_rotation_end_restart_and_no_secret_leak() {
+        let trace_capture = ThreadTraceGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join("state_w4b");
+        init_private_state_dir(&state_dir);
+
+        let sessions = Arc::new(SessionManager::with_entropy(Box::new(
+            ScriptedSessionEntropy::new(),
+        )));
+        assert!(!sessions.is_active());
+
+        let profile = supported_profile(MAX_VALIDITY_MS);
+        let session_handle = ProvenanceSessionControl::with_config_factory(
+            sessions.clone(),
+            profile.clone(),
+            |prof| SessionConfig {
+                profile: prof,
+                clock: Box::new(FixedClock(NOW_MS)),
+                decoder: Box::new(ProviderContentDecoder::new(ProviderType::OpenAi)),
+            },
+        );
+
+        let (plane, _listener, _shutdown_rx) = EngineControlPlane::bind_with_provenance_session(
+            &state_dir,
+            45210,
+            CONFIG_HASH,
+            None,
+            Some(session_handle.clone()),
+        )
+        .unwrap();
+
+        // Verify control.sock and control.token permissions are 0600 and owner-only.
+        let sock_meta = std::fs::symlink_metadata(state_dir.join("control.sock")).unwrap();
+        let token_meta = std::fs::symlink_metadata(state_dir.join("control.token")).unwrap();
+        assert_eq!(sock_meta.permissions().mode() & 0o7777, 0o600);
+        assert_eq!(token_meta.permissions().mode() & 0o7777, 0o600);
+
+        let (engine, probes) = build_engine_with_probes();
+        let next_stage = Arc::new(CapturingNextStage::default());
+        let admitter = Arc::new(SessionRequestAdmitter::new(
+            ProfileMode::RequiredOpenCode,
+            sessions.clone(),
+            PROFILE_ID,
+            SCHEMA_VERSION_V1,
+        ));
+        let app = build_router_with_admission(engine, admitter, Some(next_stage.clone()));
+
+        let token = std::fs::read_to_string(state_dir.join("control.token")).unwrap();
+
+        // 1. Wrong control token cannot start a session.
+        let (bad_start_bytes, bad_start_stop) = plane.handle_request_line(
+            "{\"schema\":\"parapet-control/v0\",\"token\":\"wrong-token\",\"action\":\"provenance_session_start\"}\n",
+        );
+        assert!(!bad_start_stop);
+        let bad_start_raw = String::from_utf8(bad_start_bytes).unwrap();
+        assert_eq!(
+            bad_start_raw,
+            "{\"schema\":\"parapet-control/v0\",\"ok\":false,\"error_code\":\"unauthorized\"}\n"
+        );
+        assert!(!sessions.is_active());
+
+        // 2. Valid start yields exact shape/length constraints and activates session.
+        let (start1_bytes, start1_stop) = plane.handle_request_line(&format!(
+            r#"{{"schema":"parapet-control/v0","token":"{token}","action":"{CONTROL_ACTION_PROVENANCE_SESSION_START}"}}"#
+        ));
+        assert!(!start1_stop);
+        assert!(sessions.is_active());
+        let start1_raw = std::str::from_utf8(&start1_bytes).unwrap();
+        let start1: Value = serde_json::from_str(start1_raw.trim()).unwrap();
+
+        let start1_obj = start1.as_object().unwrap();
+        let start1_keys: Vec<&str> = start1_obj.keys().map(String::as_str).collect();
+        assert_eq!(
+            start1_keys,
+            [
+                "builds",
+                "max_validity_ms",
+                "ok",
+                "profile",
+                "schema",
+                "schema_version",
+                "session_id",
+                "session_key_hex",
+            ]
+        );
+        assert_eq!(start1["schema"], CONTROL_SCHEMA);
+        assert_eq!(start1["ok"], true);
+        assert_eq!(start1["profile"], PROFILE_ID);
+        assert_eq!(start1["schema_version"], SCHEMA_VERSION_V1);
+        assert_eq!(start1["max_validity_ms"], MAX_VALIDITY_MS);
+        assert_eq!(start1["builds"], json!([BUILD_ID]));
+
+        let session_id_1 = start1["session_id"].as_str().unwrap().to_owned();
+        let session_key_hex_1 = start1["session_key_hex"].as_str().unwrap().to_owned();
+        assert_eq!(
+            start1_raw,
+            format!(
+                "{{\"schema\":\"{CONTROL_SCHEMA}\",\"ok\":true,\"profile\":\"{PROFILE_ID}\",\"schema_version\":{SCHEMA_VERSION_V1},\"session_id\":\"{session_id_1}\",\"session_key_hex\":\"{session_key_hex_1}\",\"max_validity_ms\":{MAX_VALIDITY_MS},\"builds\":[\"{BUILD_ID}\"]}}\n"
+            )
+        );
+        assert_eq!(session_id_1.len(), SESSION_ID_BYTES * 2);
+        assert!(is_valid_identifier(&session_id_1));
+        assert_eq!(session_key_hex_1.len(), SESSION_KEY_LEN * 2);
+        let key1 = decode_key_hex(&session_key_hex_1);
+        assert_eq!(key1.expose_bytes(), &CANARY_W4B_KEY_1_BYTES);
+
+        // Sequence 0 is usable in session 1; replay of sequence 0 is rejected.
+        let (body1_seq0, env1_seq0, tag1_seq0_hex) =
+            sign_chat_for_session_at(&session_id_1, &key1, 0, NOW_MS - 1_000, NOW_MS + 10_000);
+        let req1_seq0 = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("authorization", CANARY_AUTH_HEADER)
+            .header(
+                PROVENANCE_HEADER,
+                HeaderValue::from_bytes(&env1_seq0).unwrap(),
+            )
+            .body(Body::from(body1_seq0.clone()))
+            .unwrap();
+        let resp1_seq0 = app.clone().oneshot(req1_seq0).await.unwrap();
+        assert_eq!(resp1_seq0.status(), StatusCode::OK);
+        assert_eq!(next_stage.call_count(), 1);
+
+        let req1_seq0_replay = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header(
+                PROVENANCE_HEADER,
+                HeaderValue::from_bytes(&env1_seq0).unwrap(),
+            )
+            .body(Body::from(body1_seq0))
+            .unwrap();
+        let resp1_seq0_replay = app.clone().oneshot(req1_seq0_replay).await.unwrap();
+        let json_replay1 = assert_carrier_rejection(resp1_seq0_replay, "stale_or_replayed").await;
+        assert_eq!(next_stage.call_count(), 1);
+
+        // 3. Wrong control token cannot rotate or end the active session.
+        let (bad_rotate_bytes, bad_rotate_stop) = plane.handle_request_line(
+            "{\"schema\":\"parapet-control/v0\",\"token\":\"wrong-token\",\"action\":\"provenance_session_start\"}\n",
+        );
+        let (bad_end_bytes, bad_end_stop) = plane.handle_request_line(
+            "{\"schema\":\"parapet-control/v0\",\"token\":\"wrong-token\",\"action\":\"provenance_session_end\"}\n",
+        );
+        assert!(!bad_rotate_stop);
+        assert!(!bad_end_stop);
+        let bad_rotate_raw = String::from_utf8(bad_rotate_bytes).unwrap();
+        let bad_end_raw = String::from_utf8(bad_end_bytes).unwrap();
+        assert_eq!(
+            bad_rotate_raw,
+            "{\"schema\":\"parapet-control/v0\",\"ok\":false,\"error_code\":\"unauthorized\"}\n"
+        );
+        assert_eq!(
+            bad_end_raw,
+            "{\"schema\":\"parapet-control/v0\",\"ok\":false,\"error_code\":\"unauthorized\"}\n"
+        );
+        assert!(sessions.is_active());
+
+        // Session 1 remains active and unrotated: sequence 1 under session 1 verifies.
+        let (body1_seq1, env1_seq1, tag1_seq1_hex) =
+            sign_chat_for_session_at(&session_id_1, &key1, 1, NOW_MS - 1_000, NOW_MS + 10_000);
+        let req1_seq1 = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header(
+                PROVENANCE_HEADER,
+                HeaderValue::from_bytes(&env1_seq1).unwrap(),
+            )
+            .body(Body::from(body1_seq1))
+            .unwrap();
+        let resp1_seq1 = app.clone().oneshot(req1_seq1).await.unwrap();
+        assert_eq!(resp1_seq1.status(), StatusCode::OK);
+        assert_eq!(next_stage.call_count(), 2);
+
+        // 4. Second valid start rotates atomically: old session rejected, new sequence 0 usable,
+        //    replay remains rejected.
+        let (start2, start2_stop) = send_control_line_in_process(
+            &plane,
+            &format!(
+                r#"{{"schema":"parapet-control/v0","token":"{token}","action":"{CONTROL_ACTION_PROVENANCE_SESSION_START}"}}"#
+            ),
+        );
+        assert!(!start2_stop);
+        assert!(sessions.is_active());
+
+        let session_id_2 = start2["session_id"].as_str().unwrap().to_owned();
+        let session_key_hex_2 = start2["session_key_hex"].as_str().unwrap().to_owned();
+        assert_eq!(session_id_2.len(), SESSION_ID_BYTES * 2);
+        assert!(is_valid_identifier(&session_id_2));
+        assert_eq!(session_key_hex_2.len(), SESSION_KEY_LEN * 2);
+        assert_ne!(session_id_2, session_id_1);
+        assert_ne!(session_key_hex_2, session_key_hex_1);
+        let key2 = decode_key_hex(&session_key_hex_2);
+        assert_eq!(key2.expose_bytes(), &CANARY_W4B_KEY_2_BYTES);
+
+        // Old session with fresh sequence 2 is rejected as session_mismatch.
+        let (body_old, env_old, tag_old_hex) =
+            sign_chat_for_session_at(&session_id_1, &key1, 2, NOW_MS - 1_000, NOW_MS + 10_000);
+        let req_old = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header(
+                PROVENANCE_HEADER,
+                HeaderValue::from_bytes(&env_old).unwrap(),
+            )
+            .body(Body::from(body_old))
+            .unwrap();
+        let resp_old = app.clone().oneshot(req_old).await.unwrap();
+        let json_old_mismatch = assert_carrier_rejection(resp_old, "session_mismatch").await;
+        assert_eq!(next_stage.call_count(), 2);
+
+        // Old key under new session_id is rejected as signature_invalid.
+        let (body_wrong_key, env_wrong_key, tag_wrong_key_hex) =
+            sign_chat_for_session_at(&session_id_2, &key1, 0, NOW_MS - 1_000, NOW_MS + 10_000);
+        let req_wrong_key = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header(
+                PROVENANCE_HEADER,
+                HeaderValue::from_bytes(&env_wrong_key).unwrap(),
+            )
+            .body(Body::from(body_wrong_key))
+            .unwrap();
+        let resp_wrong_key = app.clone().oneshot(req_wrong_key).await.unwrap();
+        let json_wrong_key = assert_carrier_rejection(resp_wrong_key, "signature_invalid").await;
+        assert_eq!(next_stage.call_count(), 2);
+
+        // Sequence 0 (already consumed in session 1) is usable in rotated session 2.
+        let (body2_seq0, env2_seq0, tag2_seq0_hex) =
+            sign_chat_for_session_at(&session_id_2, &key2, 0, NOW_MS - 1_000, NOW_MS + 10_000);
+        let req2_seq0 = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header(
+                PROVENANCE_HEADER,
+                HeaderValue::from_bytes(&env2_seq0).unwrap(),
+            )
+            .body(Body::from(body2_seq0.clone()))
+            .unwrap();
+        let resp2_seq0 = app.clone().oneshot(req2_seq0).await.unwrap();
+        assert_eq!(resp2_seq0.status(), StatusCode::OK);
+        assert_eq!(next_stage.call_count(), 3);
+
+        // Replay of sequence 0 in session 2 remains rejected.
+        let req2_seq0_replay = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header(
+                PROVENANCE_HEADER,
+                HeaderValue::from_bytes(&env2_seq0).unwrap(),
+            )
+            .body(Body::from(body2_seq0))
+            .unwrap();
+        let resp2_seq0_replay = app.clone().oneshot(req2_seq0_replay).await.unwrap();
+        let json_replay2 = assert_carrier_rejection(resp2_seq0_replay, "stale_or_replayed").await;
+        assert_eq!(next_stage.call_count(), 3);
+
+        // 5. provenance_session_end removes the active session.
+        let (end_resp, end_stop) = send_control_line_in_process(
+            &plane,
+            &format!(
+                r#"{{"schema":"parapet-control/v0","token":"{token}","action":"{CONTROL_ACTION_PROVENANCE_SESSION_END}"}}"#
+            ),
+        );
+        assert!(!end_stop);
+        assert_eq!(
+            end_resp,
+            json!({
+                "schema": CONTROL_SCHEMA,
+                "ok": true,
+            })
+        );
+        assert!(!sessions.is_active());
+
+        let (body_after_end, env_after_end, tag_after_end_hex) =
+            sign_chat_for_session_at(&session_id_2, &key2, 1, NOW_MS - 1_000, NOW_MS + 10_000);
+        let req_after_end = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header(
+                PROVENANCE_HEADER,
+                HeaderValue::from_bytes(&env_after_end).unwrap(),
+            )
+            .body(Body::from(body_after_end))
+            .unwrap();
+        let resp_after_end = app.clone().oneshot(req_after_end).await.unwrap();
+        let json_after_end = assert_carrier_rejection(resp_after_end, "session_mismatch").await;
+        assert_eq!(next_stage.call_count(), 3);
+        assert_eq!(probes.http_calls.load(Ordering::SeqCst), 0);
+
+        // Ordinary control responses (`status`, `restore`, `disable`) on the plane.
+        let (status_val, _) = send_control_line_in_process(
+            &plane,
+            &format!(r#"{{"schema":"parapet-control/v0","token":"{token}","action":"status"}}"#),
+        );
+        let (restore_val, _) = send_control_line_in_process(
+            &plane,
+            &format!(r#"{{"schema":"parapet-control/v0","token":"{token}","action":"restore"}}"#),
+        );
+        let (disable_val, disable_stop) = send_control_line_in_process(
+            &plane,
+            &format!(r#"{{"schema":"parapet-control/v0","token":"{token}","action":"disable"}}"#),
+        );
+        assert!(disable_stop);
+
+        // 6. Restart / new SessionManager + new EngineControlPlane starts with no active session,
+        //    and DefaultProvenanceSessionConfigFactory (SystemClock + OsEntropy) works live.
+        drop(plane);
+        let restarted_sessions = Arc::new(SessionManager::new());
+        assert!(!restarted_sessions.is_active());
+        let restarted_handle =
+            ProvenanceSessionControl::new(restarted_sessions.clone(), profile.clone());
+        let (restarted_plane, _restarted_listener, _restarted_rx) =
+            EngineControlPlane::bind_with_provenance_session(
+                &state_dir,
+                45211,
+                CONFIG_HASH,
+                None,
+                Some(restarted_handle.clone()),
+            )
+            .unwrap();
+        assert!(!restarted_sessions.is_active());
+        let restarted_token = std::fs::read_to_string(state_dir.join("control.token")).unwrap();
+
+        let (engine2, _probes2) = build_engine_with_probes();
+        let next_stage2 = Arc::new(CapturingNextStage::default());
+        let app2 = build_router_with_admission(
+            engine2,
+            Arc::new(SessionRequestAdmitter::new(
+                ProfileMode::RequiredOpenCode,
+                restarted_sessions.clone(),
+                PROFILE_ID,
+                SCHEMA_VERSION_V1,
+            )),
+            Some(next_stage2.clone()),
+        );
+
+        // Before start on restarted manager: old session rejected.
+        let (body_restart_pre, env_restart_pre, tag_restart_pre_hex) =
+            sign_chat_for_session_at(&session_id_2, &key2, 2, NOW_MS - 1_000, NOW_MS + 10_000);
+        let req_restart_pre = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header(
+                PROVENANCE_HEADER,
+                HeaderValue::from_bytes(&env_restart_pre).unwrap(),
+            )
+            .body(Body::from(body_restart_pre))
+            .unwrap();
+        let resp_restart_pre = app2.clone().oneshot(req_restart_pre).await.unwrap();
+        let json_restart_pre = assert_carrier_rejection(resp_restart_pre, "session_mismatch").await;
+        assert_eq!(next_stage2.call_count(), 0);
+
+        // Start session on restarted plane using production OsEntropy + SystemClock.
+        let (start3, start3_stop) = send_control_line_in_process(
+            &restarted_plane,
+            &format!(
+                r#"{{"schema":"parapet-control/v0","token":"{restarted_token}","action":"{CONTROL_ACTION_PROVENANCE_SESSION_START}"}}"#
+            ),
+        );
+        assert!(!start3_stop);
+        assert!(restarted_sessions.is_active());
+        let session_id_3 = start3["session_id"].as_str().unwrap().to_owned();
+        let session_key_hex_3 = start3["session_key_hex"].as_str().unwrap().to_owned();
+        let key3 = decode_key_hex(&session_key_hex_3);
+        let live_now = SystemClock::new().now_ms();
+        let (body3, env3, tag3_hex) =
+            sign_chat_for_session_at(&session_id_3, &key3, 0, live_now, live_now + 20_000);
+        let req3 = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("authorization", CANARY_AUTH_HEADER)
+            .header(PROVENANCE_HEADER, HeaderValue::from_bytes(&env3).unwrap())
+            .body(Body::from(body3))
+            .unwrap();
+        let resp3 = app2.oneshot(req3).await.unwrap();
+        assert_eq!(resp3.status(), StatusCode::OK);
+        assert_eq!(next_stage2.call_count(), 1);
+
+        // 7. Verify captured TRACE logs, all state-dir files, owner record, ordinary control
+        //    responses, Debug outputs, and forwarded requests do NOT contain session key hex,
+        //    raw key bytes, or carrier authenticator tags.
+        let logs = String::from_utf8(trace_capture.buf.lock().unwrap().clone()).unwrap();
+        let owner_bytes = std::fs::read(state_dir.join("engine.owner.json")).unwrap();
+        let owner_record: EngineOwnerRecordV0 = serde_json::from_slice(&owner_bytes).unwrap();
+        assert_eq!(owner_record.port, 45211);
+
+        let req_debug = format!(
+            "{:?}",
+            ControlRequestV0 {
+                schema: CONTROL_SCHEMA.to_owned(),
+                token: restarted_token.clone(),
+                action: CONTROL_ACTION_PROVENANCE_SESSION_START.to_owned(),
+            }
+        );
+        let plane_debug = format!("{restarted_plane:?}");
+        assert!(req_debug.contains("<redacted>"));
+        assert!(!req_debug.contains(&restarted_token));
+        assert!(plane_debug.contains("<redacted>"));
+        assert!(!plane_debug.contains(&restarted_token));
+
+        let mut surfaces = vec![
+            logs,
+            req_debug,
+            plane_debug,
+            format!("{session_handle:?}"),
+            format!("{restarted_handle:?}"),
+            format!("{owner_record:?}"),
+            serde_json::to_string(&owner_record).unwrap(),
+            serde_json::to_string(&status_val).unwrap(),
+            serde_json::to_string(&restore_val).unwrap(),
+            serde_json::to_string(&disable_val).unwrap(),
+            serde_json::to_string(&end_resp).unwrap(),
+            bad_start_raw,
+            bad_rotate_raw,
+            bad_end_raw,
+            serde_json::to_string(&json_replay1).unwrap(),
+            serde_json::to_string(&json_old_mismatch).unwrap(),
+            serde_json::to_string(&json_wrong_key).unwrap(),
+            serde_json::to_string(&json_replay2).unwrap(),
+            serde_json::to_string(&json_after_end).unwrap(),
+            serde_json::to_string(&json_restart_pre).unwrap(),
+        ];
+
+        for entry in std::fs::read_dir(&state_dir).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.is_file() {
+                let content = std::fs::read(&path).unwrap();
+                surfaces.push(String::from_utf8_lossy(&content).into_owned());
+            }
+        }
+
+        for (_, fwd_req, _) in next_stage
+            .take_captured()
+            .into_iter()
+            .chain(next_stage2.take_captured())
+        {
+            assert!(fwd_req.headers.get(PROVENANCE_HEADER).is_none());
+            surfaces.push(format!("{:?}", fwd_req.headers));
+            surfaces.push(String::from_utf8_lossy(&fwd_req.body).into_owned());
+        }
+
+        let forbidden = [
+            session_key_hex_1.as_str(),
+            session_key_hex_2.as_str(),
+            session_key_hex_3.as_str(),
+            CANARY_W4B_KEY_1_STR,
+            CANARY_W4B_KEY_2_STR,
+            tag1_seq0_hex.as_str(),
+            tag1_seq1_hex.as_str(),
+            tag_old_hex.as_str(),
+            tag_wrong_key_hex.as_str(),
+            tag2_seq0_hex.as_str(),
+            tag_after_end_hex.as_str(),
+            tag_restart_pre_hex.as_str(),
+            tag3_hex.as_str(),
+        ];
+
+        for surface in &surfaces {
+            for needle in forbidden {
+                assert!(
+                    !surface.contains(needle),
+                    "W4b secret/authenticator leak of {needle:?} in surface: {surface}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn w4b_live_unix_socket_control_request_roundtrip() {
+        let trace_capture = ThreadTraceGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join("state_live_sock");
+        init_private_state_dir(&state_dir);
+
+        let sessions = Arc::new(SessionManager::with_entropy(Box::new(
+            ScriptedSessionEntropy::new(),
+        )));
+        assert!(!sessions.is_active());
+
+        let profile = supported_profile(MAX_VALIDITY_MS);
+        let session_handle =
+            ProvenanceSessionControl::with_config_factory(sessions.clone(), profile, |prof| {
+                SessionConfig {
+                    profile: prof,
+                    clock: Box::new(FixedClock(NOW_MS)),
+                    decoder: Box::new(ProviderContentDecoder::new(ProviderType::OpenAi)),
+                }
+            });
+        let (plane, listener, _shutdown_rx) = EngineControlPlane::bind_with_provenance_session(
+            &state_dir,
+            45220,
+            CONFIG_HASH,
+            None,
+            Some(session_handle.clone()),
+        )
+        .unwrap();
+        assert!(!sessions.is_active());
+        plane.spawn_listener(listener);
+
+        // Wrong-UID accept gate seam (also pinned in cli_v0::control_peer_credential_and_line_bound_rev9).
+        let owner_uid = std::fs::symlink_metadata(&state_dir).unwrap().uid();
+        assert!(!peer_credential_authorized(
+            Err(std::io::Error::other("peer_cred failed")),
+            owner_uid,
+        ));
+        assert!(!peer_credential_authorized(
+            Ok(owner_uid.wrapping_add(1)),
+            owner_uid,
+        ));
+        assert!(peer_credential_authorized(Ok(owner_uid), owner_uid));
+
+        // Explicit loosened-mode socket refusal: chmod control.sock away from 0600,
+        // assert send_control_request returns UnsafePermissions and no session begins,
+        // then restore 0600 before the live lifecycle.
+        let sock_path = state_dir.join("control.sock");
+        std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o660)).unwrap();
+        let state_loose = state_dir.clone();
+        let loose_res = tokio::task::spawn_blocking(move || {
+            send_control_request(&state_loose, CONTROL_ACTION_PROVENANCE_SESSION_START)
+        })
+        .await
+        .unwrap();
+        assert_eq!(loose_res, Err(ControlError::UnsafePermissions));
+        assert!(!sessions.is_active());
+        std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let token = std::fs::read_to_string(state_dir.join("control.token")).unwrap();
+
+        // Wrong token over control.sock fails with ControlError::AuthFailed and leaves session inactive.
+        write_private_file(&state_dir, "control.token", b"wrong-token").unwrap();
+        let state_bad = state_dir.clone();
+        let bad_res = tokio::task::spawn_blocking(move || {
+            send_control_request(&state_bad, CONTROL_ACTION_PROVENANCE_SESSION_START)
+        })
+        .await
+        .unwrap();
+        // In environments that forbid UnixStream::connect with EPERM, send_control_request
+        // maps the blocked connect to EngineUnavailable; when connect is permitted, it
+        // authenticates over control.sock and returns AuthFailed.
+        if bad_res == Err(ControlError::EngineUnavailable) {
+            let connect_err = std::os::unix::net::UnixStream::connect(&sock_path).unwrap_err();
+            assert_eq!(connect_err.kind(), std::io::ErrorKind::PermissionDenied);
+            assert!(!sessions.is_active());
+            return;
+        }
+        assert_eq!(bad_res, Err(ControlError::AuthFailed));
+        assert!(!sessions.is_active());
+
+        let (engine, probes) = build_engine_with_probes();
+        let next_stage = Arc::new(CapturingNextStage::default());
+        let app = build_router_with_admission(
+            engine,
+            Arc::new(SessionRequestAdmitter::new(
+                ProfileMode::RequiredOpenCode,
+                sessions.clone(),
+                PROFILE_ID,
+                SCHEMA_VERSION_V1,
+            )),
+            Some(next_stage.clone()),
+        );
+
+        // Restore valid token and perform live start -> rotate -> end over control.sock.
+        write_private_file(&state_dir, "control.token", token.as_bytes()).unwrap();
+        let state_s1 = state_dir.clone();
+        let start1 = tokio::task::spawn_blocking(move || {
+            send_control_request(&state_s1, CONTROL_ACTION_PROVENANCE_SESSION_START)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(start1["ok"], true);
+        assert!(sessions.is_active());
+        let session_id_1 = start1["session_id"].as_str().unwrap().to_owned();
+        let session_key_hex_1 = start1["session_key_hex"].as_str().unwrap().to_owned();
+        let key1 = decode_key_hex(&session_key_hex_1);
+        assert_eq!(key1.expose_bytes(), &CANARY_W4B_KEY_1_BYTES);
+
+        let (body1, env1, tag1_hex) =
+            sign_chat_for_session_at(&session_id_1, &key1, 0, NOW_MS - 1_000, NOW_MS + 10_000);
+        let req1 = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("authorization", CANARY_AUTH_HEADER)
+            .header(PROVENANCE_HEADER, HeaderValue::from_bytes(&env1).unwrap())
+            .body(Body::from(body1.clone()))
+            .unwrap();
+        let resp1 = app.clone().oneshot(req1).await.unwrap();
+        assert_eq!(resp1.status(), StatusCode::OK);
+        assert_eq!(next_stage.call_count(), 1);
+
+        let req1_replay = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header(PROVENANCE_HEADER, HeaderValue::from_bytes(&env1).unwrap())
+            .body(Body::from(body1))
+            .unwrap();
+        let resp1_replay = app.clone().oneshot(req1_replay).await.unwrap();
+        let json_replay1 = assert_carrier_rejection(resp1_replay, "stale_or_replayed").await;
+
+        let state_s2 = state_dir.clone();
+        let start2 = tokio::task::spawn_blocking(move || {
+            send_control_request(&state_s2, CONTROL_ACTION_PROVENANCE_SESSION_START)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(start2["ok"], true);
+        let session_id_2 = start2["session_id"].as_str().unwrap().to_owned();
+        let session_key_hex_2 = start2["session_key_hex"].as_str().unwrap().to_owned();
+        assert_ne!(session_id_1, session_id_2);
+        assert_ne!(session_key_hex_1, session_key_hex_2);
+        let key2 = decode_key_hex(&session_key_hex_2);
+        assert_eq!(key2.expose_bytes(), &CANARY_W4B_KEY_2_BYTES);
+
+        let (body_old, env_old, tag_old_hex) =
+            sign_chat_for_session_at(&session_id_1, &key1, 1, NOW_MS - 1_000, NOW_MS + 10_000);
+        let req_old = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header(
+                PROVENANCE_HEADER,
+                HeaderValue::from_bytes(&env_old).unwrap(),
+            )
+            .body(Body::from(body_old))
+            .unwrap();
+        let resp_old = app.clone().oneshot(req_old).await.unwrap();
+        let json_old = assert_carrier_rejection(resp_old, "session_mismatch").await;
+
+        let (body2, env2, tag2_hex) =
+            sign_chat_for_session_at(&session_id_2, &key2, 0, NOW_MS - 1_000, NOW_MS + 10_000);
+        let req2 = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("authorization", CANARY_AUTH_HEADER)
+            .header(PROVENANCE_HEADER, HeaderValue::from_bytes(&env2).unwrap())
+            .body(Body::from(body2))
+            .unwrap();
+        let resp2 = app.clone().oneshot(req2).await.unwrap();
+        assert_eq!(resp2.status(), StatusCode::OK);
+        assert_eq!(next_stage.call_count(), 2);
+
+        let state_end = state_dir.clone();
+        let end_resp = tokio::task::spawn_blocking(move || {
+            send_control_request(&state_end, CONTROL_ACTION_PROVENANCE_SESSION_END)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(end_resp, json!({"schema": CONTROL_SCHEMA, "ok": true}));
+        assert!(!sessions.is_active());
+
+        let (body_after_end, env_after_end, tag_after_end_hex) =
+            sign_chat_for_session_at(&session_id_2, &key2, 1, NOW_MS - 1_000, NOW_MS + 10_000);
+        let req_after_end = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header(
+                PROVENANCE_HEADER,
+                HeaderValue::from_bytes(&env_after_end).unwrap(),
+            )
+            .body(Body::from(body_after_end))
+            .unwrap();
+        let resp_after_end = app.oneshot(req_after_end).await.unwrap();
+        let json_after_end = assert_carrier_rejection(resp_after_end, "session_mismatch").await;
+        assert_eq!(probes.http_calls.load(Ordering::SeqCst), 0);
+
+        let logs = String::from_utf8(trace_capture.buf.lock().unwrap().clone()).unwrap();
+        let mut live_surfaces = vec![
+            logs,
+            format!("{plane:?}"),
+            format!("{session_handle:?}"),
+            serde_json::to_string(&end_resp).unwrap(),
+            serde_json::to_string(&json_replay1).unwrap(),
+            serde_json::to_string(&json_old).unwrap(),
+            serde_json::to_string(&json_after_end).unwrap(),
+        ];
+        for entry in std::fs::read_dir(&state_dir).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.is_file() {
+                let content = std::fs::read(&path).unwrap();
+                live_surfaces.push(String::from_utf8_lossy(&content).into_owned());
+            }
+        }
+        for (_, fwd_req, _) in next_stage.take_captured() {
+            assert!(fwd_req.headers.get(PROVENANCE_HEADER).is_none());
+            live_surfaces.push(format!("{:?}", fwd_req.headers));
+            live_surfaces.push(String::from_utf8_lossy(&fwd_req.body).into_owned());
+        }
+
+        let forbidden = [
+            session_key_hex_1.as_str(),
+            session_key_hex_2.as_str(),
+            CANARY_W4B_KEY_1_STR,
+            CANARY_W4B_KEY_2_STR,
+            tag1_hex.as_str(),
+            tag_old_hex.as_str(),
+            tag2_hex.as_str(),
+            tag_after_end_hex.as_str(),
+        ];
+        for surface in &live_surfaces {
+            for needle in forbidden {
+                assert!(
+                    !surface.contains(needle),
+                    "live socket TRACE/surface leaked secret or authenticator {needle:?}: {surface}"
+                );
+            }
+        }
+    }
 }

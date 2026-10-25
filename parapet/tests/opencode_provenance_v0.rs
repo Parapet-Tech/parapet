@@ -1263,3 +1263,61 @@ fn failures_receipts_and_debug_output_carry_no_content_or_secrets() {
         }
     }
 }
+
+#[test]
+fn system_clock_verifies_live_window_and_fails_closed_on_pre_epoch_and_overflow() {
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let clock = SystemClock::new();
+    let now = clock.now_ms();
+    assert!(now > 1_700_000_000_000 && now < u64::MAX);
+
+    let decodes = Arc::new(AtomicUsize::new(0));
+    let mut builds = BTreeMap::new();
+    builds.insert(
+        BUILD.to_string(),
+        VendorManifest::new([Sha256Digest::of(VENDOR.as_bytes())]),
+    );
+    let verifier = CarrierVerifier::new(CarrierVerifierDeps {
+        profile: SupportedProfile {
+            schema_version: SCHEMA_VERSION_V1,
+            profile_id: PROFILE.to_string(),
+            builds,
+            max_validity_ms: MAX_VALIDITY,
+        },
+        session_id: SESSION.to_string(),
+        authenticator: Box::new(HmacAuthenticator(KEY.to_vec())),
+        clock: Box::new(clock),
+        ledger: Box::new(InMemoryReplayLedger::new()),
+        decoder: Box::new(JsonDecoder(decodes)),
+    });
+
+    let c = standard_contents();
+    let r = refs(&c);
+    let body = body_of(&r);
+    let mut live = unsigned(&body, seg_values(&r, &standard_segs(&c)));
+    live["issued_at_ms"] = json!(now);
+    live["expires_at_ms"] = json!(now + 30_000);
+    let live_env = sign(live);
+    assert!(verifier.verify(Some(&live_env), &body).is_ok());
+    assert_eq!(
+        verifier.verify(Some(&live_env), &body).unwrap_err().outcome,
+        VerificationOutcome::StaleOrReplayed
+    );
+
+    let pre_epoch_ms = SystemClock::system_time_ms(UNIX_EPOCH - Duration::from_millis(1));
+    let overflow_ms = SystemClock::duration_ms(Some(Duration::from_secs(u64::MAX)));
+    assert_eq!(pre_epoch_ms, u64::MAX);
+    assert_eq!(overflow_ms, u64::MAX);
+    for bad_now in [pre_epoch_ms, overflow_ms] {
+        let h_bad = harness_at(bad_now);
+        let mut v = unsigned(&body, seg_values(&r, &standard_segs(&c)));
+        v["issued_at_ms"] = json!(u64::MAX - 10_000);
+        v["expires_at_ms"] = json!(u64::MAX);
+        let env = sign(v);
+        assert_eq!(
+            outcome(&h_bad, &env, &body),
+            VerificationOutcome::StaleOrReplayed
+        );
+    }
+}

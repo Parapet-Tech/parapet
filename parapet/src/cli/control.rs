@@ -7,6 +7,11 @@
 #![cfg(not(windows))]
 
 use crate::effect::{FileCleanupResultV0, FileEffectCleanupV0, RootCapabilityV0};
+use crate::provenance::{
+    ProviderContentDecoder, SessionConfig, SessionError, SessionGrant, SessionManager,
+    SupportedProfile, SystemClock,
+};
+use crate::provider::ProviderType;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -27,6 +32,12 @@ pub const ENGINE_OWNER_SCHEMA: &str = "parapet-engine-owner/v0";
 pub const MAX_CONTROL_LINE_BYTES: usize = 4096;
 /// Control request/response timeout (`5,000 ms`).
 pub const CONTROL_TIMEOUT: Duration = Duration::from_millis(5000);
+/// Control action to start or atomically rotate a provenance carrier session.
+pub const CONTROL_ACTION_PROVENANCE_SESSION_START: &str = "provenance_session_start";
+/// Control action to end the active provenance carrier session.
+pub const CONTROL_ACTION_PROVENANCE_SESSION_END: &str = "provenance_session_end";
+/// Content-free control error code returned when provenance session control is unavailable.
+pub const CONTROL_ERROR_SESSION_UNAVAILABLE: &str = "session_unavailable";
 
 /// Persistent state metadata written by `parapet init` to `<state-dir>/control.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,11 +60,21 @@ pub struct EngineOwnerRecordV0 {
 }
 
 /// Control request message over `control.sock`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlRequestV0 {
     pub schema: String,
     pub token: String,
     pub action: String,
+}
+
+impl std::fmt::Debug for ControlRequestV0 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControlRequestV0")
+            .field("schema", &self.schema)
+            .field("token", &"<redacted>")
+            .field("action", &self.action)
+            .finish()
+    }
 }
 
 #[derive(Serialize)]
@@ -88,6 +109,24 @@ struct ControlDisableResponseV0<'a> {
     stop_approved: bool,
     file_cleanup: &'a str,
     evidence_retained: bool,
+}
+
+#[derive(Serialize)]
+struct ControlProvenanceSessionStartResponseV0<'a> {
+    schema: &'static str,
+    ok: bool,
+    profile: &'a str,
+    schema_version: u32,
+    session_id: &'a str,
+    session_key_hex: &'a str,
+    max_validity_ms: u64,
+    builds: Vec<&'a str>,
+}
+
+#[derive(Serialize)]
+struct ControlProvenanceSessionEndResponseV0 {
+    schema: &'static str,
+    ok: bool,
 }
 
 /// Closed control errors (never carrying OS error text or filesystem paths).
@@ -143,6 +182,29 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+fn wipe_bytes(bytes: &mut [u8]) {
+    for b in bytes.iter_mut() {
+        // SAFETY: `b` is a valid, aligned, exclusive reference.
+        unsafe { std::ptr::write_volatile(b, 0) };
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+}
+
+fn wipe_string(s: &mut String) {
+    // SAFETY: overwriting UTF-8 bytes with 0x00 (ASCII NUL) preserves valid UTF-8.
+    wipe_bytes(unsafe { s.as_bytes_mut() });
+}
+
+fn encode_lower_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
 /// Number of random bytes in a control token.
 pub const CONTROL_TOKEN_BYTES: usize = 32;
 /// Production control-token entropy source.
@@ -157,13 +219,12 @@ pub fn open_control_token_source() -> std::io::Result<std::fs::File> {
 /// lowercase hex characters. A short or failed read is an error.
 pub fn control_token_from_reader<R: Read>(reader: &mut R) -> Result<String, ControlError> {
     let mut bytes = [0u8; CONTROL_TOKEN_BYTES];
-    reader
-        .read_exact(&mut bytes)
-        .map_err(|_| ControlError::IoFailed)?;
-    let mut hex = String::with_capacity(CONTROL_TOKEN_BYTES * 2);
-    for b in bytes {
-        hex.push_str(&format!("{b:02x}"));
+    if reader.read_exact(&mut bytes).is_err() {
+        wipe_bytes(&mut bytes);
+        return Err(ControlError::IoFailed);
     }
+    let hex = encode_lower_hex(&bytes);
+    wipe_bytes(&mut bytes);
     Ok(hex)
 }
 
@@ -301,14 +362,137 @@ pub fn remove_owned_transient_files(state_dir: &Path) {
     }
 }
 
+/// Factory building a [`SessionConfig`] for a caller-supplied [`SupportedProfile`]
+/// on each provenance session start or rotation.
+pub trait ProvenanceSessionConfigFactory: Send + Sync {
+    fn build_session_config(&self, profile: SupportedProfile) -> SessionConfig;
+}
+
+/// Production [`ProvenanceSessionConfigFactory`] using [`SystemClock`] and
+/// the OpenAI [`ProviderContentDecoder`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DefaultProvenanceSessionConfigFactory;
+
+impl ProvenanceSessionConfigFactory for DefaultProvenanceSessionConfigFactory {
+    fn build_session_config(&self, profile: SupportedProfile) -> SessionConfig {
+        SessionConfig {
+            profile,
+            clock: Box::new(SystemClock::new()),
+            decoder: Box::new(ProviderContentDecoder::new(ProviderType::OpenAi)),
+        }
+    }
+}
+
+impl<F> ProvenanceSessionConfigFactory for F
+where
+    F: Fn(SupportedProfile) -> SessionConfig + Send + Sync,
+{
+    fn build_session_config(&self, profile: SupportedProfile) -> SessionConfig {
+        (self)(profile)
+    }
+}
+
+/// Injected control-plane handle for starting, rotating, and ending an
+/// in-memory provenance carrier session (`parapet-control/v0`).
+#[derive(Clone)]
+pub struct ProvenanceSessionControl {
+    sessions: Arc<SessionManager>,
+    profile: SupportedProfile,
+    config_factory: Arc<dyn ProvenanceSessionConfigFactory>,
+}
+
+impl ProvenanceSessionControl {
+    /// Construct a handle backed by [`DefaultProvenanceSessionConfigFactory`].
+    pub fn new(sessions: Arc<SessionManager>, profile: SupportedProfile) -> Self {
+        Self::new_with(
+            sessions,
+            profile,
+            Arc::new(DefaultProvenanceSessionConfigFactory),
+        )
+    }
+
+    /// Construct a handle with an injected [`ProvenanceSessionConfigFactory`].
+    pub fn new_with(
+        sessions: Arc<SessionManager>,
+        profile: SupportedProfile,
+        config_factory: Arc<dyn ProvenanceSessionConfigFactory>,
+    ) -> Self {
+        Self {
+            sessions,
+            profile,
+            config_factory,
+        }
+    }
+
+    /// Construct a handle with any [`ProvenanceSessionConfigFactory`] implementation.
+    pub fn with_config_factory(
+        sessions: Arc<SessionManager>,
+        profile: SupportedProfile,
+        config_factory: impl ProvenanceSessionConfigFactory + 'static,
+    ) -> Self {
+        Self::new_with(sessions, profile, Arc::new(config_factory))
+    }
+
+    pub fn sessions(&self) -> &Arc<SessionManager> {
+        &self.sessions
+    }
+
+    pub fn profile(&self) -> &SupportedProfile {
+        &self.profile
+    }
+
+    /// Start or atomically rotate the active session using the configured profile and factory.
+    pub fn start_session(&self) -> Result<SessionGrant, SessionError> {
+        let config = self
+            .config_factory
+            .build_session_config(self.profile.clone());
+        self.sessions.start(config)
+    }
+
+    /// End the active session, if any.
+    pub fn end_session(&self) {
+        self.sessions.end();
+    }
+}
+
+impl std::fmt::Debug for ProvenanceSessionControl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProvenanceSessionControl")
+            .field("profile", &self.profile.profile_id)
+            .field("schema_version", &self.profile.schema_version)
+            .field("max_validity_ms", &self.profile.max_validity_ms)
+            .field("is_active", &self.sessions.is_active())
+            .finish()
+    }
+}
+
 /// Live control plane held inside the owning engine process.
 pub struct EngineControlPlane {
     state_dir: PathBuf,
     owner_uid: u32,
     token: String,
     capability: Option<Arc<RootCapabilityV0>>,
+    provenance_session: Option<ProvenanceSessionControl>,
     cleanup_state: Mutex<TrackedFileCleanupState>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
+}
+
+impl std::fmt::Debug for EngineControlPlane {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EngineControlPlane")
+            .field("state_dir", &self.state_dir)
+            .field("owner_uid", &self.owner_uid)
+            .field("token", &"<redacted>")
+            .field("file_capability_active", &self.capability.is_some())
+            .field("provenance_session", &self.provenance_session)
+            .finish()
+    }
+}
+
+impl Drop for EngineControlPlane {
+    fn drop(&mut self) {
+        wipe_string(&mut self.token);
+    }
 }
 
 impl EngineControlPlane {
@@ -335,6 +519,32 @@ impl EngineControlPlane {
         )
     }
 
+    /// Initialize `control.token`, `control.sock`, and `engine.owner.json` inside `state_dir`
+    /// with an optional injected provenance session control handle.
+    pub fn bind_with_provenance_session(
+        state_dir: &Path,
+        port: u16,
+        config_hash: &str,
+        capability: Option<Arc<RootCapabilityV0>>,
+        provenance_session: Option<ProvenanceSessionControl>,
+    ) -> Result<
+        (
+            Arc<Self>,
+            tokio::net::UnixListener,
+            tokio::sync::watch::Receiver<bool>,
+        ),
+        ControlError,
+    > {
+        Self::bind_with_token_source_and_provenance_session(
+            state_dir,
+            port,
+            config_hash,
+            capability,
+            provenance_session,
+            open_control_token_source,
+        )
+    }
+
     /// [`Self::bind`] with an injected token-source factory. The token is read
     /// before any control file or socket is created.
     pub fn bind_with_token_source<F, R>(
@@ -342,6 +552,36 @@ impl EngineControlPlane {
         port: u16,
         config_hash: &str,
         capability: Option<Arc<RootCapabilityV0>>,
+        token_source: F,
+    ) -> Result<
+        (
+            Arc<Self>,
+            tokio::net::UnixListener,
+            tokio::sync::watch::Receiver<bool>,
+        ),
+        ControlError,
+    >
+    where
+        F: FnOnce() -> std::io::Result<R>,
+        R: Read,
+    {
+        Self::bind_with_token_source_and_provenance_session(
+            state_dir,
+            port,
+            config_hash,
+            capability,
+            None,
+            token_source,
+        )
+    }
+
+    /// [`Self::bind_with_token_source`] with an optional injected provenance session control handle.
+    pub fn bind_with_token_source_and_provenance_session<F, R>(
+        state_dir: &Path,
+        port: u16,
+        config_hash: &str,
+        capability: Option<Arc<RootCapabilityV0>>,
+        provenance_session: Option<ProvenanceSessionControl>,
         token_source: F,
     ) -> Result<
         (
@@ -409,6 +649,7 @@ impl EngineControlPlane {
             owner_uid: expected_uid,
             token,
             capability,
+            provenance_session,
             cleanup_state: Mutex::new(initial_state),
             shutdown_tx,
         });
@@ -417,6 +658,10 @@ impl EngineControlPlane {
 
     pub fn state_dir(&self) -> &Path {
         &self.state_dir
+    }
+
+    pub fn provenance_session(&self) -> Option<&ProvenanceSessionControl> {
+        self.provenance_session.as_ref()
     }
 
     pub fn tracked_cleanup_state(&self) -> TrackedFileCleanupState {
@@ -457,7 +702,7 @@ impl EngineControlPlane {
     /// Process a single JSON request line and return `(response_json_bytes, approve_shutdown)`.
     pub fn handle_request_line(&self, line: &str) -> (Vec<u8>, bool) {
         let parsed: Result<ControlRequestV0, _> = serde_json::from_str(line.trim());
-        let Ok(req) = parsed else {
+        let Ok(mut req) = parsed else {
             let body = ControlErrorResponseV0 {
                 schema: CONTROL_SCHEMA,
                 ok: false,
@@ -467,9 +712,10 @@ impl EngineControlPlane {
             out.push(b'\n');
             return (out, false);
         };
-        if req.schema != CONTROL_SCHEMA
-            || !constant_time_eq(req.token.as_bytes(), self.token.as_bytes())
-        {
+        let auth_ok = req.schema == CONTROL_SCHEMA
+            && constant_time_eq(req.token.as_bytes(), self.token.as_bytes());
+        wipe_string(&mut req.token);
+        if !auth_ok {
             let body = ControlErrorResponseV0 {
                 schema: CONTROL_SCHEMA,
                 ok: false,
@@ -527,6 +773,66 @@ impl EngineControlPlane {
                 out.push(b'\n');
                 (out, approved)
             }
+            CONTROL_ACTION_PROVENANCE_SESSION_START => {
+                let Some(ref session_ctrl) = self.provenance_session else {
+                    let body = ControlErrorResponseV0 {
+                        schema: CONTROL_SCHEMA,
+                        ok: false,
+                        error_code: CONTROL_ERROR_SESSION_UNAVAILABLE,
+                    };
+                    let mut out = serde_json::to_vec(&body).unwrap_or_default();
+                    out.push(b'\n');
+                    return (out, false);
+                };
+                let Ok(grant) = session_ctrl.start_session() else {
+                    let body = ControlErrorResponseV0 {
+                        schema: CONTROL_SCHEMA,
+                        ok: false,
+                        error_code: CONTROL_ERROR_SESSION_UNAVAILABLE,
+                    };
+                    let mut out = serde_json::to_vec(&body).unwrap_or_default();
+                    out.push(b'\n');
+                    return (out, false);
+                };
+                let profile = session_ctrl.profile();
+                let mut key_hex = encode_lower_hex(grant.key.expose_bytes());
+                let builds: Vec<&str> = profile.builds.keys().map(String::as_str).collect();
+                let body = ControlProvenanceSessionStartResponseV0 {
+                    schema: CONTROL_SCHEMA,
+                    ok: true,
+                    profile: &profile.profile_id,
+                    schema_version: profile.schema_version,
+                    session_id: &grant.session_id,
+                    session_key_hex: &key_hex,
+                    max_validity_ms: profile.max_validity_ms,
+                    builds,
+                };
+                let mut out = serde_json::to_vec(&body).unwrap_or_default();
+                wipe_string(&mut key_hex);
+                drop(grant);
+                out.push(b'\n');
+                (out, false)
+            }
+            CONTROL_ACTION_PROVENANCE_SESSION_END => {
+                let Some(ref session_ctrl) = self.provenance_session else {
+                    let body = ControlErrorResponseV0 {
+                        schema: CONTROL_SCHEMA,
+                        ok: false,
+                        error_code: CONTROL_ERROR_SESSION_UNAVAILABLE,
+                    };
+                    let mut out = serde_json::to_vec(&body).unwrap_or_default();
+                    out.push(b'\n');
+                    return (out, false);
+                };
+                session_ctrl.end_session();
+                let body = ControlProvenanceSessionEndResponseV0 {
+                    schema: CONTROL_SCHEMA,
+                    ok: true,
+                };
+                let mut out = serde_json::to_vec(&body).unwrap_or_default();
+                out.push(b'\n');
+                (out, false)
+            }
             _ => {
                 let body = ControlErrorResponseV0 {
                     schema: CONTROL_SCHEMA,
@@ -562,11 +868,13 @@ impl EngineControlPlane {
                         read_bounded_control_line(buf_reader),
                     )
                     .await;
-                    let Ok(Ok(line)) = read_res else {
+                    let Ok(Ok(mut line)) = read_res else {
                         return;
                     };
-                    let (resp, approve_shutdown) = plane_conn.handle_request_line(&line);
+                    let (mut resp, approve_shutdown) = plane_conn.handle_request_line(&line);
+                    wipe_string(&mut line);
                     let _ = writer.write_all(&resp).await;
+                    wipe_bytes(&mut resp);
                     let _ = writer.flush().await;
                     let _ = writer.shutdown().await;
                     if approve_shutdown {
@@ -740,44 +1048,57 @@ pub fn check_state_dir_ownership(state_dir: &Path) -> OwnershipCheck {
 /// Send an authenticated control request over `<state_dir>/control.sock` with a 5,000 ms timeout.
 pub fn send_control_request(state_dir: &Path, action: &str) -> Result<Value, ControlError> {
     let expected_uid = verify_private_state_dir(state_dir)?;
-    let token_bytes = read_private_file(state_dir, "control.token")?;
-    let token = String::from_utf8(token_bytes)
-        .map_err(|_| ControlError::ProtocolError)?
-        .trim()
-        .to_owned();
+    let mut token_bytes = read_private_file(state_dir, "control.token")?;
+    let Ok(raw_token) = std::str::from_utf8(&token_bytes) else {
+        wipe_bytes(&mut token_bytes);
+        return Err(ControlError::ProtocolError);
+    };
+    let token = raw_token.trim().to_owned();
+    wipe_bytes(&mut token_bytes);
+
     let sock_path = state_dir.join("control.sock");
-    let sock_meta =
-        std::fs::symlink_metadata(&sock_path).map_err(|_| ControlError::EngineUnavailable)?;
+    let Ok(sock_meta) = std::fs::symlink_metadata(&sock_path) else {
+        let mut token = token;
+        wipe_string(&mut token);
+        return Err(ControlError::EngineUnavailable);
+    };
     if !sock_meta.file_type().is_socket()
         || sock_meta.uid() != expected_uid
         || (sock_meta.mode() & 0o7777) != 0o600
     {
+        let mut token = token;
+        wipe_string(&mut token);
         return Err(ControlError::UnsafePermissions);
     }
 
-    let mut stream =
-        UnixStream::connect(&sock_path).map_err(|_| ControlError::EngineUnavailable)?;
+    let Ok(mut stream) = UnixStream::connect(&sock_path) else {
+        let mut token = token;
+        wipe_string(&mut token);
+        return Err(ControlError::EngineUnavailable);
+    };
     let _ = stream.set_read_timeout(Some(CONTROL_TIMEOUT));
     let _ = stream.set_write_timeout(Some(CONTROL_TIMEOUT));
 
-    let req = ControlRequestV0 {
+    let mut req = ControlRequestV0 {
         schema: CONTROL_SCHEMA.to_owned(),
         token,
         action: action.to_owned(),
     };
-    let mut payload = serde_json::to_vec(&req).map_err(|_| ControlError::ProtocolError)?;
+    let payload_res = serde_json::to_vec(&req);
+    wipe_string(&mut req.token);
+    let mut payload = payload_res.map_err(|_| ControlError::ProtocolError)?;
     payload.push(b'\n');
-    stream
-        .write_all(&payload)
-        .map_err(|_| ControlError::EngineUnavailable)?;
-    stream
-        .flush()
-        .map_err(|_| ControlError::EngineUnavailable)?;
+    let write_ok = stream.write_all(&payload).is_ok() && stream.flush().is_ok();
+    wipe_bytes(&mut payload);
+    if !write_ok {
+        return Err(ControlError::EngineUnavailable);
+    }
 
-    let resp_line = read_bounded_control_line_sync(BufReader::new(stream))
+    let mut resp_line = read_bounded_control_line_sync(BufReader::new(stream))
         .map_err(|_| ControlError::EngineUnavailable)?;
-    let val: Value =
-        serde_json::from_str(resp_line.trim()).map_err(|_| ControlError::ProtocolError)?;
+    let parsed_val: Result<Value, _> = serde_json::from_str(resp_line.trim());
+    wipe_string(&mut resp_line);
+    let val = parsed_val.map_err(|_| ControlError::ProtocolError)?;
     if val.get("schema").and_then(Value::as_str) != Some(CONTROL_SCHEMA) {
         return Err(ControlError::ProtocolError);
     }

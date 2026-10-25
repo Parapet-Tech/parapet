@@ -11,12 +11,48 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::sync::Mutex;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::envelope::{CarrierEnvelope, Segment, Sha256Digest, Source};
 
 /// Injected wall clock, milliseconds since the Unix epoch.
 pub trait Clock: Send + Sync {
     fn now_ms(&self) -> u64;
+}
+
+/// Production wall clock backed by [`SystemTime`] since [`UNIX_EPOCH`].
+///
+/// Pre-epoch readings and millisecond durations that overflow `u64` return
+/// `u64::MAX`, where `now < expires_at_ms` is uninhabited for any `u64`
+/// expiry and verification fails closed without panicking or wrapping.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SystemClock;
+
+impl SystemClock {
+    pub const fn new() -> Self {
+        Self
+    }
+
+    /// Convert a [`SystemTime`] into milliseconds since [`UNIX_EPOCH`],
+    /// returning `u64::MAX` (fail-closed) on pre-epoch or `u64` overflow.
+    pub fn system_time_ms(time: SystemTime) -> u64 {
+        Self::duration_ms(time.duration_since(UNIX_EPOCH).ok())
+    }
+
+    /// Convert an optional post-epoch [`Duration`] into milliseconds,
+    /// returning `u64::MAX` (fail-closed) when `None` (pre-epoch) or when
+    /// `as_millis()` exceeds `u64::MAX`.
+    pub fn duration_ms(since_epoch: Option<Duration>) -> u64 {
+        since_epoch
+            .and_then(|d| u64::try_from(d.as_millis()).ok())
+            .unwrap_or(u64::MAX)
+    }
+}
+
+impl Clock for SystemClock {
+    fn now_ms(&self) -> u64 {
+        Self::system_time_ms(SystemTime::now())
+    }
 }
 
 /// Injected session authenticator. Key custody is a separate Sensor freeze
@@ -397,4 +433,111 @@ fn check_geometry(
         return Err((O::MapIncomplete, None));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provenance::auth::{HmacSha256Authenticator, SessionKey, SESSION_KEY_LEN};
+    use crate::provenance::envelope::{Authenticator, SourceMap, SCHEMA_VERSION_V1};
+
+    struct StaticClock(u64);
+
+    impl Clock for StaticClock {
+        fn now_ms(&self) -> u64 {
+            self.0
+        }
+    }
+
+    struct DummyDecoder;
+
+    impl MessageContentDecoder for DummyDecoder {
+        fn decode(&self, body: &[u8]) -> Option<Vec<DecodedMessage>> {
+            Some(vec![DecodedMessage::new(
+                String::from_utf8(body.to_vec()).ok()?,
+                false,
+            )])
+        }
+    }
+
+    #[test]
+    fn system_clock_reads_post_epoch_wall_time_and_converts_exact_durations() {
+        let now = SystemClock::new().now_ms();
+        assert!(now > 1_700_000_000_000 && now < u64::MAX);
+        assert_eq!(SystemClock::system_time_ms(UNIX_EPOCH), 0);
+        assert_eq!(
+            SystemClock::system_time_ms(UNIX_EPOCH + Duration::from_millis(123_456)),
+            123_456
+        );
+        assert_eq!(
+            SystemClock::duration_ms(Some(Duration::from_millis(u64::MAX))),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn system_clock_fails_safely_on_pre_epoch_and_overflow() {
+        let pre_epoch = UNIX_EPOCH - Duration::from_millis(1);
+        let pre_epoch_ms = SystemClock::system_time_ms(pre_epoch);
+        assert_eq!(pre_epoch_ms, u64::MAX);
+        assert_eq!(SystemClock::duration_ms(None), u64::MAX);
+
+        let overflow = Duration::from_secs(u64::MAX);
+        let overflow_ms = SystemClock::duration_ms(Some(overflow));
+        assert_eq!(overflow_ms, u64::MAX);
+
+        let body = b"hello";
+        let key = SessionKey::from_bytes([7u8; SESSION_KEY_LEN]);
+        let source_map = SourceMap {
+            segments: vec![Segment {
+                message_index: 0,
+                start: 0,
+                end: body.len(),
+                source: Source::User,
+                sha256: Sha256Digest::of(body),
+            }],
+        };
+
+        for clock_reading in [pre_epoch_ms, overflow_ms] {
+            for (issued, expires) in [
+                (0u64, 1u64),
+                (0u64, 60_000u64),
+                (u64::MAX - 60_000, u64::MAX),
+            ] {
+                let mut builds = BTreeMap::new();
+                builds.insert("b1".to_string(), VendorManifest::default());
+                let verifier = CarrierVerifier::new(CarrierVerifierDeps {
+                    profile: SupportedProfile {
+                        schema_version: SCHEMA_VERSION_V1,
+                        profile_id: "opencode".to_string(),
+                        builds,
+                        max_validity_ms: 60_000,
+                    },
+                    session_id: "01".repeat(16),
+                    authenticator: Box::new(HmacSha256Authenticator::new(key.clone())),
+                    clock: Box::new(StaticClock(clock_reading)),
+                    ledger: Box::new(InMemoryReplayLedger::new()),
+                    decoder: Box::new(DummyDecoder),
+                });
+                let mut env = CarrierEnvelope {
+                    schema_version: SCHEMA_VERSION_V1,
+                    profile: "opencode".to_string(),
+                    build: "b1".to_string(),
+                    session_id: "01".repeat(16),
+                    sequence: 0,
+                    issued_at_ms: issued,
+                    expires_at_ms: expires,
+                    request_body_sha256: Sha256Digest::of(body),
+                    source_map_sha256: source_map.canonical_digest(),
+                    source_map: source_map.clone(),
+                    authenticator: Authenticator::from_bytes(vec![0u8; 32]),
+                };
+                let tag = HmacSha256Authenticator::new(key.clone()).tag(&env.signed_payload());
+                env.authenticator = Authenticator::from_bytes(tag.to_vec());
+                let raw = serde_json::to_vec(&env).unwrap();
+                let err = verifier.verify(Some(&raw), body).unwrap_err();
+                assert_eq!(err.outcome, VerificationOutcome::StaleOrReplayed);
+            }
+        }
+    }
 }
