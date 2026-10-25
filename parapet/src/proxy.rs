@@ -350,10 +350,105 @@ pub fn strip_guard_trust_headers(headers: &mut HeaderMap) {
 // ---------------------------------------------------------------------------
 
 use crate::provenance::{
-    admit, extract_carrier_header, CarrierAdmission, CarrierError, CarrierVerifier, ProfileMode,
-    ProviderContentDecoder, SessionManager, VerificationOutcome, VerifiedCarrier,
+    admit, extract_carrier_header, CarrierAdmission, CarrierError, CarrierVerifier, Clock,
+    ProfileMode, ProviderContentDecoder, SessionConfig, SessionManager, SupportedProfile,
+    VerificationOutcome, VerifiedCarrier,
 };
 use crate::provider::ProviderType;
+
+impl Provider {
+    /// Exact canonical `POST` path accepted under required-profile carrier admission.
+    pub const fn canonical_post_path(self) -> &'static str {
+        match self {
+            Self::OpenAi => "/v1/chat/completions",
+            Self::Anthropic => "/v1/messages",
+        }
+    }
+
+    /// Corresponding [`ProviderType`] for wire adapter and [`ProviderContentDecoder`] selection.
+    pub const fn provider_type(self) -> ProviderType {
+        match self {
+            Self::OpenAi => ProviderType::OpenAi,
+            Self::Anthropic => ProviderType::Anthropic,
+        }
+    }
+
+    /// Construct the matching [`ProviderContentDecoder`] for this provider.
+    pub fn content_decoder(self) -> ProviderContentDecoder {
+        ProviderContentDecoder::new(self.provider_type())
+    }
+}
+
+/// Closed required-profile route and decoder binding for a single [`Provider`].
+///
+/// Binds one [`Provider`], its exact canonical `POST` path, and its matching
+/// [`ProviderContentDecoder`] (`OpenAi` -> `POST /v1/chat/completions`,
+/// `Anthropic` -> `POST /v1/messages`) so the session verifier decoder,
+/// proxy route gate, and post-verify consistency decoder cannot diverge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProvenanceRouteBinding {
+    provider: Provider,
+    canonical_post_path: &'static str,
+    provider_type: ProviderType,
+}
+
+impl ProvenanceRouteBinding {
+    /// Closed OpenAI binding: exact `POST /v1/chat/completions` + [`ProviderType::OpenAi`] decoder.
+    pub const OPENAI: Self = Self::for_provider(Provider::OpenAi);
+
+    /// Closed Anthropic binding: exact `POST /v1/messages` + [`ProviderType::Anthropic`] decoder.
+    pub const ANTHROPIC: Self = Self::for_provider(Provider::Anthropic);
+
+    /// Construct the closed binding for `provider`.
+    pub const fn for_provider(provider: Provider) -> Self {
+        Self {
+            provider,
+            canonical_post_path: provider.canonical_post_path(),
+            provider_type: provider.provider_type(),
+        }
+    }
+
+    /// Bound [`Provider`].
+    pub const fn provider(self) -> Provider {
+        self.provider
+    }
+
+    /// Exact canonical `POST` path for the bound [`Provider`].
+    pub const fn canonical_post_path(self) -> &'static str {
+        self.canonical_post_path
+    }
+
+    /// Matching [`ProviderType`] for [`ProviderContentDecoder`].
+    pub const fn provider_type(self) -> ProviderType {
+        self.provider_type
+    }
+
+    /// Construct the matching [`ProviderContentDecoder`].
+    pub fn content_decoder(self) -> ProviderContentDecoder {
+        ProviderContentDecoder::new(self.provider_type)
+    }
+
+    /// Build a [`SessionConfig`] for `profile` and `clock` using this binding's
+    /// [`ProviderContentDecoder`].
+    pub fn session_config(self, profile: SupportedProfile, clock: Box<dyn Clock>) -> SessionConfig {
+        SessionConfig {
+            profile,
+            clock,
+            decoder: Box::new(self.content_decoder()),
+        }
+    }
+
+    /// Check whether an inbound request matches the exact `POST` method, [`Provider`], and canonical path.
+    pub fn matches_post_route(self, method: &Method, provider: Provider, path: &str) -> bool {
+        *method == Method::POST && provider == self.provider && path == self.canonical_post_path
+    }
+}
+
+impl From<Provider> for ProvenanceRouteBinding {
+    fn from(provider: Provider) -> Self {
+        Self::for_provider(provider)
+    }
+}
 
 /// Shared state injected into axum handlers.
 #[derive(Clone)]
@@ -365,7 +460,8 @@ pub struct AppState {
 
 impl AppState {
     /// Construct [`AppState`], panicking if `admission.mode()` is
-    /// [`ProfileMode::RequiredOpenCode`] and `verified_next_stage` is `None`.
+    /// [`ProfileMode::RequiredOpenCode`] and `verified_next_stage` is `None`
+    /// or `admission.route_binding()` is `None`.
     pub fn new(
         upstream: Arc<dyn UpstreamClient>,
         admission: Arc<dyn CarrierAdmissionPolicy>,
@@ -374,6 +470,11 @@ impl AppState {
         assert!(
             admission.mode() != ProfileMode::RequiredOpenCode || verified_next_stage.is_some(),
             "RequiredOpenCode admission policy requires a VerifiedCarrierNextStage"
+        );
+        assert!(
+            admission.mode() != ProfileMode::RequiredOpenCode
+                || admission.route_binding().is_some(),
+            "RequiredOpenCode admission policy requires a ProvenanceRouteBinding"
         );
         Self {
             upstream,
@@ -411,6 +512,11 @@ pub trait CarrierAdmissionPolicy: Send + Sync {
     /// Configured profile mode.
     fn mode(&self) -> ProfileMode;
 
+    /// Closed route/provider binding enforced under [`ProfileMode::RequiredOpenCode`].
+    fn route_binding(&self) -> Option<ProvenanceRouteBinding> {
+        None
+    }
+
     /// Admit an inbound request after route binding and header extraction.
     fn admit_request(&self, envelope: Option<&[u8]>, body: &[u8]) -> RequestAdmissionDecision;
 
@@ -444,17 +550,26 @@ impl CarrierAdmissionPolicy for OrdinaryAdmissionPolicy {
 /// Verifier-backed request admission policy for [`ProfileMode::Ordinary`] or [`ProfileMode::RequiredOpenCode`].
 ///
 /// Under [`ProfileMode::RequiredOpenCode`], request bodies are verified against the
-/// OpenAI [`ProviderContentDecoder`].
+/// bound [`ProvenanceRouteBinding`] and its matching [`ProviderContentDecoder`].
 pub struct CarrierRequestAdmitter {
     mode: ProfileMode,
+    route_binding: ProvenanceRouteBinding,
     verifier: CarrierVerifier,
     supported_profile: String,
     supported_schema_version: u32,
-    openai_decoder: ProviderContentDecoder,
+    decoder: ProviderContentDecoder,
 }
 
 impl CarrierRequestAdmitter {
     pub fn new(mode: ProfileMode, verifier: CarrierVerifier) -> Self {
+        Self::new_for_route(mode, ProvenanceRouteBinding::OPENAI, verifier)
+    }
+
+    pub fn new_for_route(
+        mode: ProfileMode,
+        route_binding: impl Into<ProvenanceRouteBinding>,
+        verifier: CarrierVerifier,
+    ) -> Self {
         // `CarrierVerifier::verify(None, b"")` short-circuits on its first line
         // (`envelope.ok_or_else(|| self.fail(O::Absent, None))?`), returning only
         // the public `profile_id` and `schema_version` without parsing, reading
@@ -463,26 +578,46 @@ impl CarrierRequestAdmitter {
             Err(e) => (e.supported_profile, e.supported_schema_version),
             Ok(_) => ("opencode".to_string(), 1),
         };
-        Self::with_identity(mode, verifier, supported_profile, supported_schema_version)
+        Self::with_identity(
+            mode,
+            route_binding.into(),
+            verifier,
+            supported_profile,
+            supported_schema_version,
+        )
     }
 
     fn with_identity(
         mode: ProfileMode,
+        route_binding: ProvenanceRouteBinding,
         verifier: CarrierVerifier,
         supported_profile: impl Into<String>,
         supported_schema_version: u32,
     ) -> Self {
+        let decoder = route_binding.content_decoder();
         Self {
             mode,
+            route_binding,
             verifier,
             supported_profile: supported_profile.into(),
             supported_schema_version,
-            openai_decoder: ProviderContentDecoder::new(ProviderType::OpenAi),
+            decoder,
         }
     }
 
     pub fn required_opencode(verifier: CarrierVerifier) -> Self {
         Self::new(ProfileMode::RequiredOpenCode, verifier)
+    }
+
+    pub fn required_opencode_for_route(
+        route_binding: impl Into<ProvenanceRouteBinding>,
+        verifier: CarrierVerifier,
+    ) -> Self {
+        Self::new_for_route(ProfileMode::RequiredOpenCode, route_binding, verifier)
+    }
+
+    pub const fn bound_route(&self) -> ProvenanceRouteBinding {
+        self.route_binding
     }
 }
 
@@ -491,12 +626,16 @@ impl CarrierAdmissionPolicy for CarrierRequestAdmitter {
         self.mode
     }
 
+    fn route_binding(&self) -> Option<ProvenanceRouteBinding> {
+        Some(self.route_binding)
+    }
+
     fn admit_request(&self, envelope: Option<&[u8]>, body: &[u8]) -> RequestAdmissionDecision {
         match admit(self.mode, &self.verifier, envelope, body) {
             CarrierAdmission::WholeMessage => RequestAdmissionDecision::WholeMessage,
             CarrierAdmission::Projected(verified) => {
                 use crate::provenance::MessageContentDecoder as _;
-                match self.openai_decoder.decode(body) {
+                match self.decoder.decode(body) {
                     Some(decoded) => {
                         let expected: Vec<String> =
                             decoded.into_iter().map(|m| m.content).collect();
@@ -529,36 +668,58 @@ impl CarrierAdmissionPolicy for CarrierRequestAdmitter {
 
 /// [`SessionManager`]-backed request admission policy for [`ProfileMode::Ordinary`] or [`ProfileMode::RequiredOpenCode`].
 ///
-/// Under [`ProfileMode::RequiredOpenCode`], absence of an active session fails closed with
-/// [`VerificationOutcome::SessionMismatch`].
+/// Binds a closed [`ProvenanceRouteBinding`] (exact [`Provider`], canonical `POST` path, and
+/// matching [`ProviderContentDecoder`]). Under [`ProfileMode::RequiredOpenCode`], absence of an
+/// active session fails closed with [`VerificationOutcome::SessionMismatch`].
 pub struct SessionRequestAdmitter {
     mode: ProfileMode,
+    route_binding: ProvenanceRouteBinding,
     sessions: Arc<SessionManager>,
     supported_profile: String,
     supported_schema_version: u32,
-    openai_decoder: ProviderContentDecoder,
+    decoder: ProviderContentDecoder,
 }
 
 impl SessionRequestAdmitter {
     pub fn new(
         mode: ProfileMode,
+        route_binding: impl Into<ProvenanceRouteBinding>,
         sessions: Arc<SessionManager>,
         supported_profile: impl Into<String>,
         supported_schema_version: u32,
     ) -> Self {
+        let route_binding = route_binding.into();
+        let decoder = route_binding.content_decoder();
         Self {
             mode,
+            route_binding,
             sessions,
             supported_profile: supported_profile.into(),
             supported_schema_version,
-            openai_decoder: ProviderContentDecoder::new(ProviderType::OpenAi),
+            decoder,
         }
+    }
+
+    pub const fn bound_route(&self) -> ProvenanceRouteBinding {
+        self.route_binding
+    }
+
+    pub const fn bound_provider(&self) -> Provider {
+        self.route_binding.provider()
+    }
+
+    pub const fn canonical_post_path(&self) -> &'static str {
+        self.route_binding.canonical_post_path()
     }
 }
 
 impl CarrierAdmissionPolicy for SessionRequestAdmitter {
     fn mode(&self) -> ProfileMode {
         self.mode
+    }
+
+    fn route_binding(&self) -> Option<ProvenanceRouteBinding> {
+        Some(self.route_binding)
     }
 
     fn admit_request(&self, envelope: Option<&[u8]>, body: &[u8]) -> RequestAdmissionDecision {
@@ -571,7 +732,7 @@ impl CarrierAdmissionPolicy for SessionRequestAdmitter {
                 Some(Err(err)) => RequestAdmissionDecision::Reject(err),
                 Some(Ok(verified)) => {
                     use crate::provenance::MessageContentDecoder as _;
-                    match self.openai_decoder.decode(body) {
+                    match self.decoder.decode(body) {
                         Some(decoded) => {
                             let expected: Vec<String> =
                                 decoded.into_iter().map(|m| m.content).collect();
@@ -723,17 +884,22 @@ pub async fn proxy_handler(
         }
     };
 
-    if method != Method::POST {
-        return method_not_allowed_response(path, &method);
+    // RequiredOpenCode binds exclusively to exact POST on the admission policy's bound Provider and canonical path.
+    if state.admission.mode() == ProfileMode::RequiredOpenCode {
+        let Some(binding) = state.admission.route_binding() else {
+            return carrier_rejection_response(
+                &state.admission.fail(VerificationOutcome::SchemaMismatch),
+            );
+        };
+        if !binding.matches_post_route(&method, provider, path) {
+            return carrier_rejection_response(
+                &state.admission.fail(VerificationOutcome::SchemaMismatch),
+            );
+        }
     }
 
-    // RequiredOpenCode binds exclusively to exact POST /v1/chat/completions with OpenAI decoder.
-    if state.admission.mode() == ProfileMode::RequiredOpenCode
-        && (provider != Provider::OpenAi || path != "/v1/chat/completions")
-    {
-        return carrier_rejection_response(
-            &state.admission.fail(VerificationOutcome::SchemaMismatch),
-        );
+    if method != Method::POST {
+        return method_not_allowed_response(path, &method);
     }
 
     // Read body

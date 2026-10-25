@@ -29,8 +29,8 @@ use parapet::provenance::*;
 use parapet::provider::ProviderType;
 use parapet::proxy::{
     build_router, build_router_with_admission, CarrierAdmissionPolicy, CarrierRequestAdmitter,
-    Provider, ProxyError, ProxyRequest, ProxyResponse, SessionRequestAdmitter, UpstreamClient,
-    VerifiedCarrierNextStage,
+    ProvenanceRouteBinding, Provider, ProxyError, ProxyRequest, ProxyResponse,
+    SessionRequestAdmitter, UpstreamClient, VerifiedCarrierNextStage,
 };
 use parapet::routing::NoopOrthogonalSensorRouter;
 use parapet::signal::combiner::DefaultVerdictCombiner;
@@ -649,6 +649,25 @@ async fn required_wrong_route_or_provider_rejects_schema_mismatch_zero_forward()
         assert_carrier_rejection(resp, "schema_mismatch").await;
     }
 
+    for wrong_method in [Method::GET, Method::PUT, Method::DELETE] {
+        for path in ["/v1/chat/completions", "/v1/messages", "/v1/unknown"] {
+            let req = Request::builder()
+                .method(wrong_method.clone())
+                .uri(path)
+                .header("content-type", "application/json")
+                .header(
+                    PROVENANCE_HEADER,
+                    HeaderValue::from_bytes(&env_bytes).unwrap(),
+                )
+                .header("x-guard-trust", CANARY_TRUST_HEADER)
+                .body(Body::from(body.clone()))
+                .unwrap();
+
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_carrier_rejection(resp, "schema_mismatch").await;
+        }
+    }
+
     assert_eq!(probes.l0_calls.load(Ordering::SeqCst), 0);
     assert_eq!(probes.trust_calls.load(Ordering::SeqCst), 0);
     assert_eq!(probes.l1_calls.load(Ordering::SeqCst), 0);
@@ -1106,12 +1125,20 @@ async fn session_request_admitter_full_handler_lifecycle_and_replay() {
 
     let (engine, probes) = build_engine_with_probes();
     let next_stage = Arc::new(CapturingNextStage::default());
+    let route = ProvenanceRouteBinding::OPENAI;
+    assert_eq!(route.provider(), Provider::OpenAi);
+    assert_eq!(route.canonical_post_path(), "/v1/chat/completions");
+    assert_eq!(route.provider_type(), ProviderType::OpenAi);
     let admitter = Arc::new(SessionRequestAdmitter::new(
         ProfileMode::RequiredOpenCode,
+        route,
         sessions.clone(),
         PROFILE_ID,
         SCHEMA_VERSION_V1,
     ));
+    assert_eq!(admitter.bound_route(), route);
+    assert_eq!(admitter.bound_provider(), Provider::OpenAi);
+    assert_eq!(admitter.canonical_post_path(), "/v1/chat/completions");
     let app = build_router_with_admission(engine, admitter, Some(next_stage.clone()));
 
     let (fallback_body, fallback_env_bytes, _) = valid_chat_body_and_envelope(1);
@@ -1145,16 +1172,15 @@ async fn session_request_admitter_full_handler_lifecycle_and_replay() {
         VendorManifest::new([Sha256Digest::of(CANARY_VENDOR.as_bytes())]),
     );
     let grant = sessions
-        .start(SessionConfig {
-            profile: SupportedProfile {
+        .start(route.session_config(
+            SupportedProfile {
                 schema_version: SCHEMA_VERSION_V1,
                 profile_id: PROFILE_ID.to_string(),
                 builds,
                 max_validity_ms: MAX_VALIDITY_MS,
             },
-            clock: Box::new(FixedClock(NOW_MS)),
-            decoder: Box::new(ProviderContentDecoder::new(ProviderType::OpenAi)),
-        })
+            Box::new(FixedClock(NOW_MS)),
+        ))
         .unwrap();
     assert!(sessions.is_active());
 
@@ -1507,7 +1533,8 @@ mod w4b_control_wire {
     use super::*;
     use parapet::cli::control::{
         peer_credential_authorized, send_control_request, write_private_file, ControlError,
-        ControlRequestV0, ControlStateMetadataV0, EngineControlPlane, EngineOwnerRecordV0,
+        ControlRequestV0, ControlStateMetadataV0, DefaultProvenanceSessionClockFactory,
+        EngineControlPlane, EngineOwnerRecordV0, ProvenanceSessionClockFactory,
         ProvenanceSessionControl, CONTROL_ACTION_PROVENANCE_SESSION_END,
         CONTROL_ACTION_PROVENANCE_SESSION_START, CONTROL_ERROR_SESSION_UNAVAILABLE, CONTROL_SCHEMA,
         CONTROL_STATE_SCHEMA,
@@ -1740,8 +1767,11 @@ mod w4b_control_wire {
         let failing_sessions = Arc::new(SessionManager::with_entropy(Box::new(
             FailingSessionEntropy,
         )));
-        let fail_handle =
-            ProvenanceSessionControl::new(failing_sessions.clone(), supported_profile(60_000));
+        let fail_handle = ProvenanceSessionControl::new(
+            ProvenanceRouteBinding::OPENAI,
+            failing_sessions.clone(),
+            supported_profile(60_000),
+        );
         let (fail_plane, _fail_listener, _fail_rx) =
             EngineControlPlane::bind_with_provenance_session(
                 &state_fail,
@@ -1765,8 +1795,11 @@ mod w4b_control_wire {
         let state_zero = temp.path().join("state_zero_validity");
         init_private_state_dir(&state_zero);
         let zero_sessions = Arc::new(SessionManager::new());
-        let zero_handle =
-            ProvenanceSessionControl::new(zero_sessions.clone(), supported_profile(0));
+        let zero_handle = ProvenanceSessionControl::new(
+            ProvenanceRouteBinding::OPENAI,
+            zero_sessions.clone(),
+            supported_profile(0),
+        );
         let (zero_plane, _zero_listener, _zero_rx) =
             EngineControlPlane::bind_with_provenance_session(
                 &state_zero,
@@ -1801,14 +1834,11 @@ mod w4b_control_wire {
         assert!(!sessions.is_active());
 
         let profile = supported_profile(MAX_VALIDITY_MS);
-        let session_handle = ProvenanceSessionControl::with_config_factory(
+        let session_handle = ProvenanceSessionControl::with_clock_factory(
+            ProvenanceRouteBinding::OPENAI,
             sessions.clone(),
             profile.clone(),
-            |prof| SessionConfig {
-                profile: prof,
-                clock: Box::new(FixedClock(NOW_MS)),
-                decoder: Box::new(ProviderContentDecoder::new(ProviderType::OpenAi)),
-            },
+            || -> Box<dyn Clock> { Box::new(FixedClock(NOW_MS)) },
         );
 
         let (plane, _listener, _shutdown_rx) = EngineControlPlane::bind_with_provenance_session(
@@ -1828,12 +1858,7 @@ mod w4b_control_wire {
 
         let (engine, probes) = build_engine_with_probes();
         let next_stage = Arc::new(CapturingNextStage::default());
-        let admitter = Arc::new(SessionRequestAdmitter::new(
-            ProfileMode::RequiredOpenCode,
-            sessions.clone(),
-            PROFILE_ID,
-            SCHEMA_VERSION_V1,
-        ));
+        let admitter = Arc::new(session_handle.request_admitter(ProfileMode::RequiredOpenCode));
         let app = build_router_with_admission(engine, admitter, Some(next_stage.clone()));
 
         let token = std::fs::read_to_string(state_dir.join("control.token")).unwrap();
@@ -2102,12 +2127,15 @@ mod w4b_control_wire {
         assert!(disable_stop);
 
         // 6. Restart / new SessionManager + new EngineControlPlane starts with no active session,
-        //    and DefaultProvenanceSessionConfigFactory (SystemClock + OsEntropy) works live.
+        //    and DefaultProvenanceSessionClockFactory (SystemClock + OsEntropy) works live.
         drop(plane);
         let restarted_sessions = Arc::new(SessionManager::new());
         assert!(!restarted_sessions.is_active());
-        let restarted_handle =
-            ProvenanceSessionControl::new(restarted_sessions.clone(), profile.clone());
+        let restarted_handle = ProvenanceSessionControl::new(
+            ProvenanceRouteBinding::OPENAI,
+            restarted_sessions.clone(),
+            profile.clone(),
+        );
         let (restarted_plane, _restarted_listener, _restarted_rx) =
             EngineControlPlane::bind_with_provenance_session(
                 &state_dir,
@@ -2124,11 +2152,9 @@ mod w4b_control_wire {
         let next_stage2 = Arc::new(CapturingNextStage::default());
         let app2 = build_router_with_admission(
             engine2,
-            Arc::new(SessionRequestAdmitter::new(
+            Arc::new(SessionRequestAdmitter::from_session_control(
                 ProfileMode::RequiredOpenCode,
-                restarted_sessions.clone(),
-                PROFILE_ID,
-                SCHEMA_VERSION_V1,
+                &restarted_handle,
             )),
             Some(next_stage2.clone()),
         );
@@ -2280,14 +2306,13 @@ mod w4b_control_wire {
         assert!(!sessions.is_active());
 
         let profile = supported_profile(MAX_VALIDITY_MS);
-        let session_handle =
-            ProvenanceSessionControl::with_config_factory(sessions.clone(), profile, |prof| {
-                SessionConfig {
-                    profile: prof,
-                    clock: Box::new(FixedClock(NOW_MS)),
-                    decoder: Box::new(ProviderContentDecoder::new(ProviderType::OpenAi)),
-                }
-            });
+        let session_handle = ProvenanceSessionControl::with_clock_factory(
+            ProvenanceRouteBinding::OPENAI,
+            sessions,
+            profile,
+            || -> Box<dyn Clock> { Box::new(FixedClock(NOW_MS)) },
+        );
+        let sessions = session_handle.sessions().clone();
         let (plane, listener, _shutdown_rx) = EngineControlPlane::bind_with_provenance_session(
             &state_dir,
             45220,
@@ -2352,12 +2377,7 @@ mod w4b_control_wire {
         let next_stage = Arc::new(CapturingNextStage::default());
         let app = build_router_with_admission(
             engine,
-            Arc::new(SessionRequestAdmitter::new(
-                ProfileMode::RequiredOpenCode,
-                sessions.clone(),
-                PROFILE_ID,
-                SCHEMA_VERSION_V1,
-            )),
+            Arc::new(session_handle.request_admitter(ProfileMode::RequiredOpenCode)),
             Some(next_stage.clone()),
         );
 
@@ -2510,6 +2530,699 @@ mod w4b_control_wire {
                 assert!(
                     !surface.contains(needle),
                     "live socket TRACE/surface leaked secret or authenticator {needle:?}: {surface}"
+                );
+            }
+        }
+    }
+
+    fn sign_anthropic_for_session_at(
+        session_id: &str,
+        key: &SessionKey,
+        sequence: u64,
+        issued_at_ms: u64,
+        expires_at_ms: u64,
+    ) -> (Vec<u8>, Vec<u8>, String) {
+        let sys_content = format!("{CANARY_VENDOR}{CANARY_REPO}");
+        let body = serde_json::to_vec(&json!({
+            "model": "claude-3-5-sonnet",
+            "system": sys_content,
+            "messages": [
+                {"role": "user", "content": CANARY_USER}
+            ]
+        }))
+        .unwrap();
+
+        let v_len = CANARY_VENDOR.len();
+        let s_len = sys_content.len();
+        let u_len = CANARY_USER.len();
+        let source_map = SourceMap {
+            segments: vec![
+                Segment {
+                    message_index: 0,
+                    start: 0,
+                    end: v_len,
+                    source: Source::VendorStatic,
+                    sha256: Sha256Digest::of(CANARY_VENDOR.as_bytes()),
+                },
+                Segment {
+                    message_index: 0,
+                    start: v_len,
+                    end: s_len,
+                    source: Source::Repository,
+                    sha256: Sha256Digest::of(CANARY_REPO.as_bytes()),
+                },
+                Segment {
+                    message_index: 1,
+                    start: 0,
+                    end: u_len,
+                    source: Source::User,
+                    sha256: Sha256Digest::of(CANARY_USER.as_bytes()),
+                },
+            ],
+        };
+
+        let mut env = CarrierEnvelope {
+            schema_version: SCHEMA_VERSION_V1,
+            profile: PROFILE_ID.to_string(),
+            build: BUILD_ID.to_string(),
+            session_id: session_id.to_string(),
+            sequence,
+            issued_at_ms,
+            expires_at_ms,
+            request_body_sha256: Sha256Digest::of(&body),
+            source_map_sha256: source_map.canonical_digest(),
+            source_map,
+            authenticator: Authenticator::from_bytes(vec![0u8; 32]),
+        };
+        let auth = HmacSha256Authenticator::new(key.clone());
+        let tag = auth.tag(&env.signed_payload());
+        let tag_hex = Sha256Digest::from_bytes(tag).to_hex();
+        env.authenticator = Authenticator::from_bytes(tag.to_vec());
+        let env_bytes = serde_json::to_vec(&env).unwrap();
+        (body, env_bytes, tag_hex)
+    }
+
+    #[tokio::test]
+    async fn w4c1_anthropic_bound_session_admission_route_gate_and_failure_closure() {
+        let trace_capture = ThreadTraceGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join("state_w4c1_anthropic");
+        init_private_state_dir(&state_dir);
+
+        let route = ProvenanceRouteBinding::ANTHROPIC;
+        assert_eq!(route, ProvenanceRouteBinding::from(Provider::Anthropic));
+        assert_eq!(route.provider(), Provider::Anthropic);
+        assert_eq!(route.canonical_post_path(), "/v1/messages");
+        assert_eq!(route.provider_type(), ProviderType::Anthropic);
+
+        let sessions = Arc::new(SessionManager::with_entropy(Box::new(
+            ScriptedSessionEntropy::new(),
+        )));
+        let profile = supported_profile(MAX_VALIDITY_MS);
+
+        // Construct ProvenanceSessionControl and SessionRequestAdmitter from the single
+        // closed ProvenanceRouteBinding::ANTHROPIC so verifier and post-verify decoders
+        // cannot diverge.
+        let session_handle = ProvenanceSessionControl::with_clock_factory(
+            route,
+            sessions.clone(),
+            profile.clone(),
+            || -> Box<dyn Clock> { Box::new(FixedClock(NOW_MS)) },
+        );
+        assert_eq!(session_handle.route_binding(), route);
+        let admitter = Arc::new(session_handle.request_admitter(ProfileMode::RequiredOpenCode));
+        assert_eq!(admitter.bound_route(), route);
+        assert_eq!(admitter.bound_provider(), Provider::Anthropic);
+        assert_eq!(admitter.canonical_post_path(), "/v1/messages");
+
+        let (plane, _listener, _shutdown_rx) = EngineControlPlane::bind_with_provenance_session(
+            &state_dir,
+            45230,
+            CONFIG_HASH,
+            None,
+            Some(session_handle.clone()),
+        )
+        .unwrap();
+        let token = std::fs::read_to_string(state_dir.join("control.token")).unwrap();
+
+        let (engine, probes) = build_engine_with_probes();
+        let next_stage = Arc::new(CapturingNextStage::default());
+        let app = build_router_with_admission(engine, admitter, Some(next_stage.clone()));
+
+        let (fallback_body, fallback_env, fallback_tag_hex) = sign_anthropic_for_session_at(
+            SESSION_ID,
+            &SessionKey::from_bytes(CANARY_KEY_BYTES),
+            1,
+            NOW_MS - 1_000,
+            NOW_MS + 10_000,
+        );
+
+        // 1. No active session on POST /v1/messages rejects session_mismatch with zero sends.
+        let req_no_session = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .header("authorization", CANARY_AUTH_HEADER)
+            .header("x-guard-trust", CANARY_TRUST_HEADER)
+            .header(
+                PROVENANCE_HEADER,
+                HeaderValue::from_bytes(&fallback_env).unwrap(),
+            )
+            .body(Body::from(fallback_body.clone()))
+            .unwrap();
+        let resp_no_session = app.clone().oneshot(req_no_session).await.unwrap();
+        let json_no_session = assert_carrier_rejection(resp_no_session, "session_mismatch").await;
+        assert_eq!(probes.http_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(next_stage.call_count(), 0);
+
+        // 2. Start Anthropic session via owner-only control wire.
+        let (start1, start1_stop) = send_control_line_in_process(
+            &plane,
+            &format!(
+                r#"{{"schema":"parapet-control/v0","token":"{token}","action":"{CONTROL_ACTION_PROVENANCE_SESSION_START}"}}"#
+            ),
+        );
+        assert!(!start1_stop);
+        assert_eq!(start1["ok"], true);
+        let session_id_1 = start1["session_id"].as_str().unwrap().to_owned();
+        let session_key_hex_1 = start1["session_key_hex"].as_str().unwrap().to_owned();
+        let key1 = decode_key_hex(&session_key_hex_1);
+        assert_eq!(key1.expose_bytes(), &CANARY_W4B_KEY_1_BYTES);
+
+        // 3. Valid Anthropic request + valid carrier on POST /v1/messages reaches
+        //    VerifiedCarrierNextStage with Provider::Anthropic and sanitized headers.
+        let (anth_body, anth_env, anth_tag_hex) = sign_anthropic_for_session_at(
+            &session_id_1,
+            &key1,
+            0,
+            NOW_MS - 1_000,
+            NOW_MS + 10_000,
+        );
+        let req_valid = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .header("authorization", CANARY_AUTH_HEADER)
+            .header("x-guard-trust", CANARY_TRUST_HEADER)
+            .header("X-Guard-Trust-Span", CANARY_TRUST_HEADER)
+            .header(
+                PROVENANCE_HEADER,
+                HeaderValue::from_bytes(&anth_env).unwrap(),
+            )
+            .body(Body::from(anth_body.clone()))
+            .unwrap();
+        let resp_valid = app.clone().oneshot(req_valid).await.unwrap();
+        assert_eq!(resp_valid.status(), StatusCode::OK);
+        assert!(resp_valid.headers().get("x-guard-trust-response").is_none());
+        assert_eq!(probes.l0_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(probes.trust_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(probes.l1_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(probes.http_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(next_stage.call_count(), 1);
+
+        let captured = next_stage.take_captured();
+        assert_eq!(captured.len(), 1);
+        let (provider, proxy_req, verified) = &captured[0];
+        assert_eq!(*provider, Provider::Anthropic);
+        assert!(proxy_req
+            .headers
+            .get_all(PROVENANCE_HEADER)
+            .iter()
+            .next()
+            .is_none());
+        assert!(!proxy_req
+            .headers
+            .keys()
+            .any(|k| k.as_str().starts_with("x-guard-trust")));
+        assert_eq!(
+            proxy_req.headers.get("authorization").unwrap(),
+            CANARY_AUTH_HEADER
+        );
+        assert_eq!(proxy_req.body.as_ref(), anth_body.as_slice());
+        assert_eq!(verified.identity.profile, PROFILE_ID);
+        assert_eq!(verified.identity.build, BUILD_ID);
+        assert_eq!(verified.identity.schema_version, SCHEMA_VERSION_V1);
+        assert_eq!(verified.segments.len(), 3);
+        assert_eq!(
+            verified.messages,
+            vec![
+                format!("{CANARY_VENDOR}{CANARY_REPO}"),
+                CANARY_USER.to_string(),
+            ]
+        );
+
+        // Replay of sequence 0 on POST /v1/messages rejects stale_or_replayed with zero sends.
+        let req_replay = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .header(
+                PROVENANCE_HEADER,
+                HeaderValue::from_bytes(&anth_env).unwrap(),
+            )
+            .body(Body::from(anth_body.clone()))
+            .unwrap();
+        let resp_replay = app.clone().oneshot(req_replay).await.unwrap();
+        let json_replay = assert_carrier_rejection(resp_replay, "stale_or_replayed").await;
+        assert_eq!(next_stage.call_count(), 1);
+
+        // 4. Wrong routes (including OpenAI /v1/chat/completions) and non-POST methods
+        //    on the Anthropic-bound router fail schema_mismatch with zero sends.
+        let (anth_body_s1, anth_env_s1, anth_tag_s1_hex) = sign_anthropic_for_session_at(
+            &session_id_1,
+            &key1,
+            1,
+            NOW_MS - 1_000,
+            NOW_MS + 10_000,
+        );
+        let (oai_body_s1, oai_env_s1, oai_tag_s1_hex) =
+            sign_chat_for_session_at(&session_id_1, &key1, 1, NOW_MS - 1_000, NOW_MS + 10_000);
+
+        for wrong_path in [
+            "/v1/chat/completions",
+            "/openai/v1/chat/completions",
+            "/v1/messages/extra",
+            "/v1/messages/count_tokens",
+            "/v1/messages/batches",
+            "/v1/responses",
+            "/v1/unknown",
+            "/v1//messages",
+        ] {
+            for (b, e) in [(&anth_body_s1, &anth_env_s1), (&oai_body_s1, &oai_env_s1)] {
+                let req = Request::builder()
+                    .method(Method::POST)
+                    .uri(wrong_path)
+                    .header("content-type", "application/json")
+                    .header(PROVENANCE_HEADER, HeaderValue::from_bytes(e).unwrap())
+                    .header("x-guard-trust", CANARY_TRUST_HEADER)
+                    .body(Body::from(b.clone()))
+                    .unwrap();
+                let resp = app.clone().oneshot(req).await.unwrap();
+                assert_carrier_rejection(resp, "schema_mismatch").await;
+            }
+        }
+
+        for wrong_method in [Method::GET, Method::PUT, Method::DELETE] {
+            for path in ["/v1/messages", "/v1/chat/completions", "/v1/unknown"] {
+                let req = Request::builder()
+                    .method(wrong_method.clone())
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .header(
+                        PROVENANCE_HEADER,
+                        HeaderValue::from_bytes(&anth_env_s1).unwrap(),
+                    )
+                    .body(Body::from(anth_body_s1.clone()))
+                    .unwrap();
+                let resp = app.clone().oneshot(req).await.unwrap();
+                assert_carrier_rejection(resp, "schema_mismatch").await;
+            }
+        }
+        assert_eq!(next_stage.call_count(), 1);
+        assert_eq!(probes.http_calls.load(Ordering::SeqCst), 0);
+
+        // 5. Anthropic absent, duplicate, oversize, and malformed carrier header rejections
+        //    on POST /v1/messages.
+        let req_absent = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .header("x-guard-trust", CANARY_TRUST_HEADER)
+            .body(Body::from(anth_body_s1.clone()))
+            .unwrap();
+        let resp_absent = app.clone().oneshot(req_absent).await.unwrap();
+        let json_absent = assert_carrier_rejection(resp_absent, "absent").await;
+
+        let mut req_dup = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .body(Body::from(anth_body_s1.clone()))
+            .unwrap();
+        req_dup.headers_mut().append(
+            PROVENANCE_HEADER,
+            HeaderValue::from_bytes(&anth_env_s1).unwrap(),
+        );
+        req_dup.headers_mut().append(
+            PROVENANCE_HEADER,
+            HeaderValue::from_static(CANARY_RAW_ENV_CLAIM),
+        );
+        let resp_dup = app.clone().oneshot(req_dup).await.unwrap();
+        let json_dup = assert_carrier_rejection(resp_dup, "schema_mismatch").await;
+
+        let over = format!(
+            "{CANARY_RAW_ENV_CLAIM}{}",
+            "a".repeat(MAX_ENVELOPE_BYTES + 8)
+        );
+        let req_over = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .header(PROVENANCE_HEADER, HeaderValue::from_str(&over).unwrap())
+            .body(Body::from(anth_body_s1.clone()))
+            .unwrap();
+        let resp_over = app.clone().oneshot(req_over).await.unwrap();
+        let json_over = assert_carrier_rejection(resp_over, "schema_mismatch").await;
+
+        let req_malformed_env = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .header(
+                PROVENANCE_HEADER,
+                HeaderValue::from_static("{not-valid-carrier-json"),
+            )
+            .body(Body::from(anth_body_s1.clone()))
+            .unwrap();
+        let resp_malformed_env = app.clone().oneshot(req_malformed_env).await.unwrap();
+        let json_malformed_env = assert_carrier_rejection(resp_malformed_env, "schema_mismatch").await;
+
+        // 6. Anthropic duplicate JSON keys, malformed Anthropic body, and OpenAI-shaped body
+        //    on POST /v1/messages reject map_out_of_range with zero sends.
+        //    (Note: sequence numbers are consumed before body decode, so use distinct sequences.)
+        let req_oai_on_anth = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .header(
+                PROVENANCE_HEADER,
+                HeaderValue::from_bytes(&oai_env_s1).unwrap(),
+            )
+            .body(Body::from(oai_body_s1))
+            .unwrap();
+        let resp_oai_on_anth = app.clone().oneshot(req_oai_on_anth).await.unwrap();
+        let json_oai_on_anth =
+            assert_carrier_rejection(resp_oai_on_anth, "map_out_of_range").await;
+
+        let dup_key_body = format!(
+            r#"{{"model":"claude-3-5-sonnet","system":{sys:?},"messages":[{{"role":"user","content":{u:?},"content":{u:?}}}]}}"#,
+            sys = format!("{CANARY_VENDOR}{CANARY_REPO}"),
+            u = CANARY_USER,
+        )
+        .into_bytes();
+        let (_, mut dup_key_env_val, _): (Vec<u8>, Vec<u8>, String) =
+            sign_anthropic_for_session_at(
+                &session_id_1,
+                &key1,
+                2,
+                NOW_MS - 1_000,
+                NOW_MS + 10_000,
+            );
+        let mut dup_env: CarrierEnvelope = serde_json::from_slice(&dup_key_env_val).unwrap();
+        dup_env.request_body_sha256 = Sha256Digest::of(&dup_key_body);
+        let auth1 = HmacSha256Authenticator::new(key1.clone());
+        let dup_tag = auth1.tag(&dup_env.signed_payload());
+        let dup_tag_hex = Sha256Digest::from_bytes(dup_tag).to_hex();
+        dup_env.authenticator = Authenticator::from_bytes(dup_tag.to_vec());
+        dup_key_env_val = serde_json::to_vec(&dup_env).unwrap();
+
+        let req_dup_json_key = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .header(
+                PROVENANCE_HEADER,
+                HeaderValue::from_bytes(&dup_key_env_val).unwrap(),
+            )
+            .body(Body::from(dup_key_body))
+            .unwrap();
+        let resp_dup_json_key = app.clone().oneshot(req_dup_json_key).await.unwrap();
+        let json_dup_json_key =
+            assert_carrier_rejection(resp_dup_json_key, "map_out_of_range").await;
+
+        // 7. Rotate Anthropic session, verify old session rejects session_mismatch, new session
+        //    verifies, end session rejects session_mismatch, injected ProvenanceSessionClockFactory
+        //    via ProvenanceSessionControl::new_with enforces Anthropic decoder + deterministic/failing
+        //    clocks, and DefaultProvenanceSessionClockFactory works live.
+        let (start2, start2_stop) = send_control_line_in_process(
+            &plane,
+            &format!(
+                r#"{{"schema":"parapet-control/v0","token":"{token}","action":"{CONTROL_ACTION_PROVENANCE_SESSION_START}"}}"#
+            ),
+        );
+        assert!(!start2_stop);
+        let session_id_2 = start2["session_id"].as_str().unwrap().to_owned();
+        let session_key_hex_2 = start2["session_key_hex"].as_str().unwrap().to_owned();
+        let key2 = decode_key_hex(&session_key_hex_2);
+
+        let (body_old, env_old, tag_old_hex) = sign_anthropic_for_session_at(
+            &session_id_1,
+            &key1,
+            3,
+            NOW_MS - 1_000,
+            NOW_MS + 10_000,
+        );
+        let req_old = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .header(
+                PROVENANCE_HEADER,
+                HeaderValue::from_bytes(&env_old).unwrap(),
+            )
+            .body(Body::from(body_old))
+            .unwrap();
+        let resp_old = app.clone().oneshot(req_old).await.unwrap();
+        let json_old = assert_carrier_rejection(resp_old, "session_mismatch").await;
+
+        let (body2, env2, tag2_hex) = sign_anthropic_for_session_at(
+            &session_id_2,
+            &key2,
+            0,
+            NOW_MS - 1_000,
+            NOW_MS + 10_000,
+        );
+        let req2 = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .header("authorization", CANARY_AUTH_HEADER)
+            .header(PROVENANCE_HEADER, HeaderValue::from_bytes(&env2).unwrap())
+            .body(Body::from(body2))
+            .unwrap();
+        let resp2 = app.clone().oneshot(req2).await.unwrap();
+        assert_eq!(resp2.status(), StatusCode::OK);
+        assert_eq!(next_stage.call_count(), 2);
+
+        let (end_resp, end_stop) = send_control_line_in_process(
+            &plane,
+            &format!(
+                r#"{{"schema":"parapet-control/v0","token":"{token}","action":"{CONTROL_ACTION_PROVENANCE_SESSION_END}"}}"#
+            ),
+        );
+        assert!(!end_stop);
+        assert_eq!(end_resp, json!({"schema": CONTROL_SCHEMA, "ok": true}));
+        assert!(!sessions.is_active());
+
+        let (body_after_end, env_after_end, tag_after_end_hex) = sign_anthropic_for_session_at(
+            &session_id_2,
+            &key2,
+            1,
+            NOW_MS - 1_000,
+            NOW_MS + 10_000,
+        );
+        let req_after_end = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .header(
+                PROVENANCE_HEADER,
+                HeaderValue::from_bytes(&env_after_end).unwrap(),
+            )
+            .body(Body::from(body_after_end))
+            .unwrap();
+        let resp_after_end = app.oneshot(req_after_end).await.unwrap();
+        let json_after_end = assert_carrier_rejection(resp_after_end, "session_mismatch").await;
+        assert_eq!(next_stage.call_count(), 2);
+        assert_eq!(probes.http_calls.load(Ordering::SeqCst), 0);
+
+        // Injected ProvenanceSessionClockFactory seam via ProvenanceSessionControl::new_with:
+        // verifies Anthropic content, rejects OpenAI-shaped content with map_out_of_range,
+        // and rejects expired carriers with stale_or_replayed when the injected clock advances.
+        struct SteppingClockFactory(AtomicUsize);
+        impl ProvenanceSessionClockFactory for SteppingClockFactory {
+            fn build_clock(&self) -> Box<dyn Clock> {
+                match self.0.fetch_add(1, Ordering::SeqCst) {
+                    0 => Box::new(FixedClock(NOW_MS)),
+                    _ => Box::new(FixedClock(NOW_MS + 120_000)),
+                }
+            }
+        }
+
+        let seam_sessions = Arc::new(SessionManager::with_entropy(Box::new(
+            ScriptedSessionEntropy::new(),
+        )));
+        let clock_factory: Arc<dyn ProvenanceSessionClockFactory> =
+            Arc::new(SteppingClockFactory(AtomicUsize::new(0)));
+        let seam_handle = ProvenanceSessionControl::new_with(
+            route,
+            seam_sessions.clone(),
+            profile.clone(),
+            clock_factory,
+        );
+        let (seam_engine, seam_probes) = build_engine_with_probes();
+        let seam_next_stage = Arc::new(CapturingNextStage::default());
+        let seam_app = build_router_with_admission(
+            seam_engine,
+            Arc::new(seam_handle.request_admitter(ProfileMode::RequiredOpenCode)),
+            Some(seam_next_stage.clone()),
+        );
+        let seam_grant_1 = seam_handle.start_session().unwrap();
+        let (seam_anth_body, seam_anth_env, seam_anth_tag_hex) = sign_anthropic_for_session_at(
+            &seam_grant_1.session_id,
+            &seam_grant_1.key,
+            0,
+            NOW_MS - 1_000,
+            NOW_MS + 10_000,
+        );
+        let seam_req_anth = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .header("authorization", CANARY_AUTH_HEADER)
+            .header(
+                PROVENANCE_HEADER,
+                HeaderValue::from_bytes(&seam_anth_env).unwrap(),
+            )
+            .body(Body::from(seam_anth_body))
+            .unwrap();
+        let seam_resp_anth = seam_app.clone().oneshot(seam_req_anth).await.unwrap();
+        assert_eq!(seam_resp_anth.status(), StatusCode::OK);
+        assert_eq!(seam_next_stage.call_count(), 1);
+
+        let (seam_oai_body, seam_oai_env, seam_oai_tag_hex) = sign_chat_for_session_at(
+            &seam_grant_1.session_id,
+            &seam_grant_1.key,
+            1,
+            NOW_MS - 1_000,
+            NOW_MS + 10_000,
+        );
+        let seam_req_oai = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .header(
+                PROVENANCE_HEADER,
+                HeaderValue::from_bytes(&seam_oai_env).unwrap(),
+            )
+            .body(Body::from(seam_oai_body))
+            .unwrap();
+        let seam_resp_oai = seam_app.clone().oneshot(seam_req_oai).await.unwrap();
+        let json_seam_oai = assert_carrier_rejection(seam_resp_oai, "map_out_of_range").await;
+        assert_eq!(seam_next_stage.call_count(), 1);
+
+        // Rotate via start_session() so SteppingClockFactory returns FixedClock(NOW_MS + 120_000),
+        // causing an expired Anthropic carrier to fail closed with stale_or_replayed.
+        let seam_grant_2 = seam_handle.start_session().unwrap();
+        let (seam_exp_body, seam_exp_env, seam_exp_tag_hex) = sign_anthropic_for_session_at(
+            &seam_grant_2.session_id,
+            &seam_grant_2.key,
+            0,
+            NOW_MS - 1_000,
+            NOW_MS + 10_000,
+        );
+        let seam_req_exp = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .header(
+                PROVENANCE_HEADER,
+                HeaderValue::from_bytes(&seam_exp_env).unwrap(),
+            )
+            .body(Body::from(seam_exp_body))
+            .unwrap();
+        let seam_resp_exp = seam_app.oneshot(seam_req_exp).await.unwrap();
+        let json_seam_exp = assert_carrier_rejection(seam_resp_exp, "stale_or_replayed").await;
+        assert_eq!(seam_next_stage.call_count(), 1);
+        assert_eq!(seam_probes.http_calls.load(Ordering::SeqCst), 0);
+
+        // Live DefaultProvenanceSessionClockFactory bound to ProvenanceRouteBinding::ANTHROPIC.
+        assert_eq!(
+            DefaultProvenanceSessionClockFactory,
+            DefaultProvenanceSessionClockFactory::default()
+        );
+        drop(plane);
+        let live_sessions = Arc::new(SessionManager::new());
+        let live_handle =
+            ProvenanceSessionControl::new(route, live_sessions.clone(), profile.clone());
+        let (live_plane, _live_listener, _live_rx) =
+            EngineControlPlane::bind_with_provenance_session(
+                &state_dir,
+                45231,
+                CONFIG_HASH,
+                None,
+                Some(live_handle.clone()),
+            )
+            .unwrap();
+        let live_token = std::fs::read_to_string(state_dir.join("control.token")).unwrap();
+        let (live_engine, live_probes) = build_engine_with_probes();
+        let live_next_stage = Arc::new(CapturingNextStage::default());
+        let live_app = build_router_with_admission(
+            live_engine,
+            Arc::new(live_handle.request_admitter(ProfileMode::RequiredOpenCode)),
+            Some(live_next_stage.clone()),
+        );
+        let (start3, _) = send_control_line_in_process(
+            &live_plane,
+            &format!(
+                r#"{{"schema":"parapet-control/v0","token":"{live_token}","action":"{CONTROL_ACTION_PROVENANCE_SESSION_START}"}}"#
+            ),
+        );
+        let session_id_3 = start3["session_id"].as_str().unwrap().to_owned();
+        let session_key_hex_3 = start3["session_key_hex"].as_str().unwrap().to_owned();
+        let key3 = decode_key_hex(&session_key_hex_3);
+        let live_now = SystemClock::new().now_ms();
+        let (body3, env3, tag3_hex) = sign_anthropic_for_session_at(
+            &session_id_3,
+            &key3,
+            0,
+            live_now,
+            live_now + 20_000,
+        );
+        let req3 = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .header("authorization", CANARY_AUTH_HEADER)
+            .header(PROVENANCE_HEADER, HeaderValue::from_bytes(&env3).unwrap())
+            .body(Body::from(body3))
+            .unwrap();
+        let resp3 = live_app.oneshot(req3).await.unwrap();
+        assert_eq!(resp3.status(), StatusCode::OK);
+        assert_eq!(live_next_stage.call_count(), 1);
+        assert_eq!(live_probes.http_calls.load(Ordering::SeqCst), 0);
+
+        let logs = String::from_utf8(trace_capture.buf.lock().unwrap().clone()).unwrap();
+        let surfaces: Vec<String> = [
+            logs,
+            serde_json::to_string(&json_no_session).unwrap(),
+            serde_json::to_string(&json_replay).unwrap(),
+            serde_json::to_string(&json_absent).unwrap(),
+            serde_json::to_string(&json_dup).unwrap(),
+            serde_json::to_string(&json_over).unwrap(),
+            serde_json::to_string(&json_malformed_env).unwrap(),
+            serde_json::to_string(&json_oai_on_anth).unwrap(),
+            serde_json::to_string(&json_dup_json_key).unwrap(),
+            serde_json::to_string(&json_old).unwrap(),
+            serde_json::to_string(&json_after_end).unwrap(),
+            serde_json::to_string(&json_seam_oai).unwrap(),
+            serde_json::to_string(&json_seam_exp).unwrap(),
+        ]
+        .into_iter()
+        .collect();
+
+        let forbidden = [
+            session_key_hex_1.as_str(),
+            session_key_hex_2.as_str(),
+            session_key_hex_3.as_str(),
+            CANARY_W4B_KEY_1_STR,
+            CANARY_W4B_KEY_2_STR,
+            CANARY_KEY_STR,
+            fallback_tag_hex.as_str(),
+            anth_tag_hex.as_str(),
+            anth_tag_s1_hex.as_str(),
+            oai_tag_s1_hex.as_str(),
+            dup_tag_hex.as_str(),
+            tag_old_hex.as_str(),
+            tag2_hex.as_str(),
+            tag_after_end_hex.as_str(),
+            seam_anth_tag_hex.as_str(),
+            seam_oai_tag_hex.as_str(),
+            seam_exp_tag_hex.as_str(),
+            tag3_hex.as_str(),
+            CANARY_VENDOR.trim(),
+            CANARY_REPO.trim(),
+            CANARY_USER,
+            CANARY_LOCAL_PATH,
+            CANARY_RAW_ENV_CLAIM,
+            CANARY_TRUST_HEADER,
+            CANARY_AUTH_HEADER,
+        ];
+        for surface in &surfaces {
+            for needle in forbidden {
+                assert!(
+                    !surface.contains(needle),
+                    "W4c1 Anthropic surface leaked {needle:?}: {surface}"
                 );
             }
         }

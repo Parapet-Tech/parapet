@@ -8,10 +8,10 @@
 
 use crate::effect::{FileCleanupResultV0, FileEffectCleanupV0, RootCapabilityV0};
 use crate::provenance::{
-    ProviderContentDecoder, SessionConfig, SessionError, SessionGrant, SessionManager,
-    SupportedProfile, SystemClock,
+    Clock, ProfileMode, SessionError, SessionGrant, SessionManager, SupportedProfile, SystemClock,
 };
-use crate::provider::ProviderType;
+pub use crate::proxy::ProvenanceRouteBinding;
+use crate::proxy::SessionRequestAdmitter;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -362,33 +362,32 @@ pub fn remove_owned_transient_files(state_dir: &Path) {
     }
 }
 
-/// Factory building a [`SessionConfig`] for a caller-supplied [`SupportedProfile`]
-/// on each provenance session start or rotation.
-pub trait ProvenanceSessionConfigFactory: Send + Sync {
-    fn build_session_config(&self, profile: SupportedProfile) -> SessionConfig;
+/// Factory building a [`Clock`] on each provenance session start or rotation.
+///
+/// [`ProvenanceSessionControl`] always derives the session verifier's
+/// [`crate::provenance::ProviderContentDecoder`] from its closed
+/// [`ProvenanceRouteBinding`], so injected dependencies may vary the clock
+/// without ever overriding or diverging from the route decoder.
+pub trait ProvenanceSessionClockFactory: Send + Sync {
+    fn build_clock(&self) -> Box<dyn Clock>;
 }
 
-/// Production [`ProvenanceSessionConfigFactory`] using [`SystemClock`] and
-/// the OpenAI [`ProviderContentDecoder`].
-#[derive(Debug, Default, Clone, Copy)]
-pub struct DefaultProvenanceSessionConfigFactory;
+/// Production [`ProvenanceSessionClockFactory`] backed by [`SystemClock`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DefaultProvenanceSessionClockFactory;
 
-impl ProvenanceSessionConfigFactory for DefaultProvenanceSessionConfigFactory {
-    fn build_session_config(&self, profile: SupportedProfile) -> SessionConfig {
-        SessionConfig {
-            profile,
-            clock: Box::new(SystemClock::new()),
-            decoder: Box::new(ProviderContentDecoder::new(ProviderType::OpenAi)),
-        }
+impl ProvenanceSessionClockFactory for DefaultProvenanceSessionClockFactory {
+    fn build_clock(&self) -> Box<dyn Clock> {
+        Box::new(SystemClock::new())
     }
 }
 
-impl<F> ProvenanceSessionConfigFactory for F
+impl<F> ProvenanceSessionClockFactory for F
 where
-    F: Fn(SupportedProfile) -> SessionConfig + Send + Sync,
+    F: Fn() -> Box<dyn Clock> + Send + Sync,
 {
-    fn build_session_config(&self, profile: SupportedProfile) -> SessionConfig {
-        (self)(profile)
+    fn build_clock(&self) -> Box<dyn Clock> {
+        (self)()
     }
 }
 
@@ -396,41 +395,63 @@ where
 /// in-memory provenance carrier session (`parapet-control/v0`).
 #[derive(Clone)]
 pub struct ProvenanceSessionControl {
+    route_binding: ProvenanceRouteBinding,
     sessions: Arc<SessionManager>,
     profile: SupportedProfile,
-    config_factory: Arc<dyn ProvenanceSessionConfigFactory>,
+    clock_factory: Arc<dyn ProvenanceSessionClockFactory>,
 }
 
 impl ProvenanceSessionControl {
-    /// Construct a handle backed by [`DefaultProvenanceSessionConfigFactory`].
-    pub fn new(sessions: Arc<SessionManager>, profile: SupportedProfile) -> Self {
+    /// Construct a handle bound to `route_binding` and backed by
+    /// [`DefaultProvenanceSessionClockFactory`].
+    pub fn new(
+        route_binding: impl Into<ProvenanceRouteBinding>,
+        sessions: Arc<SessionManager>,
+        profile: SupportedProfile,
+    ) -> Self {
         Self::new_with(
+            route_binding,
             sessions,
             profile,
-            Arc::new(DefaultProvenanceSessionConfigFactory),
+            Arc::new(DefaultProvenanceSessionClockFactory),
         )
     }
 
-    /// Construct a handle with an injected [`ProvenanceSessionConfigFactory`].
+    /// Construct a handle bound to `route_binding` with an injected
+    /// [`ProvenanceSessionClockFactory`].
+    ///
+    /// On each session start or rotation, [`Self::start_session`] builds the
+    /// [`crate::provenance::SessionConfig`] via
+    /// [`ProvenanceRouteBinding::session_config`], so the verifier decoder and
+    /// [`Self::request_admitter`] decoder cannot diverge.
     pub fn new_with(
+        route_binding: impl Into<ProvenanceRouteBinding>,
         sessions: Arc<SessionManager>,
         profile: SupportedProfile,
-        config_factory: Arc<dyn ProvenanceSessionConfigFactory>,
+        clock_factory: Arc<dyn ProvenanceSessionClockFactory>,
     ) -> Self {
         Self {
+            route_binding: route_binding.into(),
             sessions,
             profile,
-            config_factory,
+            clock_factory,
         }
     }
 
-    /// Construct a handle with any [`ProvenanceSessionConfigFactory`] implementation.
-    pub fn with_config_factory(
+    /// Construct a handle bound to `route_binding` with any
+    /// [`ProvenanceSessionClockFactory`] implementation.
+    pub fn with_clock_factory(
+        route_binding: impl Into<ProvenanceRouteBinding>,
         sessions: Arc<SessionManager>,
         profile: SupportedProfile,
-        config_factory: impl ProvenanceSessionConfigFactory + 'static,
+        clock_factory: impl ProvenanceSessionClockFactory + 'static,
     ) -> Self {
-        Self::new_with(sessions, profile, Arc::new(config_factory))
+        Self::new_with(route_binding, sessions, profile, Arc::new(clock_factory))
+    }
+
+    /// Closed route and decoder binding for this session control handle.
+    pub const fn route_binding(&self) -> ProvenanceRouteBinding {
+        self.route_binding
     }
 
     pub fn sessions(&self) -> &Arc<SessionManager> {
@@ -441,11 +462,27 @@ impl ProvenanceSessionControl {
         &self.profile
     }
 
-    /// Start or atomically rotate the active session using the configured profile and factory.
+    /// Construct a [`SessionRequestAdmitter`] sharing this handle's exact
+    /// [`ProvenanceRouteBinding`], [`SessionManager`], and [`SupportedProfile`] identity,
+    /// guaranteeing that the session verifier decoder and post-verify consistency decoder
+    /// cannot diverge.
+    pub fn request_admitter(&self, mode: ProfileMode) -> SessionRequestAdmitter {
+        SessionRequestAdmitter::new(
+            mode,
+            self.route_binding,
+            self.sessions.clone(),
+            self.profile.profile_id.clone(),
+            self.profile.schema_version,
+        )
+    }
+
+    /// Start or atomically rotate the active session using the bound route decoder
+    /// and configured clock factory.
     pub fn start_session(&self) -> Result<SessionGrant, SessionError> {
+        let injected_clock = self.clock_factory.build_clock();
         let config = self
-            .config_factory
-            .build_session_config(self.profile.clone());
+            .route_binding
+            .session_config(self.profile.clone(), injected_clock);
         self.sessions.start(config)
     }
 
@@ -455,9 +492,18 @@ impl ProvenanceSessionControl {
     }
 }
 
+impl SessionRequestAdmitter {
+    /// Construct a [`SessionRequestAdmitter`] from a [`ProvenanceSessionControl`],
+    /// sharing its exact [`ProvenanceRouteBinding`], [`SessionManager`], and profile identity.
+    pub fn from_session_control(mode: ProfileMode, control: &ProvenanceSessionControl) -> Self {
+        control.request_admitter(mode)
+    }
+}
+
 impl std::fmt::Debug for ProvenanceSessionControl {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProvenanceSessionControl")
+            .field("route_binding", &self.route_binding)
             .field("profile", &self.profile.profile_id)
             .field("schema_version", &self.profile.schema_version)
             .field("max_validity_ms", &self.profile.max_validity_ms)
