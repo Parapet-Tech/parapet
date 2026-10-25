@@ -107,11 +107,11 @@ impl<F: Fn(&ProjectedInput) -> bool> RecordingScorer<F> {
 }
 
 impl<F: Fn(&ProjectedInput) -> bool> ProjectionScorer for RecordingScorer<F> {
-    fn is_positive(&self, input: &ProjectedInput) -> bool {
+    fn is_positive(&self, input: &ProjectedInput) -> Result<bool, ProjectionScanError> {
         self.seen
             .borrow_mut()
             .push((input.kind, input.text.clone()));
-        (self.script)(input)
+        Ok((self.script)(input))
     }
 }
 
@@ -419,7 +419,7 @@ fn valid_carrier_verifies_and_receipt_is_structural() {
     let geometry = geometry_of(&verified);
     let scorer = RecordingScorer::new(|_| false);
     let inputs = project(&geometry);
-    let report = scan(&inputs, &scorer);
+    let report = scan(&inputs, &scorer).expect("scan");
     assert_eq!(report.verdict, ScanVerdict::Allow);
 
     // Vendor exempt; configured_agent + repository coalesce into one unit.
@@ -926,7 +926,7 @@ fn labels_inside_content_and_trust_headers_grant_nothing() {
     ));
     let verified = harness().verifier.verify(Some(&env), &body).unwrap();
     let scorer = RecordingScorer::new(|_| false);
-    scan(&project(&geometry_of(&verified)), &scorer);
+    scan(&project(&geometry_of(&verified)), &scorer).expect("scan");
     let seen = scorer.seen.borrow();
     assert!(
         seen.contains(&(ProjectionKind::Unit, spoof.to_string())),
@@ -941,7 +941,7 @@ fn scanned_inputs(segs: &[Seg], contents: &[&str]) -> (Vec<(ProjectionKind, Stri
     let env = sign(unsigned(&body, seg_values(contents, segs)));
     let verified = harness().verifier.verify(Some(&env), &body).unwrap();
     let scorer = RecordingScorer::new(|i| i.text.contains("IGNORE-PRIOR"));
-    let report = scan(&project(&geometry_of(&verified)), &scorer);
+    let report = scan(&project(&geometry_of(&verified)), &scorer).expect("scan");
     let seen = scorer.seen.into_inner();
     (seen, report.verdict)
 }
@@ -1011,7 +1011,7 @@ fn split_across_trust_boundary_is_blocked_by_boundary_window() {
     let verified = verifier.verify(Some(&env), &body).unwrap();
 
     let scorer = RecordingScorer::new(|i| i.text.contains("IGNORE-PRIOR"));
-    let report = scan(&project(&geometry_of(&verified)), &scorer);
+    let report = scan(&project(&geometry_of(&verified)), &scorer).expect("scan");
     assert_eq!(report.verdict, ScanVerdict::Block);
     assert_eq!(report.positives.len(), 1);
     assert_eq!(report.positives[0].kind, ProjectionKind::Boundary);
@@ -1049,7 +1049,7 @@ fn split_across_untrusted_units_is_blocked_by_aggregate_only() {
     ];
     let geometry = [MessageGeometry::new(&content, &ranges)];
     let scorer = RecordingScorer::new(|i| i.text.contains("IGNORE") && i.text.contains("PRIOR"));
-    let report = scan(&project(&geometry), &scorer);
+    let report = scan(&project(&geometry), &scorer).expect("scan");
     assert_eq!(report.verdict, ScanVerdict::Block);
     let kinds: Vec<ProjectionKind> = report.positives.iter().map(|p| p.kind).collect();
     assert_eq!(kinds, vec![ProjectionKind::Aggregate]);
@@ -1097,7 +1097,7 @@ fn any_single_scripted_positive_blocks_in_every_kind() {
             *n += 1;
             *n - 1 == target
         });
-        let report = scan(&inputs, &scorer);
+        let report = scan(&inputs, &scorer).expect("scan");
         assert_eq!(
             report.verdict,
             ScanVerdict::Block,
@@ -1111,7 +1111,7 @@ fn any_single_scripted_positive_blocks_in_every_kind() {
         assert_eq!(report.positives.len(), 1);
         assert_eq!(report.positives[0].kind, inputs[target].kind);
     }
-    let report = scan(&inputs, &RecordingScorer::new(|_| false));
+    let report = scan(&inputs, &RecordingScorer::new(|_| false)).expect("scan");
     assert_eq!(report.verdict, ScanVerdict::Allow);
 }
 
@@ -1119,7 +1119,7 @@ fn any_single_scripted_positive_blocks_in_every_kind() {
 struct StripTags;
 
 impl ViewDeriver for StripTags {
-    fn views(&self, original: &str) -> Vec<String> {
+    fn views(&self, original: &str) -> Result<Vec<String>, ProjectionScanError> {
         let mut stripped = String::new();
         let mut rest = original;
         while let Some(open) = rest.find('<') {
@@ -1132,15 +1132,15 @@ impl ViewDeriver for StripTags {
             }
         }
         stripped.push_str(rest);
-        vec![original.to_string(), stripped]
+        Ok(vec![original.to_string(), stripped])
     }
 }
 
 struct ContainsView(&'static str);
 
 impl ViewScorer for ContainsView {
-    fn is_positive(&self, view: &str) -> bool {
-        view.contains(self.0)
+    fn is_positive(&self, view: &str) -> Result<bool, ProjectionScanError> {
+        Ok(view.contains(self.0))
     }
 }
 
@@ -1162,7 +1162,7 @@ fn markup_split_across_trust_boundary_is_seen_only_in_joined_views() {
     ];
     let geometry = [MessageGeometry::new(content, &ranges)];
     let scorer = DualViewScorer::new(StripTags, ContainsView("IGNOREPRIOR"));
-    let report = scan(&project(&geometry), &scorer);
+    let report = scan(&project(&geometry), &scorer).expect("scan");
     assert_eq!(report.verdict, ScanVerdict::Block);
     let kinds: Vec<ProjectionKind> = report.positives.iter().map(|p| p.kind).collect();
     assert_eq!(kinds, vec![ProjectionKind::Boundary]);
@@ -1170,7 +1170,7 @@ fn markup_split_across_trust_boundary_is_seen_only_in_joined_views() {
     // Concatenating per-unit transformed views would have missed it.
     let per_unit: String = [&content[..split], &content[split..]]
         .iter()
-        .map(|u| StripTags.views(u)[1].clone())
+        .map(|u| StripTags.views(u).expect("views")[1].clone())
         .collect();
     assert!(!per_unit.contains("IGNOREPRIOR"));
 }
@@ -1204,7 +1204,7 @@ fn failures_receipts_and_debug_output_carry_no_content_or_secrets() {
     rendered.push(format!("{verified:?}"));
     let inputs = project(&geometry_of(&verified));
     rendered.push(format!("{inputs:?}"));
-    let report = scan(&inputs, &RecordingScorer::new(|_| true));
+    let report = scan(&inputs, &RecordingScorer::new(|_| true)).expect("scan");
     let mut receipts =
         vec![serde_json::to_string(&CarrierReceipt::verified(&verified, &report)).unwrap()];
 

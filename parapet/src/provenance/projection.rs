@@ -212,13 +212,75 @@ pub struct OriginalSpan {
     pub end: usize,
 }
 
+/// One treated sub-range of a projected input: `[text_start,text_end)` in
+/// `ProjectedInput::text` is exactly the bytes of `original`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProjectedRegion {
+    pub text_start: usize,
+    pub text_end: usize,
+    pub original: OriginalSpan,
+    pub treatment: Treatment,
+}
+
 /// One scan input: original bytes plus structural coordinates.
+///
+/// `regions` partition `text` in order, except aggregate separator bytes,
+/// which belong to no region and map to no original byte. They let a scan
+/// finding over `text` be mapped to original bytes and their treatment.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ProjectedInput {
     pub kind: ProjectionKind,
     pub spans: Vec<OriginalSpan>,
     pub separator_positions: Vec<usize>,
+    pub regions: Vec<ProjectedRegion>,
     pub text: String,
+}
+
+impl ProjectedInput {
+    /// Whether text range `[start,end)` intersects at least one non-exempt
+    /// original byte (Sensor Q1 is byte-based, so an empty range intersects
+    /// nothing). `None` when the range or the region partition is invalid.
+    pub fn intersects_non_exempt(&self, start: usize, end: usize) -> Option<bool> {
+        if start > end || end > self.text.len() || !self.regions_valid() {
+            return None;
+        }
+        if start == end {
+            return Some(false);
+        }
+        Some(
+            self.regions
+                .iter()
+                .filter(|r| r.treatment.is_untrusted())
+                .any(|r| r.text_start < end && start < r.text_end),
+        )
+    }
+
+    /// Regions are ordered, in bounds, length-preserving, and cover every
+    /// text byte except exactly the separator bytes.
+    fn regions_valid(&self) -> bool {
+        let sep_len = AGGREGATE_SEPARATOR.len_utf8();
+        let mut cursor = 0;
+        let mut seps = self.separator_positions.iter().peekable();
+        for r in &self.regions {
+            while seps.peek() == Some(&&cursor) {
+                seps.next();
+                cursor += sep_len;
+            }
+            if r.text_start != cursor
+                || r.text_end < r.text_start
+                || r.original.end < r.original.start
+                || r.text_end - r.text_start != r.original.end - r.original.start
+            {
+                return false;
+            }
+            cursor = r.text_end;
+        }
+        while seps.peek() == Some(&&cursor) {
+            seps.next();
+            cursor += sep_len;
+        }
+        cursor == self.text.len() && seps.next().is_none()
+    }
 }
 
 impl std::fmt::Debug for ProjectedInput {
@@ -227,6 +289,7 @@ impl std::fmt::Debug for ProjectedInput {
             .field("kind", &self.kind)
             .field("spans", &self.spans)
             .field("separator_positions", &self.separator_positions)
+            .field("regions", &self.regions)
             .field(
                 "text",
                 &format_args!("<{} bytes redacted>", self.text.len()),
@@ -249,6 +312,7 @@ pub fn project(messages: &[MessageGeometry<'_>]) -> Vec<ProjectedInput> {
                     end: u.end,
                 }],
                 separator_positions: Vec::new(),
+                regions: window_regions(mi, &m.units, u.start, u.end),
                 text: m.content[u.start..u.end].to_string(),
             });
         }
@@ -261,43 +325,116 @@ pub fn project(messages: &[MessageGeometry<'_>]) -> Vec<ProjectedInput> {
                     end: w.end,
                 }],
                 separator_positions: Vec::new(),
+                regions: window_regions(mi, &m.units, w.start, w.end),
                 text: m.content[w.start..w.end].to_string(),
             });
         }
     }
     if let Some(agg) = aggregate(messages) {
+        let spans: Vec<OriginalSpan> = agg
+            .map
+            .iter()
+            .map(|e| OriginalSpan {
+                message_index: e.message_index,
+                start: e.orig_start,
+                end: e.orig_end,
+            })
+            .collect();
+        let regions = agg
+            .map
+            .iter()
+            .zip(&spans)
+            .map(|(e, span)| ProjectedRegion {
+                text_start: e.agg_start,
+                text_end: e.agg_end,
+                original: *span,
+                treatment: Treatment::Untrusted,
+            })
+            .collect();
         inputs.push(ProjectedInput {
             kind: ProjectionKind::Aggregate,
-            spans: agg
-                .map
-                .iter()
-                .map(|e| OriginalSpan {
-                    message_index: e.message_index,
-                    start: e.orig_start,
-                    end: e.orig_end,
-                })
-                .collect(),
+            spans,
             separator_positions: agg.separator_positions,
+            regions,
             text: agg.text,
         });
     }
     inputs
 }
 
+/// Per-unit treated sub-ranges of the window `[start,end)` of message `mi`,
+/// in window-relative text coordinates. A window may cross several units.
+fn window_regions(
+    mi: usize,
+    units: &[TreatedRange],
+    start: usize,
+    end: usize,
+) -> Vec<ProjectedRegion> {
+    units
+        .iter()
+        .filter(|u| u.start < end && start < u.end)
+        .map(|u| {
+            let (s, e) = (u.start.max(start), u.end.min(end));
+            ProjectedRegion {
+                text_start: s - start,
+                text_end: e - start,
+                original: OriginalSpan {
+                    message_index: mi,
+                    start: s,
+                    end: e,
+                },
+                treatment: u.treatment,
+            }
+        })
+        .collect()
+}
+
+/// Closed, content-free projection scan failure. Every variant fails closed:
+/// the request forwards zero bytes upstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectionScanError {
+    /// A non-empty projected input normalized to empty in every L0 view.
+    EmptyAfterL0,
+    /// L0 views or their source mappings could not be established.
+    MappingInvariant,
+    /// The detector produced a non-finite score or threshold.
+    NonFiniteScore,
+}
+
+impl ProjectionScanError {
+    /// Stable content-free label for logs and response evidence.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::EmptyAfterL0 => "empty_after_l0",
+            Self::MappingInvariant => "mapping_invariant",
+            Self::NonFiniteScore => "non_finite_score",
+        }
+    }
+}
+
+impl std::fmt::Display for ProjectionScanError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::error::Error for ProjectionScanError {}
+
 /// Injected per-input scorer: the unchanged L1 path and threshold applied to
 /// one projected input. Implementations derive L0 views from `input.text`.
 pub trait ProjectionScorer {
-    fn is_positive(&self, input: &ProjectedInput) -> bool;
+    fn is_positive(&self, input: &ProjectedInput) -> Result<bool, ProjectionScanError>;
 }
 
 /// Injected L0 dual-view derivation over joined original bytes (gate 1).
 pub trait ViewDeriver {
-    fn views(&self, original: &str) -> Vec<String>;
+    fn views(&self, original: &str) -> Result<Vec<String>, ProjectionScanError>;
 }
 
 /// Injected single-view detector at the unchanged threshold.
 pub trait ViewScorer {
-    fn is_positive(&self, view: &str) -> bool;
+    fn is_positive(&self, view: &str) -> Result<bool, ProjectionScanError>;
 }
 
 /// Derives views from each whole projected input; positive if any view is.
@@ -313,11 +450,13 @@ impl<D: ViewDeriver, S: ViewScorer> DualViewScorer<D, S> {
 }
 
 impl<D: ViewDeriver, S: ViewScorer> ProjectionScorer for DualViewScorer<D, S> {
-    fn is_positive(&self, input: &ProjectedInput) -> bool {
-        self.deriver
-            .views(&input.text)
-            .iter()
-            .any(|v| self.scorer.is_positive(v))
+    fn is_positive(&self, input: &ProjectedInput) -> Result<bool, ProjectionScanError> {
+        for view in self.deriver.views(&input.text)? {
+            if self.scorer.is_positive(&view)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 }
 
@@ -346,17 +485,22 @@ pub struct ScanReport {
 }
 
 /// Score every input; any positive blocks. Inputs never suppress each other.
-pub fn scan(inputs: &[ProjectedInput], scorer: &dyn ProjectionScorer) -> ScanReport {
-    let positives: Vec<Attribution> = inputs
-        .iter()
-        .filter(|i| scorer.is_positive(i))
-        .map(|i| Attribution {
-            kind: i.kind,
-            spans: i.spans.clone(),
-            separator_positions: i.separator_positions.clone(),
-        })
-        .collect();
-    ScanReport {
+/// Any scorer error fails the whole scan closed.
+pub fn scan(
+    inputs: &[ProjectedInput],
+    scorer: &dyn ProjectionScorer,
+) -> Result<ScanReport, ProjectionScanError> {
+    let mut positives = Vec::new();
+    for input in inputs {
+        if scorer.is_positive(input)? {
+            positives.push(Attribution {
+                kind: input.kind,
+                spans: input.spans.clone(),
+                separator_positions: input.separator_positions.clone(),
+            });
+        }
+    }
+    Ok(ScanReport {
         verdict: if positives.is_empty() {
             ScanVerdict::Allow
         } else {
@@ -364,5 +508,5 @@ pub fn scan(inputs: &[ProjectedInput], scorer: &dyn ProjectionScorer) -> ScanRep
         },
         inputs_scored: inputs.len(),
         positives,
-    }
+    })
 }

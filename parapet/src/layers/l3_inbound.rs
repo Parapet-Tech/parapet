@@ -127,6 +127,78 @@ pub trait InboundScanner: Send + Sync {
     ) -> Result<InboundResult, InboundDualScanError> {
         Err(InboundDualScanError::UnsupportedScanner)
     }
+
+    /// [`Self::scan_dual_view`] where a content match counts only if
+    /// `admission` admits its verified original byte range. A rejected match
+    /// does not hide a later admitted match of the same pattern.
+    ///
+    /// Custom scanners must explicitly override this method; the default fails
+    /// closed with `InboundDualScanError::UnsupportedScanner`.
+    fn scan_dual_view_admitted(
+        &self,
+        _views: &dyn crate::normalize::L0DualScanView,
+        _config: &Config,
+        _admission: &dyn MatchAdmission,
+    ) -> Result<InboundResult, InboundDualScanError> {
+        Err(InboundDualScanError::UnsupportedScanner)
+    }
+}
+
+/// Decides whether a content match counts, given its verified original byte
+/// range `[orig_start, orig_end)` in scanned message `message_index`.
+pub trait MatchAdmission {
+    fn admits(
+        &self,
+        message_index: usize,
+        orig_start: usize,
+        orig_end: usize,
+    ) -> Result<bool, InboundDualScanError>;
+}
+
+/// Admits every match: the ordinary whole-message rule.
+struct AdmitAll;
+
+impl MatchAdmission for AdmitAll {
+    fn admits(&self, _: usize, _: usize, _: usize) -> Result<bool, InboundDualScanError> {
+        Ok(true)
+    }
+}
+
+/// First match of `pattern` in `view` message `idx` that `admission` admits,
+/// as its verified original byte range. Under [`AdmitAll`] this is exactly
+/// the first match.
+fn find_admitted(
+    views: &dyn crate::normalize::L0DualScanView,
+    view: crate::normalize::L0ScanView,
+    idx: usize,
+    pat_idx: usize,
+    regex: &regex::Regex,
+    content: &str,
+    admission: &dyn MatchAdmission,
+) -> Result<Option<(usize, usize)>, InboundDualScanError> {
+    let mut at = 0;
+    while at <= content.len() {
+        let Some(m) = regex.find_at(content, at) else {
+            return Ok(None);
+        };
+        let (orig_start, orig_end) = views
+            .map_range_to_original(view, idx, m.start(), m.end())
+            .ok_or(InboundDualScanError::MissingSourceMapping {
+                view,
+                message_index: idx,
+                pattern_index: pat_idx,
+            })?;
+        if admission.admits(idx, orig_start, orig_end)? {
+            return Ok(Some((orig_start, orig_end)));
+        }
+        // Retry from the next char so a rejected match hides no later one.
+        let step = content[m.start()..]
+            .chars()
+            .next()
+            .map_or(1, char::len_utf8);
+        at = m.start() + step;
+    }
+    Ok(None)
 }
 
 fn validate_dual_views(
@@ -412,6 +484,15 @@ impl InboundScanner for DefaultInboundScanner {
         views: &dyn crate::normalize::L0DualScanView,
         config: &Config,
     ) -> Result<InboundResult, InboundDualScanError> {
+        self.scan_dual_view_admitted(views, config, &AdmitAll)
+    }
+
+    fn scan_dual_view_admitted(
+        &self,
+        views: &dyn crate::normalize::L0DualScanView,
+        config: &Config,
+        admission: &dyn MatchAdmission,
+    ) -> Result<InboundResult, InboundDualScanError> {
         validate_dual_views(views)?;
 
         const MAX_MATCHES: usize = 256;
@@ -441,20 +522,15 @@ impl InboundScanner for DefaultInboundScanner {
                         continue;
                     }
                 }
-                if let Some(m) = pattern.regex.find(&msg.content) {
-                    let (orig_start, orig_end) = views
-                        .map_range_to_original(
-                            crate::normalize::L0ScanView::HtmlStripped,
-                            idx,
-                            m.start(),
-                            m.end(),
-                        )
-                        .ok_or(InboundDualScanError::MissingSourceMapping {
-                            view: crate::normalize::L0ScanView::HtmlStripped,
-                            message_index: idx,
-                            pattern_index: pat_idx,
-                        })?;
-
+                if let Some((orig_start, orig_end)) = find_admitted(
+                    views,
+                    crate::normalize::L0ScanView::HtmlStripped,
+                    idx,
+                    pat_idx,
+                    &pattern.regex,
+                    &msg.content,
+                    admission,
+                )? {
                     if pattern.action == PatternAction::Block && first_block.is_none() {
                         first_block = Some(InboundBlock {
                             reason: format!("block pattern matched: {}", pattern.pattern),
@@ -547,20 +623,15 @@ impl InboundScanner for DefaultInboundScanner {
                         continue;
                     }
                 }
-                if let Some(m) = pattern.regex.find(&msg.content) {
-                    let (orig_start, orig_end) = views
-                        .map_range_to_original(
-                            crate::normalize::L0ScanView::PreHtml,
-                            idx,
-                            m.start(),
-                            m.end(),
-                        )
-                        .ok_or(InboundDualScanError::MissingSourceMapping {
-                            view: crate::normalize::L0ScanView::PreHtml,
-                            message_index: idx,
-                            pattern_index: pat_idx,
-                        })?;
-
+                if let Some((orig_start, orig_end)) = find_admitted(
+                    views,
+                    crate::normalize::L0ScanView::PreHtml,
+                    idx,
+                    pat_idx,
+                    &pattern.regex,
+                    &msg.content,
+                    admission,
+                )? {
                     let key = ContentDedupKey {
                         pattern_index: pat_idx,
                         message_index: idx,

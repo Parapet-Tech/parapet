@@ -64,6 +64,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+mod projected;
+pub use projected::{
+    derive_projected_views, scan_projected_l3, L0ViewDeriver, L1ViewScorer, ProjectedEngineStage,
+    ProjectedL3Block, ProjectedL3Match, ProjectedL3Result,
+};
+
 // ---------------------------------------------------------------------------
 // Request context for structured logging
 // ---------------------------------------------------------------------------
@@ -410,12 +416,80 @@ fn receipt_provider(provider: Provider) -> crate::receipt::Provider {
     }
 }
 
+/// L3-inbound result on either basis. Projected results carry
+/// projected-input indexes, which are not message indexes.
+enum L3Outcome {
+    Message(crate::layers::l3_inbound::InboundResult),
+    Projected(projected::ProjectedL3Result),
+}
+
+/// Inbound scan basis for L1 and L3-inbound.
+#[derive(Clone, Copy)]
+enum InboundBasis<'a> {
+    /// Ordinary whole-message scanning over the L0 dual views.
+    WholeMessage,
+    /// Verified carrier (Sensor L-1): both layers scan only these projected
+    /// inputs; caller trust headers are ignored.
+    Projected(&'a [crate::provenance::ProjectedInput]),
+}
+
 #[async_trait]
 impl UpstreamClient for EngineUpstreamClient {
     async fn forward(
         &self,
         provider: Provider,
         request: ProxyRequest,
+    ) -> Result<ProxyResponse, ProxyError> {
+        self.run_pipeline(provider, request, InboundBasis::WholeMessage)
+            .await
+    }
+}
+
+impl EngineUpstreamClient {
+    /// Run the full pipeline for a request whose provenance carrier was
+    /// verified, with L1 and L3-inbound on the projected basis (Sensor L-1).
+    ///
+    /// Only attested `vendor_static` bytes are exempt. L0 whole-message
+    /// normalization, L2a, L4, L3-outbound and L5a run unchanged. The carrier
+    /// header and every `x-guard-trust*` header are removed before any stage
+    /// reads the request, and never reach upstream.
+    pub async fn forward_verified(
+        &self,
+        provider: Provider,
+        mut request: ProxyRequest,
+        verified: &crate::provenance::VerifiedCarrier,
+    ) -> Result<ProxyResponse, ProxyError> {
+        use crate::provenance::{geometry_of, project, treatment_of_verified, ProjectionKind};
+
+        request.headers.remove(crate::provenance::PROVENANCE_HEADER);
+        crate::proxy::strip_guard_trust_headers(&mut request.headers);
+
+        let inputs = project(&geometry_of(verified));
+        let count_kind = |k: ProjectionKind| inputs.iter().filter(|i| i.kind == k).count();
+        tracing::info!(
+            request_id = %request_id_from_headers(&request.headers),
+            layer = "provenance",
+            segments = verified.segments.len(),
+            exempt_segments = verified
+                .segments
+                .iter()
+                .filter(|s| !treatment_of_verified(s).is_untrusted())
+                .count(),
+            unit_inputs = count_kind(ProjectionKind::Unit),
+            boundary_inputs = count_kind(ProjectionKind::Boundary),
+            aggregate_inputs = count_kind(ProjectionKind::Aggregate),
+            "verified carrier projected"
+        );
+
+        self.run_pipeline(provider, request, InboundBasis::Projected(&inputs))
+            .await
+    }
+
+    async fn run_pipeline(
+        &self,
+        provider: Provider,
+        request: ProxyRequest,
+        basis: InboundBasis<'_>,
     ) -> Result<ProxyResponse, ProxyError> {
         let adapter = self.deps.registry.adapter_for(provider);
 
@@ -469,8 +543,11 @@ impl UpstreamClient for EngineUpstreamClient {
             }
         };
 
-        // 1.5) Parse trust header spans from SDK (X-Guard-Trust)
-        parse_trust_header(&request.headers, &request.body, &mut messages);
+        // 1.5) Parse trust header spans from SDK (X-Guard-Trust). A verified
+        // carrier is the only provenance source on the projected basis.
+        if matches!(basis, InboundBasis::WholeMessage) {
+            parse_trust_header(&request.headers, &request.body, &mut messages);
+        }
 
         // 2) Trust assignment
         self.deps
@@ -592,7 +669,20 @@ impl UpstreamClient for EngineUpstreamClient {
         // Harness path produces Vec<L1Signal> for the signal extractor and
         // derives L1Verdict for backward-compatible blocking/logging.
         // Legacy path produces L1Result directly (ensemble scanners).
-        if let (Some(model), Some(l1_config)) =
+        // A verified carrier replaces both with the projected-basis scan.
+        if let (InboundBasis::Projected(inputs), Some(l1_config)) =
+            (basis, &self.deps.config.policy.layers.l1)
+        {
+            if let Some(resp) = self.projected_l1(
+                inputs,
+                l1_config,
+                adapter.as_ref(),
+                &ctx,
+                &mut pending_block,
+            ) {
+                return Ok(resp);
+            }
+        } else if let (Some(model), Some(l1_config)) =
             (&self.deps.l1_model, &self.deps.config.policy.layers.l1)
         {
             let l1_start = Instant::now();
@@ -952,14 +1042,36 @@ impl UpstreamClient for EngineUpstreamClient {
             let l3i_start = Instant::now();
             let scanner_ref = &self.deps.inbound_scanner;
             let config_ref = &self.deps.config;
-            let l3i_scan = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                scanner_ref.scan_dual_view(&scan_views, config_ref)
+            let normalizer_ref = &self.deps.normalizer;
+            let l3i_scan = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match basis {
+                InboundBasis::WholeMessage => scanner_ref
+                    .scan_dual_view(&scan_views, config_ref)
+                    .map(L3Outcome::Message),
+                InboundBasis::Projected(inputs) => projected::scan_projected_l3(
+                    scanner_ref.as_ref(),
+                    normalizer_ref.as_ref(),
+                    inputs,
+                    config_ref,
+                )
+                .map(L3Outcome::Projected),
             }));
             let l3i_ms = l3i_start.elapsed().as_secs_f64() * 1000.0;
 
             match l3i_scan {
-                Ok(Ok(result)) => {
+                Ok(Ok(L3Outcome::Message(result))) => {
                     inbound_result_opt = Some(result);
+                }
+                Ok(Ok(L3Outcome::Projected(result))) => {
+                    // Projected-input attribution never enters message-indexed
+                    // routing or signal records (W4c gate).
+                    (evidence_count, evidence_categories) = self.apply_projected_l3(
+                        &result,
+                        layer,
+                        adapter.as_ref(),
+                        &ctx,
+                        l3i_ms,
+                        &mut pending_block,
+                    );
                 }
                 Ok(Err(dual_err @ InboundDualScanError::UnsupportedScanner)) => {
                     if let Some(resp) = handle_layer_error(
@@ -1387,6 +1499,200 @@ impl UpstreamClient for EngineUpstreamClient {
 }
 
 impl EngineUpstreamClient {
+    /// Log and enforce a projected-basis L3-inbound result. Returns the
+    /// evidence count and sorted categories.
+    fn apply_projected_l3(
+        &self,
+        result: &projected::ProjectedL3Result,
+        layer: &crate::config::LayerConfig,
+        adapter: &dyn ProviderAdapter,
+        ctx: &RequestContext,
+        l3i_ms: f64,
+        pending_block: &mut Option<ProxyResponse>,
+    ) -> (usize, Vec<String>) {
+        let evidence: Vec<_> = result
+            .matches
+            .iter()
+            .filter(|m| m.action == PatternAction::Evidence)
+            .collect();
+        let categories: Vec<String> = evidence
+            .iter()
+            .filter_map(|m| {
+                self.deps
+                    .config
+                    .policy
+                    .block_patterns
+                    .get(m.pattern_index)
+                    .and_then(|p| p.category.clone())
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+
+        match &result.block {
+            Some(block) => {
+                let enforced = layer.mode == "block";
+                tracing::info!(
+                    request_id = %ctx.request_id,
+                    contract_hash = %ctx.contract_hash,
+                    provider = ctx.provider_str,
+                    model = %ctx.model,
+                    layer = "L3-inbound",
+                    verdict = if enforced { "block" } else { "block_shadow" },
+                    basis = "projected",
+                    projected_input_index = block.projected_input_index,
+                    projected_kind = ?block.kind,
+                    inspected_view = block.scan_view.map(|view| view.as_str()).unwrap_or("not_applicable"),
+                    reason = %block.reason,
+                    matched_patterns = result.matches.len(),
+                    evidence_count = evidence.len(),
+                    latency_ms = l3i_ms,
+                    "inbound projected scan blocked"
+                );
+                if enforced && pending_block.is_none() {
+                    let body = adapter.serialize_error("request blocked by content policy", 403);
+                    let mut response = ProxyResponse::blocked(body, "L3-inbound");
+                    if let Some(view) = block.scan_view {
+                        response.headers.insert(
+                            "x-parapet-blocked-view",
+                            HeaderValue::from_static(view.as_str()),
+                        );
+                    }
+                    *pending_block = Some(response);
+                }
+            }
+            None => {
+                tracing::info!(
+                    request_id = %ctx.request_id,
+                    contract_hash = %ctx.contract_hash,
+                    provider = ctx.provider_str,
+                    model = %ctx.model,
+                    layer = "L3-inbound",
+                    verdict = "allow",
+                    basis = "projected",
+                    evidence_count = evidence.len(),
+                    latency_ms = l3i_ms,
+                    "inbound allowed"
+                );
+            }
+        }
+        (evidence.len(), categories)
+    }
+
+    /// L1 over the projected basis. Returns a response to send immediately
+    /// (fail closed), or records an enforced block in `pending_block`.
+    fn projected_l1(
+        &self,
+        inputs: &[crate::provenance::ProjectedInput],
+        l1_config: &crate::config::L1Config,
+        adapter: &dyn ProviderAdapter,
+        ctx: &RequestContext,
+        pending_block: &mut Option<ProxyResponse>,
+    ) -> Option<ProxyResponse> {
+        use crate::provenance::{scan, DualViewScorer, ScanVerdict};
+
+        let Some(model) = &self.deps.l1_model else {
+            // The ensemble scanner has no projected scorer; never fall back
+            // to whole-message scanning across exempt bytes.
+            tracing::error!(
+                request_id = %ctx.request_id,
+                contract_hash = %ctx.contract_hash,
+                layer = "L1",
+                error_type = "scan_error",
+                error = "projected_scorer_unavailable",
+                "L1 projected scan unavailable — blocking request in all failure modes"
+            );
+            return Some(layer_error_503(adapter, "L1", "scan_error"));
+        };
+
+        let scorer = DualViewScorer::new(
+            projected::L0ViewDeriver::new(self.deps.normalizer.clone()),
+            projected::L1ViewScorer::new(model.clone(), l1_config.threshold),
+        );
+        let l1_start = Instant::now();
+        let l1_scan =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scan(inputs, &scorer)));
+        let l1_ms = l1_start.elapsed().as_secs_f64() * 1000.0;
+
+        match l1_scan {
+            Ok(Ok(report)) => {
+                let positive_kinds: Vec<_> = report.positives.iter().map(|a| a.kind).collect();
+                match report.verdict {
+                    ScanVerdict::Block if l1_config.mode == crate::config::L1Mode::Block => {
+                        tracing::info!(
+                            request_id = %ctx.request_id,
+                            contract_hash = %ctx.contract_hash,
+                            provider = ctx.provider_str,
+                            model = %ctx.model,
+                            layer = "L1",
+                            verdict = "block",
+                            basis = "projected",
+                            inputs_scored = report.inputs_scored,
+                            positive_kinds = ?positive_kinds,
+                            latency_ms = l1_ms,
+                            "L1 classifier blocked"
+                        );
+                        let body =
+                            adapter.serialize_error("request blocked by content policy", 403);
+                        *pending_block = Some(ProxyResponse::blocked(body, "L1"));
+                    }
+                    ScanVerdict::Block => {
+                        tracing::info!(
+                            request_id = %ctx.request_id,
+                            contract_hash = %ctx.contract_hash,
+                            provider = ctx.provider_str,
+                            model = %ctx.model,
+                            layer = "L1",
+                            verdict = "shadow_block",
+                            basis = "projected",
+                            inputs_scored = report.inputs_scored,
+                            positive_kinds = ?positive_kinds,
+                            latency_ms = l1_ms,
+                            "L1 classifier detected (shadow)"
+                        );
+                    }
+                    ScanVerdict::Allow => {
+                        tracing::debug!(
+                            request_id = %ctx.request_id,
+                            contract_hash = %ctx.contract_hash,
+                            provider = ctx.provider_str,
+                            model = %ctx.model,
+                            layer = "L1",
+                            verdict = "allow",
+                            basis = "projected",
+                            inputs_scored = report.inputs_scored,
+                            latency_ms = l1_ms,
+                            "L1 classifier passed"
+                        );
+                    }
+                }
+                None
+            }
+            Ok(Err(scan_err)) => {
+                tracing::error!(
+                    request_id = %ctx.request_id,
+                    contract_hash = %ctx.contract_hash,
+                    provider = ctx.provider_str,
+                    model = %ctx.model,
+                    layer = "L1",
+                    error_type = "scan_error",
+                    error = scan_err.as_str(),
+                    latency_ms = l1_ms,
+                    "L1 projected scan invariant failure — blocking request in all failure modes"
+                );
+                Some(layer_error_503(adapter, "L1", "scan_error"))
+            }
+            Err(_) => handle_layer_error(
+                &self.deps.config.runtime.engine.on_failure,
+                adapter,
+                "L1",
+                "scanner_panic",
+                "scanner panicked",
+                &ctx.request_id,
+            ),
+        }
+    }
+
     #[cfg_attr(windows, allow(unused_variables))]
     fn handle_streaming_response_with(
         &self,
