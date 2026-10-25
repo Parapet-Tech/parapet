@@ -108,6 +108,11 @@ class LandingScriptTests(unittest.TestCase):
         self.assertIn("git merge --ff-only", commands)
         self.assertIn("check_publisher_context.py", script)
         self.assertIn("gh pr checks", commands)
+        self.assertIn("required_status_checks", commands)
+        self.assertIn("waiting for required checks to register", script)
+        self.assertNotIn("gh api --method DELETE", commands)
+        self.assertNotIn("gh api --method PUT", commands)
+        self.assertIn("configure the controlled publisher bypass", script)
 
     def test_pre_push_hook_verifies_publisher_context(self):
         hook = (ROOT / ".githooks" / "pre-push").read_text()
@@ -120,6 +125,149 @@ class LandingScriptTests(unittest.TestCase):
         self.assertIn("--full-blob-scan", workflow)
         self.assertIn("+refs/heads/*:refs/remotes/origin/*", workflow)
         self.assertIn("Test publication controls", workflow)
+
+
+class LanderHarnessTests(unittest.TestCase):
+    def write_executable(self, path: Path, body: str) -> None:
+        path.write_text(f"#!{sys.executable}\n{body}")
+        path.chmod(0o755)
+
+    def run_lander(
+        self,
+        *,
+        push_fails: bool = False,
+        locked: bool = False,
+        required_api_fails: bool = False,
+        required_missing: bool = False,
+    ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            log = root / "events.log"
+            check_count = root / "check-count"
+
+            self.write_executable(
+                fake_bin / "git",
+                """import os
+import sys
+from pathlib import Path
+
+args = sys.argv[1:]
+log = Path(os.environ["HARNESS_LOG"])
+with log.open("a") as handle:
+    handle.write("GIT " + " ".join(args) + "\\n")
+
+if args == ["rev-parse", "--show-toplevel"]:
+    print(os.environ["HARNESS_ROOT"])
+elif args[:1] == ["config"]:
+    values = {
+        "core.hooksPath": ".githooks",
+        "user.name": "some one",
+        "user.email": "someone@example.com",
+    }
+    print(values.get(args[-1], ""))
+elif args == ["status", "--porcelain"]:
+    pass
+elif args == ["rev-parse", "pr-26"]:
+    print("a" * 40)
+elif args[:1] == ["push"] and os.environ.get("PUSH_FAIL") == "1":
+    raise SystemExit(1)
+raise SystemExit(0)
+""",
+            )
+            self.write_executable(
+                fake_bin / "gh",
+                """import os
+import sys
+from pathlib import Path
+
+args = sys.argv[1:]
+log = Path(os.environ["HARNESS_LOG"])
+with log.open("a") as handle:
+    handle.write("GH " + " ".join(args) + "\\n")
+
+if args[:2] == ["pr", "view"]:
+    query = args[args.index("-q") + 1]
+    values = {
+        ".baseRefName": "main",
+        ".title": "publication controls",
+        ".headRefOid": "a" * 40,
+    }
+    print(values[query])
+elif args[:2] == ["repo", "view"]:
+    print("Parapet-Tech/parapet")
+elif args[:2] == ["pr", "checks"] and "--json" in args:
+    counter = Path(os.environ["CHECK_COUNT"])
+    count = int(counter.read_text()) if counter.exists() else 0
+    counter.write_text(str(count + 1))
+    print("hygiene")
+    if count:
+        print("Rust tests passed")
+elif args[:2] == ["pr", "checks"]:
+    pass
+elif args[:1] == ["api"]:
+    endpoint = next(arg for arg in args[1:] if arg.startswith("repos/"))
+    if "required_status_checks" in endpoint:
+        if os.environ.get("REQUIRED_API_FAIL") == "1":
+            raise SystemExit(1)
+        print("hygiene")
+        if os.environ.get("REQUIRED_MISSING") != "1":
+            print("Rust tests passed")
+    elif endpoint.endswith("/protection"):
+        print(os.environ["GH_LOCKED"])
+raise SystemExit(0)
+""",
+            )
+            self.write_executable(fake_bin / "python3", "raise SystemExit(0)\n")
+            self.write_executable(fake_bin / "sleep", "raise SystemExit(0)\n")
+
+            env = {
+                **os.environ,
+                "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                "HARNESS_LOG": str(log),
+                "HARNESS_ROOT": str(root),
+                "CHECK_COUNT": str(check_count),
+                "CHECK_WAIT_TIMEOUT_SECONDS": "2",
+                "PUSH_FAIL": "1" if push_fails else "0",
+                "GH_LOCKED": "true" if locked else "false",
+                "REQUIRED_API_FAIL": "1" if required_api_fails else "0",
+                "REQUIRED_MISSING": "1" if required_missing else "0",
+            }
+            result = subprocess.run(
+                ["/bin/sh", str(ROOT / "scripts" / "merge_pr_local.sh"), "26"],
+                cwd=root,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            return result, log.read_text().splitlines()
+
+    def test_lander_waits_for_all_contexts_before_push(self):
+        result, events = self.run_lander()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(
+            "waiting for required checks to register: Rust tests passed",
+            result.stdout,
+        )
+        self.assertIn("GIT push origin main", events)
+
+    def test_lander_refuses_a_locked_branch_without_mutating_settings(self):
+        result, events = self.run_lander(locked=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("GIT push origin main", events)
+        self.assertFalse(any("--method" in event for event in events))
+
+    def test_lander_fails_closed_when_required_check_api_fails(self):
+        result, events = self.run_lander(required_api_fails=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("GIT push origin main", events)
+
+    def test_lander_fails_closed_when_contract_check_is_not_configured(self):
+        result, events = self.run_lander(required_missing=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("GIT push origin main", events)
 
 
 class HygieneRangeTests(unittest.TestCase):

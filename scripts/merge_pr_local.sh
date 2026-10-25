@@ -46,8 +46,56 @@ python3 "$PUBLISHER_CHECK" --remote origin
 BASE=$(gh pr view "$PR" --json baseRefName -q .baseRefName)
 TITLE=$(gh pr view "$PR" --json title -q .title)
 EXPECTED_HEAD=$(gh pr view "$PR" --json headRefOid -q .headRefOid)
+REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner)
+
+wait_for_required_check_registration() {
+    if ! required=$(gh api \
+        "repos/$REPO/branches/$BASE/protection/required_status_checks" \
+        --jq '.contexts[]'); then
+        echo "abort: could not read required checks for $BASE" >&2
+        return 1
+    fi
+    if [ -z "$required" ]; then
+        echo "abort: no required checks are configured for $BASE" >&2
+        return 1
+    fi
+    expected_required='hygiene
+Rust tests passed'
+    while IFS= read -r context; do
+        if ! printf '%s\n' "$required" | grep -Fqx -- "$context"; then
+            echo "abort: configured required check is missing: $context" >&2
+            return 1
+        fi
+    done <<EOF
+$expected_required
+EOF
+
+    timeout=${CHECK_WAIT_TIMEOUT_SECONDS:-1800}
+    deadline=$(($(date +%s) + timeout))
+    while :; do
+        observed=$(gh pr checks "$PR" --required --json name \
+            --jq '.[].name' 2>/dev/null || true)
+        missing=""
+        while IFS= read -r context; do
+            [ -n "$context" ] || continue
+            if ! printf '%s\n' "$observed" | grep -Fqx -- "$context"; then
+                missing="${missing}${missing:+, }$context"
+            fi
+        done <<EOF
+$required
+EOF
+        [ -z "$missing" ] && return 0
+        if [ "$(date +%s)" -ge "$deadline" ]; then
+            echo "abort: required checks never registered: $missing" >&2
+            return 1
+        fi
+        echo "waiting for required checks to register: $missing"
+        sleep 5
+    done
+}
 
 # Do not turn a not-yet-green push into a reason to use another landing path.
+wait_for_required_check_registration
 gh pr checks "$PR" --required --watch
 
 git checkout "$BASE"
@@ -84,6 +132,16 @@ esac
 
 # Verify everything about to go out, then push (pre-push hook re-checks).
 python3 "$CHECK" "origin/$BASE..$BASE"
+
+if ! lock_enabled=$(gh api "repos/$REPO/branches/$BASE/protection" \
+    --jq '.lock_branch.enabled // false'); then
+    echo "abort: could not read branch-lock state for $BASE" >&2
+    exit 1
+fi
+[ "$lock_enabled" != true ] || {
+    echo "abort: $BASE is locked; configure the controlled publisher bypass" >&2
+    exit 1
+}
 git push origin "$BASE"
 
 if [ "$MODE" = "--squash" ]; then
