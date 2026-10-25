@@ -8,17 +8,23 @@
 //! projection geometry, block-only scoring through an injected scorer, and
 //! content-free receipts. Engine wiring follows the L0 dual-view gate.
 
+pub mod auth;
 pub mod decode;
 pub mod envelope;
 pub mod projection;
 pub mod receipt;
+pub mod session;
+pub mod transport;
 pub mod treatment;
 pub mod verify;
 
+pub use auth::*;
 pub use decode::*;
 pub use envelope::*;
 pub use projection::*;
 pub use receipt::*;
+pub use session::*;
+pub use transport::*;
 pub use treatment::*;
 pub use verify::*;
 

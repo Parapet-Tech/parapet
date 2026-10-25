@@ -44,6 +44,8 @@ aho-corasick = "1"
 regex = "1"
 unicode-normalization = "0.1"
 sha2 = "0.10"
+subtle = "2.6"
+getrandom = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 uuid = { version = "1", features = ["v4"] }
