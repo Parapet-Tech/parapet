@@ -379,20 +379,37 @@ pub struct EngineDeps {
 // EngineUpstreamClient
 // ---------------------------------------------------------------------------
 
+/// Fixed capacity of the in-memory [`crate::provenance::CarrierReceipt`] ring buffer
+/// retained by [`EngineUpstreamClient`] for internal observability.
+///
+/// Once full, recording a new receipt deterministically evicts the oldest retained
+/// entry so memory remains strictly bounded when no caller drains the store.
+pub const MAX_RETAINED_CARRIER_RECEIPTS: usize = 64;
+
 /// Upstream client that runs the full Parapet pipeline.
 pub struct EngineUpstreamClient {
     deps: EngineDeps,
     /// Opt-in effect-receipt runtime envelope; `None` unless explicitly attached.
     #[cfg(not(windows))]
     envelope: Option<Arc<RuntimeEnvelopeV0>>,
+    /// Bounded ring buffer (capacity [`MAX_RETAINED_CARRIER_RECEIPTS`]) of content-free
+    /// carrier receipts emitted for verified projected requests, ordered oldest-to-newest.
+    carrier_receipts:
+        std::sync::Mutex<std::collections::VecDeque<crate::provenance::CarrierReceipt>>,
 }
 
 impl EngineUpstreamClient {
+    /// Fixed capacity of the internal [`crate::provenance::CarrierReceipt`] store.
+    pub const MAX_RETAINED_CARRIER_RECEIPTS: usize = MAX_RETAINED_CARRIER_RECEIPTS;
+
     pub fn new_with(deps: EngineDeps) -> Self {
         Self {
             deps,
             #[cfg(not(windows))]
             envelope: None,
+            carrier_receipts: std::sync::Mutex::new(std::collections::VecDeque::with_capacity(
+                MAX_RETAINED_CARRIER_RECEIPTS,
+            )),
         }
     }
 
@@ -404,7 +421,45 @@ impl EngineUpstreamClient {
         Self {
             deps,
             envelope: Some(envelope),
+            carrier_receipts: std::sync::Mutex::new(std::collections::VecDeque::with_capacity(
+                MAX_RETAINED_CARRIER_RECEIPTS,
+            )),
         }
+    }
+
+    /// Snapshot of currently retained [`crate::provenance::CarrierReceipt`] records emitted by
+    /// `forward_verified` (at most [`MAX_RETAINED_CARRIER_RECEIPTS`], in oldest-to-newest
+    /// emission order), without removing them from the store.
+    pub fn carrier_receipts(&self) -> Vec<crate::provenance::CarrierReceipt> {
+        self.lock_carrier_receipts().iter().cloned().collect()
+    }
+
+    /// Drain and return all currently retained [`crate::provenance::CarrierReceipt`] records
+    /// emitted by `forward_verified` in oldest-to-newest emission order, leaving the internal
+    /// bounded store empty.
+    pub fn take_carrier_receipts(&self) -> Vec<crate::provenance::CarrierReceipt> {
+        self.lock_carrier_receipts().drain(..).collect()
+    }
+
+    /// The ring holds complete receipts only (every mutation is a single
+    /// `VecDeque` call), so a poisoned lock is recovered rather than
+    /// propagated: receipt emission runs on Drop/unwind paths and must not
+    /// panic a second time.
+    fn lock_carrier_receipts(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::VecDeque<crate::provenance::CarrierReceipt>>
+    {
+        self.carrier_receipts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn push_carrier_receipt(&self, receipt: crate::provenance::CarrierReceipt) {
+        let mut store = self.lock_carrier_receipts();
+        while store.len() >= MAX_RETAINED_CARRIER_RECEIPTS {
+            store.pop_front();
+        }
+        store.push_back(receipt);
     }
 }
 
@@ -433,6 +488,213 @@ enum InboundBasis<'a> {
     Projected(&'a [crate::provenance::ProjectedInput]),
 }
 
+/// Per-request projected scan state used to emit exactly one [`crate::provenance::CarrierReceipt`]
+/// on completion of `forward_verified` (Sensor Q2 / C1 / Q3).
+#[derive(Default)]
+struct ProjectedScanTracker {
+    l1_report: Option<crate::provenance::ScanReport>,
+    l1_enforced_block: bool,
+    l1_scan_error: bool,
+    l3_blocked: bool,
+    l3_positive_attributions: Vec<crate::provenance::Attribution>,
+    other_inbound_blocked: bool,
+    post_verify_scan_error: bool,
+    pre_scan_error: bool,
+}
+
+impl ProjectedScanTracker {
+    fn build_receipt(
+        &self,
+        verified: &crate::provenance::VerifiedCarrier,
+        inputs: &[crate::provenance::ProjectedInput],
+        l1_configured: bool,
+    ) -> crate::provenance::CarrierReceipt {
+        use crate::provenance::{CarrierReceipt, ProjectedL1DetectionRecord, ScanVerdict};
+
+        let l1_detection = if !l1_configured {
+            ProjectedL1DetectionRecord::not_configured(&verified.identity)
+        } else if self.pre_scan_error {
+            ProjectedL1DetectionRecord::not_evaluated(&verified.identity)
+        } else if self.l1_scan_error {
+            ProjectedL1DetectionRecord::scan_error(&verified.identity)
+        } else if let Some(ref report) = self.l1_report {
+            ProjectedL1DetectionRecord::from_report(&verified.identity, report)
+        } else {
+            ProjectedL1DetectionRecord::not_evaluated(&verified.identity)
+        };
+
+        let verdict = if self.pre_scan_error || self.l1_scan_error || self.post_verify_scan_error {
+            None
+        } else if self.l1_enforced_block || self.l3_blocked || self.other_inbound_blocked {
+            Some(ScanVerdict::Block)
+        } else {
+            Some(ScanVerdict::Allow)
+        };
+
+        let inputs_scored =
+            if self.pre_scan_error || (self.l1_scan_error && self.l1_report.is_none()) {
+                0
+            } else if let Some(ref report) = self.l1_report {
+                report.inputs_scored
+            } else if !self.post_verify_scan_error {
+                inputs.len()
+            } else {
+                0
+            };
+
+        let mut attributions = self
+            .l1_report
+            .as_ref()
+            .map(|r| r.positives.clone())
+            .unwrap_or_default();
+        for attr in &self.l3_positive_attributions {
+            if !attributions.contains(attr) {
+                attributions.push(attr.clone());
+            }
+        }
+
+        CarrierReceipt::verified_stage(verified, verdict, inputs_scored, attributions, l1_detection)
+    }
+
+    /// Receipt for a request whose future was dropped or unwound before the
+    /// stage 5.6 decision: no verdict was reached, and L1 is reported as
+    /// evaluated only if its scan actually completed.
+    fn build_interrupted_receipt(
+        &self,
+        verified: &crate::provenance::VerifiedCarrier,
+        l1_configured: bool,
+    ) -> crate::provenance::CarrierReceipt {
+        use crate::provenance::{CarrierReceipt, ProjectedL1DetectionRecord};
+
+        let l1_detection = match (&self.l1_report, l1_configured) {
+            (_, false) => ProjectedL1DetectionRecord::not_configured(&verified.identity),
+            (Some(report), true) => {
+                ProjectedL1DetectionRecord::from_report(&verified.identity, report)
+            }
+            (None, true) if self.l1_scan_error => {
+                ProjectedL1DetectionRecord::scan_error(&verified.identity)
+            }
+            (None, true) => ProjectedL1DetectionRecord::not_evaluated(&verified.identity),
+        };
+        let inputs_scored = self.l1_report.as_ref().map_or(0, |r| r.inputs_scored);
+        let mut attributions = self
+            .l1_report
+            .as_ref()
+            .map(|r| r.positives.clone())
+            .unwrap_or_default();
+        for attr in &self.l3_positive_attributions {
+            if !attributions.contains(attr) {
+                attributions.push(attr.clone());
+            }
+        }
+
+        CarrierReceipt::verified_stage(verified, None, inputs_scored, attributions, l1_detection)
+    }
+}
+
+/// RAII emitter guaranteeing exactly one [`crate::provenance::CarrierReceipt`]
+/// per verified request.
+///
+/// `forward_verified_with_sink` emits explicitly at the stage 5.6 decision
+/// point (or right after an earlier return), before any upstream I/O. If the
+/// request future is dropped (client cancellation, outer timeout) or unwinds
+/// first, `Drop` emits once from the latest tracker state instead. Both paths
+/// share [`Self::emit_with`], which marks the emitter spent before any side
+/// effect, so no path can emit twice.
+struct ProjectedReceiptEmitter<'a> {
+    engine: &'a EngineUpstreamClient,
+    verified: &'a crate::provenance::VerifiedCarrier,
+    inputs: &'a [crate::provenance::ProjectedInput],
+    sink: Option<&'a dyn crate::provenance::CarrierReceiptSink>,
+    request_id: String,
+    tracker: ProjectedScanTracker,
+    /// `Some` once emitted; holds the emitted L1 record for the response header.
+    emitted: Option<Option<crate::provenance::ProjectedL1DetectionRecord>>,
+}
+
+impl<'a> ProjectedReceiptEmitter<'a> {
+    fn new(
+        engine: &'a EngineUpstreamClient,
+        verified: &'a crate::provenance::VerifiedCarrier,
+        inputs: &'a [crate::provenance::ProjectedInput],
+        sink: Option<&'a dyn crate::provenance::CarrierReceiptSink>,
+        request_id: String,
+    ) -> Self {
+        Self {
+            engine,
+            verified,
+            inputs,
+            sink,
+            request_id,
+            tracker: ProjectedScanTracker::default(),
+            emitted: None,
+        }
+    }
+
+    /// Emit the decided receipt if not already emitted; returns the emitted
+    /// L1 detection record.
+    fn emit(&mut self) -> Option<&crate::provenance::ProjectedL1DetectionRecord> {
+        self.emit_with(false);
+        self.emitted.as_ref().and_then(Option::as_ref)
+    }
+
+    fn emit_with(&mut self, interrupted: bool) {
+        if self.emitted.is_some() {
+            return;
+        }
+        let l1_configured = self.engine.deps.config.policy.layers.l1.is_some();
+        let receipt = if interrupted {
+            self.tracker
+                .build_interrupted_receipt(self.verified, l1_configured)
+        } else {
+            self.tracker
+                .build_receipt(self.verified, self.inputs, l1_configured)
+        };
+        self.emitted = Some(receipt.l1_detection.clone());
+
+        tracing::info!(
+            request_id = %self.request_id,
+            layer = "provenance",
+            event = "carrier_receipt",
+            outcome = receipt.outcome.as_str(),
+            profile = %self.verified.identity.profile,
+            build = %self.verified.identity.build,
+            verdict = ?receipt.verdict,
+            inputs_scored = receipt.inputs_scored,
+            attributions = receipt.attributions.len(),
+            l1_status = ?receipt.l1_detection.as_ref().map(|d| d.status),
+            interrupted,
+            "carrier receipt emitted"
+        );
+
+        if let Some(sink) = self.sink {
+            // A panicking external sink must neither lose the internal record
+            // nor turn an in-progress unwind into an abort.
+            let recorded =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sink.record(&receipt)));
+            if recorded.is_err() {
+                tracing::error!(
+                    request_id = %self.request_id,
+                    layer = "provenance",
+                    event = "carrier_receipt_sink_panic",
+                    "carrier receipt sink panicked; receipt retained internally"
+                );
+            }
+        }
+        self.engine.push_carrier_receipt(receipt);
+    }
+}
+
+impl Drop for ProjectedReceiptEmitter<'_> {
+    fn drop(&mut self) {
+        if self.emitted.is_some() {
+            return;
+        }
+        // Never let emission panic out of Drop: during an unwind that aborts.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.emit_with(true)));
+    }
+}
+
 #[async_trait]
 impl UpstreamClient for EngineUpstreamClient {
     async fn forward(
@@ -440,7 +702,7 @@ impl UpstreamClient for EngineUpstreamClient {
         provider: Provider,
         request: ProxyRequest,
     ) -> Result<ProxyResponse, ProxyError> {
-        self.run_pipeline(provider, request, InboundBasis::WholeMessage)
+        self.run_pipeline(provider, request, InboundBasis::WholeMessage, None)
             .await
     }
 }
@@ -456,18 +718,30 @@ impl EngineUpstreamClient {
     pub async fn forward_verified(
         &self,
         provider: Provider,
+        request: ProxyRequest,
+        verified: &crate::provenance::VerifiedCarrier,
+    ) -> Result<ProxyResponse, ProxyError> {
+        self.forward_verified_with_sink(provider, request, verified, None)
+            .await
+    }
+
+    pub(crate) async fn forward_verified_with_sink(
+        &self,
+        provider: Provider,
         mut request: ProxyRequest,
         verified: &crate::provenance::VerifiedCarrier,
+        stage_sink: Option<&dyn crate::provenance::CarrierReceiptSink>,
     ) -> Result<ProxyResponse, ProxyError> {
         use crate::provenance::{geometry_of, project, treatment_of_verified, ProjectionKind};
 
         request.headers.remove(crate::provenance::PROVENANCE_HEADER);
         crate::proxy::strip_guard_trust_headers(&mut request.headers);
 
+        let req_id = request_id_from_headers(&request.headers);
         let inputs = project(&geometry_of(verified));
         let count_kind = |k: ProjectionKind| inputs.iter().filter(|i| i.kind == k).count();
         tracing::info!(
-            request_id = %request_id_from_headers(&request.headers),
+            request_id = %req_id,
             layer = "provenance",
             segments = verified.segments.len(),
             exempt_segments = verified
@@ -481,8 +755,31 @@ impl EngineUpstreamClient {
             "verified carrier projected"
         );
 
-        self.run_pipeline(provider, request, InboundBasis::Projected(&inputs))
-            .await
+        let mut emitter =
+            ProjectedReceiptEmitter::new(self, verified, &inputs, stage_sink, req_id.to_string());
+        let mut result = self
+            .run_pipeline(
+                provider,
+                request,
+                InboundBasis::Projected(&inputs),
+                Some(&mut emitter),
+            )
+            .await;
+
+        // Early returns before stage 5.6 land here without upstream I/O;
+        // otherwise this is a no-op returning the record emitted at 5.6.
+        let l1_det = emitter.emit();
+        if self.deps.emit_l1_signals {
+            if let (Ok(ref mut resp), Some(l1_det)) = (&mut result, l1_det) {
+                if let Ok(json) = serde_json::to_string(l1_det) {
+                    if let Ok(val) = json.parse() {
+                        resp.headers.insert("x-parapet-l1-signals", val);
+                    }
+                }
+            }
+        }
+
+        result
     }
 
     async fn run_pipeline(
@@ -490,7 +787,9 @@ impl EngineUpstreamClient {
         provider: Provider,
         request: ProxyRequest,
         basis: InboundBasis<'_>,
+        mut projected_receipt: Option<&mut ProjectedReceiptEmitter<'_>>,
     ) -> Result<ProxyResponse, ProxyError> {
+        let mut projected_tracker = projected_receipt.as_deref_mut().map(|e| &mut e.tracker);
         let adapter = self.deps.registry.adapter_for(provider);
 
         // Build request context for structured logging
@@ -518,6 +817,9 @@ impl EngineUpstreamClient {
         if let Some(envelope) = &self.envelope {
             if envelope.fixed_run_id().is_some() {
                 if is_streaming_request(&request.headers, &request.body) {
+                    if let Some(t) = projected_tracker.as_deref_mut() {
+                        t.pre_scan_error = true;
+                    }
                     return Ok(effect_runtime_error(
                         adapter.as_ref(),
                         StatusCode::BAD_REQUEST,
@@ -525,6 +827,9 @@ impl EngineUpstreamClient {
                     ));
                 }
                 if !envelope.claim_fixed_run() {
+                    if let Some(t) = projected_tracker.as_deref_mut() {
+                        t.pre_scan_error = true;
+                    }
                     return Ok(effect_runtime_error(
                         adapter.as_ref(),
                         StatusCode::CONFLICT,
@@ -538,6 +843,9 @@ impl EngineUpstreamClient {
         let mut messages = match adapter.parse_request(&request.body) {
             Ok(msgs) => msgs,
             Err(e) => {
+                if let Some(t) = projected_tracker.as_deref_mut() {
+                    t.pre_scan_error = true;
+                }
                 let body = adapter.serialize_error(&format!("invalid request: {e}"), 400);
                 return Ok(ProxyResponse::from_bytes(StatusCode::BAD_REQUEST, body));
             }
@@ -559,16 +867,22 @@ impl EngineUpstreamClient {
         let capture: Option<RequestCaptureV0> = match &self.envelope {
             Some(envelope) => {
                 if ctx.model.len() > 256 {
+                    if let Some(t) = projected_tracker.as_deref_mut() {
+                        t.pre_scan_error = true;
+                    }
                     let body =
                         adapter.serialize_error("invalid request: model exceeds 256 bytes", 400);
                     return Ok(ProxyResponse::from_bytes(StatusCode::BAD_REQUEST, body));
                 }
-                Some(envelope.capture(
-                    &messages,
-                    request.headers.get("x-request-id").map(|v| v.as_bytes()),
-                    &ctx.request_id,
-                    &ctx.model,
-                ))
+                let req_id_hdr = request.headers.get("x-request-id").map(|v| v.as_bytes());
+                Some(match basis {
+                    InboundBasis::WholeMessage => {
+                        envelope.capture(&messages, req_id_hdr, &ctx.request_id, &ctx.model)
+                    }
+                    InboundBasis::Projected(_) => {
+                        envelope.capture_projected(req_id_hdr, &ctx.request_id, &ctx.model)
+                    }
+                })
             }
             None => None,
         };
@@ -630,6 +944,9 @@ impl EngineUpstreamClient {
                         views
             }
                     Err(build_err) => {
+                        if let Some(t) = projected_tracker.as_deref_mut() {
+                            t.pre_scan_error = true;
+                        }
                         tracing::warn!(
                             request_id = %ctx.request_id,
                             contract_hash = %ctx.contract_hash,
@@ -679,6 +996,7 @@ impl EngineUpstreamClient {
                 adapter.as_ref(),
                 &ctx,
                 &mut pending_block,
+                projected_tracker.as_deref_mut(),
             ) {
                 return Ok(resp);
             }
@@ -931,6 +1249,9 @@ impl EngineUpstreamClient {
                             .any(|s| s.score >= l2a_config.block_threshold);
                         match (&l2a_config.mode, has_block) {
                             (L2aMode::Block, true) => {
+                                if let Some(t) = projected_tracker.as_deref_mut() {
+                                    t.other_inbound_blocked = true;
+                                }
                                 tracing::info!(
                                     request_id = %ctx.request_id,
                                     contract_hash = %ctx.contract_hash,
@@ -983,6 +1304,9 @@ impl EngineUpstreamClient {
                             &format!("scan error: {scan_err}"),
                             &ctx.request_id,
                         ) {
+                            if let Some(t) = projected_tracker.as_deref_mut() {
+                                t.post_verify_scan_error = true;
+                            }
                             return Ok(resp);
                         }
                     }
@@ -996,6 +1320,9 @@ impl EngineUpstreamClient {
                             &format!("scan panicked: {join_err}"),
                             &ctx.request_id,
                         ) {
+                            if let Some(t) = projected_tracker.as_deref_mut() {
+                                t.post_verify_scan_error = true;
+                            }
                             return Ok(resp);
                         }
                     }
@@ -1009,6 +1336,9 @@ impl EngineUpstreamClient {
                             &format!("scan timed out ({}ms)", l2a_config.timeout_ms),
                             &ctx.request_id,
                         ) {
+                            if let Some(t) = projected_tracker.as_deref_mut() {
+                                t.post_verify_scan_error = true;
+                            }
                             return Ok(resp);
                         }
                     }
@@ -1023,6 +1353,9 @@ impl EngineUpstreamClient {
                     "concurrency limit reached",
                     &ctx.request_id,
                 ) {
+                    if let Some(t) = projected_tracker.as_deref_mut() {
+                        t.post_verify_scan_error = true;
+                    }
                     return Ok(resp);
                 }
             }
@@ -1063,15 +1396,21 @@ impl EngineUpstreamClient {
                     inbound_result_opt = Some(result);
                 }
                 Ok(Ok(L3Outcome::Projected(result))) => {
+                    let proj_inputs = match basis {
+                        InboundBasis::Projected(inputs) => inputs,
+                        InboundBasis::WholeMessage => &[],
+                    };
                     // Projected-input attribution never enters message-indexed
                     // routing or signal records (W4c gate).
                     (evidence_count, evidence_categories) = self.apply_projected_l3(
                         &result,
+                        proj_inputs,
                         layer,
                         adapter.as_ref(),
                         &ctx,
                         l3i_ms,
                         &mut pending_block,
+                        projected_tracker.as_deref_mut(),
                     );
                 }
                 Ok(Err(dual_err @ InboundDualScanError::UnsupportedScanner)) => {
@@ -1083,6 +1422,9 @@ impl EngineUpstreamClient {
                         &format!("scan error: {dual_err}"),
                         &ctx.request_id,
                     ) {
+                        if let Some(t) = projected_tracker.as_deref_mut() {
+                            t.post_verify_scan_error = true;
+                        }
                         return Ok(resp);
                     }
                 }
@@ -1091,6 +1433,9 @@ impl EngineUpstreamClient {
                     | InboundDualScanError::MissingOriginalLength { .. }
                     | InboundDualScanError::MissingSourceMapping { .. }),
                 )) => {
+                    if let Some(t) = projected_tracker.as_deref_mut() {
+                        t.post_verify_scan_error = true;
+                    }
                     tracing::error!(
                         request_id = %ctx.request_id,
                         contract_hash = %ctx.contract_hash,
@@ -1118,6 +1463,9 @@ impl EngineUpstreamClient {
                         "scanner panicked",
                         &ctx.request_id,
                     ) {
+                        if let Some(t) = projected_tracker.as_deref_mut() {
+                            t.post_verify_scan_error = true;
+                        }
                         return Ok(resp);
                     }
                 }
@@ -1252,6 +1600,9 @@ impl EngineUpstreamClient {
                         "scanner panicked",
                         &ctx.request_id,
                     ) {
+                        if let Some(t) = projected_tracker.as_deref_mut() {
+                            t.post_verify_scan_error = true;
+                        }
                         return Ok(resp);
                     }
                 }
@@ -1266,6 +1617,9 @@ impl EngineUpstreamClient {
 
             match &l4_result.verdict {
                 L4Verdict::Block { reason } if l4_config.mode == L4Mode::Block => {
+                    if let Some(t) = projected_tracker.as_deref_mut() {
+                        t.other_inbound_blocked = true;
+                    }
                     tracing::info!(
                         request_id = %ctx.request_id,
                         contract_hash = %ctx.contract_hash,
@@ -1360,6 +1714,11 @@ impl EngineUpstreamClient {
 
         // 5.6) Collect-then-decide: if any inbound layer blocked, return now.
         // All layers have run and logged their signals — the first blocker wins.
+        // The verified-carrier receipt is final here and is emitted before
+        // any upstream I/O, so cancellation past this point cannot lose it.
+        if let Some(emitter) = projected_receipt.as_deref_mut() {
+            emitter.emit();
+        }
         if let Some(mut resp) = pending_block {
             attach_evidence_headers(&mut resp.headers, evidence_count, &evidence_categories);
             if self.deps.emit_l1_signals {
@@ -1505,11 +1864,13 @@ impl EngineUpstreamClient {
     fn apply_projected_l3(
         &self,
         result: &projected::ProjectedL3Result,
+        inputs: &[crate::provenance::ProjectedInput],
         layer: &crate::config::LayerConfig,
         adapter: &dyn ProviderAdapter,
         ctx: &RequestContext,
         l3i_ms: f64,
         pending_block: &mut Option<ProxyResponse>,
+        mut tracker: Option<&mut ProjectedScanTracker>,
     ) -> (usize, Vec<String>) {
         let evidence: Vec<_> = result
             .matches
@@ -1548,6 +1909,21 @@ impl EngineUpstreamClient {
                             ("tool_call_argument", None, None, Some(*message_index))
                         }
                     };
+                if let Some(t) = tracker.as_deref_mut() {
+                    if enforced {
+                        t.l3_blocked = true;
+                    }
+                    if let Some(idx) = projected_input_index {
+                        if let Some(inp) = inputs.get(idx) {
+                            t.l3_positive_attributions
+                                .push(crate::provenance::Attribution {
+                                    kind: inp.kind,
+                                    spans: inp.spans.clone(),
+                                    separator_positions: inp.separator_positions.clone(),
+                                });
+                        }
+                    }
+                }
                 tracing::info!(
                     request_id = %ctx.request_id,
                     contract_hash = %ctx.contract_hash,
@@ -1606,12 +1982,17 @@ impl EngineUpstreamClient {
         adapter: &dyn ProviderAdapter,
         ctx: &RequestContext,
         pending_block: &mut Option<ProxyResponse>,
+        mut tracker: Option<&mut ProjectedScanTracker>,
     ) -> Option<ProxyResponse> {
         use crate::provenance::{scan, DualViewScorer, ScanVerdict};
 
         let Some(model) = &self.deps.l1_model else {
             // The ensemble scanner has no projected scorer; never fall back
             // to whole-message scanning across exempt bytes.
+            if let Some(t) = tracker.as_deref_mut() {
+                t.l1_scan_error = true;
+                t.post_verify_scan_error = true;
+            }
             tracing::error!(
                 request_id = %ctx.request_id,
                 contract_hash = %ctx.contract_hash,
@@ -1637,6 +2018,9 @@ impl EngineUpstreamClient {
                 let positive_kinds: Vec<_> = report.positives.iter().map(|a| a.kind).collect();
                 match report.verdict {
                     ScanVerdict::Block if l1_config.mode == crate::config::L1Mode::Block => {
+                        if let Some(t) = tracker.as_deref_mut() {
+                            t.l1_enforced_block = true;
+                        }
                         tracing::info!(
                             request_id = %ctx.request_id,
                             contract_hash = %ctx.contract_hash,
@@ -1684,9 +2068,16 @@ impl EngineUpstreamClient {
                         );
                     }
                 }
+                if let Some(t) = tracker.as_deref_mut() {
+                    t.l1_report = Some(report);
+                }
                 None
             }
             Ok(Err(scan_err)) => {
+                if let Some(t) = tracker.as_deref_mut() {
+                    t.l1_scan_error = true;
+                    t.post_verify_scan_error = true;
+                }
                 tracing::error!(
                     request_id = %ctx.request_id,
                     contract_hash = %ctx.contract_hash,
@@ -1700,14 +2091,20 @@ impl EngineUpstreamClient {
                 );
                 Some(layer_error_503(adapter, "L1", "scan_error"))
             }
-            Err(_) => handle_layer_error(
-                &self.deps.config.runtime.engine.on_failure,
-                adapter,
-                "L1",
-                "scanner_panic",
-                "scanner panicked",
-                &ctx.request_id,
-            ),
+            Err(_) => {
+                if let Some(t) = tracker.as_deref_mut() {
+                    t.l1_scan_error = true;
+                    t.post_verify_scan_error = true;
+                }
+                handle_layer_error(
+                    &self.deps.config.runtime.engine.on_failure,
+                    adapter,
+                    "L1",
+                    "scanner_panic",
+                    "scanner panicked",
+                    &ctx.request_id,
+                )
+            }
         }
     }
 

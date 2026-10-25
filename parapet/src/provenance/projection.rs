@@ -482,6 +482,8 @@ pub struct ScanReport {
     pub verdict: ScanVerdict,
     pub inputs_scored: usize,
     pub positives: Vec<Attribution>,
+    pub positive_projected_input_indices: Vec<usize>,
+    pub positive_projected_unit_indices: Vec<usize>,
 }
 
 /// Score every input; any positive blocks. Inputs never suppress each other.
@@ -491,13 +493,27 @@ pub fn scan(
     scorer: &dyn ProjectionScorer,
 ) -> Result<ScanReport, ProjectionScanError> {
     let mut positives = Vec::new();
-    for input in inputs {
+    let mut positive_projected_input_indices = Vec::new();
+    let mut positive_projected_unit_indices = Vec::new();
+    let mut unit_index = 0usize;
+    for (input_index, input) in inputs.iter().enumerate() {
+        let current_unit_index = if input.kind == ProjectionKind::Unit {
+            let idx = unit_index;
+            unit_index += 1;
+            Some(idx)
+        } else {
+            None
+        };
         if scorer.is_positive(input)? {
             positives.push(Attribution {
                 kind: input.kind,
                 spans: input.spans.clone(),
                 separator_positions: input.separator_positions.clone(),
             });
+            positive_projected_input_indices.push(input_index);
+            if let Some(u_idx) = current_unit_index {
+                positive_projected_unit_indices.push(u_idx);
+            }
         }
     }
     Ok(ScanReport {
@@ -508,5 +524,7 @@ pub fn scan(
         },
         inputs_scored: inputs.len(),
         positives,
+        positive_projected_input_indices,
+        positive_projected_unit_indices,
     })
 }

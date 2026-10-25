@@ -2191,3 +2191,1200 @@ async fn w4c2b_anthropic_array_system_projected_stage_geometry_with_synthetic_ma
         assert_eq!(rig.sender.calls(), 0);
     }
 }
+
+// ---------------------------------------------------------------------------
+// W4c3: One CarrierReceipt per verified request + C1/Q2/Q3 effect truth
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct RecordingReceiptSink {
+    receipts: Mutex<Vec<CarrierReceipt>>,
+}
+
+impl CarrierReceiptSink for RecordingReceiptSink {
+    fn record(&self, receipt: &CarrierReceipt) {
+        self.receipts.lock().unwrap().push(receipt.clone());
+    }
+}
+
+fn rig_with_l1_signals(yaml: &str, model: Option<Arc<dyn L1Model>>) -> Rig {
+    let config = load_config(&StringSource {
+        content: yaml.to_string(),
+    })
+    .expect("valid test config");
+    let config = Arc::new(config);
+    let sender = Arc::new(CapturingHttpSender::default());
+    let deps = EngineDeps {
+        config,
+        http: sender.clone(),
+        resolver: Arc::new(DummyResolver),
+        registry: Arc::new(DefaultProviderRegistry),
+        normalizer: Arc::new(L0Normalizer::new()),
+        trust_assigner: Arc::new(RoleTrustAssigner),
+        l1_scanner: None,
+        l1_model: model,
+        l2a_scanner: None,
+        l2a_semaphore: None,
+        inbound_scanner: Arc::new(DefaultInboundScanner::new()),
+        constraint_evaluator: Arc::new(DslConstraintEvaluator::new()),
+        output_scanner: Arc::new(L5aScanner),
+        session_store: None,
+        multi_turn_scanner: None,
+        orthogonal_sensor_router: Arc::new(NoopOrthogonalSensorRouter::new()),
+        signal_extractor: Arc::new(DefaultSignalExtractor::new()),
+        verdict_combiner: Arc::new(DefaultVerdictCombiner::new()),
+        emit_l1_signals: true,
+    };
+    Rig {
+        engine: Arc::new(EngineUpstreamClient::new_with(deps)),
+        sender,
+    }
+}
+
+fn signed_request_seq(messages: &[Msg<'_>], sequence: u64) -> Request<Body> {
+    let body = chat_body(wire_messages(messages, |_, _| {}));
+    let mut segments = Vec::new();
+    for (mi, (_, parts)) in messages.iter().enumerate() {
+        let mut offset = 0;
+        for (text, source) in parts {
+            segments.push(Segment {
+                message_index: mi,
+                start: offset,
+                end: offset + text.len(),
+                source: *source,
+                sha256: Sha256Digest::of(text.as_bytes()),
+            });
+            offset += text.len();
+        }
+    }
+    let source_map = SourceMap { segments };
+    let mut env = CarrierEnvelope {
+        schema_version: SCHEMA_VERSION_V1,
+        profile: PROFILE_ID.to_string(),
+        build: BUILD_ID.to_string(),
+        session_id: SESSION_ID.to_string(),
+        sequence,
+        issued_at_ms: NOW_MS - 1_000,
+        expires_at_ms: NOW_MS + 10_000,
+        request_body_sha256: Sha256Digest::of(&body),
+        source_map_sha256: source_map.canonical_digest(),
+        source_map,
+        authenticator: Authenticator::from_bytes(vec![0u8; 32]),
+    };
+    let tag = HmacSha256Authenticator::new(SessionKey::from_bytes(KEY)).tag(&env.signed_payload());
+    env.authenticator = Authenticator::from_bytes(tag.to_vec());
+
+    Request::builder()
+        .method(Method::POST)
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer test-upstream-key")
+        .header(PROVENANCE_HEADER, serde_json::to_vec(&env).unwrap())
+        .body(Body::from(body))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn w4c3_verified_allow_emits_single_receipt_with_profile_build_and_projected_l1_record() {
+    let rig = rig_with_l1_signals(FULL_YAML, Some(Arc::new(TriggerModel)));
+    let sink = Arc::new(RecordingReceiptSink::default());
+    let stage = Arc::new(ProjectedEngineStage::with_receipt_sink(
+        rig.engine.clone(),
+        sink.clone(),
+    ));
+    let router = build_router_with_admission(
+        rig.engine.clone(),
+        Arc::new(CarrierRequestAdmitter::required_opencode(verifier())),
+        Some(stage.clone()),
+    );
+
+    let agent_rule = "Repository rule: keep tests green.\n";
+    let user_text = "Please summarize the module structure.";
+    let resp = router
+        .oneshot(signed_request(&[
+            ("system", vec![(VENDOR_HOSTILE, Source::VendorStatic), (agent_rule, Source::ConfiguredAgent)]),
+            ("user", vec![(user_text, Source::User)]),
+        ]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(rig.sender.calls(), 1);
+
+    let stage_receipts = stage.receipts();
+    let sink_receipts = sink.receipts.lock().unwrap().clone();
+    assert_eq!(stage_receipts.len(), 1);
+    assert_eq!(sink_receipts, stage_receipts);
+
+    let receipt = &stage_receipts[0];
+    assert_eq!(receipt.outcome, VerificationOutcome::Verified);
+    assert_eq!(
+        receipt.identity,
+        Some(CarrierIdentity {
+            schema_version: SCHEMA_VERSION_V1,
+            profile: PROFILE_ID.to_string(),
+            build: BUILD_ID.to_string(),
+        })
+    );
+    assert_eq!(receipt.verdict, Some(ScanVerdict::Allow));
+    assert_eq!(receipt.inputs_scored, 4); // 2 units + 1 boundary + 1 aggregate
+    assert!(receipt.attributions.is_empty());
+
+    // F18: only exempt vendor_static carries sha256; untrusted segments have sha256: None.
+    assert_eq!(receipt.segments.len(), 3);
+    assert_eq!(
+        receipt.segments[0].sha256,
+        Some(Sha256Digest::of(VENDOR_HOSTILE.as_bytes()))
+    );
+    assert!(!receipt.segments[0].scanned);
+    assert_eq!(
+        receipt.segments[0].exemption,
+        Some(ExemptionReason::VendorStaticAttested)
+    );
+    for seg in &receipt.segments[1..] {
+        assert_eq!(seg.sha256, None);
+        assert!(seg.scanned);
+        assert_eq!(seg.exemption, None);
+    }
+
+    // Q3: projected L1 detection/effect record is explicitly present and never masquerades as message_index.
+    let l1_det = receipt.l1_detection.as_ref().expect("projected L1 record must be present");
+    assert_eq!(l1_det.basis, ProjectedL1Basis::Projected);
+    assert_eq!(l1_det.identity.profile, PROFILE_ID);
+    assert_eq!(l1_det.identity.build, BUILD_ID);
+    assert_eq!(l1_det.status, ProjectedL1Status::EvaluatedSignalsNotRecorded);
+    assert!(!l1_det.signals_recorded);
+    assert_eq!(l1_det.inputs_scored, 4);
+    assert_eq!(l1_det.verdict, Some(ScanVerdict::Allow));
+    assert!(l1_det.positive_projected_input_indices.is_empty());
+    assert!(l1_det.positive_projected_unit_indices.is_empty());
+
+    // When emit_l1_signals is enabled, x-parapet-l1-signals is not silently absent and never uses message_index.
+    let hdr = header(&resp, "x-parapet-l1-signals").expect("x-parapet-l1-signals must not be silently absent");
+    assert!(!hdr.contains("message_index"), "projected L1 header must not masquerade as message_index: {hdr}");
+    let parsed_hdr: Value = serde_json::from_str(hdr).unwrap();
+    assert_eq!(parsed_hdr["basis"], "projected");
+    assert_eq!(parsed_hdr["status"], "evaluated_signals_not_recorded");
+    assert_eq!(parsed_hdr["signals_recorded"], false);
+    assert_eq!(parsed_hdr["identity"]["profile"], PROFILE_ID);
+    assert_eq!(parsed_hdr["identity"]["build"], BUILD_ID);
+    assert_eq!(parsed_hdr["verdict"], "allow");
+}
+
+#[tokio::test]
+async fn w4c3_projected_l1_block_emits_single_receipt_with_projected_unit_index_and_no_message_index_masquerade() {
+    let rig = rig_with_l1_signals(FULL_YAML, Some(Arc::new(TriggerModel)));
+    // Message 0 is purely exempt VendorStatic (0 untrusted units), so Message 1's User
+    // segment is at message_index == 1 but projected_unit_index == 0.
+    let resp = app(&rig)
+        .oneshot(signed_request(&[
+            ("system", vec![(VENDOR_BENIGN, Source::VendorStatic)]),
+            ("user", vec![(L1_TRIGGER, Source::User)]),
+        ]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(header(&resp, "x-parapet-blocked-by"), Some("L1"));
+    assert_eq!(rig.sender.calls(), 0);
+
+    let receipts = rig.engine.carrier_receipts();
+    assert_eq!(receipts.len(), 1);
+    let receipt = &receipts[0];
+    assert_eq!(receipt.outcome, VerificationOutcome::Verified);
+    assert_eq!(
+        receipt.identity,
+        Some(CarrierIdentity {
+            schema_version: SCHEMA_VERSION_V1,
+            profile: PROFILE_ID.to_string(),
+            build: BUILD_ID.to_string(),
+        })
+    );
+    assert_eq!(receipt.verdict, Some(ScanVerdict::Block));
+    assert_eq!(receipt.inputs_scored, 1); // 1 unit (aggregate is None for <2 untrusted units)
+    assert_eq!(receipt.attributions.len(), 1);
+    assert_eq!(receipt.attributions[0].kind, ProjectionKind::Unit);
+    assert_eq!(receipt.attributions[0].spans[0].message_index, 1);
+
+    let l1_det = receipt.l1_detection.as_ref().expect("projected L1 record must be present");
+    assert_eq!(l1_det.basis, ProjectedL1Basis::Projected);
+    assert_eq!(l1_det.identity.profile, PROFILE_ID);
+    assert_eq!(l1_det.identity.build, BUILD_ID);
+    assert_eq!(l1_det.status, ProjectedL1Status::EvaluatedSignalsNotRecorded);
+    assert!(!l1_det.signals_recorded);
+    assert_eq!(l1_det.verdict, Some(ScanVerdict::Block));
+    // Message is at message_index 1, but projected unit is at index 0.
+    assert_eq!(l1_det.positive_projected_unit_indices, vec![0]);
+    assert_eq!(l1_det.positive_projected_input_indices, vec![0]);
+
+    let hdr = header(&resp, "x-parapet-l1-signals").expect("x-parapet-l1-signals must be present on projected L1 block");
+    assert!(!hdr.contains("message_index"), "projected L1 header must not contain message_index: {hdr}");
+    let parsed_hdr: Value = serde_json::from_str(hdr).unwrap();
+    assert_eq!(parsed_hdr["basis"], "projected");
+    assert_eq!(parsed_hdr["verdict"], "block");
+    assert_eq!(parsed_hdr["positive_projected_unit_indices"], json!([0]));
+}
+
+#[tokio::test]
+async fn w4c3_projected_l3_block_emits_single_receipt_and_truthful_projected_l1_record() {
+    // Case A: Both L1 and L3 enabled; L1 allows, L3 blocks.
+    let rig_full = rig();
+    let resp_full = app(&rig_full)
+        .oneshot(signed_request(&[
+            benign_system("Repository rule: keep tests green.\n"),
+            ("user", vec![(L3_TRIGGER, Source::User)]),
+        ]))
+        .await
+        .unwrap();
+    assert_eq!(resp_full.status(), StatusCode::FORBIDDEN);
+    assert_eq!(header(&resp_full, "x-parapet-blocked-by"), Some("L3-inbound"));
+    assert_eq!(rig_full.sender.calls(), 0);
+
+    let receipts_full = rig_full.engine.carrier_receipts();
+    assert_eq!(receipts_full.len(), 1);
+    let r_full = &receipts_full[0];
+    assert_eq!(r_full.outcome, VerificationOutcome::Verified);
+    assert_eq!(r_full.identity.as_ref().unwrap().profile, PROFILE_ID);
+    assert_eq!(r_full.identity.as_ref().unwrap().build, BUILD_ID);
+    assert_eq!(r_full.verdict, Some(ScanVerdict::Block));
+    assert!(!r_full.attributions.is_empty());
+    let l1_full = r_full.l1_detection.as_ref().unwrap();
+    assert_eq!(l1_full.status, ProjectedL1Status::EvaluatedSignalsNotRecorded);
+    assert_eq!(l1_full.verdict, Some(ScanVerdict::Allow));
+    assert!(l1_full.positive_projected_unit_indices.is_empty());
+
+    // Case B: L3-only policy (L1 not configured); L3 blocks.
+    let rig_l3 = rig_with(L3_ONLY_YAML, None, Arc::new(L0Normalizer::new()));
+    let resp_l3 = app(&rig_l3)
+        .oneshot(signed_request(&[
+            benign_system("Repository rule: keep tests green.\n"),
+            ("user", vec![(L3_TRIGGER, Source::User)]),
+        ]))
+        .await
+        .unwrap();
+    assert_eq!(resp_l3.status(), StatusCode::FORBIDDEN);
+    assert_eq!(header(&resp_l3, "x-parapet-blocked-by"), Some("L3-inbound"));
+
+    let receipts_l3 = rig_l3.engine.carrier_receipts();
+    assert_eq!(receipts_l3.len(), 1);
+    let r_l3 = &receipts_l3[0];
+    assert_eq!(r_l3.outcome, VerificationOutcome::Verified);
+    assert_eq!(r_l3.verdict, Some(ScanVerdict::Block));
+    let l1_l3 = r_l3.l1_detection.as_ref().unwrap();
+    assert_eq!(l1_l3.status, ProjectedL1Status::NotConfigured);
+    assert_eq!(l1_l3.verdict, None);
+    assert!(!l1_l3.signals_recorded);
+}
+
+#[tokio::test]
+async fn w4c3_post_verify_scan_error_emits_single_verified_receipt_with_scan_error_status() {
+    // 1. Invisible-only untrusted segment fails closed in projected L1 (503 scan_error).
+    let rig_l1 = rig();
+    assert_scan_error(&rig_l1, invisible_only_request(), "L1").await;
+    let receipts_l1 = rig_l1.engine.carrier_receipts();
+    assert_eq!(receipts_l1.len(), 1);
+    let r_l1 = &receipts_l1[0];
+    assert_eq!(r_l1.outcome, VerificationOutcome::Verified);
+    assert_eq!(
+        r_l1.identity,
+        Some(CarrierIdentity {
+            schema_version: SCHEMA_VERSION_V1,
+            profile: PROFILE_ID.to_string(),
+            build: BUILD_ID.to_string(),
+        })
+    );
+    assert_eq!(r_l1.verdict, None);
+    assert_eq!(r_l1.inputs_scored, 0);
+    assert!(r_l1.attributions.is_empty());
+    let l1_det = r_l1.l1_detection.as_ref().unwrap();
+    assert_eq!(l1_det.status, ProjectedL1Status::ScanError);
+    assert_eq!(l1_det.verdict, None);
+    assert!(!l1_det.signals_recorded);
+
+    // 2. Non-finite L1 score fails closed in projected L1 (503 scan_error) and emits 1 receipt.
+    let rig_nan = rig_with(FULL_YAML, Some(Arc::new(NanModel)), Arc::new(L0Normalizer::new()));
+    let req_nan = signed_request(&[
+        benign_system("Repository rule: keep tests green.\n"),
+        ("user", vec![("Please review the change.", Source::User)]),
+    ]);
+    assert_scan_error(&rig_nan, req_nan, "L1").await;
+    let receipts_nan = rig_nan.engine.carrier_receipts();
+    assert_eq!(receipts_nan.len(), 1);
+    assert_eq!(receipts_nan[0].verdict, None);
+    assert_eq!(
+        receipts_nan[0].l1_detection.as_ref().unwrap().status,
+        ProjectedL1Status::ScanError
+    );
+
+    // 3. Invisible-only untrusted segment in L3-only mode fails closed in projected L3 (503 scan_error) and emits 1 receipt.
+    let rig_l3 = rig_with(L3_ONLY_YAML, None, Arc::new(L0Normalizer::new()));
+    assert_scan_error(&rig_l3, invisible_only_request(), "L3-inbound").await;
+    let receipts_l3 = rig_l3.engine.carrier_receipts();
+    assert_eq!(receipts_l3.len(), 1);
+    assert_eq!(receipts_l3[0].outcome, VerificationOutcome::Verified);
+    assert_eq!(receipts_l3[0].verdict, None);
+    assert_eq!(
+        receipts_l3[0].l1_detection.as_ref().unwrap().status,
+        ProjectedL1Status::NotConfigured
+    );
+}
+
+#[tokio::test]
+async fn w4c3_ordinary_mode_parity_preserves_output_receipts_and_contract_hash() {
+    let cfg_a = load_config(&StringSource {
+        content: FULL_YAML.to_string(),
+    })
+    .unwrap();
+    let cfg_b = load_config(&StringSource {
+        content: FULL_YAML.to_string(),
+    })
+    .unwrap();
+    assert_eq!(cfg_a.contract_hash, cfg_b.contract_hash);
+
+    let rig_plain = rig_with_l1_signals(FULL_YAML, Some(Arc::new(TriggerModel)));
+    let rig_adm = rig_with_l1_signals(FULL_YAML, Some(Arc::new(TriggerModel)));
+
+    let router_plain = build_router(rig_plain.engine.clone());
+    let router_adm = build_router_with_admission(
+        rig_adm.engine.clone(),
+        Arc::new(CarrierRequestAdmitter::new(ProfileMode::Ordinary, verifier())),
+        Some(Arc::new(ProjectedEngineStage::new(rig_adm.engine.clone()))),
+    );
+
+    for (sys, usr, expect_status) in [
+        ("You are helpful.", "Hello world.", StatusCode::OK),
+        ("You are helpful.", L1_TRIGGER, StatusCode::FORBIDDEN),
+        ("You are helpful.", L3_TRIGGER, StatusCode::FORBIDDEN),
+    ] {
+        let make_req = || {
+            let body = serde_json::to_vec(&json!({
+                "model": "gpt-4o",
+                "messages": [
+                    {"role": "system", "content": sys},
+                    {"role": "user", "content": usr},
+                ]
+            }))
+            .unwrap();
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("x-request-id", "req-parity-fixed")
+                .body(Body::from(body))
+                .unwrap()
+        };
+
+        let resp_plain = router_plain.clone().oneshot(make_req()).await.unwrap();
+        let resp_adm = router_adm.clone().oneshot(make_req()).await.unwrap();
+        assert_eq!(resp_plain.status(), expect_status);
+        assert_eq!(resp_adm.status(), expect_status);
+
+        // Ordinary mode x-parapet-l1-signals still uses message_index and is byte-identical.
+        let sig_plain = header(&resp_plain, "x-parapet-l1-signals").unwrap().to_string();
+        let sig_adm = header(&resp_adm, "x-parapet-l1-signals").unwrap().to_string();
+        assert!(sig_plain.contains("message_index"));
+        assert_eq!(sig_plain, sig_adm);
+
+        let body_plain = axum::body::to_bytes(resp_plain.into_body(), 64 * 1024).await.unwrap();
+        let body_adm = axum::body::to_bytes(resp_adm.into_body(), 64 * 1024).await.unwrap();
+        assert_eq!(body_plain, body_adm);
+    }
+
+    // Ordinary mode never emits CarrierReceipt records.
+    assert!(rig_plain.engine.carrier_receipts().is_empty());
+    assert!(rig_adm.engine.carrier_receipts().is_empty());
+}
+
+#[tokio::test]
+async fn w4c3_exactly_one_receipt_per_verified_request_and_zero_on_pre_verify_reject() {
+    let rig = rig();
+    let stage = Arc::new(ProjectedEngineStage::new(rig.engine.clone()));
+    let router = build_router_with_admission(
+        rig.engine.clone(),
+        Arc::new(CarrierRequestAdmitter::required_opencode(verifier())),
+        Some(stage.clone()),
+    );
+
+    // 1. Pre-verify reject (missing carrier header) -> 0 receipts.
+    let unauthenticated = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "model": "gpt-4o",
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp0 = router.clone().oneshot(unauthenticated).await.unwrap();
+    assert_eq!(resp0.status(), StatusCode::FORBIDDEN);
+    assert_eq!(stage.receipts().len(), 0);
+
+    // 2. Pre-verify reject (tampered body -> body_digest_mismatch) -> still 0 receipts.
+    let mut tampered = signed_request_seq(
+        &[
+            benign_system("Repository rule: keep tests green.\n"),
+            ("user", vec![("Hello", Source::User)]),
+        ],
+        10,
+    );
+    *tampered.body_mut() = Body::from(
+        serde_json::to_vec(&json!({
+            "model": "gpt-4o-mini",
+            "messages": [
+                {"role": "system", "content": format!("{VENDOR_BENIGN}Repository rule: keep tests green.\n")},
+                {"role": "user", "content": "Tampered"}
+            ]
+        }))
+        .unwrap(),
+    );
+    let resp_tampered = router.clone().oneshot(tampered).await.unwrap();
+    assert_eq!(resp_tampered.status(), StatusCode::FORBIDDEN);
+    assert_eq!(stage.receipts().len(), 0);
+
+    // 3. Verified allow -> exactly 1 receipt (total = 1).
+    let resp1 = router
+        .clone()
+        .oneshot(signed_request_seq(
+            &[
+                benign_system("Repository rule: keep tests green.\n"),
+                ("user", vec![("Benign question.", Source::User)]),
+            ],
+            11,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp1.status(), StatusCode::OK);
+    assert_eq!(stage.receipts().len(), 1);
+    assert_eq!(stage.receipts()[0].verdict, Some(ScanVerdict::Allow));
+
+    // 4. Simultaneous L1 + L3 block on the same verified request -> still emits ONE receipt (total = 2, never 3).
+    let both_triggers = format!("{L1_TRIGGER} and {L3_TRIGGER}");
+    let resp2 = router
+        .clone()
+        .oneshot(signed_request_seq(
+            &[
+                benign_system("Repository rule: keep tests green.\n"),
+                ("user", vec![(both_triggers.as_str(), Source::User)]),
+            ],
+            12,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp2.status(), StatusCode::FORBIDDEN);
+    assert_eq!(stage.receipts().len(), 2);
+    assert_eq!(stage.receipts()[1].verdict, Some(ScanVerdict::Block));
+    assert_eq!(
+        stage.receipts()[1].l1_detection.as_ref().unwrap().verdict,
+        Some(ScanVerdict::Block)
+    );
+
+    // 5. Verified L3-only block -> emits ONE receipt (total = 3).
+    let resp3 = router
+        .clone()
+        .oneshot(signed_request_seq(
+            &[
+                benign_system("Repository rule: keep tests green.\n"),
+                ("user", vec![(L3_TRIGGER, Source::User)]),
+            ],
+            13,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp3.status(), StatusCode::FORBIDDEN);
+    assert_eq!(stage.receipts().len(), 3);
+    assert_eq!(stage.receipts()[2].verdict, Some(ScanVerdict::Block));
+    assert_eq!(
+        stage.receipts()[2].l1_detection.as_ref().unwrap().verdict,
+        Some(ScanVerdict::Allow)
+    );
+
+    // 6. Verified post-verify scan_error -> emits ONE receipt (total = 4).
+    let resp4 = router
+        .clone()
+        .oneshot(signed_request_seq(
+            &[
+                benign_system("Repository rule: keep tests green.\n"),
+                ("user", vec![("\u{200B}\u{200C}\u{2060}", Source::User)]),
+            ],
+            14,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp4.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(stage.receipts().len(), 4);
+    assert_eq!(stage.receipts()[3].verdict, None);
+    assert_eq!(
+        stage.receipts()[3].l1_detection.as_ref().unwrap().status,
+        ProjectedL1Status::ScanError
+    );
+}
+
+#[tokio::test]
+async fn w4c3_negative_content_leak_on_verified_and_rejected_paths() {
+    let canary_agent = "CANARY_W4C3_AGENT_SECRET_TEXT";
+    let canary_repo = "CANARY_W4C3_REPO_SECRET_TEXT";
+    let canary_user = "CANARY_W4C3_USER_SECRET_TEXT";
+    let canary_attacker_profile = "CANARY-ATTACKER-PROFILE-CLAIM";
+    let canary_attacker_build = "CANARY-ATTACKER-BUILD-CLAIM";
+
+    let rig = rig_with_l1_signals(FULL_YAML, Some(Arc::new(TriggerModel)));
+    let stage = Arc::new(ProjectedEngineStage::new(rig.engine.clone()));
+    let router = build_router_with_admission(
+        rig.engine.clone(),
+        Arc::new(CarrierRequestAdmitter::required_opencode(verifier())),
+        Some(stage.clone()),
+    );
+
+    let user_block = format!("{canary_user} {L1_TRIGGER} {L3_TRIGGER}");
+    for (seq, user_payload) in [(21u64, canary_user), (22u64, user_block.as_str())] {
+        let _ = router
+            .clone()
+            .oneshot(signed_request_seq(
+                &[
+                    (
+                        "system",
+                        vec![
+                            (VENDOR_BENIGN, Source::VendorStatic),
+                            (canary_agent, Source::ConfiguredAgent),
+                            (canary_repo, Source::Repository),
+                        ],
+                    ),
+                    ("user", vec![(user_payload, Source::User)]),
+                ],
+                seq,
+            ))
+            .await
+            .unwrap();
+    }
+
+    // Also construct a pre-verify rejection with attacker-claimed profile and build strings.
+    let body = serde_json::to_vec(&json!({
+        "model": "gpt-4o-mini",
+        "messages": [
+            {"role": "system", "content": format!("{VENDOR_BENIGN}{canary_agent}")},
+            {"role": "user", "content": canary_user},
+        ]
+    }))
+    .unwrap();
+    let segs = vec![
+        Segment {
+            message_index: 0,
+            start: 0,
+            end: VENDOR_BENIGN.len(),
+            source: Source::VendorStatic,
+            sha256: Sha256Digest::of(VENDOR_BENIGN.as_bytes()),
+        },
+        Segment {
+            message_index: 0,
+            start: VENDOR_BENIGN.len(),
+            end: VENDOR_BENIGN.len() + canary_agent.len(),
+            source: Source::ConfiguredAgent,
+            sha256: Sha256Digest::of(canary_agent.as_bytes()),
+        },
+        Segment {
+            message_index: 1,
+            start: 0,
+            end: canary_user.len(),
+            source: Source::User,
+            sha256: Sha256Digest::of(canary_user.as_bytes()),
+        },
+    ];
+    let source_map = SourceMap { segments: segs };
+    let mut forged_env = CarrierEnvelope {
+        schema_version: SCHEMA_VERSION_V1,
+        profile: canary_attacker_profile.to_string(),
+        build: canary_attacker_build.to_string(),
+        session_id: SESSION_ID.to_string(),
+        sequence: 99,
+        issued_at_ms: NOW_MS,
+        expires_at_ms: NOW_MS + 30_000,
+        request_body_sha256: Sha256Digest::of(&body),
+        source_map_sha256: source_map.canonical_digest(),
+        authenticator: Authenticator::from_bytes(vec![0u8; 32]),
+        source_map,
+    };
+    let tag = HmacSha256Authenticator::new(SessionKey::from_bytes(KEY)).tag(&forged_env.signed_payload());
+    forged_env.authenticator = Authenticator::from_bytes(tag.to_vec());
+    let forged_bytes = serde_json::to_vec(&forged_env).unwrap();
+
+    let v = verifier();
+    let reject_err = v.verify(Some(&forged_bytes), &body).unwrap_err();
+    let rejected_receipt = CarrierReceipt::rejected(&reject_err);
+    assert_eq!(rejected_receipt.identity, None);
+    assert_eq!(rejected_receipt.l1_detection, None);
+
+    let req_reject = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header(PROVENANCE_HEADER, forged_bytes)
+        .body(Body::from(body))
+        .unwrap();
+    let resp_reject = router.clone().oneshot(req_reject).await.unwrap();
+    assert_eq!(resp_reject.status(), StatusCode::FORBIDDEN);
+    let reject_body = String::from_utf8(
+        axum::body::to_bytes(resp_reject.into_body(), 64 * 1024)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+
+    // Still only the 2 verified requests produced stage receipts.
+    let verified_receipts = stage.receipts();
+    assert_eq!(verified_receipts.len(), 2);
+
+    let mut serialized_surfaces = vec![
+        serde_json::to_string(&rejected_receipt).unwrap(),
+        format!("{rejected_receipt:?}"),
+        reject_err.to_string(),
+        format!("{reject_err:?}"),
+        reject_body,
+    ];
+    for r in &verified_receipts {
+        // VendorStatic digest is present, untrusted segment digests are None.
+        assert_eq!(
+            r.segments[0].sha256,
+            Some(Sha256Digest::of(VENDOR_BENIGN.as_bytes()))
+        );
+        for seg in &r.segments[1..] {
+            assert_eq!(seg.sha256, None);
+        }
+        serialized_surfaces.push(serde_json::to_string(r).unwrap());
+        serialized_surfaces.push(format!("{r:?}"));
+    }
+
+    let forbidden = [
+        canary_agent.to_string(),
+        canary_repo.to_string(),
+        canary_user.to_string(),
+        canary_attacker_profile.to_string(),
+        canary_attacker_build.to_string(),
+        Sha256Digest::of(canary_agent.as_bytes()).to_hex(),
+        Sha256Digest::of(canary_repo.as_bytes()).to_hex(),
+        Sha256Digest::of(canary_user.as_bytes()).to_hex(),
+        Sha256Digest::of(user_block.as_bytes()).to_hex(),
+        String::from_utf8_lossy(&KEY).to_string(),
+        Sha256Digest::from_bytes(KEY).to_hex(),
+    ];
+
+    for surface in &serialized_surfaces {
+        for needle in &forbidden {
+            assert!(
+                !surface.contains(needle),
+                "forbidden content/digest/identity {needle:?} leaked in {surface}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn w4c3_pre_l1_exit_emits_not_evaluated_and_single_external_sink_delivery() {
+    use parapet::proxy::{ProxyRequest, VerifiedCarrierNextStage};
+
+    let make_verified_and_body = |sequence: u64| {
+        let messages: &[Msg<'_>] = &[
+            benign_system("Repository rule: keep tests green.\n"),
+            ("user", vec![("Hello", Source::User)]),
+        ];
+        let body = chat_body(wire_messages(messages, |_, _| {}));
+        let req = signed_request_seq(messages, sequence);
+        let env_bytes = req
+            .headers()
+            .get(PROVENANCE_HEADER)
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+        let verified = verifier().verify(Some(&env_bytes), &body).unwrap();
+        (verified, body)
+    };
+
+    // 1. L1 configured: verified carrier exits at step 1 (parse failure before projected L1)
+    // -> NotEvaluated, 1 internal receipt, 1 external sink record.
+    let rig_l1 = rig_with_l1_signals(FULL_YAML, Some(Arc::new(TriggerModel)));
+    let sink_l1 = Arc::new(RecordingReceiptSink::default());
+    let stage_l1 = ProjectedEngineStage::with_receipt_sink(rig_l1.engine.clone(), sink_l1.clone());
+
+    let (verified_31, body_31) = make_verified_and_body(31);
+    let resp_l1 = stage_l1
+        .handle_verified(
+            Provider::Anthropic,
+            ProxyRequest {
+                method: Method::POST,
+                uri: "/v1/messages".parse().unwrap(),
+                headers: HeaderMap::new(),
+                body: Bytes::from(body_31),
+            },
+            verified_31,
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp_l1.status, StatusCode::BAD_REQUEST);
+    assert_eq!(rig_l1.sender.calls(), 0);
+
+    let stage_receipts = stage_l1.receipts();
+    let sink_receipts = sink_l1.receipts.lock().unwrap().clone();
+    assert_eq!(stage_receipts.len(), 1);
+    assert_eq!(sink_receipts.len(), 1);
+    assert_eq!(sink_receipts, stage_receipts);
+
+    let r = &stage_receipts[0];
+    assert_eq!(r.outcome, VerificationOutcome::Verified);
+    assert_eq!(
+        r.identity,
+        Some(CarrierIdentity {
+            schema_version: SCHEMA_VERSION_V1,
+            profile: PROFILE_ID.to_string(),
+            build: BUILD_ID.to_string(),
+        })
+    );
+    assert_eq!(r.verdict, None);
+    assert_eq!(r.inputs_scored, 0);
+    assert!(r.attributions.is_empty());
+
+    let l1_det = r
+        .l1_detection
+        .as_ref()
+        .expect("projected L1 record must be present");
+    assert_eq!(l1_det.basis, ProjectedL1Basis::Projected);
+    assert_eq!(l1_det.status, ProjectedL1Status::NotEvaluated);
+    assert_eq!(l1_det.status.as_str(), "not_evaluated");
+    assert_eq!(l1_det.verdict, None);
+    assert_eq!(l1_det.inputs_scored, 0);
+    assert!(l1_det.positive_projected_input_indices.is_empty());
+    assert!(l1_det.positive_projected_unit_indices.is_empty());
+    assert!(!l1_det.signals_recorded);
+    assert_eq!(l1_det.identity.profile, PROFILE_ID);
+    assert_eq!(l1_det.identity.build, BUILD_ID);
+
+    let hdr = resp_l1
+        .headers
+        .get("x-parapet-l1-signals")
+        .and_then(|v| v.to_str().ok())
+        .expect("x-parapet-l1-signals must be present on verified pre-L1 exit");
+    let parsed_hdr: Value = serde_json::from_str(hdr).unwrap();
+    assert_eq!(parsed_hdr["status"], "not_evaluated");
+    assert_eq!(parsed_hdr["verdict"], Value::Null);
+    assert_eq!(parsed_hdr["inputs_scored"], 0);
+    assert_eq!(parsed_hdr["signals_recorded"], false);
+
+    // 2. Full router pre-L1 exit (whole-message L0 fails before step 3.5 projected L1 runs)
+    // -> NotEvaluated, 1 internal receipt, 1 external sink record.
+    let rig_l0_exit = rig_with(
+        FULL_YAML,
+        Some(Arc::new(TriggerModel)),
+        Arc::new(DivergentNormalizer),
+    );
+    let sink_l0 = Arc::new(RecordingReceiptSink::default());
+    let stage_l0 = Arc::new(ProjectedEngineStage::with_receipt_sink(
+        rig_l0_exit.engine.clone(),
+        sink_l0.clone(),
+    ));
+    let router_l0 = build_router_with_admission(
+        rig_l0_exit.engine.clone(),
+        Arc::new(CarrierRequestAdmitter::required_opencode(verifier())),
+        Some(stage_l0.clone()),
+    );
+    let resp_l0 = router_l0
+        .oneshot(signed_request_seq(
+            &[
+                benign_system("Repository rule: keep tests green.\n"),
+                ("user", vec![("Hello", Source::User)]),
+            ],
+            32,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp_l0.status(), StatusCode::FORBIDDEN);
+    assert_eq!(header(&resp_l0, "x-parapet-blocked-by"), Some("L0"));
+    assert_eq!(stage_l0.receipts().len(), 1);
+    assert_eq!(sink_l0.receipts.lock().unwrap().len(), 1);
+    assert_eq!(
+        stage_l0.receipts()[0]
+            .l1_detection
+            .as_ref()
+            .unwrap()
+            .status,
+        ProjectedL1Status::NotEvaluated
+    );
+
+    // 3. L1 disabled in policy: the same verified pre-L1 exit keeps NotConfigured and 1 external sink record.
+    let rig_l3 = rig_with(L3_ONLY_YAML, None, Arc::new(L0Normalizer::new()));
+    let sink_l3 = Arc::new(RecordingReceiptSink::default());
+    let stage_l3 = ProjectedEngineStage::with_receipt_sink(rig_l3.engine.clone(), sink_l3.clone());
+    let (verified_33, body_33) = make_verified_and_body(33);
+    let resp_l3 = stage_l3
+        .handle_verified(
+            Provider::Anthropic,
+            ProxyRequest {
+                method: Method::POST,
+                uri: "/v1/messages".parse().unwrap(),
+                headers: HeaderMap::new(),
+                body: Bytes::from(body_33),
+            },
+            verified_33,
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp_l3.status, StatusCode::BAD_REQUEST);
+    assert_eq!(stage_l3.receipts().len(), 1);
+    assert_eq!(sink_l3.receipts.lock().unwrap().len(), 1);
+    let r_l3 = &stage_l3.receipts()[0];
+    assert_eq!(r_l3.verdict, None);
+    assert_eq!(r_l3.inputs_scored, 0);
+    assert_eq!(
+        r_l3.l1_detection.as_ref().unwrap().status,
+        ProjectedL1Status::NotConfigured
+    );
+}
+
+#[tokio::test]
+async fn w4c3_internal_receipt_store_is_bounded_with_oldest_eviction_and_drain_semantics() {
+    use parapet::engine::MAX_RETAINED_CARRIER_RECEIPTS;
+
+    assert_eq!(
+        EngineUpstreamClient::MAX_RETAINED_CARRIER_RECEIPTS,
+        MAX_RETAINED_CARRIER_RECEIPTS
+    );
+    assert_eq!(MAX_RETAINED_CARRIER_RECEIPTS, 64);
+
+    let rig = rig_with(L3_ONLY_YAML, None, Arc::new(L0Normalizer::new()));
+    let sink = Arc::new(RecordingReceiptSink::default());
+    let stage = Arc::new(ProjectedEngineStage::with_receipt_sink(
+        rig.engine.clone(),
+        sink.clone(),
+    ));
+    let router = build_router_with_admission(
+        rig.engine.clone(),
+        Arc::new(CarrierRequestAdmitter::required_opencode(verifier())),
+        Some(stage.clone()),
+    );
+
+    let overflow = 12usize;
+    let total = MAX_RETAINED_CARRIER_RECEIPTS + overflow;
+    let mut expected_digests = Vec::with_capacity(total);
+
+    for i in 0..total {
+        let seq = (i + 1) as u64;
+        let user_msg = format!("Prompt sequence {seq} for bounded ring verification.");
+        let messages: &[Msg<'_>] = &[
+            benign_system("Repository rule: keep tests green.\n"),
+            ("user", vec![(user_msg.as_str(), Source::User)]),
+        ];
+        let body = chat_body(wire_messages(messages, |_, _| {}));
+        expected_digests.push(Sha256Digest::of(&body));
+
+        let resp = router
+            .clone()
+            .oneshot(signed_request_seq(messages, seq))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            stage.receipts().len() <= MAX_RETAINED_CARRIER_RECEIPTS,
+            "retained store exceeded capacity at request {seq}"
+        );
+    }
+
+    assert_eq!(rig.sender.calls(), total);
+
+    // External stage sink still receives every single verified receipt (1 per request).
+    let sink_receipts = sink.receipts.lock().unwrap().clone();
+    assert_eq!(sink_receipts.len(), total);
+    let sink_digests: Vec<Sha256Digest> = sink_receipts
+        .iter()
+        .map(|r| r.request_body_sha256.expect("verified receipt has body digest"))
+        .collect();
+    assert_eq!(sink_digests, expected_digests);
+
+    // Internal store is strictly capped at MAX_RETAINED_CARRIER_RECEIPTS and retains the newest window in order.
+    let snapshot = stage.receipts();
+    assert_eq!(snapshot.len(), MAX_RETAINED_CARRIER_RECEIPTS);
+    assert_eq!(rig.engine.carrier_receipts(), snapshot);
+    let retained_digests: Vec<Sha256Digest> = snapshot
+        .iter()
+        .map(|r| r.request_body_sha256.expect("verified receipt has body digest"))
+        .collect();
+    assert_eq!(retained_digests.as_slice(), &expected_digests[overflow..]);
+
+    // Drain returns the exact retained window and empties the internal store.
+    let drained = stage.take_receipts();
+    assert_eq!(drained, snapshot);
+    assert!(stage.receipts().is_empty());
+    assert!(rig.engine.carrier_receipts().is_empty());
+    assert!(stage.take_receipts().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// W4c3 r5: exactly-once receipts across cancellation, drop, and unwind
+// ---------------------------------------------------------------------------
+
+/// Signals once upstream send has begun, then never completes.
+struct PendingHttpSender {
+    started: Arc<tokio::sync::Notify>,
+    calls: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl HttpSender for PendingHttpSender {
+    async fn send(&self, _request: HttpRequest) -> Result<HttpResponse, HttpError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.started.notify_one();
+        std::future::pending().await
+    }
+}
+
+/// Unwinds the pipeline at L0, before the projected L1 scan runs.
+struct PanickingNormalizer;
+
+impl Normalizer for PanickingNormalizer {
+    fn normalize(&self, _input: &str) -> String {
+        panic!("injected L0 panic");
+    }
+}
+
+/// Parks the L2a await (after L1 completed) until released by the test.
+struct ParkedL2aScanner {
+    entered: Arc<tokio::sync::Notify>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl parapet::layers::l2a::L2aScanner for ParkedL2aScanner {
+    fn scan(
+        &self,
+        _messages: &[Message],
+        _config: &parapet::config::L2aConfig,
+    ) -> Result<Vec<parapet::signal::Signal>, parapet::layers::l2a::L2aScanError> {
+        self.entered.notify_one();
+        let _ = self
+            .release
+            .lock()
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(30));
+        Ok(Vec::new())
+    }
+}
+
+#[derive(Default)]
+struct PanickingReceiptSink {
+    records: AtomicUsize,
+}
+
+impl CarrierReceiptSink for PanickingReceiptSink {
+    fn record(&self, _receipt: &CarrierReceipt) {
+        self.records.fetch_add(1, Ordering::SeqCst);
+        panic!("injected receipt sink panic");
+    }
+}
+
+const L2A_PARKED_YAML: &str = r#"
+parapet: v1
+use_default_block_patterns: false
+use_default_sensitive_patterns: false
+block_patterns:
+  - 'exfiltrate\s+the\s+credentials'
+layers:
+  L0: { mode: sanitize }
+  L1: { mode: block, threshold: 0.0 }
+  L2a:
+    mode: block
+    model: pg2-22m
+    pg_threshold: 0.5
+    block_threshold: 0.8
+    heuristic_weight: 0.3
+    fusion_confidence_agreement: 0.95
+    fusion_confidence_pg_only: 0.7
+    fusion_confidence_heuristic_only: 0.4
+    max_segments: 32
+    timeout_ms: 30000
+    max_concurrent_scans: 1
+  L3_inbound: { mode: block }
+"#;
+
+fn engine_with(
+    yaml: &str,
+    normalizer: Arc<dyn Normalizer>,
+    http: Arc<dyn HttpSender>,
+    l2a_scanner: Option<Arc<dyn parapet::layers::l2a::L2aScanner>>,
+) -> Arc<EngineUpstreamClient> {
+    let config = load_config(&StringSource {
+        content: yaml.to_string(),
+    })
+    .expect("valid test config");
+    let l2a_semaphore = l2a_scanner
+        .as_ref()
+        .map(|_| Arc::new(tokio::sync::Semaphore::new(1)));
+    Arc::new(EngineUpstreamClient::new_with(EngineDeps {
+        config: Arc::new(config),
+        http,
+        resolver: Arc::new(DummyResolver),
+        registry: Arc::new(DefaultProviderRegistry),
+        normalizer,
+        trust_assigner: Arc::new(RoleTrustAssigner),
+        l1_scanner: None,
+        l1_model: Some(Arc::new(TriggerModel)),
+        l2a_scanner,
+        l2a_semaphore,
+        inbound_scanner: Arc::new(DefaultInboundScanner::new()),
+        constraint_evaluator: Arc::new(DslConstraintEvaluator::new()),
+        output_scanner: Arc::new(L5aScanner),
+        session_store: None,
+        multi_turn_scanner: None,
+        orthogonal_sensor_router: Arc::new(NoopOrthogonalSensorRouter::new()),
+        signal_extractor: Arc::new(DefaultSignalExtractor::new()),
+        verdict_combiner: Arc::new(DefaultVerdictCombiner::new()),
+        emit_l1_signals: true,
+    }))
+}
+
+fn router_with_stage(
+    engine: &Arc<EngineUpstreamClient>,
+    sink: Arc<dyn CarrierReceiptSink>,
+) -> axum::Router {
+    build_router_with_admission(
+        engine.clone(),
+        Arc::new(CarrierRequestAdmitter::required_opencode(verifier())),
+        Some(Arc::new(ProjectedEngineStage::with_receipt_sink(
+            engine.clone(),
+            sink,
+        ))),
+    )
+}
+
+fn benign_verified_request() -> Request<Body> {
+    signed_request(&[
+        benign_system("Repository rule: keep tests green.\n"),
+        (
+            "user",
+            vec![("Please summarize the module structure.", Source::User)],
+        ),
+    ])
+}
+
+#[tokio::test]
+async fn w4c3_cancel_after_upstream_send_began_emits_exactly_one_decided_receipt() {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let http = Arc::new(PendingHttpSender {
+        started: started.clone(),
+        calls: AtomicUsize::new(0),
+    });
+    let engine = engine_with(FULL_YAML, Arc::new(L0Normalizer::new()), http.clone(), None);
+    let sink = Arc::new(RecordingReceiptSink::default());
+    let router = router_with_stage(&engine, sink.clone());
+
+    let task = tokio::spawn(router.oneshot(benign_verified_request()));
+    started.notified().await;
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert_eq!(http.calls.load(Ordering::SeqCst), 1);
+
+    let receipts = engine.carrier_receipts();
+    assert_eq!(receipts.len(), 1, "exactly one receipt across cancellation");
+    assert_eq!(*sink.receipts.lock().unwrap(), receipts);
+    let receipt = &receipts[0];
+    assert_eq!(receipt.outcome, VerificationOutcome::Verified);
+    assert_eq!(receipt.verdict, Some(ScanVerdict::Allow));
+    assert!(receipt.inputs_scored > 0);
+    let l1 = receipt.l1_detection.as_ref().unwrap();
+    assert_eq!(l1.status, ProjectedL1Status::EvaluatedSignalsNotRecorded);
+    assert_eq!(l1.verdict, Some(ScanVerdict::Allow));
+}
+
+#[tokio::test]
+async fn w4c3_cancel_during_scan_after_l1_emits_one_undecided_receipt() {
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let (release, park) = std::sync::mpsc::channel();
+    let l2a = Arc::new(ParkedL2aScanner {
+        entered: entered.clone(),
+        release: Mutex::new(park),
+    });
+    let http = Arc::new(CapturingHttpSender::default());
+    let engine = engine_with(
+        L2A_PARKED_YAML,
+        Arc::new(L0Normalizer::new()),
+        http.clone(),
+        Some(l2a),
+    );
+    let sink = Arc::new(RecordingReceiptSink::default());
+    let router = router_with_stage(&engine, sink.clone());
+
+    let task = tokio::spawn(router.oneshot(benign_verified_request()));
+    entered.notified().await;
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    release.send(()).unwrap();
+    assert_eq!(http.calls(), 0);
+
+    let receipts = engine.carrier_receipts();
+    assert_eq!(receipts.len(), 1, "exactly one receipt across cancellation");
+    assert_eq!(*sink.receipts.lock().unwrap(), receipts);
+    let receipt = &receipts[0];
+    assert_eq!(receipt.outcome, VerificationOutcome::Verified);
+    assert_eq!(receipt.verdict, None, "no decision was reached");
+    // L1 completed before the L2a await, so its record reflects the finished scan.
+    let l1 = receipt.l1_detection.as_ref().unwrap();
+    assert_eq!(l1.status, ProjectedL1Status::EvaluatedSignalsNotRecorded);
+    assert_eq!(receipt.inputs_scored, l1.inputs_scored);
+}
+
+#[tokio::test]
+async fn w4c3_unwind_before_l1_completes_emits_one_receipt_with_l1_not_evaluated() {
+    let http = Arc::new(CapturingHttpSender::default());
+    let engine = engine_with(FULL_YAML, Arc::new(PanickingNormalizer), http.clone(), None);
+    let sink = Arc::new(RecordingReceiptSink::default());
+    let router = router_with_stage(&engine, sink.clone());
+
+    let joined = tokio::spawn(router.oneshot(benign_verified_request())).await;
+    assert!(joined.unwrap_err().is_panic());
+    assert_eq!(http.calls(), 0);
+
+    let receipts = engine.carrier_receipts();
+    assert_eq!(receipts.len(), 1, "exactly one receipt across unwind");
+    assert_eq!(*sink.receipts.lock().unwrap(), receipts);
+    let receipt = &receipts[0];
+    assert_eq!(receipt.outcome, VerificationOutcome::Verified);
+    assert_eq!(receipt.verdict, None);
+    assert_eq!(receipt.inputs_scored, 0);
+    assert!(receipt.attributions.is_empty());
+    let l1 = receipt.l1_detection.as_ref().unwrap();
+    assert_eq!(l1.status, ProjectedL1Status::NotEvaluated);
+}
+
+#[tokio::test]
+async fn w4c3_receipt_sink_panic_during_unwind_does_not_abort_or_lose_receipt() {
+    let http = Arc::new(CapturingHttpSender::default());
+    let engine = engine_with(FULL_YAML, Arc::new(PanickingNormalizer), http.clone(), None);
+    let sink = Arc::new(PanickingReceiptSink::default());
+    let router = router_with_stage(&engine, sink.clone());
+
+    // Reaching the assertions at all proves the second panic did not abort.
+    let joined = tokio::spawn(router.oneshot(benign_verified_request())).await;
+    assert!(joined.unwrap_err().is_panic());
+    assert_eq!(sink.records.load(Ordering::SeqCst), 1);
+
+    let receipts = engine.carrier_receipts();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].verdict, None);
+    assert_eq!(
+        receipts[0].l1_detection.as_ref().unwrap().status,
+        ProjectedL1Status::NotEvaluated
+    );
+}
+
+#[tokio::test]
+async fn w4c3_receipt_sink_panic_on_normal_path_still_emits_once_and_responds() {
+    let rig = rig_with_l1_signals(FULL_YAML, Some(Arc::new(TriggerModel)));
+    let sink = Arc::new(PanickingReceiptSink::default());
+    let resp = router_with_stage(&rig.engine, sink.clone())
+        .oneshot(benign_verified_request())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(header(&resp, "x-parapet-l1-signals").is_some());
+    assert_eq!(rig.sender.calls(), 1);
+    assert_eq!(sink.records.load(Ordering::SeqCst), 1);
+    let receipts = rig.engine.carrier_receipts();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].verdict, Some(ScanVerdict::Allow));
+}

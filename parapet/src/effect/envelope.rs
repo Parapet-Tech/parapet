@@ -296,6 +296,22 @@ impl RuntimeEnvelopeV0 {
         }
     }
 
+    /// Capture for a verified-carrier projected request: whole-message
+    /// `last_untrusted_user_message_before_l0/v0` detection is absent by
+    /// contract because L1 runs on the projected basis (Sensor C1/Q3).
+    pub fn capture_projected(
+        &self,
+        request_id_header: Option<&[u8]>,
+        generated_request_id: &str,
+        model: &str,
+    ) -> RequestCaptureV0 {
+        RequestCaptureV0 {
+            request_ref: request_ref_from_header(request_id_header, generated_request_id),
+            model: model.to_owned(),
+            detection: super::capture::DetectionBindingV0::absent(),
+        }
+    }
+
     fn prepare(
         &self,
         policy: &ResolvedPolicyV0,

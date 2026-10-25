@@ -360,11 +360,39 @@ pub fn scan_projected_l3(
 /// L3-inbound on the projected basis and every other stage unchanged.
 pub struct ProjectedEngineStage {
     engine: Arc<EngineUpstreamClient>,
+    receipt_sink: Option<Arc<dyn crate::provenance::CarrierReceiptSink>>,
 }
 
 impl ProjectedEngineStage {
     pub fn new(engine: Arc<EngineUpstreamClient>) -> Self {
-        Self { engine }
+        Self {
+            engine,
+            receipt_sink: None,
+        }
+    }
+
+    pub fn with_receipt_sink(
+        engine: Arc<EngineUpstreamClient>,
+        receipt_sink: Arc<dyn crate::provenance::CarrierReceiptSink>,
+    ) -> Self {
+        Self {
+            engine,
+            receipt_sink: Some(receipt_sink),
+        }
+    }
+
+    /// Snapshot of currently retained [`crate::provenance::CarrierReceipt`] records emitted
+    /// through this stage's engine (at most [`super::MAX_RETAINED_CARRIER_RECEIPTS`], in
+    /// oldest-to-newest emission order), without removing them from the store.
+    pub fn receipts(&self) -> Vec<crate::provenance::CarrierReceipt> {
+        self.engine.carrier_receipts()
+    }
+
+    /// Drain and return all currently retained [`crate::provenance::CarrierReceipt`] records
+    /// emitted through this stage's engine in oldest-to-newest emission order, leaving the
+    /// internal bounded store empty.
+    pub fn take_receipts(&self) -> Vec<crate::provenance::CarrierReceipt> {
+        self.engine.take_carrier_receipts()
     }
 }
 
@@ -377,7 +405,7 @@ impl VerifiedCarrierNextStage for ProjectedEngineStage {
         verified: VerifiedCarrier,
     ) -> Result<ProxyResponse, ProxyError> {
         self.engine
-            .forward_verified(provider, request, &verified)
+            .forward_verified_with_sink(provider, request, &verified, self.receipt_sink.as_deref())
             .await
     }
 }
