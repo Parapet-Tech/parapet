@@ -6913,7 +6913,7 @@ async fn l0_dual_view_control_l3_dedup_c2_tool_calls_and_max_length() {
 }
 
 #[tokio::test]
-async fn l0_dual_view_custom_inbound_scanner_without_override_blocks_content_free_and_panic_stays_explicit(
+async fn l0_dual_view_custom_inbound_scanner_without_override_uses_on_failure_and_panic_stays_explicit(
 ) {
     struct LegacyCustomInboundScanner;
     impl InboundScanner for LegacyCustomInboundScanner {
@@ -6951,18 +6951,18 @@ async fn l0_dual_view_custom_inbound_scanner_without_override_blocks_content_fre
         }
     }
 
-    let mut config = config_with_l0_mode(Some("sanitize"));
-    config.policy.layers.l3_inbound = Some(crate::config::LayerConfig {
+    let mut closed_config = config_with_l0_mode(Some("sanitize"));
+    closed_config.policy.layers.l3_inbound = Some(crate::config::LayerConfig {
         mode: "shadow".to_string(),
         block_action: None,
         window_chars: None,
     });
-    config.runtime.engine.on_failure = FailureMode::Closed;
-    let config = Arc::new(config);
+    closed_config.runtime.engine.on_failure = FailureMode::Closed;
+    let closed_config = Arc::new(closed_config);
 
     let sender = Arc::new(CountingRecordingSender::new());
     let engine = EngineUpstreamClient::new_with(EngineDeps {
-        config: config.clone(),
+        config: closed_config.clone(),
         http: sender.clone(),
         resolver: Arc::new(NoopResolver),
         registry: Arc::new(DefaultRegistry),
@@ -6988,18 +6988,73 @@ async fn l0_dual_view_custom_inbound_scanner_without_override_blocks_content_fre
         .forward(Provider::OpenAi, chat_request(sentinel))
         .await
         .unwrap();
-    assert_eq!(resp.status, StatusCode::FORBIDDEN);
-    assert_eq!(blocked_by(&resp).as_deref(), Some("L3-inbound"));
+    assert_eq!(resp.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        resp.headers
+            .get("x-parapet-action")
+            .and_then(|v| v.to_str().ok()),
+        Some("error")
+    );
+    assert_eq!(
+        resp.headers
+            .get("x-parapet-layer")
+            .and_then(|v| v.to_str().ok()),
+        Some("L3-inbound")
+    );
+    assert_eq!(
+        resp.headers
+            .get("x-parapet-error")
+            .and_then(|v| v.to_str().ok()),
+        Some("scan_error")
+    );
+    assert_eq!(blocked_by(&resp), None);
     assert_eq!(sender.call_count(), 0);
     let body_bytes = axum::body::to_bytes(resp.body, 64 * 1024).await.unwrap();
     let body_str = std::str::from_utf8(&body_bytes).unwrap();
-    assert!(body_str.contains("request blocked by content policy"));
+    assert!(body_str.contains("service unavailable (guardrail layer error)"));
     assert!(!body_str.contains(sentinel));
+
+    // Under FailureMode::Open, UnsupportedScanner skips L3-inbound and forwards.
+    let mut open_config = config_with_l0_mode(Some("sanitize"));
+    open_config.policy.layers.l3_inbound = Some(crate::config::LayerConfig {
+        mode: "block".to_string(),
+        block_action: None,
+        window_chars: None,
+    });
+    open_config.runtime.engine.on_failure = FailureMode::Open;
+    let open_sender = Arc::new(CountingRecordingSender::new());
+    let open_engine = EngineUpstreamClient::new_with(EngineDeps {
+        config: Arc::new(open_config),
+        http: open_sender.clone(),
+        resolver: Arc::new(NoopResolver),
+        registry: Arc::new(DefaultRegistry),
+        normalizer: Arc::new(L0Normalizer::new()),
+        trust_assigner: Arc::new(RoleTrustAssigner),
+        l1_scanner: None,
+        l1_model: None,
+        l2a_scanner: None,
+        l2a_semaphore: None,
+        inbound_scanner: Arc::new(LegacyCustomInboundScanner),
+        constraint_evaluator: Arc::new(DslConstraintEvaluator::new()),
+        output_scanner: Arc::new(L5aScanner),
+        session_store: None,
+        multi_turn_scanner: None,
+        signal_extractor: Arc::new(DefaultSignalExtractor::new()),
+        verdict_combiner: Arc::new(DefaultVerdictCombiner::new()),
+        orthogonal_sensor_router: Arc::new(NoopOrthogonalSensorRouter::new()),
+        emit_l1_signals: false,
+    });
+    let open_resp = open_engine
+        .forward(Provider::OpenAi, chat_request(sentinel))
+        .await
+        .unwrap();
+    assert_eq!(open_resp.status, StatusCode::OK);
+    assert_eq!(open_sender.call_count(), 1);
 
     // Keep explicit panic behavior verified when scan_dual_view itself panics.
     let panic_sender = Arc::new(CountingRecordingSender::new());
     let panic_engine = EngineUpstreamClient::new_with(EngineDeps {
-        config,
+        config: closed_config,
         http: panic_sender.clone(),
         resolver: Arc::new(NoopResolver),
         registry: Arc::new(DefaultRegistry),
@@ -7080,4 +7135,223 @@ async fn l0_dual_view_divergent_custom_normalizer_blocks_content_free_with_zero_
     let body_str = std::str::from_utf8(&body_bytes).unwrap();
     assert!(body_str.contains("request blocked by content policy"));
     assert!(!body_str.contains(sentinel));
+}
+
+#[derive(Clone, Copy, Debug)]
+enum MalformedDualViewInvariant {
+    InvalidScanViews,
+    MissingOriginalLength,
+    MissingSourceMapping,
+}
+
+struct MalformedDualScanView<'a> {
+    inner: &'a dyn crate::normalize::L0DualScanView,
+    invariant: MalformedDualViewInvariant,
+}
+
+impl crate::normalize::L0DualScanView for MalformedDualScanView<'_> {
+    fn pre_html_messages(&self) -> &[Message] {
+        match self.invariant {
+            MalformedDualViewInvariant::InvalidScanViews => &[],
+            _ => self.inner.pre_html_messages(),
+        }
+    }
+
+    fn html_stripped_messages(&self) -> &[Message] {
+        self.inner.html_stripped_messages()
+    }
+
+    fn original_byte_len(&self, message_index: usize) -> Option<usize> {
+        self.inner.original_byte_len(message_index)
+    }
+
+    fn original_char_len(&self, message_index: usize) -> Option<usize> {
+        match self.invariant {
+            MalformedDualViewInvariant::MissingOriginalLength => None,
+            _ => self.inner.original_char_len(message_index),
+        }
+    }
+
+    fn original_untrusted_span_char_len(
+        &self,
+        message_index: usize,
+        untrusted_span_index: usize,
+    ) -> Option<usize> {
+        self.inner
+            .original_untrusted_span_char_len(message_index, untrusted_span_index)
+    }
+
+    fn original_total_untrusted_span_char_len(&self, message_index: usize) -> Option<usize> {
+        self.inner
+            .original_total_untrusted_span_char_len(message_index)
+    }
+
+    fn offset_mappings(
+        &self,
+        view: crate::normalize::L0ScanView,
+        message_index: usize,
+    ) -> Option<&[crate::normalize::OffsetMapping]> {
+        self.inner.offset_mappings(view, message_index)
+    }
+
+    fn map_range_to_original(
+        &self,
+        view: crate::normalize::L0ScanView,
+        message_index: usize,
+        new_start: usize,
+        new_end: usize,
+    ) -> Option<(usize, usize)> {
+        match self.invariant {
+            MalformedDualViewInvariant::MissingSourceMapping => None,
+            _ => self
+                .inner
+                .map_range_to_original(view, message_index, new_start, new_end),
+        }
+    }
+}
+
+struct MalformedDualViewInboundScanner {
+    invariant: MalformedDualViewInvariant,
+}
+
+impl InboundScanner for MalformedDualViewInboundScanner {
+    fn scan(
+        &self,
+        messages: &[Message],
+        config: &Config,
+    ) -> crate::layers::l3_inbound::InboundResult {
+        DefaultInboundScanner::new().scan(messages, config)
+    }
+
+    fn scan_dual_view(
+        &self,
+        views: &dyn crate::normalize::L0DualScanView,
+        config: &Config,
+    ) -> Result<
+        crate::layers::l3_inbound::InboundResult,
+        crate::layers::l3_inbound::InboundDualScanError,
+    > {
+        let malformed = MalformedDualScanView {
+            inner: views,
+            invariant: self.invariant,
+        };
+        let res = DefaultInboundScanner::new().scan_dual_view(&malformed, config);
+        match (self.invariant, &res) {
+            (
+                MalformedDualViewInvariant::InvalidScanViews,
+                Err(crate::layers::l3_inbound::InboundDualScanError::InvalidScanViews { .. }),
+            )
+            | (
+                MalformedDualViewInvariant::MissingOriginalLength,
+                Err(crate::layers::l3_inbound::InboundDualScanError::MissingOriginalLength {
+                    ..
+                }),
+            )
+            | (
+                MalformedDualViewInvariant::MissingSourceMapping,
+                Err(crate::layers::l3_inbound::InboundDualScanError::MissingSourceMapping {
+                    ..
+                }),
+            ) => {}
+            other => panic!("expected matching InboundDualScanError variant, got {other:?}"),
+        }
+        res
+    }
+}
+
+async fn assert_open_mode_dual_view_invariant_returns_503(
+    invariant: MalformedDualViewInvariant,
+    sentinel: &str,
+) {
+    let mut open_config = config_with_l0_mode(Some("sanitize"));
+    open_config.policy.block_patterns = vec![
+        crate::config::CompiledPattern::compile("ignore previous instructions").unwrap(),
+    ];
+    open_config.policy.layers.l3_inbound = Some(crate::config::LayerConfig {
+        mode: "block".to_string(),
+        block_action: None,
+        window_chars: None,
+    });
+    open_config.runtime.engine.on_failure = FailureMode::Open;
+
+    let sender = Arc::new(CountingRecordingSender::new());
+    let engine = EngineUpstreamClient::new_with(EngineDeps {
+        config: Arc::new(open_config),
+        http: sender.clone(),
+        resolver: Arc::new(NoopResolver),
+        registry: Arc::new(DefaultRegistry),
+        normalizer: Arc::new(L0Normalizer::new()),
+        trust_assigner: Arc::new(RoleTrustAssigner),
+        l1_scanner: None,
+        l1_model: None,
+        l2a_scanner: None,
+        l2a_semaphore: None,
+        inbound_scanner: Arc::new(MalformedDualViewInboundScanner { invariant }),
+        constraint_evaluator: Arc::new(DslConstraintEvaluator::new()),
+        output_scanner: Arc::new(L5aScanner),
+        session_store: None,
+        multi_turn_scanner: None,
+        signal_extractor: Arc::new(DefaultSignalExtractor::new()),
+        verdict_combiner: Arc::new(DefaultVerdictCombiner::new()),
+        orthogonal_sensor_router: Arc::new(NoopOrthogonalSensorRouter::new()),
+        emit_l1_signals: false,
+    });
+
+    let prompt = format!("ignore previous instructions {sentinel}");
+    let resp = engine
+        .forward(Provider::OpenAi, chat_request(&prompt))
+        .await
+        .unwrap();
+    assert_eq!(resp.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        resp.headers
+            .get("x-parapet-action")
+            .and_then(|v| v.to_str().ok()),
+        Some("error")
+    );
+    assert_eq!(
+        resp.headers
+            .get("x-parapet-layer")
+            .and_then(|v| v.to_str().ok()),
+        Some("L3-inbound")
+    );
+    assert_eq!(
+        resp.headers
+            .get("x-parapet-error")
+            .and_then(|v| v.to_str().ok()),
+        Some("scan_error")
+    );
+    assert_eq!(blocked_by(&resp), None);
+    assert_eq!(sender.call_count(), 0);
+    let body_bytes = axum::body::to_bytes(resp.body, 64 * 1024).await.unwrap();
+    let body_str = std::str::from_utf8(&body_bytes).unwrap();
+    assert!(body_str.contains("service unavailable (guardrail layer error)"));
+    assert!(!body_str.contains(sentinel));
+}
+
+#[tokio::test]
+async fn l0_dual_view_open_mode_invalid_scan_views_returns_503_with_zero_upstream_calls() {
+    assert_open_mode_dual_view_invariant_returns_503(
+        MalformedDualViewInvariant::InvalidScanViews,
+        "SECRET_OPEN_INVALID_VIEWS_SENTINEL_1001",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn l0_dual_view_open_mode_missing_original_length_returns_503_with_zero_upstream_calls() {
+    assert_open_mode_dual_view_invariant_returns_503(
+        MalformedDualViewInvariant::MissingOriginalLength,
+        "SECRET_OPEN_MISSING_ORIG_LEN_SENTINEL_1002",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn l0_dual_view_open_mode_missing_source_mapping_returns_503_with_zero_upstream_calls() {
+    assert_open_mode_dual_view_invariant_returns_503(
+        MalformedDualViewInvariant::MissingSourceMapping,
+        "SECRET_OPEN_MISSING_MAPPING_SENTINEL_1003",
+    )
+    .await;
 }

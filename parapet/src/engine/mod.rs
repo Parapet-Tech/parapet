@@ -28,7 +28,9 @@ use crate::effect::RuntimeEnvelopeV0;
 use crate::layers::l1::{EnsembleL1Scanner, L1Block, L1Scanner, L1Verdict, SvmModel};
 use crate::layers::l1_harness::{L1Harness, L1Model, L1Signal, OutcomeView};
 use crate::layers::l2a::L2aScanner;
-use crate::layers::l3_inbound::{DefaultInboundScanner, InboundScanner, InboundVerdict};
+use crate::layers::l3_inbound::{
+    DefaultInboundScanner, InboundDualScanError, InboundScanner, InboundVerdict,
+};
 use crate::layers::l4::{DefaultMultiTurnScanner, L4Verdict, MultiTurnScanner};
 use crate::layers::l5a::{L5aScanner, OutputScanner};
 use crate::message::ToolCall;
@@ -959,22 +961,40 @@ impl UpstreamClient for EngineUpstreamClient {
                 Ok(Ok(result)) => {
                     inbound_result_opt = Some(result);
                 }
-                Ok(Err(dual_err)) => {
-                    tracing::warn!(
+                Ok(Err(dual_err @ InboundDualScanError::UnsupportedScanner)) => {
+                    if let Some(resp) = handle_layer_error(
+                        on_failure,
+                        adapter.as_ref(),
+                        "L3-inbound",
+                        "scan_error",
+                        &format!("scan error: {dual_err}"),
+                        &ctx.request_id,
+                    ) {
+                        return Ok(resp);
+                    }
+                }
+                Ok(Err(
+                    dual_err @ (InboundDualScanError::InvalidScanViews { .. }
+                    | InboundDualScanError::MissingOriginalLength { .. }
+                    | InboundDualScanError::MissingSourceMapping { .. }),
+                )) => {
+                    tracing::error!(
                         request_id = %ctx.request_id,
                         contract_hash = %ctx.contract_hash,
                         provider = ctx.provider_str,
                         model = %ctx.model,
                         layer = "L3-inbound",
+                        failure_mode = ?on_failure,
+                        error_type = "scan_error",
                         error = %dual_err,
                         latency_ms = l3i_ms,
-                        "L3 dual-view invariant failure; failing closed"
+                        "L3-inbound dual-view invariant failure — blocking request in all failure modes"
                     );
-                    if pending_block.is_none() {
-                        let body =
-                            adapter.serialize_error("request blocked by content policy", 403);
-                        pending_block = Some(ProxyResponse::blocked(body, "L3-inbound"));
-                    }
+                    return Ok(layer_error_503(
+                        adapter.as_ref(),
+                        "L3-inbound",
+                        "scan_error",
+                    ));
                 }
                 Err(_) => {
                     if let Some(resp) = handle_layer_error(
