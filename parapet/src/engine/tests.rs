@@ -7355,3 +7355,436 @@ async fn l0_dual_view_open_mode_missing_source_mapping_returns_503_with_zero_ups
     )
     .await;
 }
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn deterministic_offline_sender_v0_anthropic_stream_true_returns_protocol_correct_sse() {
+    let sender = Arc::new(DeterministicOfflineHttpSenderV0::new(
+        OfflineUpstreamFixtureV0::V0,
+    ));
+    let stream_body = Bytes::from_static(
+        br#"{"model":"claude-3-5-sonnet-20241022","max_tokens":128,"stream":true,"messages":[{"role":"user","content":"hello"}]}"#,
+    );
+
+    let direct = sender
+        .send(HttpRequest {
+            method: Method::POST,
+            url: "https://api.anthropic.com/v1/messages".to_string(),
+            headers: HeaderMap::new(),
+            body: stream_body.clone(),
+            timeout_ms: None,
+            stream: true,
+        })
+        .await
+        .expect("direct offline streaming response");
+    assert_eq!(direct.status, StatusCode::OK);
+    assert_eq!(
+        direct
+            .headers
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("text/event-stream")
+    );
+
+    let engine = engine_with_http_sender(config_with_l0_mode(None), sender);
+    let mut headers = HeaderMap::new();
+    headers.insert("content-type", HeaderValue::from_static("application/json"));
+    let resp = engine
+        .forward(
+            Provider::Anthropic,
+            ProxyRequest {
+                method: Method::POST,
+                uri: "/v1/messages".parse().unwrap(),
+                headers,
+                body: stream_body,
+            },
+        )
+        .await
+        .expect("engine forward streaming anthropic");
+    assert_eq!(resp.status, StatusCode::OK);
+    assert_eq!(
+        resp.headers
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("text/event-stream")
+    );
+
+    let raw_bytes = collect_proxy_body(resp).await;
+    let text = std::str::from_utf8(&raw_bytes).expect("valid utf-8 sse stream");
+    assert!(
+        text.ends_with("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"),
+        "SSE stream must terminate with message_stop event frame: {text}"
+    );
+
+    let frames: Vec<&str> = text.split("\n\n").filter(|f| !f.is_empty()).collect();
+    let mut events: Vec<(String, serde_json::Value)> = Vec::new();
+    for frame in &frames {
+        let mut lines = frame.lines();
+        let event_line = lines.next().expect("event line");
+        let data_line = lines.next().expect("data line");
+        assert!(
+            lines.next().is_none(),
+            "unexpected extra line in SSE frame: {frame}"
+        );
+        let event_name = event_line
+            .strip_prefix("event: ")
+            .expect("event: prefix")
+            .to_string();
+        let data_json: serde_json::Value =
+            serde_json::from_str(data_line.strip_prefix("data: ").expect("data: prefix"))
+                .expect("valid JSON in SSE data line");
+        assert_eq!(
+            data_json.get("type").and_then(|v| v.as_str()),
+            Some(event_name.as_str())
+        );
+        events.push((event_name, data_json));
+    }
+
+    let event_names: Vec<&str> = events.iter().map(|(e, _)| e.as_str()).collect();
+    assert_eq!(
+        event_names,
+        vec![
+            "message_start",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+            "message_stop",
+        ]
+    );
+    assert_eq!(events[0].1["message"]["id"], "msg_offline_v0");
+    assert_eq!(events[0].1["message"]["role"], "assistant");
+    assert_eq!(events[0].1["message"]["content"], serde_json::json!([]));
+    assert!(events[0].1["message"]["usage"]["input_tokens"].is_u64());
+    assert!(events[0].1["message"]["usage"]["output_tokens"].is_u64());
+    assert_eq!(events[1].1["index"], 0);
+    assert_eq!(events[1].1["content_block"]["type"], "text");
+    assert_eq!(events[2].1["index"], 0);
+    assert_eq!(events[2].1["delta"]["type"], "text_delta");
+    assert_eq!(events[2].1["delta"]["text"], "parapet offline fixture ok");
+    assert_eq!(events[3].1["index"], 0);
+    assert_eq!(events[4].1["delta"]["stop_reason"], "end_turn");
+    assert!(events[4].1["usage"]["output_tokens"].is_u64());
+
+    // Accept: text/event-stream without `"stream": true` in body sets HttpRequest.stream = true
+    // and receives the same generic SSE response via authoritative HttpRequest.stream.
+    let mut accept_headers = HeaderMap::new();
+    accept_headers.insert("content-type", HeaderValue::from_static("application/json"));
+    accept_headers.insert(
+        reqwest::header::ACCEPT,
+        HeaderValue::from_static("text/event-stream"),
+    );
+    let accept_resp = engine
+        .forward(
+            Provider::Anthropic,
+            ProxyRequest {
+                method: Method::POST,
+                uri: "/v1/messages".parse().unwrap(),
+                headers: accept_headers,
+                body: Bytes::from_static(
+                    br#"{"model":"claude-3-5-sonnet-20241022","max_tokens":128,"messages":[{"role":"user","content":"hello"}]}"#,
+                ),
+            },
+        )
+        .await
+        .expect("engine forward accept-only streaming anthropic");
+    assert_eq!(accept_resp.status, StatusCode::OK);
+    assert_eq!(
+        accept_resp
+            .headers
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("text/event-stream")
+    );
+    let accept_bytes = collect_proxy_body(accept_resp).await;
+    assert_eq!(accept_bytes, raw_bytes);
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn deterministic_offline_sender_v0_anthropic_stream_rejects_explicit_scenarios_non_200() {
+    let sender = Arc::new(DeterministicOfflineHttpSenderV0::new(
+        OfflineUpstreamFixtureV0::V0,
+    ));
+    let engine = engine_with_http_sender(config_with_l0_mode(None), sender.clone());
+
+    // 1. Header `x-parapet-offline-scenario: block_no_effect` with stream=true.
+    let mut header_block = HeaderMap::new();
+    header_block.insert("content-type", HeaderValue::from_static("application/json"));
+    header_block.insert(
+        "x-parapet-offline-scenario",
+        HeaderValue::from_static("block_no_effect"),
+    );
+    let benign_stream_body = Bytes::from_static(
+        br#"{"model":"claude-3-5-sonnet-20241022","max_tokens":128,"stream":true,"messages":[{"role":"user","content":"hello"}]}"#,
+    );
+
+    let direct_hdr = sender
+        .send(HttpRequest {
+            method: Method::POST,
+            url: "https://api.anthropic.com/v1/messages".to_string(),
+            headers: header_block.clone(),
+            body: benign_stream_body.clone(),
+            timeout_ms: None,
+            stream: true,
+        })
+        .await
+        .expect("direct response for header block_no_effect");
+    assert_eq!(direct_hdr.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        direct_hdr
+            .headers
+            .get("x-parapet-error")
+            .and_then(|v| v.to_str().ok()),
+        Some("offline_streaming_scenario_unsupported")
+    );
+
+    let resp_hdr = engine
+        .forward(
+            Provider::Anthropic,
+            ProxyRequest {
+                method: Method::POST,
+                uri: "/v1/messages".parse().unwrap(),
+                headers: header_block,
+                body: benign_stream_body.clone(),
+            },
+        )
+        .await
+        .expect("engine forward header block_no_effect with stream=true");
+    assert_eq!(resp_hdr.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        resp_hdr
+            .headers
+            .get("x-parapet-error")
+            .and_then(|v| v.to_str().ok()),
+        Some("offline_streaming_scenario_unsupported")
+    );
+    let hdr_bytes = collect_proxy_body(resp_hdr).await;
+    let hdr_text = std::str::from_utf8(&hdr_bytes).expect("utf-8 error body");
+    assert!(hdr_text.contains("offline_streaming_scenario_unsupported"));
+    assert!(!hdr_text.contains("parapet offline fixture ok"));
+
+    // 2. Body marker `block_no_effect` (and `../escape.txt`) with stream=true.
+    for marker_body in [
+        Bytes::from_static(
+            br#"{"model":"claude-3-5-sonnet-20241022","max_tokens":128,"stream":true,"messages":[{"role":"user","content":"block_no_effect"}]}"#,
+        ),
+        Bytes::from_static(
+            br#"{"model":"claude-3-5-sonnet-20241022","max_tokens":128,"stream":true,"messages":[{"role":"user","content":"../escape.txt"}]}"#,
+        ),
+        Bytes::from_static(
+            br#"{"model":"claude-3-5-sonnet-20241022","max_tokens":128,"stream":true,"messages":[{"role":"user","content":"allow_no_executor"}]}"#,
+        ),
+        Bytes::from_static(
+            br#"{"model":"claude-3-5-sonnet-20241022","max_tokens":128,"stream":true,"messages":[{"role":"user","content":"shadow_parse_error_l3_off"}]}"#,
+        ),
+    ] {
+        let direct_marker = sender
+            .send(HttpRequest {
+                method: Method::POST,
+                url: "https://api.anthropic.com/v1/messages".to_string(),
+                headers: HeaderMap::new(),
+                body: marker_body.clone(),
+                timeout_ms: None,
+                stream: true,
+            })
+            .await
+            .expect("direct response for body marker with stream=true");
+        assert_eq!(direct_marker.status, StatusCode::BAD_REQUEST);
+
+        let mut req_headers = HeaderMap::new();
+        req_headers.insert("content-type", HeaderValue::from_static("application/json"));
+        let resp_marker = engine
+            .forward(
+                Provider::Anthropic,
+                ProxyRequest {
+                    method: Method::POST,
+                    uri: "/v1/messages".parse().unwrap(),
+                    headers: req_headers,
+                    body: marker_body,
+                },
+            )
+            .await
+            .expect("engine forward body marker with stream=true");
+        assert_eq!(resp_marker.status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            resp_marker
+                .headers
+                .get("x-parapet-error")
+                .and_then(|v| v.to_str().ok()),
+            Some("offline_streaming_scenario_unsupported")
+        );
+        let marker_bytes = collect_proxy_body(resp_marker).await;
+        let marker_text = std::str::from_utf8(&marker_bytes).expect("utf-8 error body");
+        assert!(marker_text.contains("offline_streaming_scenario_unsupported"));
+        assert!(!marker_text.contains("parapet offline fixture ok"));
+    }
+
+    // 3. Explicit non-V0 sender fixture and all valid non-V0 scenario headers with stream=true.
+    for hdr_val in [
+        "block_no_effect",
+        "allow_no_executor",
+        "allow_verified_write",
+        "shadow_parse_error_l3_off",
+    ] {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-parapet-offline-scenario",
+            HeaderValue::from_static(hdr_val),
+        );
+        let resp = sender
+            .send(HttpRequest {
+                method: Method::POST,
+                url: "https://api.anthropic.com/v1/messages".to_string(),
+                headers,
+                body: benign_stream_body.clone(),
+                timeout_ms: None,
+                stream: true,
+            })
+            .await
+            .expect("non-v0 header streaming response");
+        assert_eq!(resp.status, StatusCode::BAD_REQUEST, "header={hdr_val}");
+        assert_eq!(
+            resp.headers
+                .get("x-parapet-error")
+                .and_then(|v| v.to_str().ok()),
+            Some("offline_streaming_scenario_unsupported")
+        );
+    }
+
+    for fixture in [
+        OfflineUpstreamFixtureV0::AllowNoExecutor,
+        OfflineUpstreamFixtureV0::AllowVerifiedWrite,
+        OfflineUpstreamFixtureV0::BlockNoEffect,
+        OfflineUpstreamFixtureV0::ShadowParseErrorL3Off,
+    ] {
+        let non_v0_sender = DeterministicOfflineHttpSenderV0::new(fixture);
+        let resp = non_v0_sender
+            .send(HttpRequest {
+                method: Method::POST,
+                url: "https://api.anthropic.com/v1/messages".to_string(),
+                headers: HeaderMap::new(),
+                body: benign_stream_body.clone(),
+                timeout_ms: None,
+                stream: true,
+            })
+            .await
+            .expect("non-v0 fixture streaming response");
+        assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            resp.headers
+                .get("x-parapet-error")
+                .and_then(|v| v.to_str().ok()),
+            Some("offline_streaming_scenario_unsupported")
+        );
+    }
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn deterministic_offline_sender_v0_non_stream_regression_preserves_exact_bytes() {
+    let sender = DeterministicOfflineHttpSenderV0::new(OfflineUpstreamFixtureV0::V0);
+    let expected_anthropic = serde_json::to_vec(&serde_json::json!({
+        "id": "msg_offline_v0",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-3-5-sonnet-20241022",
+        "content": [
+            {
+                "type": "tool_use",
+                "id": "toolu_offline_v0_1",
+                "name": "write_file",
+                "input": {
+                    "path": "note.txt",
+                    "content": "hello parapet\n"
+                }
+            }
+        ],
+        "stop_reason": "tool_use"
+    }))
+    .unwrap();
+
+    for body in [
+        Bytes::new(),
+        Bytes::from_static(br#"{"model":"claude-3-5-sonnet-20241022","messages":[{"role":"user","content":"hi"}]}"#),
+        Bytes::from_static(br#"{"model":"claude-3-5-sonnet-20241022","stream":false,"messages":[{"role":"user","content":"hi"}]}"#),
+        // Even if raw body JSON says `"stream": true`, HttpRequest.stream == false is authoritative.
+        Bytes::from_static(br#"{"model":"claude-3-5-sonnet-20241022","stream":true,"messages":[{"role":"user","content":"hi"}]}"#),
+    ] {
+        let resp = sender
+            .send(HttpRequest {
+                method: Method::POST,
+                url: "https://api.anthropic.com/v1/messages".to_string(),
+                headers: HeaderMap::new(),
+                body,
+                timeout_ms: None,
+                stream: false,
+            })
+            .await
+            .expect("non-stream anthropic offline response");
+        assert_eq!(resp.status, StatusCode::OK);
+        assert_eq!(
+            resp.headers
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        let HttpBody::Full(bytes) = resp.body else {
+            panic!("expected HttpBody::Full for non-stream response");
+        };
+        assert_eq!(bytes.as_ref(), expected_anthropic.as_slice());
+    }
+
+    let expected_block_anthropic = serde_json::to_vec(&serde_json::json!({
+        "id": "msg_offline_v0",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-3-5-sonnet-20241022",
+        "content": [
+            {
+                "type": "tool_use",
+                "id": "toolu_offline_v0_1",
+                "name": "write_file",
+                "input": {
+                    "path": "../escape.txt",
+                    "content": "blocked"
+                }
+            }
+        ],
+        "stop_reason": "tool_use"
+    }))
+    .unwrap();
+
+    let mut block_headers = HeaderMap::new();
+    block_headers.insert(
+        "x-parapet-offline-scenario",
+        HeaderValue::from_static("block_no_effect"),
+    );
+    for (headers, body) in [
+        (
+            block_headers,
+            Bytes::from_static(br#"{"model":"claude-3-5-sonnet-20241022","messages":[{"role":"user","content":"hi"}]}"#),
+        ),
+        (
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"model":"claude-3-5-sonnet-20241022","messages":[{"role":"user","content":"block_no_effect"}]}"#),
+        ),
+    ] {
+        let resp = sender
+            .send(HttpRequest {
+                method: Method::POST,
+                url: "https://api.anthropic.com/v1/messages".to_string(),
+                headers,
+                body,
+                timeout_ms: None,
+                stream: false,
+            })
+            .await
+            .expect("non-stream anthropic block_no_effect response");
+        assert_eq!(resp.status, StatusCode::OK);
+        let HttpBody::Full(bytes) = resp.body else {
+            panic!("expected HttpBody::Full for non-stream response");
+        };
+        assert_eq!(bytes.as_ref(), expected_block_anthropic.as_slice());
+    }
+}

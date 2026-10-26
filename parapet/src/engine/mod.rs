@@ -4305,7 +4305,11 @@ impl OfflineUpstreamFixtureV0 {
 /// Deterministic offline HTTP sender (`parapet-offline-upstream/v0`).
 ///
 /// Never performs network I/O. Preserves normal `DefaultUpstreamResolver` HTTPS
-/// host allowlist checks before `HttpSender::send` is invoked.
+/// host allowlist checks before `HttpSender::send` is invoked. For Anthropic
+/// requests with `HttpRequest.stream == true`, serves a generic benign text-only
+/// SSE smoke turn only when no explicit offline scenario is selected; explicit
+/// effect/tool scenarios are rejected with deterministic `400 Bad Request`
+/// (`offline_streaming_scenario_unsupported`).
 #[cfg(not(windows))]
 pub struct DeterministicOfflineHttpSenderV0 {
     fixture: OfflineUpstreamFixtureV0,
@@ -4318,7 +4322,7 @@ impl DeterministicOfflineHttpSenderV0 {
         Self { fixture }
     }
 
-    fn resolve_scenario(&self, request: &HttpRequest) -> OfflineUpstreamFixtureV0 {
+    fn resolve_explicit_scenario(&self, request: &HttpRequest) -> Option<OfflineUpstreamFixtureV0> {
         if let Some(hdr) = request
             .headers
             .get("x-parapet-offline-scenario")
@@ -4333,25 +4337,55 @@ impl DeterministicOfflineHttpSenderV0 {
                     parsed
                 };
                 if parsed != OfflineUpstreamFixtureV0::V0 {
-                    return parsed;
+                    return Some(parsed);
                 }
             }
         }
         if self.fixture != OfflineUpstreamFixtureV0::V0 {
-            return self.fixture;
+            return Some(self.fixture);
         }
         let body_str = std::str::from_utf8(&request.body).unwrap_or("");
         if body_str.contains("shadow_parse_error_l3_off") {
-            OfflineUpstreamFixtureV0::ShadowParseErrorL3Off
+            Some(OfflineUpstreamFixtureV0::ShadowParseErrorL3Off)
         } else if body_str.contains("block_no_effect") || body_str.contains("../escape.txt") {
-            OfflineUpstreamFixtureV0::BlockNoEffect
+            Some(OfflineUpstreamFixtureV0::BlockNoEffect)
         } else if body_str.contains("allow_no_executor") {
-            OfflineUpstreamFixtureV0::AllowNoExecutor
+            Some(OfflineUpstreamFixtureV0::AllowNoExecutor)
         } else {
-            OfflineUpstreamFixtureV0::AllowVerifiedWrite
+            None
         }
     }
+
+    fn resolve_scenario(&self, request: &HttpRequest) -> OfflineUpstreamFixtureV0 {
+        self.resolve_explicit_scenario(request)
+            .unwrap_or(OfflineUpstreamFixtureV0::AllowVerifiedWrite)
+    }
 }
+
+/// Generic text-only Anthropic SSE smoke fixture for the default `V0` no-scenario path.
+/// Does not exercise effect or tool-call scenario semantics.
+#[cfg(not(windows))]
+const ANTHROPIC_OFFLINE_STREAM_SSE_V0: &str = concat!(
+    "event: message_start\n",
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_offline_v0\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-5-sonnet-20241022\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+    "event: content_block_start\n",
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+    "event: content_block_delta\n",
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"parapet offline fixture ok\"}}\n\n",
+    "event: content_block_stop\n",
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+    "event: message_delta\n",
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":1}}\n\n",
+    "event: message_stop\n",
+    "data: {\"type\":\"message_stop\"}\n\n",
+);
+
+#[cfg(not(windows))]
+const OFFLINE_STREAM_SCENARIO_UNSUPPORTED: &str = "offline_streaming_scenario_unsupported";
+
+#[cfg(not(windows))]
+const ANTHROPIC_OFFLINE_STREAM_SCENARIO_UNSUPPORTED_JSON: &str =
+    "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"offline_streaming_scenario_unsupported\"}}";
 
 #[cfg(not(windows))]
 #[async_trait]
@@ -4368,9 +4402,42 @@ impl HttpSender for DeterministicOfflineHttpSenderV0 {
                 "offline fixture requires HTTPS resolved upstream URL".into(),
             ));
         }
+        let has_explicit_scenario = self.resolve_explicit_scenario(&request).is_some();
         let scenario = self.resolve_scenario(&request);
         let is_anthropic =
             request.url.contains("anthropic.com") || request.url.ends_with("/v1/messages");
+        if is_anthropic && request.stream {
+            if has_explicit_scenario {
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    reqwest::header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                );
+                headers.insert(
+                    "x-parapet-error",
+                    HeaderValue::from_static(OFFLINE_STREAM_SCENARIO_UNSUPPORTED),
+                );
+                return Ok(HttpResponse {
+                    status: StatusCode::BAD_REQUEST,
+                    headers,
+                    body: HttpBody::Full(Bytes::from_static(
+                        ANTHROPIC_OFFLINE_STREAM_SCENARIO_UNSUPPORTED_JSON.as_bytes(),
+                    )),
+                });
+            }
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                reqwest::header::CONTENT_TYPE,
+                HeaderValue::from_static("text/event-stream"),
+            );
+            return Ok(HttpResponse {
+                status: StatusCode::OK,
+                headers,
+                body: HttpBody::Full(Bytes::from_static(
+                    ANTHROPIC_OFFLINE_STREAM_SSE_V0.as_bytes(),
+                )),
+            });
+        }
         let payload = if is_anthropic {
             let input_val = match scenario {
                 OfflineUpstreamFixtureV0::AllowNoExecutor
