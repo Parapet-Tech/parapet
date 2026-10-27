@@ -56,6 +56,10 @@ struct Cli {
     /// Explicitly require verified provenance carriers for one supported profile (requires --state-dir)
     #[arg(long, value_enum)]
     provenance_profile: Option<parapet::cli::ProvenanceProfileArg>,
+
+    /// Provider route bound by --provenance-profile (default: anthropic)
+    #[arg(long, value_enum, requires = "provenance_profile")]
+    provenance_route: Option<parapet::cli::ProvenanceRouteArg>,
 }
 
 #[tokio::main]
@@ -82,10 +86,23 @@ async fn main() {
         || cli.effect_root.is_some()
         || cli.offline_fixture.is_some()
         || cli.provenance_profile.is_some()
+        || cli.provenance_route.is_some()
     {
         tracing::error!("state-dir and effect-root are not supported on Windows");
         std::process::exit(6);
     }
+
+    #[cfg(not(windows))]
+    let provenance = match parapet::cli::ProvenanceActivation::from_args(
+        cli.provenance_profile,
+        cli.provenance_route,
+    ) {
+        Ok(activation) => activation,
+        Err(e) => {
+            tracing::error!(%e, "invalid provenance arguments");
+            std::process::exit(2);
+        }
+    };
 
     #[cfg(not(windows))]
     let (profile, offline_fixture) = if cli.state_dir.is_some() {
@@ -125,7 +142,7 @@ async fn main() {
             || cli.max_content_bytes.is_some()
             || cli.offline_fixture.is_some()
             || cli.ready_file.is_some()
-            || cli.provenance_profile.is_some()
+            || provenance.is_some()
         {
             tracing::error!("runtime options require --state-dir");
             std::process::exit(2);
@@ -273,7 +290,7 @@ async fn main() {
                     }
                 };
             let routing = parapet::cli::activation::build_runtime_routing(
-                cli.provenance_profile,
+                provenance,
                 std::sync::Arc::new(client),
             );
             let app = routing.router;

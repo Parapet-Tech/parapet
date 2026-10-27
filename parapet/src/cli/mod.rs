@@ -131,9 +131,95 @@ struct InitArgs {
 /// Explicit CLI-only provenance carrier profile selector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum ProvenanceProfileArg {
-    /// Required OpenCode 2.0.32 carrier admission on exact Anthropic `POST /v1/messages`
+    /// Required OpenCode 2.0.32 carrier admission on exactly one `--provenance-route`
     #[value(name = "opencode")]
     OpenCode,
+}
+
+/// Explicit CLI-only provider route selector for a provenance profile.
+///
+/// Exactly one route is bound per runtime; the unselected provider route is
+/// refused under required admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum ProvenanceRouteArg {
+    /// Anthropic `POST /v1/messages` (default)
+    #[default]
+    #[value(name = "anthropic")]
+    Anthropic,
+    /// OpenAI-compatible `POST /v1/chat/completions`
+    #[value(name = "openai")]
+    OpenAi,
+}
+
+impl ProvenanceRouteArg {
+    /// Closed [`crate::proxy::ProvenanceRouteBinding`] for this route.
+    pub const fn route_binding(self) -> crate::proxy::ProvenanceRouteBinding {
+        match self {
+            Self::Anthropic => crate::proxy::ProvenanceRouteBinding::ANTHROPIC,
+            Self::OpenAi => crate::proxy::ProvenanceRouteBinding::OPENAI,
+        }
+    }
+}
+
+/// Validated explicit provenance activation: one profile bound to exactly one provider route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProvenanceActivation {
+    profile: ProvenanceProfileArg,
+    route: ProvenanceRouteArg,
+}
+
+/// Invalid provenance activation argument combination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProvenanceActivationError {
+    /// `--provenance-route` was given without `--provenance-profile`.
+    RouteWithoutProfile,
+}
+
+impl std::fmt::Display for ProvenanceActivationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RouteWithoutProfile => {
+                f.write_str("--provenance-route requires --provenance-profile")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ProvenanceActivationError {}
+
+impl ProvenanceActivation {
+    /// Bind `profile` to exactly `route`.
+    pub const fn new(profile: ProvenanceProfileArg, route: ProvenanceRouteArg) -> Self {
+        Self { profile, route }
+    }
+
+    /// Validate CLI arguments. No profile means no activation; an absent route
+    /// defaults to [`ProvenanceRouteArg::Anthropic`]; a route without a profile is refused.
+    pub fn from_args(
+        profile: Option<ProvenanceProfileArg>,
+        route: Option<ProvenanceRouteArg>,
+    ) -> Result<Option<Self>, ProvenanceActivationError> {
+        match (profile, route) {
+            (None, None) => Ok(None),
+            (None, Some(_)) => Err(ProvenanceActivationError::RouteWithoutProfile),
+            (Some(profile), route) => Ok(Some(Self::new(profile, route.unwrap_or_default()))),
+        }
+    }
+
+    /// Selected provenance profile.
+    pub const fn profile(self) -> ProvenanceProfileArg {
+        self.profile
+    }
+
+    /// Selected provider route.
+    pub const fn route(self) -> ProvenanceRouteArg {
+        self.route
+    }
+
+    /// Closed [`crate::proxy::ProvenanceRouteBinding`] for the selected route.
+    pub const fn route_binding(self) -> crate::proxy::ProvenanceRouteBinding {
+        self.route.route_binding()
+    }
 }
 
 #[derive(Args)]
@@ -182,6 +268,10 @@ struct RunArgs {
     /// Explicitly require verified provenance carriers for one supported profile
     #[arg(long, value_enum)]
     provenance_profile: Option<ProvenanceProfileArg>,
+
+    /// Provider route bound by --provenance-profile (default: anthropic)
+    #[arg(long, value_enum, requires = "provenance_profile")]
+    provenance_route: Option<ProvenanceRouteArg>,
 }
 
 #[derive(Args)]
@@ -1156,6 +1246,14 @@ fn run_engine_cmd(args: RunArgs, json_mode: bool) -> i32 {
         );
     }
 
+    let provenance =
+        match ProvenanceActivation::from_args(args.provenance_profile, args.provenance_route) {
+            Ok(activation) => activation,
+            Err(err) => {
+                return emit_cli_error("run", "invalid_arguments", 2, &err.to_string(), json_mode);
+            }
+        };
+
     let Ok(cfg) = config::load_config(&config::FileSource {
         path: args.config.clone(),
     }) else {
@@ -1274,7 +1372,7 @@ fn run_engine_cmd(args: RunArgs, json_mode: bool) -> i32 {
         // Capture the engine-generated identity before the capability moves into the control plane.
         let run_id = root_cap.as_ref().map(|cap| cap.run_id().clone());
         let routing = crate::cli::activation::build_runtime_routing(
-            args.provenance_profile,
+            provenance,
             std::sync::Arc::new(client),
         );
         let app = routing.router;

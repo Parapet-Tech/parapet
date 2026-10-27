@@ -8,17 +8,18 @@
 //! provenance session control is exposed. With `--provenance-profile opencode`
 //! one [`SessionManager`] backs both the control-plane session handle and the
 //! [`ProfileMode::RequiredOpenCode`] request admitter, bound exclusively to
-//! exact Anthropic `POST /v1/messages`.
+//! the one [`ProvenanceRouteBinding`] selected by `--provenance-route`:
+//! exact Anthropic `POST /v1/messages` (default) or exact OpenAI
+//! `POST /v1/chat/completions`.
 
 #![cfg(not(windows))]
 
 use std::sync::Arc;
 
 use crate::cli::control::{
-    DefaultProvenanceSessionClockFactory, ProvenanceRouteBinding, ProvenanceSessionClockFactory,
-    ProvenanceSessionControl,
+    DefaultProvenanceSessionClockFactory, ProvenanceSessionClockFactory, ProvenanceSessionControl,
 };
-use crate::cli::ProvenanceProfileArg;
+use crate::cli::{ProvenanceActivation, ProvenanceProfileArg};
 use crate::engine::{EngineUpstreamClient, ProjectedEngineStage};
 use crate::provenance::{opencode_2_0_32_profile, ProfileMode, SessionManager};
 use crate::proxy::{build_router, build_router_with_admission, UpstreamClient};
@@ -30,14 +31,14 @@ pub struct RuntimeRouting {
     pub provenance_session: Option<ProvenanceSessionControl>,
 }
 
-/// Build runtime routing for `profile` with an OS-entropy [`SessionManager`]
+/// Build runtime routing for `activation` with an OS-entropy [`SessionManager`]
 /// and the system clock.
 pub fn build_runtime_routing(
-    profile: Option<ProvenanceProfileArg>,
+    activation: Option<ProvenanceActivation>,
     engine: Arc<EngineUpstreamClient>,
 ) -> RuntimeRouting {
     build_runtime_routing_with(
-        profile,
+        activation,
         engine,
         Arc::new(SessionManager::new()),
         Arc::new(DefaultProvenanceSessionClockFactory),
@@ -45,24 +46,24 @@ pub fn build_runtime_routing(
 }
 
 /// [`build_runtime_routing`] with an injected [`SessionManager`] and
-/// [`ProvenanceSessionClockFactory`]. Both are unused without a profile.
+/// [`ProvenanceSessionClockFactory`]. Both are unused without an activation.
 pub fn build_runtime_routing_with(
-    profile: Option<ProvenanceProfileArg>,
+    activation: Option<ProvenanceActivation>,
     engine: Arc<EngineUpstreamClient>,
     sessions: Arc<SessionManager>,
     clock_factory: Arc<dyn ProvenanceSessionClockFactory>,
 ) -> RuntimeRouting {
-    match profile {
-        None => {
-            let upstream: Arc<dyn UpstreamClient> = engine;
-            RuntimeRouting {
-                router: build_router(upstream),
-                provenance_session: None,
-            }
-        }
-        Some(ProvenanceProfileArg::OpenCode) => {
+    let Some(activation) = activation else {
+        let upstream: Arc<dyn UpstreamClient> = engine;
+        return RuntimeRouting {
+            router: build_router(upstream),
+            provenance_session: None,
+        };
+    };
+    match activation.profile() {
+        ProvenanceProfileArg::OpenCode => {
             let control = ProvenanceSessionControl::new_with(
-                ProvenanceRouteBinding::ANTHROPIC,
+                activation.route_binding(),
                 sessions,
                 opencode_2_0_32_profile(),
                 clock_factory,

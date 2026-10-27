@@ -718,6 +718,203 @@ async fn parapet_engine_opencode_profile_wires_required_admission_and_session_co
     exercise_opencode_activation(Surface::ParapetEngine, "engine").await;
 }
 
+#[test]
+fn provenance_route_is_documented_in_help_on_both_surfaces() {
+    let mut run = Command::new(env!("CARGO_BIN_EXE_parapet"));
+    clear_upstream_env(&mut run);
+    let run_help = run.args(["run", "--help"]).output().unwrap();
+    let mut eng = Command::new(env!("CARGO_BIN_EXE_parapet-engine"));
+    clear_upstream_env(&mut eng);
+    let eng_help = eng.arg("--help").output().unwrap();
+    for (label, out) in [("run", run_help), ("engine", eng_help)] {
+        assert_eq!(out.status.code(), Some(0), "{label} --help");
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(text.contains("--provenance-route"), "{label}: {text}");
+        assert!(text.contains("anthropic"), "{label}: {text}");
+        assert!(text.contains("openai"), "{label}: {text}");
+        assert!(text.contains("default: anthropic"), "{label}: {text}");
+    }
+}
+
+#[test]
+fn invalid_provenance_route_combinations_are_rejected_before_listening() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = write_config(tmp.path());
+    let state_dir = private_state_dir(tmp.path(), "state-route-reject");
+
+    let route_cases: &[&[&str]] = &[
+        // Route without a profile is never an implicit activation.
+        &["--provenance-route", "openai"],
+        &["--provenance-route", "anthropic"],
+        // Unknown or non-canonical route values.
+        &[
+            "--provenance-profile",
+            "opencode",
+            "--provenance-route",
+            "OpenAI",
+        ],
+        &[
+            "--provenance-profile",
+            "opencode",
+            "--provenance-route",
+            "responses",
+        ],
+        &["--provenance-profile", "opencode", "--provenance-route", ""],
+        // Exactly one route: binding both providers is refused.
+        &[
+            "--provenance-profile",
+            "opencode",
+            "--provenance-route",
+            "openai",
+            "--provenance-route",
+            "anthropic",
+        ],
+        &[
+            "--provenance-profile",
+            "opencode",
+            "--provenance-route",
+            "openai,anthropic",
+        ],
+    ];
+    for extra in route_cases {
+        let mut run = Command::new(env!("CARGO_BIN_EXE_parapet"));
+        clear_upstream_env(&mut run);
+        let out = run
+            .args(["run", "--json", "--port", "0", "--config"])
+            .arg(&cfg)
+            .arg("--state-dir")
+            .arg(&state_dir)
+            .args(["--ready-file", "ready.port"])
+            .args(*extra)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "run extra={extra:?}");
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(v["error_code"], "invalid_arguments", "run extra={extra:?}");
+
+        let mut eng = Command::new(env!("CARGO_BIN_EXE_parapet-engine"));
+        clear_upstream_env(&mut eng);
+        let out = eng
+            .args(["--port", "0", "--config"])
+            .arg(&cfg)
+            .arg("--state-dir")
+            .arg(&state_dir)
+            .args(["--ready-file", "ready.port"])
+            .args(*extra)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "engine extra={extra:?}");
+    }
+
+    assert!(!state_dir.join("ready.port").exists());
+    assert!(!state_dir.join("control.sock").exists());
+    assert!(!state_dir.join("engine.owner.json").exists());
+}
+
+async fn exercise_explicit_route(surface: Surface, tag: &str, route: &str) {
+    let upstream = FakeUpstream::spawn().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = write_config(tmp.path());
+    let state_dir = private_state_dir(tmp.path(), &format!("state-{tag}"));
+    let child = spawn_surface(
+        surface,
+        &state_dir,
+        &cfg,
+        &upstream,
+        &[
+            "--provenance-profile",
+            "opencode",
+            "--provenance-route",
+            route,
+        ],
+        &[],
+    );
+    let port = wait_ready(&state_dir).await;
+    let (bound_path, bound_body, other_path, other_body, alias_path) = if route == "openai" {
+        (
+            "/v1/chat/completions",
+            openai_body(),
+            "/v1/messages",
+            anthropic_body(),
+            "/openai/v1/chat/completions",
+        )
+    } else {
+        (
+            "/v1/messages",
+            anthropic_body(),
+            "/v1/chat/completions",
+            openai_body(),
+            "/anthropic/v1/messages",
+        )
+    };
+
+    // Before a session exists, the bound route fails closed on its carrier
+    // and the unselected route is refused by the route gate.
+    let (s, b) = post(port, bound_path, &bound_body, None).await;
+    assert_carrier_rejected(s, &b, Some("session_mismatch"));
+    let (s, b) = post(port, other_path, &other_body, None).await;
+    assert_carrier_rejected(s, &b, Some("schema_mismatch"));
+    assert_eq!(upstream.count(), 0);
+
+    let grant = Grant::from_start(&control(
+        &state_dir,
+        CONTROL_ACTION_PROVENANCE_SESSION_START,
+    ));
+
+    // A validly keyed carrier on the unselected provider or an alias path is refused.
+    let (env, _) = sign(&grant, &other_body, 0);
+    let (s, b) = post(port, other_path, &other_body, Some(&env)).await;
+    assert_carrier_rejected(s, &b, Some("schema_mismatch"));
+    let (env, _) = sign(&grant, &bound_body, 1);
+    let (s, b) = post(port, alias_path, &bound_body, Some(&env)).await;
+    assert_carrier_rejected(s, &b, Some("schema_mismatch"));
+    assert_eq!(upstream.count(), 0);
+
+    // A verified carrier on the bound route reaches the explicit loopback upstream once.
+    let (env, _) = sign(&grant, &bound_body, 2);
+    let (s, b) = post(port, bound_path, &bound_body, Some(&env)).await;
+    assert_eq!(s, reqwest::StatusCode::OK, "body={b}");
+    assert_eq!(upstream.count(), 1);
+    let forwarded = upstream.last();
+    assert_eq!(forwarded.target, bound_path);
+    assert!(forwarded
+        .headers
+        .iter()
+        .all(|(k, _)| !k.eq_ignore_ascii_case(PROVENANCE_HEADER)));
+
+    // Replay is refused.
+    let (s, b) = post(port, bound_path, &bound_body, Some(&env)).await;
+    assert_carrier_rejected(s, &b, None);
+    assert_eq!(upstream.count(), 1);
+
+    disable(&state_dir);
+    let (stdout, stderr) = child.finish();
+    assert_no_secret(
+        &[("stdout", stdout.as_str()), ("stderr", stderr.as_str())],
+        &[&grant.key_hex],
+    );
+}
+
+#[tokio::test]
+async fn parapet_run_explicit_openai_route_admits_only_chat_completions() {
+    exercise_explicit_route(Surface::ParapetRun, "run-openai", "openai").await;
+}
+
+#[tokio::test]
+async fn parapet_engine_explicit_openai_route_admits_only_chat_completions() {
+    exercise_explicit_route(Surface::ParapetEngine, "engine-openai", "openai").await;
+}
+
+#[tokio::test]
+async fn parapet_run_explicit_anthropic_route_matches_default() {
+    exercise_explicit_route(Surface::ParapetRun, "run-anthropic", "anthropic").await;
+}
+
+#[tokio::test]
+async fn parapet_engine_explicit_anthropic_route_matches_default() {
+    exercise_explicit_route(Surface::ParapetEngine, "engine-anthropic", "anthropic").await;
+}
+
 // ---------------------------------------------------------------------------
 // In-process wiring (no sockets): shared manager, route binding, projected stage
 // ---------------------------------------------------------------------------
@@ -729,7 +926,9 @@ mod in_process {
     use bytes::Bytes;
     use parapet::cli::activation::{build_runtime_routing_with, RuntimeRouting};
     use parapet::cli::control::{ProvenanceRouteBinding, ProvenanceSessionClockFactory};
-    use parapet::cli::ProvenanceProfileArg;
+    use parapet::cli::{
+        ProvenanceActivation, ProvenanceActivationError, ProvenanceProfileArg, ProvenanceRouteArg,
+    };
     use parapet::config::{load_config, StringSource};
     use parapet::constraint::DslConstraintEvaluator;
     use parapet::engine::{
@@ -828,7 +1027,7 @@ mod in_process {
     }
 
     fn routing(
-        profile: Option<ProvenanceProfileArg>,
+        activation: Option<ProvenanceActivation>,
     ) -> (
         RuntimeRouting,
         Arc<SessionManager>,
@@ -840,7 +1039,8 @@ mod in_process {
         let clock: Arc<dyn ProvenanceSessionClockFactory> =
             Arc::new(|| -> Box<dyn Clock> { Box::new(FixedClock) });
         let engine = engine(sender.clone());
-        let routing = build_runtime_routing_with(profile, engine.clone(), sessions.clone(), clock);
+        let routing =
+            build_runtime_routing_with(activation, engine.clone(), sessions.clone(), clock);
         (routing, sessions, sender, engine)
     }
 
@@ -909,7 +1109,9 @@ mod in_process {
 
     #[tokio::test]
     async fn opencode_profile_binds_exact_anthropic_route_shared_manager_and_projected_stage() {
-        let (routing, sessions, sender, engine) = routing(Some(ProvenanceProfileArg::OpenCode));
+        let activation =
+            ProvenanceActivation::from_args(Some(ProvenanceProfileArg::OpenCode), None).unwrap();
+        let (routing, sessions, sender, engine) = routing(activation);
         let control = routing.provenance_session.expect("session control");
         let app = routing.router;
         let anthropic = anthropic_body();
@@ -968,5 +1170,76 @@ mod in_process {
         for key in [&g1.key_hex, &g2.key_hex] {
             assert!(!debug.contains(key.as_str()));
         }
+    }
+
+    #[test]
+    fn activation_defaults_to_anthropic_and_refuses_route_without_profile() {
+        let opencode = Some(ProvenanceProfileArg::OpenCode);
+        assert_eq!(ProvenanceActivation::from_args(None, None), Ok(None));
+        let default = ProvenanceActivation::from_args(opencode, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(default.route(), ProvenanceRouteArg::Anthropic);
+        assert_eq!(default.route_binding(), ProvenanceRouteBinding::ANTHROPIC);
+        assert_eq!(
+            ProvenanceActivation::from_args(opencode, Some(ProvenanceRouteArg::Anthropic)),
+            Ok(Some(default))
+        );
+        let openai = ProvenanceActivation::from_args(opencode, Some(ProvenanceRouteArg::OpenAi))
+            .unwrap()
+            .unwrap();
+        assert_eq!(openai.route_binding(), ProvenanceRouteBinding::OPENAI);
+        for route in [ProvenanceRouteArg::Anthropic, ProvenanceRouteArg::OpenAi] {
+            assert_eq!(
+                ProvenanceActivation::from_args(None, Some(route)),
+                Err(ProvenanceActivationError::RouteWithoutProfile)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn opencode_openai_route_binds_exact_chat_completions_and_projected_stage() {
+        let activation =
+            ProvenanceActivation::new(ProvenanceProfileArg::OpenCode, ProvenanceRouteArg::OpenAi);
+        let (routing, sessions, sender, engine) = routing(Some(activation));
+        let control = routing.provenance_session.expect("session control");
+        let app = routing.router;
+        let anthropic = anthropic_body();
+        let openai = openai_body();
+
+        assert_eq!(control.route_binding(), ProvenanceRouteBinding::OPENAI);
+        assert_eq!(
+            control.profile().profile_id,
+            opencode_2_0_32_profile().profile_id
+        );
+        assert!(Arc::ptr_eq(control.sessions(), &sessions));
+
+        let (s, b) = send(&app, "/v1/chat/completions", &openai, None).await;
+        reject(s, &b, Some("session_mismatch"));
+        let (s, b) = send(&app, "/v1/messages", &anthropic, None).await;
+        reject(s, &b, Some("schema_mismatch"));
+        assert_eq!(sender.count(), 0);
+
+        let g = grant_of(&control);
+        let (env, _) = sign_at(&g, &anthropic, 0, NOW_MS);
+        let (s, b) = send(&app, "/v1/messages", &anthropic, Some(&env)).await;
+        reject(s, &b, Some("schema_mismatch"));
+        let (env, _) = sign_at(&g, &openai, 1, NOW_MS);
+        let (s, b) = send(&app, "/openai/v1/chat/completions", &openai, Some(&env)).await;
+        reject(s, &b, Some("schema_mismatch"));
+        assert_eq!(sender.count(), 0);
+
+        let (env, _) = sign_at(&g, &openai, 2, NOW_MS);
+        let (s, b) = send(&app, "/v1/chat/completions", &openai, Some(&env)).await;
+        assert_eq!(s, StatusCode::OK, "body={b}");
+        assert_eq!(sender.count(), 1);
+        assert!(sender.urls.lock().unwrap()[0].starts_with("http://openai.invalid"));
+        assert_eq!(engine.carrier_receipts().len(), 1);
+
+        control.end_session();
+        let (env, _) = sign_at(&g, &openai, 3, NOW_MS);
+        let (s, b) = send(&app, "/v1/chat/completions", &openai, Some(&env)).await;
+        reject(s, &b, Some("session_mismatch"));
+        assert_eq!(sender.count(), 1);
     }
 }
