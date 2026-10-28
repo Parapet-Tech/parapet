@@ -911,8 +911,8 @@ pub async fn proxy_handler(
                 return method_not_allowed_response(path, &method);
             }
             // Ordinary-mode Responses requests enter the engine's dedicated
-            // strict request/output path. Streaming remains locally refused
-            // by the engine until its stateful policy seam is activated.
+            // strict request/output path; streaming uses the activated
+            // full-buffer executor. RequiredOpenCode was refused above.
             Provider::OpenAi
         }
         PathClass::KnownUnsupported => {
