@@ -1093,6 +1093,17 @@ mod tests {
         json!({"type": "reasoning", "id": "rs_1", "summary": summary, "encrypted_content": enc})
     }
 
+    /// `reasoning_summary_part.{phase}` on `rs_1`; `status` is added as given.
+    fn summary_part(phase: &str, index: usize, text: &str, status: Option<&str>) -> Value {
+        let mut v = json!({"type": format!("response.reasoning_summary_part.{phase}"),
+            "item_id": "rs_1", "output_index": 0, "summary_index": index,
+            "part": {"type": "summary_text", "text": text}});
+        if let Some(status) = status {
+            v["status"] = json!(status);
+        }
+        v
+    }
+
     /// Reasoning item whose opaque value rotates across added, done, and the
     /// terminal snapshot; `last` replaces the terminal event when given.
     fn encrypted_events(last: Option<Value>) -> Vec<Value> {
@@ -1100,10 +1111,12 @@ mod tests {
             json!({"type": "response.created", "response": response("queued", vec![])}),
             json!({"type": "response.output_item.added", "output_index": 0,
                 "item": reasoning(ADDED_ENC, &[])}),
+            summary_part("added", 0, "", None),
             json!({"type": "response.reasoning_summary_text.delta", "item_id": "rs_1",
                 "output_index": 0, "summary_index": 0, "delta": "S"}),
             json!({"type": "response.reasoning_summary_text.done", "item_id": "rs_1",
                 "output_index": 0, "summary_index": 0, "text": "S"}),
+            summary_part("done", 0, "S", None),
             json!({"type": "response.output_item.done", "output_index": 0,
                 "item": reasoning(DONE_ENC, &["S"])}),
         ];
@@ -1182,5 +1195,310 @@ mod tests {
         );
         assert!(format!("{c:?}").contains("canonical_bytes: 0"));
         assert_eq!(c.finish().unwrap_err(), E::Poisoned);
+    }
+
+    // -- reasoning summary wrapper (OA-R2b2a) -------------------------------
+
+    /// Two wrapped summary parts on an opaque reasoning item; the second
+    /// wrapper done carries `status` as given. `last` replaces the terminal.
+    fn summary_events(status: Option<&str>, last: Option<Value>) -> Vec<Value> {
+        let text = |phase: &str, index: usize, key: &str, s: &str| {
+            json!({"type": format!("response.reasoning_summary_text.{phase}"),
+                "item_id": "rs_1", "output_index": 0, "summary_index": index, key: s})
+        };
+        let mut evs = vec![
+            json!({"type": "response.created", "response": response("queued", vec![])}),
+            json!({"type": "response.output_item.added", "output_index": 0,
+                "item": reasoning(ADDED_ENC, &[])}),
+            summary_part("added", 0, "", None),
+            text("delta", 0, "delta", "Su"),
+            text("delta", 0, "delta", "m"),
+            text("done", 0, "text", "Sum"),
+            summary_part("done", 0, "Sum", None),
+            summary_part("added", 1, "", None),
+            text("delta", 1, "delta", "Two"),
+            text("done", 1, "text", "Two"),
+            summary_part("done", 1, "Two", status),
+            json!({"type": "response.output_item.done", "output_index": 0,
+                "item": reasoning(DONE_ENC, &["Sum", "Two"])}),
+        ];
+        evs.push(last.unwrap_or_else(|| {
+            json!({"type": "response.completed", "response":
+                response("completed", vec![reasoning(TERM_ENC, &["Sum", "Two"])])})
+        }));
+        number(evs)
+    }
+
+    #[test]
+    fn summary_wrappers_release_original_frames_and_project_once() {
+        for status in [None, Some("incomplete")] {
+            let evs = summary_events(status, None);
+            let collected = collect(sse(&evs, false, "\r\n").as_bytes())
+                .unwrap_or_else(|e| panic!("{status:?}: {e}"));
+            // Canonical frames are the validated originals, status included.
+            assert_eq!(
+                collected.canonical().as_ref(),
+                sse(&evs, true, "\n").as_bytes()
+            );
+            let canonical = std::str::from_utf8(collected.canonical()).unwrap();
+            assert_eq!(
+                canonical.matches("\"status\":\"incomplete\"").count(),
+                usize::from(status.is_some())
+            );
+            let Terminal::Completed(stream) = collected.terminal() else {
+                panic!("completed")
+            };
+            // Exactly one projection per summary part, from the terminal.
+            let texts: Vec<_> = stream
+                .response()
+                .texts()
+                .iter()
+                .map(|s| (s.kind(), s.part_index(), s.text()))
+                .collect();
+            assert_eq!(
+                texts,
+                [
+                    (TextSegmentKind::ReasoningSummary, 0, "Sum"),
+                    (TextSegmentKind::ReasoningSummary, 1, "Two")
+                ]
+            );
+            let parts: Vec<_> = stream.items()[0]
+                .summary_parts()
+                .iter()
+                .map(|p| (p.added_text(), p.text_done(), p.part_done_text()))
+                .collect();
+            assert_eq!(
+                parts,
+                [
+                    (Some(""), "Sum", Some("Sum")),
+                    (Some(""), "Two", Some("Two"))
+                ]
+            );
+            assert_eq!(
+                stream
+                    .response()
+                    .encrypted_continuation(0)
+                    .map(|c| c.expose_ciphertext()),
+                Some(TERM_ENC)
+            );
+        }
+    }
+
+    #[test]
+    fn summary_wrapper_violations_poison_and_release_nothing() {
+        type Mutation = fn(&mut Vec<Value>);
+        let cases: Vec<(&str, Mutation, E)> = vec![
+            (
+                "added text not empty",
+                |e| e[2]["part"]["text"] = json!(MARKER),
+                E::Assembly(StreamStateError::PartAddedTextNotEmpty),
+            ),
+            (
+                "wrapper done mismatch",
+                |e| e[6]["part"]["text"] = json!(MARKER),
+                E::Assembly(StreamStateError::PartDoneMismatch),
+            ),
+            (
+                "wrapper done before text done",
+                |e| e.swap(5, 6),
+                E::Assembly(StreamStateError::PartTextOpen),
+            ),
+            (
+                "wrapper done dropped",
+                |e| {
+                    e.remove(10);
+                },
+                E::Assembly(StreamStateError::ChildrenOpen),
+            ),
+            (
+                "wrapper added dropped",
+                |e| {
+                    e.remove(2);
+                },
+                E::Assembly(StreamStateError::UnknownPart),
+            ),
+            (
+                "summary index gap",
+                |e| e[7]["summary_index"] = json!(2),
+                E::Assembly(StreamStateError::PartIndexGap),
+            ),
+            (
+                "wrong item id",
+                |e| e[2]["item_id"] = json!("rs_2"),
+                E::Assembly(StreamStateError::UnknownItem),
+            ),
+            (
+                "item done text mismatch",
+                |e| e[11]["item"]["summary"][1]["text"] = json!(MARKER),
+                E::Assembly(StreamStateError::ItemDoneTextMismatch),
+            ),
+            (
+                "terminal text mismatch",
+                |e| e[12]["response"]["output"][0]["summary"][0]["text"] = json!(MARKER),
+                E::Assembly(StreamStateError::SnapshotTextMismatch),
+            ),
+            ("status null", |e| e[10]["status"] = json!(null), E::Decode),
+            (
+                "status other",
+                |e| e[10]["status"] = json!("completed"),
+                E::Decode,
+            ),
+            (
+                "status on added",
+                |e| e[2]["status"] = json!("incomplete"),
+                E::Decode,
+            ),
+            (
+                "extra part field",
+                |e| e[6]["part"]["annotations"] = json!([]),
+                E::Decode,
+            ),
+            (
+                "wrong part type",
+                |e| e[6]["part"]["type"] = json!("reasoning_text"),
+                E::Decode,
+            ),
+        ];
+        for (label, mutate, expected) in cases {
+            let mut evs = summary_events(Some("incomplete"), None);
+            mutate(&mut evs);
+            let evs = number(evs);
+            let mut c = ResponsesSseCollector::new();
+            let err = c.push(sse(&evs, true, "\n").as_bytes()).unwrap_err();
+            assert_eq!(err, expected, "{label}");
+            let debug = format!("{c:?}");
+            assert!(debug.contains("canonical_bytes: 0"), "{label}: {debug}");
+            assert_no_echo(label, &format!("{err} {err:?} {debug}"));
+            assert_eq!(c.finish().unwrap_err(), E::Poisoned, "{label}");
+        }
+    }
+
+    // -- reasoning content wrapper (OA-3) ------------------------------------
+
+    fn reasoning_content(content: &[&str]) -> Value {
+        let content: Vec<Value> = content
+            .iter()
+            .map(|t| json!({"type": "reasoning_text", "text": t}))
+            .collect();
+        json!({"type": "reasoning", "id": "rs_1", "summary": [], "content": content})
+    }
+
+    /// Reasoning item: content index 0 wrapped ("Re" + "a"), index 1 bare.
+    fn reasoning_content_events() -> Vec<Value> {
+        let text = |phase: &str, index: usize, key: &str, s: &str| {
+            json!({"type": format!("response.reasoning_text.{phase}"), "item_id": "rs_1",
+                "output_index": 0, "content_index": index, key: s})
+        };
+        let wrapper = |phase: &str, s: &str| {
+            json!({"type": format!("response.content_part.{phase}"), "item_id": "rs_1",
+                "output_index": 0, "content_index": 0,
+                "part": {"type": "reasoning_text", "text": s}})
+        };
+        number(vec![
+            json!({"type": "response.created", "response": response("queued", vec![])}),
+            json!({"type": "response.output_item.added", "output_index": 0,
+                "item": reasoning_content(&[])}),
+            wrapper("added", ""),
+            text("delta", 0, "delta", "Re"),
+            text("delta", 0, "delta", "a"),
+            text("done", 0, "text", "Rea"),
+            wrapper("done", "Rea"),
+            text("delta", 1, "delta", "B"),
+            text("done", 1, "text", "B"),
+            json!({"type": "response.output_item.done", "output_index": 0,
+                "item": reasoning_content(&["Rea", "B"])}),
+            json!({"type": "response.completed", "response":
+                response("completed", vec![reasoning_content(&["Rea", "B"])])}),
+        ])
+    }
+
+    #[test]
+    fn reasoning_content_wrappers_release_original_frames_and_project_once() {
+        let evs = reasoning_content_events();
+        let collected = collect(sse(&evs, false, "\r\n").as_bytes()).expect("wrapped + bare");
+        assert_eq!(
+            collected.canonical().as_ref(),
+            sse(&evs, true, "\n").as_bytes()
+        );
+        let canonical = std::str::from_utf8(collected.canonical()).unwrap();
+        // Both wrapper frames are retained as their original payloads.
+        assert_eq!(
+            canonical
+                .matches(r#""type":"response.content_part."#)
+                .count(),
+            2
+        );
+        let Terminal::Completed(stream) = collected.terminal() else {
+            panic!("completed")
+        };
+        let texts: Vec<_> = stream
+            .response()
+            .texts()
+            .iter()
+            .map(|s| (s.kind(), s.part_index(), s.text()))
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                (TextSegmentKind::ReasoningContent, 0, "Rea"),
+                (TextSegmentKind::ReasoningContent, 1, "B")
+            ]
+        );
+    }
+
+    #[test]
+    fn reasoning_content_wrapper_violations_poison_and_release_nothing() {
+        type Mutation = fn(&mut Vec<Value>);
+        let cases: Vec<(&str, Mutation, E)> = vec![
+            (
+                "added text not empty",
+                |e| e[2]["part"]["text"] = json!(MARKER),
+                E::Assembly(StreamStateError::PartAddedTextNotEmpty),
+            ),
+            (
+                "wrapper done mismatch",
+                |e| e[6]["part"]["text"] = json!(MARKER),
+                E::Assembly(StreamStateError::PartDoneMismatch),
+            ),
+            (
+                "wrapper done dropped",
+                |e| {
+                    e.remove(6);
+                },
+                E::Assembly(StreamStateError::ChildrenOpen),
+            ),
+            (
+                "delta before wrapper added",
+                |e| e.swap(2, 3),
+                E::Assembly(StreamStateError::PartIndexGap),
+            ),
+            (
+                "terminal text mismatch",
+                |e| e[10]["response"]["output"][0]["content"][0]["text"] = json!(MARKER),
+                E::Assembly(StreamStateError::SnapshotTextMismatch),
+            ),
+            (
+                "wrong part type",
+                |e| e[6]["part"]["type"] = json!("summary_text"),
+                E::Decode,
+            ),
+            (
+                "extra part field",
+                |e| e[2]["part"]["annotations"] = json!([]),
+                E::Decode,
+            ),
+        ];
+        for (label, mutate, expected) in cases {
+            let mut evs = reasoning_content_events();
+            mutate(&mut evs);
+            let evs = number(evs);
+            let mut c = ResponsesSseCollector::new();
+            let err = c.push(sse(&evs, true, "\n").as_bytes()).unwrap_err();
+            assert_eq!(err, expected, "{label}");
+            let debug = format!("{c:?}");
+            assert!(debug.contains("canonical_bytes: 0"), "{label}: {debug}");
+            assert_no_echo(label, &format!("{err} {err:?} {debug}"));
+            assert_eq!(c.finish().unwrap_err(), E::Poisoned, "{label}");
+        }
     }
 }

@@ -13,6 +13,13 @@
 // - Fail closed without echoing payload bytes on `[DONE]`, unknown event
 //   types, hosted-tool/audio/image/file events, `obfuscation` padding, and
 //   any unexpected model-visible field
+// - Decode the reasoning-summary wrapper pair (OA-R2b2a): a closed
+//   `summary_text` part, and on `.done` an optional `status` that is absent
+//   or exactly `incomplete`. The status is validated, never exposed; the
+//   original payload keeps it
+// - Decode `content_part.*` parts as a closed message part (`output_text`,
+//   `refusal`) or a closed `{type: "reasoning_text", text}` reasoning
+//   content part (OA-3); item-kind binding is left to the assembler
 // - Apply an injected [`EncryptedReasoningPolicy`] to reasoning
 //   `encrypted_content` on output items and terminal snapshots (OA-R2b1).
 //   The default accepts capped opaque strings: an item event records
@@ -83,13 +90,24 @@ pub enum StreamEventKind {
         output_index: usize,
         item: StreamItem,
     },
-    /// `response.content_part.added` / `.done` on a message item.
+    /// `response.content_part.added` / `.done`: an `output_text` / `refusal`
+    /// part (message items) or a `reasoning_text` part (reasoning items).
     ContentPart {
         phase: Phase,
         item_id: String,
         output_index: usize,
         content_index: usize,
         kind: TextSegmentKind,
+        text: String,
+    },
+    /// `response.reasoning_summary_part.added` / `.done` on a reasoning item.
+    /// `text` is the closed `summary_text` part's text. The optional `.done`
+    /// `status` (absent or `incomplete`) is validated and not carried.
+    ReasoningSummaryPart {
+        phase: Phase,
+        item_id: String,
+        output_index: usize,
+        summary_index: usize,
         text: String,
     },
     /// `response.{output_text,refusal,reasoning_summary_text,reasoning_text}.delta`.
@@ -173,6 +191,13 @@ impl StreamEventKind {
             ContentPart {
                 phase: Phase::Done, ..
             } => "response.content_part.done",
+            ReasoningSummaryPart {
+                phase: Phase::Added,
+                ..
+            } => "response.reasoning_summary_part.added",
+            ReasoningSummaryPart {
+                phase: Phase::Done, ..
+            } => "response.reasoning_summary_part.done",
             TextDelta { kind, .. } => text(kind, false),
             TextDone { kind, .. } => text(kind, true),
             FunctionCallArgumentsDelta { .. } => "response.function_call_arguments.delta",
@@ -323,6 +348,9 @@ impl<P: JsonParser> OpenAiResponsesStreamDecoder<P> {
         if let Some(phase) = added_done("response.content_part") {
             return decode_content_part(obj, phase);
         }
+        if let Some(phase) = added_done("response.reasoning_summary_part") {
+            return decode_summary_part(obj, phase);
+        }
         for &(prefix, kind, index_key, done_key) in TEXT_EVENTS {
             match event_type.strip_prefix(prefix) {
                 Some(".delta") => return decode_text_delta(obj, kind, index_key),
@@ -432,7 +460,16 @@ fn decode_content_part(
     let part = obj
         .get("part")
         .ok_or_else(|| ProviderError::MissingField("event.part".to_string()))?;
-    let (kind, _, text) = decode_message_part(part, "event.part")?;
+    let (kind, text) = match part.get("type").and_then(Value::as_str) {
+        Some("reasoning_text") => (
+            TextSegmentKind::ReasoningContent,
+            decode_reasoning_text_part(part)?,
+        ),
+        _ => {
+            let (kind, _, text) = decode_message_part(part, "event.part")?;
+            (kind, text)
+        }
+    };
     Ok(StreamEventKind::ContentPart {
         phase,
         item_id: non_empty_string(obj, "item_id", "event")?.to_string(),
@@ -440,6 +477,57 @@ fn decode_content_part(
         content_index: index(obj, "content_index")?,
         kind,
         text: text.to_string(),
+    })
+}
+
+/// Reasoning-content wrapper part (OA-3): exactly `{type: "reasoning_text",
+/// text}`. Which item kind may carry it is the assembler's concern.
+fn decode_reasoning_text_part(part: &Value) -> Result<&str, ProviderError> {
+    let part = part
+        .as_object()
+        .ok_or_else(|| invalid("event.part must be an object"))?;
+    allow_keys(part, &["type", "text"], "event.part")?;
+    required_string(part, "text", "event.part")
+}
+
+/// Reasoning-summary wrapper. `part` is exactly `{type: "summary_text",
+/// text}`; `.done` may add `status`, absent or exactly `incomplete`.
+fn decode_summary_part(
+    obj: &Map<String, Value>,
+    phase: Phase,
+) -> Result<StreamEventKind, ProviderError> {
+    let mut allowed = vec![
+        "type",
+        "sequence_number",
+        "item_id",
+        "output_index",
+        "summary_index",
+        "part",
+    ];
+    if phase == Phase::Done {
+        allowed.push("status");
+    }
+    allow_keys(obj, &allowed, "event")?;
+    match obj.get("status") {
+        None => {}
+        Some(Value::String(s)) if s == "incomplete" => {}
+        Some(_) => return Err(invalid("event.status must be absent or \"incomplete\"")),
+    }
+    let part = obj
+        .get("part")
+        .ok_or_else(|| ProviderError::MissingField("event.part".to_string()))?
+        .as_object()
+        .ok_or_else(|| invalid("event.part must be an object"))?;
+    allow_keys(part, &["type", "text"], "event.part")?;
+    if required_string(part, "type", "event.part")? != "summary_text" {
+        return Err(invalid("event.part has an unsupported type"));
+    }
+    Ok(StreamEventKind::ReasoningSummaryPart {
+        phase,
+        item_id: non_empty_string(obj, "item_id", "event")?.to_string(),
+        output_index: index(obj, "output_index")?,
+        summary_index: index(obj, "summary_index")?,
+        text: required_string(part, "text", "event.part")?.to_string(),
     })
 }
 
@@ -603,6 +691,8 @@ mod tests {
             ("response.output_text.done", r#"{"type":"response.output_text.done","sequence_number":5,"item_id":"msg_1","output_index":0,"content_index":0,"text":"Hi","logprobs":[]}"#.to_string()),
             ("response.refusal.delta", r#"{"type":"response.refusal.delta","sequence_number":4,"item_id":"msg_1","output_index":0,"content_index":1,"delta":"No"}"#.to_string()),
             ("response.refusal.done", r#"{"type":"response.refusal.done","sequence_number":5,"item_id":"msg_1","output_index":0,"content_index":1,"refusal":"No."}"#.to_string()),
+            ("response.reasoning_summary_part.added", r#"{"type":"response.reasoning_summary_part.added","sequence_number":3,"item_id":"rs_1","output_index":0,"summary_index":2,"part":{"type":"summary_text","text":""}}"#.to_string()),
+            ("response.reasoning_summary_part.done", r#"{"type":"response.reasoning_summary_part.done","sequence_number":6,"item_id":"rs_1","output_index":0,"summary_index":2,"part":{"type":"summary_text","text":"S1"}}"#.to_string()),
             ("response.reasoning_summary_text.delta", r#"{"type":"response.reasoning_summary_text.delta","sequence_number":4,"item_id":"rs_1","output_index":0,"summary_index":2,"delta":"S"}"#.to_string()),
             ("response.reasoning_summary_text.done", r#"{"type":"response.reasoning_summary_text.done","sequence_number":5,"item_id":"rs_1","output_index":0,"summary_index":2,"text":"S1"}"#.to_string()),
             ("response.reasoning_text.delta", r#"{"type":"response.reasoning_text.delta","sequence_number":4,"item_id":"rs_1","output_index":0,"content_index":0,"delta":"R"}"#.to_string()),
@@ -771,6 +861,21 @@ mod tests {
             ev("response.refusal.done").kind,
             done(Refusal, "msg_1", 1, "No.")
         );
+        let summary_part = |phase, s: &str| ReasoningSummaryPart {
+            phase,
+            item_id: "rs_1".into(),
+            output_index: 0,
+            summary_index: 2,
+            text: s.into(),
+        };
+        assert_eq!(
+            ev("response.reasoning_summary_part.added").kind,
+            summary_part(Phase::Added, "")
+        );
+        assert_eq!(
+            ev("response.reasoning_summary_part.done").kind,
+            summary_part(Phase::Done, "S1")
+        );
         assert_eq!(
             ev("response.reasoning_summary_text.delta").kind,
             delta(ReasoningSummary, "rs_1", 2, "S")
@@ -930,8 +1035,8 @@ mod tests {
             "response.mcp_list_tools.completed",
             "response.custom_tool_call_input.delta",
             "response.output_text.annotation.added",
-            "response.reasoning_summary_part.added",
-            "response.reasoning_summary_part.done",
+            "response.reasoning_summary_part.delta",
+            "response.reasoning_summary_part",
             "response.output_text",
             "response.output_text.added",
             "response.output_item.delta",
@@ -1030,6 +1135,16 @@ mod tests {
             ("response.refusal.done", "/item_id", json!(null)),
             ("response.content_part.added", "/item_id", json!("")),
             (
+                "response.reasoning_summary_part.added",
+                "/item_id",
+                json!(""),
+            ),
+            (
+                "response.reasoning_summary_part.done",
+                "/item_id",
+                json!(null),
+            ),
+            (
                 "response.function_call_arguments.delta",
                 "/item_id",
                 json!(""),
@@ -1072,6 +1187,8 @@ mod tests {
             ("response.function_call_arguments.delta", "/delta"),
             ("response.function_call_arguments.done", "/arguments"),
             ("response.content_part.added", "/part/text"),
+            ("response.reasoning_summary_part.added", "/part/text"),
+            ("response.reasoning_summary_part.done", "/part/text"),
             ("error", "/message"),
         ];
         for (name, path) in cases {
@@ -1147,13 +1264,133 @@ mod tests {
             json!({"type": "output_audio", "data": MARKER, "transcript": MARKER}),
             json!({"type": "output_image", "image_url": MARKER}),
             json!({"type": "output_file", "file_id": MARKER}),
-            json!({"type": "reasoning_text", "text": MARKER}),
+            json!({"type": "summary_text", "text": MARKER}),
             json!({"type": MARKER, "text": MARKER}),
             json!(MARKER),
         ] {
             let mut v = fixture_value("response.content_part.added");
             v["part"] = part;
             assert_fails_without_echo(decode_value("response.content_part.added", &v), "part");
+        }
+    }
+
+    // -- reasoning content wrapper (OA-3) ------------------------------------
+
+    #[test]
+    fn reasoning_text_content_part_decodes_closed() {
+        for (name, phase) in [
+            ("response.content_part.added", Phase::Added),
+            ("response.content_part.done", Phase::Done),
+        ] {
+            let mut v = fixture_value(name);
+            v["item_id"] = json!("rs_1");
+            v["part"] = json!({"type": "reasoning_text", "text": "R1"});
+            assert_eq!(
+                decode_value(name, &v).unwrap().kind,
+                StreamEventKind::ContentPart {
+                    phase,
+                    item_id: "rs_1".into(),
+                    output_index: 0,
+                    content_index: v["content_index"].as_u64().unwrap() as usize,
+                    kind: TextSegmentKind::ReasoningContent,
+                    text: "R1".into(),
+                }
+            );
+            for part in [
+                json!({"type": "reasoning_text"}),
+                json!({"type": "reasoning_text", "text": null}),
+                json!({"type": "reasoning_text", "text": 1}),
+                json!({"type": "reasoning_text", "text": MARKER, "annotations": []}),
+                json!({"type": "reasoning_text", "text": MARKER, "logprobs": []}),
+                json!({"type": "reasoning_text", "text": MARKER, "obfuscation": MARKER}),
+                json!({"type": "reasoning_text", "refusal": MARKER}),
+                json!({"type": "Reasoning_Text", "text": MARKER}),
+            ] {
+                let mut v = fixture_value(name);
+                v["part"] = part.clone();
+                assert_fails_without_echo(decode_value(name, &v), &format!("{name} {part}"));
+            }
+            // The message-part forms stay closed to their own fields.
+            let mut v = fixture_value(name);
+            v["part"] = json!({"type": "output_text", "text": MARKER, "obfuscation": MARKER});
+            assert_fails_without_echo(decode_value(name, &v), &format!("{name} output_text"));
+        }
+    }
+
+    // -- reasoning summary wrapper (OA-R2b2a) -------------------------------
+
+    #[test]
+    fn summary_part_done_status_is_absent_or_incomplete_only() {
+        let name = "response.reasoning_summary_part.done";
+        let base = decode_value(name, &fixture_value(name)).unwrap();
+        let mut v = fixture_value(name);
+        v["status"] = json!("incomplete");
+        // Validated, not carried: the decoded event equals the status-free one.
+        assert_eq!(decode_value(name, &v).unwrap(), base);
+        for status in [
+            json!(null),
+            json!("completed"),
+            json!("in_progress"),
+            json!("Incomplete"),
+            json!("incomplete "),
+            json!(""),
+            json!(MARKER),
+            json!(1),
+            json!(true),
+            json!(["incomplete"]),
+            json!({"v": "incomplete"}),
+        ] {
+            let mut v = fixture_value(name);
+            v["status"] = status.clone();
+            assert_fails_without_echo(decode_value(name, &v), &format!("status {status}"));
+        }
+        // `.added` carries no status at all.
+        let added = "response.reasoning_summary_part.added";
+        let mut v = fixture_value(added);
+        v["status"] = json!("incomplete");
+        assert_fails_without_echo(decode_value(added, &v), "added status");
+    }
+
+    #[test]
+    fn summary_part_shape_is_closed() {
+        for name in [
+            "response.reasoning_summary_part.added",
+            "response.reasoning_summary_part.done",
+        ] {
+            let parts = [
+                json!({"type": "reasoning_text", "text": MARKER}),
+                json!({"type": "output_text", "text": MARKER}),
+                json!({"type": "Summary_Text", "text": MARKER}),
+                json!({"text": MARKER}),
+                json!({"type": null, "text": MARKER}),
+                json!({"type": "summary_text", "text": MARKER, "annotations": []}),
+                json!({"type": "summary_text", "text": MARKER, "obfuscation": MARKER}),
+                json!(MARKER),
+                json!([MARKER]),
+                json!(null),
+            ];
+            for part in parts {
+                let mut v = fixture_value(name);
+                v["part"] = part.clone();
+                assert_fails_without_echo(decode_value(name, &v), &format!("{name} {part}"));
+            }
+            for key in ["part", "item_id", "output_index", "summary_index"] {
+                let mut v = fixture_value(name);
+                v.as_object_mut().unwrap().remove(key);
+                assert_fails_without_echo(decode_value(name, &v), &format!("{name} -{key}"));
+            }
+            for (key, value) in [
+                ("summary_index", json!(-1)),
+                ("summary_index", json!("0")),
+                ("output_index", json!(1.5)),
+                ("content_index", json!(0)),
+                ("delta", json!(MARKER)),
+                ("text", json!(MARKER)),
+            ] {
+                let mut v = fixture_value(name);
+                v[key] = value;
+                assert_fails_without_echo(decode_value(name, &v), &format!("{name} {key}"));
+            }
         }
     }
 

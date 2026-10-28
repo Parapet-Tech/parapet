@@ -17,18 +17,25 @@
 //     with no child after done and every child closed before done
 //   - message content parts opened by `content_part.added` at contiguous
 //     indexes, with one bound kind, one text done, then one part done
-//   - reasoning summary/content parts bound by index and kind; their wrapper
-//     events are not decoded yet, so the first text event opens the part and
-//     its text done closes it
+//   - reasoning summary parts opened by `reasoning_summary_part.added` at
+//     contiguous `summary_index`es (OA-R2b2a), with one text done, then one
+//     `reasoning_summary_part.done`; an unwrapped summary text event fails
+//   - reasoning content parts bound by index and kind, wrapped or bare per
+//     `content_index` (OA-3): a `reasoning_text` `content_part.added` opens
+//     the next index before any of its text and requires exactly one
+//     `content_part.done` after its text done; without one, the first text
+//     event opens the part and its text done closes it. A wrapper never
+//     attaches to a bare part
 //   - function-call argument events only on function-call items, done once
 // - Enforce injected hard bounds on events, items, parts, accumulated delta
 //   bytes, and stored snapshot bytes
 // - Enforce exact byte equality across every layer of every content address
 //   (item, container, part index, kind), so the terminal snapshot is the
 //   single content authority:
-//   - `output_item.added` texts, `content_part.added` text, and
-//     `output_item.added` arguments are empty
-//   - concat(text deltas) == text done == `content_part.done` (where
+//   - `output_item.added` texts, wrapper-added (`content_part.added`,
+//     `reasoning_summary_part.added`) text, and `output_item.added`
+//     arguments are empty
+//   - concat(text deltas) == text done == wrapper-done text (where
 //     wrapped) == the `output_item.done` segment at the same address == the
 //     terminal snapshot segment at the same address
 //   - concat(argument deltas) == arguments done == `output_item.done`
@@ -187,7 +194,7 @@ pub enum StreamStateError {
     UnknownPart,
     #[error("stream: event does not match the part kind")]
     PartKindMismatch,
-    #[error("stream: content_part.done before its text done")]
+    #[error("stream: part done before its text done")]
     PartTextOpen,
     #[error("stream: terminal response while an item is still open")]
     ItemsOpen,
@@ -195,11 +202,11 @@ pub enum StreamStateError {
     SnapshotIdentityMismatch,
     #[error("stream: output_item.added text is not empty")]
     ItemAddedTextNotEmpty,
-    #[error("stream: content_part.added text is not empty")]
+    #[error("stream: part added text is not empty")]
     PartAddedTextNotEmpty,
     #[error("stream: text done does not equal its deltas")]
     TextDoneMismatch,
-    #[error("stream: content_part.done text does not equal its text done")]
+    #[error("stream: part done text does not equal its text done")]
     PartDoneMismatch,
     #[error("stream: output_item.done text does not equal its streamed parts")]
     ItemDoneTextMismatch,
@@ -291,8 +298,9 @@ impl AssembledPart {
         self.kind
     }
 
-    /// `content_part.added` text; `None` for reasoning parts, whose wrapper
-    /// events are not decoded.
+    /// Wrapper-added text (`content_part.added` or
+    /// `reasoning_summary_part.added`); `None` for a bare reasoning content
+    /// part.
     pub fn added_text(&self) -> Option<&str> {
         self.added_text.as_deref()
     }
@@ -307,7 +315,7 @@ impl AssembledPart {
         &self.text_done
     }
 
-    /// `content_part.done` text; `None` for reasoning parts.
+    /// Wrapper-done text; `None` for a bare reasoning content part.
     pub fn part_done_text(&self) -> Option<&str> {
         self.part_done_text.as_deref()
     }
@@ -390,7 +398,7 @@ struct Usage {
 
 struct PartState {
     kind: TextSegmentKind,
-    /// `Some` iff the part was opened by `content_part.added`.
+    /// `Some` iff the part was opened by a wrapper-added event.
     added_text: Option<String>,
     deltas: String,
     text_done: Option<String>,
@@ -398,8 +406,8 @@ struct PartState {
 }
 
 impl PartState {
-    /// Wrapped parts close on `content_part.done`; unwrapped reasoning parts
-    /// close on their text done.
+    /// Wrapped parts close on their wrapper done; bare reasoning content
+    /// parts close on their text done.
     fn closed(&self) -> bool {
         if self.added_text.is_some() {
             self.part_done_text.is_some()
@@ -646,7 +654,21 @@ impl<P: JsonParser> ResponsesStreamAssembler<P> {
                 content_index,
                 kind,
                 text,
-            } => self.content_part(phase, &item_id, output_index, content_index, kind, text)?,
+            } => self.wrapper_part(phase, &item_id, output_index, content_index, kind, text)?,
+            ReasoningSummaryPart {
+                phase,
+                item_id,
+                output_index,
+                summary_index,
+                text,
+            } => self.wrapper_part(
+                phase,
+                &item_id,
+                output_index,
+                summary_index,
+                TextSegmentKind::ReasoningSummary,
+                text,
+            )?,
             TextDelta {
                 kind,
                 item_id,
@@ -876,23 +898,29 @@ impl<P: JsonParser> ResponsesStreamAssembler<P> {
         Ok(index)
     }
 
-    fn content_part(
+    /// `content_part.*` on a message item (`output_text` / `refusal`) or a
+    /// reasoning item (`reasoning_text`), or `reasoning_summary_part.*` on a
+    /// reasoning item: added opens the next part with empty text, so it can
+    /// never wrap a part a bare text event already opened; done closes a
+    /// wrapped part once, after its text done, with byte-equal text.
+    fn wrapper_part(
         &mut self,
         phase: Phase,
         item_id: &str,
         output_index: usize,
-        content_index: usize,
+        part_index: usize,
         kind: TextSegmentKind,
         text: String,
     ) -> Result<(), StreamStateError> {
         let index = self.open_item(item_id, output_index)?;
-        if self.items[index].added.kind != OutputItemKind::Message {
+        let (owner, slot) = slot_for(kind);
+        if self.items[index].added.kind != owner {
             return Err(StreamStateError::ItemKindMismatch);
         }
-        let parts_len = self.items[index].content.len();
+        let parts_len = parts(&self.items[index], slot).len();
         match phase {
             Phase::Added => {
-                if content_index != parts_len {
+                if part_index != parts_len {
                     return Err(StreamStateError::PartIndexGap);
                 }
                 bump(
@@ -904,7 +932,7 @@ impl<P: JsonParser> ResponsesStreamAssembler<P> {
                 if !text.is_empty() {
                     return Err(StreamStateError::PartAddedTextNotEmpty);
                 }
-                self.items[index].content.push(PartState {
+                parts_mut(&mut self.items[index], slot).push(PartState {
                     kind,
                     added_text: Some(text),
                     deltas: String::new(),
@@ -913,12 +941,15 @@ impl<P: JsonParser> ResponsesStreamAssembler<P> {
                 });
             }
             Phase::Done => {
-                let part = self.items[index]
-                    .content
-                    .get(content_index)
+                let part = parts(&self.items[index], slot)
+                    .get(part_index)
                     .ok_or(StreamStateError::UnknownPart)?;
                 if part.kind != kind {
                     return Err(StreamStateError::PartKindMismatch);
+                }
+                // A bare reasoning content part has no wrapper to close.
+                if part.added_text.is_none() {
+                    return Err(StreamStateError::UnknownPart);
                 }
                 if part.part_done_text.is_some() {
                     return Err(StreamStateError::AfterDone);
@@ -929,13 +960,13 @@ impl<P: JsonParser> ResponsesStreamAssembler<P> {
                     Some(_) => {}
                 }
                 self.snapshot(text.len())?;
-                self.items[index].content[content_index].part_done_text = Some(text);
+                parts_mut(&mut self.items[index], slot)[part_index].part_done_text = Some(text);
             }
         }
         Ok(())
     }
 
-    /// Resolve (and for unwrapped reasoning parts, open) the part a text
+    /// Resolve (and for bare reasoning content parts, open) the part a text
     /// event addresses. Rejects parts whose text is already done. Returns the
     /// item index and part slot.
     fn text_part(
@@ -950,7 +981,7 @@ impl<P: JsonParser> ResponsesStreamAssembler<P> {
         if self.items[index].added.kind != owner {
             return Err(StreamStateError::ItemKindMismatch);
         }
-        let wrapped = owner == OutputItemKind::Message;
+        let wrapped = wrapper_required(kind);
         let len = parts(&self.items[index], slot).len();
         if part_index > len || (wrapped && part_index == len) {
             return Err(if wrapped {
@@ -978,8 +1009,8 @@ impl<P: JsonParser> ResponsesStreamAssembler<P> {
         if part.kind != kind {
             return Err(StreamStateError::PartKindMismatch);
         }
-        // Covers both a closed part and a wrapped part awaiting its
-        // `content_part.done`.
+        // Covers both a closed part and a wrapped part awaiting its wrapper
+        // done.
         if part.text_done.is_some() {
             return Err(StreamStateError::AfterDone);
         }
@@ -1008,6 +1039,13 @@ fn slot_for(kind: TextSegmentKind) -> (OutputItemKind, Slot) {
         TextSegmentKind::ReasoningSummary => (OutputItemKind::Reasoning, Slot::Summary),
         TextSegmentKind::ReasoningContent => (OutputItemKind::Reasoning, Slot::Content),
     }
+}
+
+/// Whether parts of `kind` must be opened and closed by wrapper events.
+/// Reasoning summaries require the official `reasoning_summary_part`
+/// lifecycle; reasoning content may be wrapped or bare per index.
+fn wrapper_required(kind: TextSegmentKind) -> bool {
+    kind != TextSegmentKind::ReasoningContent
 }
 
 fn parts(item: &ItemState, slot: Slot) -> &Vec<PartState> {
@@ -1176,6 +1214,38 @@ mod tests {
         json!({"type": format!("response.content_part.{phase}"), "item_id": item_id,
             "output_index": output_index, "content_index": content_index, "part": part})
     }
+    /// `reasoning_summary_part.{phase}` with a `summary_text` part.
+    fn spart(phase: &str, item_id: &str, output_index: usize, index: usize, s: &str) -> Value {
+        json!({"type": format!("response.reasoning_summary_part.{phase}"), "item_id": item_id,
+            "output_index": output_index, "summary_index": index,
+            "part": {"type": "summary_text", "text": s}})
+    }
+    /// The full official lifecycle of one summary part: wrapper added, one
+    /// delta per entry of `deltas`, text done, wrapper done.
+    fn summary(item_id: &str, output_index: usize, index: usize, deltas: &[&str]) -> Vec<Value> {
+        let full = deltas.concat();
+        let mut evs = vec![spart("added", item_id, output_index, index, "")];
+        evs.extend(deltas.iter().map(|d| {
+            text(
+                "reasoning_summary_text",
+                "delta",
+                item_id,
+                output_index,
+                index,
+                d,
+            )
+        }));
+        evs.push(text(
+            "reasoning_summary_text",
+            "done",
+            item_id,
+            output_index,
+            index,
+            &full,
+        ));
+        evs.push(spart("done", item_id, output_index, index, &full));
+        evs
+    }
     /// Text delta/done. `family` is `output_text`, `refusal`,
     /// `reasoning_summary_text`, or `reasoning_text`.
     fn text(
@@ -1339,10 +1409,14 @@ mod tests {
         let terminal = finish_ok(vec![
             created(),
             item("added", 0, rs("rs_1", &[], &[])),
+            spart("added", "rs_1", 0, 0, ""),
             text("reasoning_summary_text", "delta", "rs_1", 0, 0, "S"),
             text("reasoning_summary_text", "done", "rs_1", 0, 0, "S"),
+            spart("done", "rs_1", 0, 0, "S"),
             // Zero deltas concatenate to the empty string.
+            spart("added", "rs_1", 0, 1, ""),
             text("reasoning_summary_text", "done", "rs_1", 0, 1, ""),
+            spart("done", "rs_1", 0, 1, ""),
             text("reasoning_text", "delta", "rs_1", 0, 0, "R"),
             text("reasoning_text", "done", "rs_1", 0, 0, "R"),
             item("done", 0, rs("rs_1", &["S", ""], &["R"])),
@@ -1355,13 +1429,33 @@ mod tests {
         let summary: Vec<_> = item
             .summary_parts()
             .iter()
-            .map(|p| (p.kind(), p.deltas(), p.text_done()))
+            .map(|p| {
+                (
+                    p.kind(),
+                    p.added_text(),
+                    p.deltas(),
+                    p.text_done(),
+                    p.part_done_text(),
+                )
+            })
             .collect();
         assert_eq!(
             summary,
             [
-                (TextSegmentKind::ReasoningSummary, "S", "S"),
-                (TextSegmentKind::ReasoningSummary, "", "")
+                (
+                    TextSegmentKind::ReasoningSummary,
+                    Some(""),
+                    "S",
+                    "S",
+                    Some("S")
+                ),
+                (
+                    TextSegmentKind::ReasoningSummary,
+                    Some(""),
+                    "",
+                    "",
+                    Some("")
+                )
             ]
         );
         let content = &item.content_parts()[0];
@@ -1810,9 +1904,49 @@ mod tests {
                 E::PartIndexGap,
             ),
             (
-                "summary index gap",
-                text("reasoning_summary_text", "delta", "rs_1", 2, 1, "x"),
+                "summary part on message",
+                spart("added", "msg_1", 0, 0, ""),
+                E::ItemKindMismatch,
+            ),
+            (
+                "summary part on function",
+                spart("added", "fc_1", 1, 0, ""),
+                E::ItemKindMismatch,
+            ),
+            (
+                "summary part unknown item",
+                spart("added", "rs_9", 2, 0, ""),
+                E::UnknownItem,
+            ),
+            (
+                "summary part wrong index",
+                spart("added", "rs_1", 1, 0, ""),
+                E::OutputIndexMismatch,
+            ),
+            (
+                "summary part index gap",
+                spart("added", "rs_1", 2, 1, ""),
                 E::PartIndexGap,
+            ),
+            (
+                "unwrapped summary delta",
+                text("reasoning_summary_text", "delta", "rs_1", 2, 0, "x"),
+                E::UnknownPart,
+            ),
+            (
+                "unwrapped summary done",
+                text("reasoning_summary_text", "done", "rs_1", 2, 0, ""),
+                E::UnknownPart,
+            ),
+            (
+                "unopened summary part done",
+                spart("done", "rs_1", 2, 0, ""),
+                E::UnknownPart,
+            ),
+            (
+                "summary text beyond opened parts",
+                text("reasoning_summary_text", "delta", "rs_1", 2, 1, "x"),
+                E::UnknownPart,
             ),
             (
                 "reasoning content gap",
@@ -1957,38 +2091,83 @@ mod tests {
             assert_eq!(run(events).1, Err(expected), "{label}");
         }
 
-        let rs_open = || vec![created(), item("added", 0, rs("rs_1", &[], &[]))];
+        // Reasoning item with summary part 0 opened and holding "x".
+        let rs_open = || {
+            vec![
+                created(),
+                item("added", 0, rs("rs_1", &[], &[])),
+                spart("added", "rs_1", 0, 0, ""),
+                text("reasoning_summary_text", "delta", "rs_1", 0, 0, "x"),
+            ]
+        };
         let summary = |phase, s| text("reasoning_summary_text", phase, "rs_1", 0, 0, s);
+        let wrapper_done = || spart("done", "rs_1", 0, 0, "x");
+        let rs_item_done = || item("done", 0, rs("rs_1", &["x"], &[]));
         let rs_cases = [
             (
                 "item done with open summary",
-                with(
-                    rs_open(),
-                    vec![
-                        summary("delta", "x"),
-                        item("done", 0, rs("rs_1", &["x"], &[])),
-                    ],
-                ),
+                with(rs_open(), vec![rs_item_done()]),
                 E::ChildrenOpen,
             ),
             (
+                "item done after summary text only",
+                with(rs_open(), vec![summary("done", "x"), rs_item_done()]),
+                E::ChildrenOpen,
+            ),
+            (
+                "summary wrapper done before text done",
+                with(rs_open(), vec![wrapper_done()]),
+                E::PartTextOpen,
+            ),
+            (
                 "duplicate summary done",
-                with(rs_open(), vec![summary("done", ""), summary("done", "")]),
+                with(rs_open(), vec![summary("done", "x"), summary("done", "x")]),
                 E::AfterDone,
             ),
             (
                 "delta after summary done",
-                with(rs_open(), vec![summary("done", ""), summary("delta", "y")]),
+                with(rs_open(), vec![summary("done", "x"), summary("delta", "y")]),
+                E::AfterDone,
+            ),
+            (
+                "duplicate summary wrapper done",
+                with(
+                    rs_open(),
+                    vec![summary("done", "x"), wrapper_done(), wrapper_done()],
+                ),
+                E::AfterDone,
+            ),
+            (
+                "delta after summary wrapper done",
+                with(
+                    rs_open(),
+                    vec![summary("done", "x"), wrapper_done(), summary("delta", "y")],
+                ),
+                E::AfterDone,
+            ),
+            (
+                "duplicate summary wrapper added",
+                with(rs_open(), vec![spart("added", "rs_1", 0, 0, "")]),
+                E::PartIndexGap,
+            ),
+            (
+                "summary wrapper after item done",
+                with(
+                    rs_open(),
+                    vec![
+                        summary("done", "x"),
+                        wrapper_done(),
+                        rs_item_done(),
+                        spart("added", "rs_1", 0, 1, ""),
+                    ],
+                ),
                 E::AfterDone,
             ),
             (
                 "summary index rebinds kind",
                 with(
                     rs_open(),
-                    vec![
-                        summary("delta", "x"),
-                        text("reasoning_text", "delta", "rs_1", 0, 1, "y"),
-                    ],
+                    vec![text("reasoning_text", "delta", "rs_1", 0, 1, "y")],
                 ),
                 E::PartIndexGap,
             ),
@@ -2081,9 +2260,11 @@ mod tests {
             part("done", "msg_1", 0, 1, refusal_part("Nope")),
             item("done", 0, out[0].clone()),
             item("added", 1, rs("rs_1", &[], &[])),
+            spart("added", "rs_1", 1, 0, ""),
             text("reasoning_summary_text", "delta", "rs_1", 1, 0, "Su"),
             text("reasoning_summary_text", "delta", "rs_1", 1, 0, "m"),
             text("reasoning_summary_text", "done", "rs_1", 1, 0, "Sum"),
+            spart("done", "rs_1", 1, 0, "Sum"),
             text("reasoning_text", "delta", "rs_1", 1, 0, "Re"),
             text("reasoning_text", "delta", "rs_1", 1, 0, "a"),
             text("reasoning_text", "done", "rs_1", 1, 0, "Rea"),
@@ -2159,7 +2340,13 @@ mod tests {
         let content: Vec<_> = r.content_parts().iter().map(layers).collect();
         assert_eq!(
             summary,
-            [(ReasoningSummary, None, "Sum".into(), "Sum".into(), None)]
+            [(
+                ReasoningSummary,
+                Some("".into()),
+                "Sum".into(),
+                "Sum".into(),
+                Some("Sum".into())
+            )]
         );
         assert_eq!(
             content,
@@ -2268,6 +2455,16 @@ mod tests {
                 "refusal done",
                 |e| at(e, "refusal.done", 0)["refusal"] = json!(MARKER),
                 E::TextDoneMismatch,
+            ),
+            (
+                "summary part added",
+                |e| at(e, "reasoning_summary_part.added", 0)["part"]["text"] = json!(MARKER),
+                E::PartAddedTextNotEmpty,
+            ),
+            (
+                "summary part done",
+                |e| at(e, "reasoning_summary_part.done", 0)["part"]["text"] = json!(MARKER),
+                E::PartDoneMismatch,
             ),
             (
                 "summary delta",
@@ -2620,16 +2817,11 @@ mod tests {
 
         // Reasoning summary parts are bound by index.
         let reasoning = |done: Value| {
-            vec![
-                created(),
-                item("added", 0, rs("rs_1", &[], &[])),
-                text("reasoning_summary_text", "delta", "rs_1", 0, 0, "X"),
-                text("reasoning_summary_text", "done", "rs_1", 0, 0, "X"),
-                text("reasoning_summary_text", "delta", "rs_1", 0, 1, "Y"),
-                text("reasoning_summary_text", "done", "rs_1", 0, 1, "Y"),
-                item("done", 0, done.clone()),
-                completed(vec![done]),
-            ]
+            let mut evs = vec![created(), item("added", 0, rs("rs_1", &[], &[]))];
+            evs.extend(summary("rs_1", 0, 0, &["X"]));
+            evs.extend(summary("rs_1", 0, 1, &["Y"]));
+            evs.extend([item("done", 0, done.clone()), completed(vec![done])]);
+            evs
         };
         assert!(matches!(
             finish_ok(reasoning(rs("rs_1", &["X", "Y"], &[]))),
@@ -2734,8 +2926,10 @@ mod tests {
         events.pop();
         events.extend([
             item("added", 1, rs("rs_1", &[], &[])),
+            spart("added", "rs_1", 1, 0, ""),
             text("reasoning_summary_text", "delta", "rs_1", 1, 0, "S"),
             text("reasoning_summary_text", "done", "rs_1", 1, 0, "S"),
+            spart("done", "rs_1", 1, 0, "S"),
             item("done", 1, rs("rs_1", &["S"], &[])),
             item("added", 2, fc("fc_1", "")),
             args_delta("fc_1", 2, "{\"a\":1}"),
@@ -2887,6 +3081,9 @@ mod tests {
         item
     }
 
+    /// Position of the reasoning `output_item.done` in [`encrypted_stream`].
+    const ENC_ITEM_DONE: usize = 8;
+
     /// Reasoning stream with summary "S" and reasoning_text "R", plus a
     /// trailing message, carrying `encrypted_content` as given on added,
     /// done, and the terminal snapshot (`None` omits the key).
@@ -2895,8 +3092,10 @@ mod tests {
         vec![
             created(),
             item("added", 0, rs_enc(&[], &[], added)),
+            spart("added", "rs_1", 0, 0, ""),
             text("reasoning_summary_text", "delta", "rs_1", 0, 0, "S"),
             text("reasoning_summary_text", "done", "rs_1", 0, 0, "S"),
+            spart("done", "rs_1", 0, 0, "S"),
             text("reasoning_text", "delta", "rs_1", 0, 0, "R"),
             text("reasoning_text", "done", "rs_1", 0, 0, "R"),
             item("done", 0, full),
@@ -3011,10 +3210,10 @@ mod tests {
         let base = || encrypted_stream(Some(ADDED_ENC), Some(DONE_ENC), Some(TERM_ENC));
         // Done at another output_index or under another id.
         let mut evs = base();
-        evs[6]["output_index"] = json!(1);
+        evs[ENC_ITEM_DONE]["output_index"] = json!(1);
         expect_err(evs, E::OutputIndexMismatch);
         let mut evs = base();
-        evs[6]["item"]["id"] = json!("rs_other");
+        evs[ENC_ITEM_DONE]["item"]["id"] = json!("rs_other");
         expect_err(evs, E::UnknownItem);
         // Terminal must name the same item, in the same place.
         let last = base().len() - 1;
@@ -3051,10 +3250,10 @@ mod tests {
     fn text_equality_still_binds_reasoning_items_with_opaque() {
         let base = || encrypted_stream(Some(ADDED_ENC), Some(DONE_ENC), Some(TERM_ENC));
         let mut evs = base();
-        evs[6]["item"] = rs_enc(&["X"], &["R"], Some(DONE_ENC));
+        evs[ENC_ITEM_DONE]["item"] = rs_enc(&["X"], &["R"], Some(DONE_ENC));
         expect_err(evs, E::ItemDoneTextMismatch);
         let mut evs = base();
-        evs[6]["item"] = rs_enc(&["S"], &["X"], Some(DONE_ENC));
+        evs[ENC_ITEM_DONE]["item"] = rs_enc(&["S"], &["X"], Some(DONE_ENC));
         expect_err(evs, E::ItemDoneTextMismatch);
         let last = base().len() - 1;
         let mut evs = base();
@@ -3079,5 +3278,266 @@ mod tests {
             a.usage.snapshot_bytes
         };
         assert_eq!(probe("A"), probe(&"A".repeat(4096)));
+    }
+
+    // -- reasoning content wrapper (OA-3) -----------------------------------
+
+    /// `content_part.{phase}` on `rs_1` with a `reasoning_text` part.
+    fn rpart(phase: &str, index: usize, s: &str) -> Value {
+        part(
+            phase,
+            "rs_1",
+            0,
+            index,
+            json!({"type": "reasoning_text", "text": s}),
+        )
+    }
+
+    fn rtext(phase: &str, index: usize, s: &str) -> Value {
+        text("reasoning_text", phase, "rs_1", 0, index, s)
+    }
+
+    /// Reasoning item whose content index 0 is wrapped (deltas "Re", "a") and
+    /// index 1 is bare ("B").
+    fn reasoning_content_stream() -> Vec<Value> {
+        vec![
+            created(),
+            item("added", 0, rs("rs_1", &[], &[])),
+            rpart("added", 0, ""),
+            rtext("delta", 0, "Re"),
+            rtext("delta", 0, "a"),
+            rtext("done", 0, "Rea"),
+            rpart("done", 0, "Rea"),
+            rtext("delta", 1, "B"),
+            rtext("done", 1, "B"),
+            item("done", 0, rs("rs_1", &[], &["Rea", "B"])),
+            completed(vec![rs("rs_1", &[], &["Rea", "B"])]),
+        ]
+    }
+
+    /// `(added, deltas, text done, wrapper done)` of every content part.
+    fn content_layers(item: &AssembledItem) -> Vec<(Option<&str>, &str, &str, Option<&str>)> {
+        item.content_parts()
+            .iter()
+            .map(|p| {
+                (
+                    p.added_text(),
+                    p.deltas(),
+                    p.text_done(),
+                    p.part_done_text(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn reasoning_content_wrapper_is_optional_per_index() {
+        let Terminal::Completed(stream) = finish_ok(reasoning_content_stream()) else {
+            panic!("completed")
+        };
+        let assembled = &stream.items()[0];
+        assert_eq!(
+            content_layers(assembled),
+            [
+                (Some(""), "Rea", "Rea", Some("Rea")),
+                (None, "B", "B", None)
+            ]
+        );
+        assert!(assembled
+            .content_parts()
+            .iter()
+            .all(|p| p.kind() == TextSegmentKind::ReasoningContent));
+        // Exactly one projection per content index, from the terminal.
+        let projected: Vec<_> = stream
+            .response()
+            .texts()
+            .iter()
+            .map(|s| (s.kind(), s.part_index(), s.text()))
+            .collect();
+        assert_eq!(
+            projected,
+            [
+                (TextSegmentKind::ReasoningContent, 0, "Rea"),
+                (TextSegmentKind::ReasoningContent, 1, "B")
+            ]
+        );
+
+        // Fully bare and fully wrapped streams also pass.
+        let bare = vec![
+            created(),
+            item("added", 0, rs("rs_1", &[], &[])),
+            rtext("delta", 0, "R"),
+            rtext("done", 0, "R"),
+            item("done", 0, rs("rs_1", &[], &["R"])),
+            completed(vec![rs("rs_1", &[], &["R"])]),
+        ];
+        let Terminal::Completed(stream) = finish_ok(bare) else {
+            panic!("completed")
+        };
+        assert_eq!(content_layers(&stream.items()[0]), [(None, "R", "R", None)]);
+        let wrapped = vec![
+            created(),
+            item("added", 0, rs("rs_1", &[], &[])),
+            rpart("added", 0, ""),
+            rtext("done", 0, ""),
+            rpart("done", 0, ""),
+            rpart("added", 1, ""),
+            rtext("delta", 1, "W"),
+            rtext("done", 1, "W"),
+            rpart("done", 1, "W"),
+            item("done", 0, rs("rs_1", &[], &["", "W"])),
+            completed(vec![rs("rs_1", &[], &["", "W"])]),
+        ];
+        let Terminal::Completed(stream) = finish_ok(wrapped) else {
+            panic!("completed")
+        };
+        assert_eq!(
+            content_layers(&stream.items()[0]),
+            [
+                (Some(""), "", "", Some("")),
+                (Some(""), "W", "W", Some("W"))
+            ]
+        );
+    }
+
+    #[test]
+    fn reasoning_content_wrapper_violations_poison() {
+        type Mutation = fn(&mut Vec<Value>);
+        let cases: Vec<(&str, Mutation, E)> = vec![
+            (
+                "added text not empty",
+                |e| e[2]["part"]["text"] = json!(MARKER),
+                E::PartAddedTextNotEmpty,
+            ),
+            (
+                "text done != deltas",
+                |e| e[5]["text"] = json!(MARKER),
+                E::TextDoneMismatch,
+            ),
+            (
+                "wrapper done != text done",
+                |e| e[6]["part"]["text"] = json!(MARKER),
+                E::PartDoneMismatch,
+            ),
+            (
+                "item done != wrapper done",
+                |e| e[9]["item"] = rs("rs_1", &[], &[MARKER, "B"]),
+                E::ItemDoneTextMismatch,
+            ),
+            (
+                "terminal != item done",
+                |e| e[10]["response"]["output"][0] = rs("rs_1", &[], &[MARKER, "B"]),
+                E::SnapshotTextMismatch,
+            ),
+            (
+                "wrapper done before text done",
+                |e| e.swap(5, 6),
+                E::PartTextOpen,
+            ),
+            (
+                "wrapper done missing",
+                |e| {
+                    e.remove(6);
+                },
+                E::ChildrenOpen,
+            ),
+            (
+                "delta before wrapper added",
+                |e| e.swap(2, 3),
+                E::PartIndexGap,
+            ),
+            (
+                "wrapper added after bare delta",
+                |e| e.insert(8, rpart("added", 1, "")),
+                E::PartIndexGap,
+            ),
+            (
+                "duplicate wrapper added",
+                |e| e.insert(3, rpart("added", 0, "")),
+                E::PartIndexGap,
+            ),
+            (
+                "duplicate wrapper done",
+                |e| e.insert(7, rpart("done", 0, "Rea")),
+                E::AfterDone,
+            ),
+            (
+                "orphan wrapper done on unopened index",
+                |e| e.insert(7, rpart("done", 1, "")),
+                E::UnknownPart,
+            ),
+            (
+                "orphan wrapper done on bare part",
+                |e| e.insert(9, rpart("done", 1, "B")),
+                E::UnknownPart,
+            ),
+            (
+                "delta after wrapper done",
+                |e| e.insert(7, rtext("delta", 0, MARKER)),
+                E::AfterDone,
+            ),
+            (
+                "text done after wrapper done",
+                |e| e.insert(7, rtext("done", 0, "Rea")),
+                E::AfterDone,
+            ),
+            (
+                "wrapper after item done",
+                |e| e.insert(10, rpart("added", 2, "")),
+                E::AfterDone,
+            ),
+            (
+                "content index gap",
+                |e| e[2]["content_index"] = json!(1),
+                E::PartIndexGap,
+            ),
+            (
+                "wrong item id",
+                |e| e[2]["item_id"] = json!("rs_2"),
+                E::UnknownItem,
+            ),
+            (
+                "wrong output index",
+                |e| e[6]["output_index"] = json!(1),
+                E::OutputIndexMismatch,
+            ),
+            (
+                "wrong wrapper done index",
+                |e| e[6]["content_index"] = json!(1),
+                E::UnknownPart,
+            ),
+            (
+                "output_text wrapper on reasoning",
+                |e| e[2]["part"] = text_part(""),
+                E::ItemKindMismatch,
+            ),
+            (
+                "refusal wrapper done on reasoning",
+                |e| e[6]["part"] = refusal_part("Rea"),
+                E::ItemKindMismatch,
+            ),
+        ];
+        for (label, mutate, expected) in cases {
+            let mut evs = reasoning_content_stream();
+            mutate(&mut evs);
+            let (mut a, result) = run(evs);
+            let err = result.expect_err(label);
+            assert_eq!(err, expected, "{label}");
+            assert_no_echo(label, &format!("{err} {err:?} {a:?}"));
+            assert_eq!(a.push(decode(99, created())), Err(E::Poisoned), "{label}");
+            assert_eq!(a.finish().unwrap_err(), E::Poisoned, "{label}");
+        }
+    }
+
+    #[test]
+    fn reasoning_text_wrapper_on_message_refuses() {
+        let reasoning = || json!({"type": "reasoning_text", "text": ""});
+        let mut added = message_stream();
+        added[3] = part("added", "msg_1", 0, 0, reasoning());
+        expect_err(added, E::ItemKindMismatch);
+        let mut done = message_stream();
+        let at = done.len() - 3;
+        done[at] = part("done", "msg_1", 0, 0, reasoning());
+        expect_err(done, E::ItemKindMismatch);
     }
 }
