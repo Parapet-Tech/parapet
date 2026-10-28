@@ -251,8 +251,45 @@ Regression coverage: `parapet/tests/stock_openai_loopback_v0.rs`.
 
 Ordinary-mode Parapet also accepts exact `POST /v1/responses` and
 `POST /responses` requests. Non-streaming requests use the same upstream base
-and whole-message policy pipeline as Chat Completions. Responses streaming is
-currently rejected with HTTP 501 before upstream I/O.
+and whole-message policy pipeline as Chat Completions.
+
+Ordinary-mode Responses requests with `"stream": true` use the live HTTP SSE
+full-buffer path. Parapet reads the whole upstream stream before releasing any
+byte: nothing reaches the client until upstream EOF, stream validation,
+L3-outbound, and (when enabled) L5a all pass. Every other outcome returns a
+fixed, content-free local refusal (for example `content_policy_block`,
+`responses_stream_idle_timeout`, `responses_stream_wall_clock_timeout`, or
+`upstream_stream_truncated`); upstream status, headers, and body are never
+echoed. Responses requests on a verified provenance carrier (projected basis)
+are still rejected with HTTP 501 before upstream I/O.
+
+#### Stock OpenCode with a ChatGPT subscription
+
+Stock OpenCode can use its ChatGPT subscription through Parapet without a
+client patch, SDK, or trust exception:
+
+```bash
+parapet run --state-dir <state-dir> --config <config> --json \
+  --upstream openai=https://chatgpt.com/backend-api/codex
+```
+
+`PARAPET_OPENAI_BASE_URL=https://chatgpt.com/backend-api/codex` is the
+equivalent primary environment setting. Parapet listens on a loopback address
+such as `127.0.0.1:9800`; point OpenCode's provider base URL at that listener
+through OpenCode's normal configuration. OpenCode owns and sends its
+subscription credentials; Parapet forwards them unchanged and never logs them.
+
+Requests carrying a ChatGPT subscription marker header (`chatgpt-account-id`,
+`originator`, `session-id`, or `x-codex-beta-features`) may reach only the
+exact upstream URL `https://chatgpt.com/backend-api/codex/responses`. Any other
+resolved target is refused with HTTP 502
+`responses_subscription_target_refused` before upstream I/O.
+
+Status: this path is activated and validated by static review and tests, but
+the operator-credential R5 run has not yet been performed. Still open: the
+target-binding measurement for unmarked bearer requests (N-R4b2a-2), actual
+operator subscription validation, and observing stock OpenCode's WebSocket to
+HTTP SSE fallback.
 
 Responses function-tool definitions are decoded into one scan-internal,
 untrusted System message per tool. The message contains a deterministic
