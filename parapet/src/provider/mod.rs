@@ -9,8 +9,11 @@
 // - Extract tool calls from both formats into Vec<ToolCall>
 // - Serialize error responses in provider-specific format
 // - Handle edge cases: empty messages, null arguments, content arrays, etc.
+// - OpenAI Responses request decoding lives in `responses` (request-side only)
 
 use crate::message::{Message, Role, ToolCall, TrustLevel};
+
+pub mod responses;
 
 // ---------------------------------------------------------------------------
 // Error type

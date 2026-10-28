@@ -4853,6 +4853,72 @@ fn t_s1_14_ingress_alias_canonicalization_and_base_overlap_url_join() {
 }
 
 #[test]
+fn responses_paths_join_prefixed_upstream_base_exactly() {
+    // (base, client path, expected) -- the base path prefix is kept once and
+    // a trailing /v1 on the base absorbs only a client-side /v1 segment.
+    let cases = [
+        (
+            "http://127.0.0.1:11434/proxy",
+            "/responses",
+            "http://127.0.0.1:11434/proxy/responses",
+        ),
+        (
+            "http://127.0.0.1:11434/proxy/",
+            "/responses",
+            "http://127.0.0.1:11434/proxy/responses",
+        ),
+        (
+            "http://127.0.0.1:11434/proxy",
+            "/v1/responses",
+            "http://127.0.0.1:11434/proxy/v1/responses",
+        ),
+        (
+            "http://127.0.0.1:11434/tenant/v1",
+            "/responses",
+            "http://127.0.0.1:11434/tenant/v1/responses",
+        ),
+        (
+            "http://127.0.0.1:11434/tenant/v1",
+            "/v1/responses",
+            "http://127.0.0.1:11434/tenant/v1/responses",
+        ),
+        (
+            "http://127.0.0.1:11434/a/b/v1/",
+            "/v1/responses",
+            "http://127.0.0.1:11434/a/b/v1/responses",
+        ),
+        (
+            "http://127.0.0.1:11434",
+            "/v1/responses",
+            "http://127.0.0.1:11434/v1/responses",
+        ),
+    ];
+
+    for (base, path, expected) in cases {
+        let opts = UpstreamValidationOptions {
+            cli_upstreams: vec![format!("openai={base}")],
+            allow_loopback_http_upstream: true,
+            listener_port: Some(9800),
+        };
+        let table = UpstreamTable::from_env_fn_with_options(&|_| None, &opts)
+            .expect("valid base for responses join matrix");
+        let resolver = EnvUpstreamResolver::from_table(table);
+
+        let req = proxy_request_with_header(path, None);
+        let joined =
+            build_upstream_url(&resolver, Provider::OpenAi, &req).expect("join without query");
+        assert_eq!(joined, expected, "base={base} path={path}");
+        assert!(!joined.contains("/v1/v1"), "base={base} path={path}");
+        assert!(!joined.contains("//responses"), "base={base} path={path}");
+
+        let req_q = proxy_request_with_header(&format!("{path}?stream=true"), None);
+        let joined_q =
+            build_upstream_url(&resolver, Provider::OpenAi, &req_q).expect("join with query");
+        assert_eq!(joined_q, format!("{expected}?stream=true"), "base={base}");
+    }
+}
+
+#[test]
 fn t_s1_15_provenance_no_copy_sentinel_sweep_on_all_stage1_rules() {
     let s = Stage0SentinelRun::generate();
     let tok = &s.tokens[0].full;

@@ -118,9 +118,35 @@ pub trait UpstreamClient: Send + Sync {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathClass {
     Supported(Provider),
+    /// Exact route of a recognized wire format whose forwarding is disabled.
+    Staged(StagedRoute),
     KnownUnsupported,
     NonCanonical,
     Unknown,
+}
+
+/// Wire formats with an exact route and a request decoder, but no response/SSE
+/// safety path yet. Requests are refused locally and never forwarded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StagedRoute {
+    /// OpenAI Responses API (`crate::provider::responses`).
+    OpenAiResponses,
+}
+
+impl StagedRoute {
+    /// Exact POST paths for this wire format. No aliases, suffixes, or prefixes.
+    pub const fn exact_post_paths(self) -> &'static [&'static str] {
+        match self {
+            Self::OpenAiResponses => &["/v1/responses", "/responses"],
+        }
+    }
+
+    /// Match `path` exactly against every staged route.
+    pub fn for_exact_path(path: &str) -> Option<Self> {
+        [Self::OpenAiResponses]
+            .into_iter()
+            .find(|route| route.exact_post_paths().contains(&path))
+    }
 }
 
 const KNOWN_UNSUPPORTED_SUBPATHS: &[&str] = &[
@@ -202,6 +228,9 @@ fn is_known_unsupported_path(path: &str) -> bool {
 pub fn classify_path(path: &str) -> PathClass {
     if is_non_canonical_path(path) {
         return PathClass::NonCanonical;
+    }
+    if let Some(route) = StagedRoute::for_exact_path(path) {
+        return PathClass::Staged(route);
     }
     if is_known_unsupported_path(path) {
         return PathClass::KnownUnsupported;
@@ -854,6 +883,24 @@ pub async fn proxy_handler(
                 StatusCode::BAD_REQUEST,
                 "parapet_path_not_canonical",
                 "path_not_canonical",
+            );
+        }
+        PathClass::Staged(_) => {
+            if state.admission.mode() == ProfileMode::RequiredOpenCode {
+                return carrier_rejection_response(
+                    &state.admission.fail(VerificationOutcome::SchemaMismatch),
+                );
+            }
+            if method != Method::POST {
+                return method_not_allowed_response(path, &method);
+            }
+            // Request decoding exists, but response/SSE output filtering and
+            // tool-call enforcement do not: refuse before reading the body.
+            return path_refusal_response(
+                path,
+                StatusCode::NOT_IMPLEMENTED,
+                "parapet_unsupported_path",
+                "unsupported_wire_format",
             );
         }
         PathClass::KnownUnsupported => {
@@ -1556,7 +1603,6 @@ mod tests {
     #[test]
     fn t11_classify_path_known_unsupported() {
         for path in [
-            "/v1/responses",
             "/v1/embeddings",
             "/v1/completions",
             "/v1/models",
@@ -1599,6 +1645,138 @@ mod tests {
         assert_eq!(
             classify_path("/v1/chat/completionsXYZ"),
             PathClass::Supported(Provider::OpenAi)
+        );
+    }
+
+    #[test]
+    fn responses_route_matrix_is_exact() {
+        for path in ["/v1/responses", "/responses"] {
+            assert_eq!(
+                classify_path(path),
+                PathClass::Staged(StagedRoute::OpenAiResponses),
+                "expected Staged for {path}"
+            );
+        }
+
+        // Retrieval/sub-resources and the /openai alias stay generic unsupported.
+        for path in [
+            "/v1/responses/",
+            "/v1/responses/resp_1",
+            "/v1/responses/resp_1/input_items",
+            "/v1/responses/resp_1/cancel",
+            "/openai/v1/responses",
+            "/openai/v1/responses/resp_1",
+        ] {
+            assert_eq!(
+                classify_path(path),
+                PathClass::KnownUnsupported,
+                "expected KnownUnsupported for {path}"
+            );
+        }
+
+        // Suffix, case, and alias confusion never match the staged route.
+        for path in [
+            "/responses/",
+            "/responses/resp_1",
+            "/responsesX",
+            "/v1/responsesX",
+            "/v1/responses.json",
+            "/RESPONSES",
+            "/v1/Responses",
+            "/openai/responses",
+            "/v2/responses",
+            "/api/v1/responses",
+            "/v1/chat/responses",
+        ] {
+            assert!(
+                !matches!(classify_path(path), PathClass::Staged(_)),
+                "unexpected Staged for {path}"
+            );
+            assert!(
+                !matches!(classify_path(path), PathClass::Supported(_)),
+                "unexpected Supported for {path}"
+            );
+        }
+
+        // Traversal and encoding tricks are refused as non-canonical first.
+        for path in [
+            "/v1/../responses",
+            "/v1/./responses",
+            "/v1//responses",
+            "//responses",
+            "/v1/%2e%2e/responses",
+            "/v1/%72esponses",
+            "/%72esponses",
+            "/responses%2f",
+            "/v1\\responses",
+            "/v1/chat/completions/../../responses",
+            "/responses/..",
+        ] {
+            assert_eq!(
+                classify_path(path),
+                PathClass::NonCanonical,
+                "expected NonCanonical for {path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_routes_refuse_locally_and_never_forward() {
+        let client = Arc::new(CapturingClient::new());
+        let app = build_router(client.clone());
+        let valid_body = r#"{"model":"gpt-test","instructions":"be brief","input":"hi"}"#;
+
+        for path in ["/v1/responses", "/responses"] {
+            let resp = app
+                .clone()
+                .oneshot(json_request("POST", path, valid_body))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED, "path={path}");
+            assert_eq!(
+                resp.headers()
+                    .get("x-parapet-error")
+                    .and_then(|v| v.to_str().ok()),
+                Some("unsupported_wire_format"),
+                "path={path}"
+            );
+
+            for method in ["GET", "PUT", "DELETE", "PATCH"] {
+                let resp = app
+                    .clone()
+                    .oneshot(json_request(method, path, valid_body))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "method={method} path={path}"
+                );
+                assert_eq!(
+                    resp.headers().get("allow").and_then(|v| v.to_str().ok()),
+                    Some("POST")
+                );
+            }
+        }
+
+        for (path, status) in [
+            ("/responses/", StatusCode::NOT_FOUND),
+            ("/openai/responses", StatusCode::NOT_FOUND),
+            ("/openai/v1/responses", StatusCode::NOT_IMPLEMENTED),
+            ("/v1/responses/resp_1", StatusCode::NOT_IMPLEMENTED),
+            ("/v1/../responses", StatusCode::BAD_REQUEST),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(json_request("POST", path, valid_body))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), status, "path={path}");
+        }
+
+        assert!(
+            client.captured_provider.lock().await.is_none(),
+            "Responses routes must never reach the upstream client in Stage 1"
         );
     }
 
