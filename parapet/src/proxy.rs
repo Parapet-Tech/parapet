@@ -108,6 +108,18 @@ pub trait UpstreamClient: Send + Sync {
         provider: Provider,
         request: ProxyRequest,
     ) -> Result<ProxyResponse, ProxyError>;
+
+    /// Forward a request the proxy received at `received_at`. Clients with a
+    /// receipt-bound budget override this; the default ignores the instant.
+    async fn forward_received(
+        &self,
+        provider: Provider,
+        request: ProxyRequest,
+        received_at: tokio::time::Instant,
+    ) -> Result<ProxyResponse, ProxyError> {
+        let _ = received_at;
+        self.forward(provider, request).await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -862,6 +874,9 @@ pub async fn proxy_handler(
     State(state): State<AppState>,
     request: Request<Body>,
 ) -> impl IntoResponse {
+    // Request receipt: budgets bound to receipt include classification,
+    // body read, admission and validation below.
+    let received_at = tokio::time::Instant::now();
     let method = request.method().clone();
     let uri = request.uri().clone();
     let inbound_headers = request.headers().clone();
@@ -1013,7 +1028,10 @@ pub async fn proxy_handler(
                 headers: whole_message_headers,
                 body,
             };
-            state.upstream.forward(provider, proxy_req).await
+            state
+                .upstream
+                .forward_received(provider, proxy_req, received_at)
+                .await
         }
     };
 
@@ -1220,6 +1238,53 @@ mod tests {
 
         let captured = client.captured_provider.lock().await;
         assert_eq!(*captured, Some(Provider::OpenAi));
+    }
+
+    /// A client implementing only `forward` keeps forwarding through the
+    /// default `forward_received`, regardless of how long ago receipt was.
+    #[tokio::test(start_paused = true)]
+    async fn default_forward_received_delegates_to_forward() {
+        let client = Arc::new(CapturingClient::new());
+        let received_at = tokio::time::Instant::now();
+        tokio::time::advance(std::time::Duration::from_secs(3_600)).await;
+        let resp = client
+            .forward_received(
+                Provider::Anthropic,
+                ProxyRequest {
+                    method: Method::POST,
+                    uri: "/v1/messages".parse().unwrap(),
+                    headers: HeaderMap::new(),
+                    body: Bytes::from_static(b"{}"),
+                },
+                received_at,
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status, StatusCode::OK);
+        assert_eq!(
+            *client.captured_provider.lock().await,
+            Some(Provider::Anthropic)
+        );
+
+        // Through the handler, with the body read stalling on the clock.
+        let client = Arc::new(CapturingClient::new());
+        let app = build_router(client.clone());
+        let slow_body = futures_util::stream::once(async {
+            tokio::time::sleep(std::time::Duration::from_secs(3_600)).await;
+            Ok::<_, std::convert::Infallible>(Bytes::from_static(b"{\"model\":\"gpt-4o\"}"))
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from_stream(slow_body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            *client.captured_provider.lock().await,
+            Some(Provider::OpenAi)
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -722,8 +722,24 @@ impl UpstreamClient for EngineUpstreamClient {
         provider: Provider,
         request: ProxyRequest,
     ) -> Result<ProxyResponse, ProxyError> {
-        self.run_pipeline(provider, request, InboundBasis::WholeMessage, None)
+        self.forward_received(provider, request, tokio::time::Instant::now())
             .await
+    }
+
+    async fn forward_received(
+        &self,
+        provider: Provider,
+        request: ProxyRequest,
+        received_at: tokio::time::Instant,
+    ) -> Result<ProxyResponse, ProxyError> {
+        self.run_pipeline(
+            provider,
+            request,
+            InboundBasis::WholeMessage,
+            None,
+            received_at,
+        )
+        .await
     }
 }
 
@@ -783,6 +799,7 @@ impl EngineUpstreamClient {
                 request,
                 InboundBasis::Projected(&inputs),
                 Some(&mut emitter),
+                tokio::time::Instant::now(),
             )
             .await;
 
@@ -808,9 +825,9 @@ impl EngineUpstreamClient {
         request: ProxyRequest,
         basis: InboundBasis<'_>,
         mut projected_receipt: Option<&mut ProjectedReceiptEmitter<'_>>,
-    ) -> Result<ProxyResponse, ProxyError> {
         // The Responses stream wall-clock budget runs from request receipt.
-        let received_at = tokio::time::Instant::now();
+        received_at: tokio::time::Instant,
+    ) -> Result<ProxyResponse, ProxyError> {
         let mut projected_tracker = projected_receipt.as_deref_mut().map(|e| &mut e.tracker);
         let adapter = self.deps.registry.adapter_for(provider);
         let responses_wire = provider == Provider::OpenAi

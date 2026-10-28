@@ -9749,6 +9749,50 @@ mod responses_live_stream {
         );
     }
 
+    /// The wall budget runs from proxy receipt: time the handler spends
+    /// reading the body counts before the engine is entered. The body
+    /// stream stalls on the paused clock, so no real time passes.
+    #[tokio::test(start_paused = true)]
+    async fn wall_budget_spent_before_engine_entry_never_calls_upstream() {
+        use tower::ServiceExt;
+
+        async fn route(body_delay: Duration) -> (usize, StatusCode, Option<String>) {
+            let sender = Arc::new(ScriptedSender::ok(&safe_sse()));
+            let app = crate::proxy::build_router(Arc::new(engine(
+                with_stream_bounds(shipped_default_config(), "  wall_clock_ms: 1000\n"),
+                sender.clone(),
+            )));
+            let body = stock_request_body();
+            let slow_body = stream::once(async move {
+                tokio::time::sleep(body_delay).await;
+                Ok::<_, std::convert::Infallible>(body)
+            });
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/responses")
+                .header("content-type", "application/json")
+                .body(Body::from_stream(slow_body))
+                .unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            let code = resp
+                .headers()
+                .get("x-parapet-error")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            (sender.calls(), resp.status(), code)
+        }
+
+        let (calls, status, code) = route(Duration::from_millis(1_001)).await;
+        assert_eq!(calls, 0);
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(code.as_deref(), Some("responses_stream_wall_clock_timeout"));
+
+        // Control: a body read inside the budget streams normally.
+        let (calls, status, _) = route(Duration::from_millis(500)).await;
+        assert_eq!(calls, 1);
+        assert_eq!(status, StatusCode::OK);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn config_mismatch_refuses_before_upstream() {
         let sender = Arc::new(ScriptedSender::ok(&safe_sse()));
@@ -9893,6 +9937,7 @@ mod responses_live_stream {
                 request("/responses", valid_responses_request(true), json_headers()),
                 InboundBasis::Projected(&[]),
                 None,
+                tokio::time::Instant::now(),
             )
             .await
             .unwrap();
