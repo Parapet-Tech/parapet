@@ -221,11 +221,12 @@ impl ResponsesStreamExecutor {
     /// worker and cannot be preempted; a result that completes past the
     /// deadline is refused, never released.
     ///
-    /// N-R4b1-2 (open; gates R4b2 closure): the live route now calls this,
-    /// but worst-case finish plus policy on a max-size stream has not yet
-    /// been release-benchmarked against the `300 s - wall_clock` margin, and
-    /// up to `concurrent_streams` tails can occupy runtime workers at once.
-    /// Defaults are unchanged pending that benchmark.
+    /// N-R4b1-2: up to `concurrent_streams` tails can occupy runtime workers
+    /// at once. The ignored release gate
+    /// `n_r4b1_2_release_tail_fits_client_timeout_margin` times finish plus
+    /// policy on accepted max-size streams and requires each tail to stay
+    /// strictly below the `300 s - DEFAULT_WALL_CLOCK_MS` margin; it also
+    /// reports that many worst-case tails run back to back.
     pub(super) async fn execute<U: ResponsesStreamUpstream>(
         &self,
         received_at: Instant,
@@ -1405,6 +1406,365 @@ mod tests {
             policy(&config, &evaluator, &L5aScanner),
         );
         assert_send(&fut);
+    }
+
+    // -- N-R4b1-2: release tail benchmark -------------------------------------
+
+    /// N-R4b1-2 resource gate for the executor's non-preemptible tail:
+    /// `SseCollector::finish` plus `enforce_streaming_responses` after the
+    /// final upstream chunk, on accepted streams at the reviewed default
+    /// maxima, with the shipped default policy (`parapet: v1`: L3-outbound
+    /// block, L5a redact, default sensitive patterns) and the real
+    /// `DslConstraintEvaluator` / `L5aScanner`. Ignored so it never runs in
+    /// a normal test pass; it is test-only code, so it is never built into
+    /// the engine. Run explicitly:
+    ///
+    /// `cargo test --locked --release --lib n_r4b1_2 -- --ignored --nocapture`
+    ///
+    /// The bounds cannot all be full at once. Text crosses the wire five
+    /// times (delta, text done, part done, item done, terminal) and is stored
+    /// four times; arguments cross four times, JSON escaped, and are stored
+    /// four times. So full text plus full arguments overflow the 32 MiB
+    /// snapshot bound, and escaped arguments overflow the 40 MiB stream bound
+    /// sooner. Three cases cover the expensive tail dimensions between them:
+    /// - `max_text_and_snapshot_bytes`: 4 MiB text over 1,024 parts plus the
+    ///   longest single argument leaf the snapshot bound then admits; most
+    ///   bytes scanned (per segment, aggregate, canonical arguments, leaf)
+    ///   and the snapshot filled to its bound.
+    /// - `max_argument_scan_units`: 4 MiB arguments of empty-string leaves,
+    ///   so L5a runs once per leaf; most scanner calls.
+    /// - `max_frame_and_opaque`: a terminal frame filled to the 16 MiB frame
+    ///   bound with four opaque reasoning values; largest decoded terminal
+    ///   and opaque payload dropped inside the tail.
+    ///
+    /// Only setup runs before the timer. Output is content-free numbers.
+    #[test]
+    #[ignore = "N-R4b1-2 release benchmark; run with --release -- --ignored"]
+    fn n_r4b1_2_release_tail_fits_client_timeout_margin() {
+        use crate::provider::responses_sse::ResponsesSseCollector;
+        use crate::provider::responses_stream::StreamEventDecoder;
+        use crate::provider::responses_stream_state::{Progress, StreamAssembler};
+        use std::time::Instant as Clock;
+
+        assert!(
+            !cfg!(debug_assertions),
+            "N-R4b1-2 is a release benchmark; run it with --release"
+        );
+
+        const CLIENT_HEADER_TIMEOUT_MS: u64 = 300_000;
+        // Near-misses for every default sensitive pattern, alone or
+        // concatenated: no `@`, quote, backslash, or private-key footer.
+        const FILLER: &str = "sk-ab AKIA12 aws_secret_access_key=ab ghp_ab AIzaB \
+            sk_test_ab -----BEGIN RSA KEY Bearer ab xoxb-1 api_key=ab postgres://u:p \
+            SG.ab.cd npm_ab shpat_ab lorem ipsum ";
+
+        let margin_ms = CLIENT_HEADER_TIMEOUT_MS - ResponsesStreamConfig::DEFAULT_WALL_CLOCK_MS;
+        let config = load_config(&StringSource {
+            content: "parapet: v1\n".to_string(),
+        })
+        .expect("shipped default config");
+        let layers = &config.policy.layers;
+        assert_eq!(layers.l3_outbound.as_ref().unwrap().mode, "block");
+        assert_eq!(layers.l5a.as_ref().unwrap().mode, "redact");
+        assert!(!config.policy.sensitive_patterns.is_empty());
+        let stream = config.runtime.responses_stream;
+        assert_eq!(stream, ResponsesStreamConfig::DEFAULT);
+        let sse_limits = stream.sse_limits();
+        let limits = stream.stream_limits();
+        let evaluator = DslConstraintEvaluator::new();
+
+        let filler =
+            |len: usize| -> String { FILLER.chars().cycle().take(len).collect::<String>() };
+
+        struct Shape {
+            name: &'static str,
+            incomplete: bool,
+            /// Text of every message part, grouped by message item.
+            messages: Vec<Vec<String>>,
+            arguments: String,
+            /// Opaque reasoning values, one reasoning item each.
+            opaque: Vec<String>,
+        }
+
+        /// `(event type, data payload)` per frame, numbered in order.
+        fn frames(shape: &Shape) -> Vec<(String, String)> {
+            let output_text =
+                |t: &str| json!({"type": "output_text", "text": t, "annotations": []});
+            let message = |id: &str, texts: &[String]| {
+                let content: Vec<Value> = texts.iter().map(|t| output_text(t)).collect();
+                json!({"type": "message", "id": id, "status": "completed",
+                    "role": "assistant", "content": content})
+            };
+            let function = |arguments: &str| {
+                json!({"type": "function_call", "id": "fc_1", "status": "completed",
+                    "call_id": "call_1", "name": "save_note", "arguments": arguments})
+            };
+            let reasoning = |id: &str, opaque: Option<&str>| {
+                let mut item = json!({"type": "reasoning", "id": id, "summary": []});
+                if let Some(opaque) = opaque {
+                    item["encrypted_content"] = json!(opaque);
+                }
+                item
+            };
+
+            let mut events = vec![json!({"type": "response.created",
+                "response": response("queued", vec![])})];
+            let mut output = Vec::new();
+            let mut index = 0;
+            for (i, opaque) in shape.opaque.iter().enumerate() {
+                let id = format!("rs_{i}");
+                events.push(json!({"type": "response.output_item.added",
+                    "output_index": index, "item": reasoning(&id, None)}));
+                let done = reasoning(&id, Some(opaque));
+                events.push(json!({"type": "response.output_item.done",
+                    "output_index": index, "item": done.clone()}));
+                output.push(done);
+                index += 1;
+            }
+            for (i, texts) in shape.messages.iter().enumerate() {
+                let id = format!("msg_{i}");
+                events.push(json!({"type": "response.output_item.added",
+                    "output_index": index, "item": message(&id, &[])}));
+                for (part, text) in texts.iter().enumerate() {
+                    let address = json!({"item_id": id, "output_index": index,
+                        "content_index": part});
+                    let event = |kind: &str, extra: Value| {
+                        let mut event = address.clone();
+                        event["type"] = json!(kind);
+                        for (key, value) in extra.as_object().unwrap() {
+                            event[key] = value.clone();
+                        }
+                        event
+                    };
+                    events.push(event(
+                        "response.content_part.added",
+                        json!({"part": output_text("")}),
+                    ));
+                    events.push(event("response.output_text.delta", json!({"delta": text})));
+                    events.push(event("response.output_text.done", json!({"text": text})));
+                    events.push(event(
+                        "response.content_part.done",
+                        json!({"part": output_text(text)}),
+                    ));
+                }
+                let done = message(&id, texts);
+                events.push(json!({"type": "response.output_item.done",
+                    "output_index": index, "item": done.clone()}));
+                output.push(done);
+                index += 1;
+            }
+            events.push(json!({"type": "response.output_item.added",
+                "output_index": index, "item": function("")}));
+            events.push(json!({"type": "response.function_call_arguments.delta",
+                "item_id": "fc_1", "output_index": index, "delta": shape.arguments}));
+            events.push(json!({"type": "response.function_call_arguments.done",
+                "item_id": "fc_1", "output_index": index, "name": "save_note",
+                "arguments": shape.arguments}));
+            let done = function(&shape.arguments);
+            events.push(json!({"type": "response.output_item.done",
+                "output_index": index, "item": done.clone()}));
+            output.push(done);
+            let status = if shape.incomplete {
+                "incomplete"
+            } else {
+                "completed"
+            };
+            events.push(
+                json!({"type": format!("response.{status}"), "response": response(status, output)}),
+            );
+            events
+                .into_iter()
+                .enumerate()
+                .map(|(seq, mut event)| {
+                    event["sequence_number"] = json!(seq);
+                    (
+                        event["type"].as_str().unwrap().to_string(),
+                        event.to_string(),
+                    )
+                })
+                .collect()
+        }
+
+        /// Counted bytes of one frame (non-blank lines with endings).
+        fn frame_bytes((kind, data): &(String, String)) -> usize {
+            "event: \n".len() + kind.len() + "data: \n".len() + data.len()
+        }
+
+        fn body(frames: &[(String, String)]) -> String {
+            frames
+                .iter()
+                .map(|(kind, data)| format!("event: {kind}\ndata: {data}\n\n"))
+                .collect()
+        }
+
+        fn collected(stream: &ResponsesStreamConfig, body: &str) -> ResponsesSseCollector {
+            let mut collector = stream.sse_collector();
+            let mut progress = Progress::Open;
+            for chunk in body.as_bytes().chunks(64 * 1024) {
+                progress = collector.push(chunk).expect("accepted stream");
+            }
+            assert_eq!(progress, Progress::Terminal);
+            collector
+        }
+
+        /// The executor's tail, exactly: finish, then the policy bridge.
+        fn tail(
+            collector: ResponsesSseCollector,
+            config: &Config,
+            evaluator: &dyn ConstraintEvaluator,
+        ) -> ResponsesStreamOutcome {
+            match collector.finish() {
+                Ok(collected) => {
+                    enforce_streaming_responses(collected, config, evaluator, &L5aScanner).into()
+                }
+                Err(err) => err.into(),
+            }
+        }
+
+        /// Assembler usage counters, read from its content-free `Debug`.
+        fn usage(stream: &ResponsesStreamConfig, frames: &[(String, String)]) -> [usize; 5] {
+            let decoder = stream.stream_decoder();
+            let mut assembler = stream.stream_assembler();
+            for (kind, data) in frames {
+                let event = decoder
+                    .decode_event(Some(kind), data.as_bytes())
+                    .expect("decodes");
+                assembler.push(event).expect("assembles");
+            }
+            let debug = format!("{assembler:?}");
+            [
+                "events",
+                "parts",
+                "text_bytes",
+                "argument_bytes",
+                "snapshot_bytes",
+            ]
+            .map(|field| {
+                let rest = debug.split(&format!(" {field}: ")).nth(1).unwrap();
+                let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                digits.parse().unwrap()
+            })
+        }
+
+        // 4 MiB text over 1,024 parts in four messages, plus one argument
+        // leaf as long as the snapshot bound allows: each leaf byte is
+        // stored four times (arguments done, item done twice, terminal).
+        let part_bytes = limits.max_text_bytes / limits.max_parts;
+        let mut text_and_arguments = Shape {
+            name: "max_text_and_snapshot_bytes",
+            incomplete: false,
+            messages: (0..4)
+                .map(|_| {
+                    (0..limits.max_parts / 4)
+                        .map(|_| filler(part_bytes))
+                        .collect()
+                })
+                .collect(),
+            arguments: r#"{"k":""}"#.to_string(),
+            opaque: Vec::new(),
+        };
+        let [.., unfilled] = usage(&stream, &frames(&text_and_arguments));
+        let leaf = ((limits.max_snapshot_bytes - unfilled) / 4)
+            .min(limits.max_argument_bytes - text_and_arguments.arguments.len());
+        text_and_arguments.arguments = format!(r#"{{"k":"{}"}}"#, filler(leaf));
+        // `{"k":[` + n+1 `""` joined by `,` + `]}` = 3n + 10 bytes.
+        let leaves = (limits.max_argument_bytes - 10) / 3 + 1;
+        assert_eq!((leaves - 1) * 3 + 10, limits.max_argument_bytes);
+        let scan_units = Shape {
+            name: "max_argument_scan_units",
+            incomplete: true,
+            messages: vec![(0..384).map(|_| filler(part_bytes)).collect()],
+            arguments: format!(r#"{{"k":[{}]}}"#, vec![r#""""#; leaves].join(",")),
+            opaque: Vec::new(),
+        };
+        // Fill the terminal frame to the frame bound with four opaque values.
+        let mut frame_and_opaque = Shape {
+            name: "max_frame_and_opaque",
+            incomplete: false,
+            messages: vec![(0..128).map(|_| filler(part_bytes)).collect()],
+            arguments: r#"{"path":"note.txt"}"#.to_string(),
+            opaque: vec![String::new(); 4],
+        };
+        let unfilled = frame_bytes(frames(&frame_and_opaque).last().unwrap());
+        let opaque_bytes = ((sse_limits.max_frame_bytes - unfilled) / 4)
+            .min(stream.opaque_limits().max_field_bytes);
+        frame_and_opaque.opaque = vec!["Q".repeat(opaque_bytes); 4];
+
+        let mut worst: Option<(&'static str, std::time::Duration, String)> = None;
+        for shape in [text_and_arguments, scan_units, frame_and_opaque] {
+            let frames = frames(&shape);
+            let body = body(&frames);
+            let max_frame = frames.iter().map(frame_bytes).max().unwrap();
+            assert!(body.len() <= sse_limits.max_stream_bytes);
+            assert!(max_frame <= sse_limits.max_frame_bytes);
+            let [events, parts, text_bytes, argument_bytes, snapshot_bytes] =
+                usage(&stream, &frames);
+            assert!(snapshot_bytes <= limits.max_snapshot_bytes);
+            drop(frames);
+            let collector = collected(&stream, &body);
+
+            let start = Clock::now();
+            let outcome = tail(collector, &config, &evaluator);
+            let elapsed = start.elapsed();
+
+            let ResponsesStreamOutcome::Release(canonical) = &outcome else {
+                panic!("{}: expected release, got {outcome:?}", shape.name)
+            };
+            assert_eq!(canonical.len(), body.len(), "canonical framing is exact");
+            println!(
+                "N-R4b1-2 case={} terminal={} stream_bytes={} canonical_bytes={} \
+                 max_frame_bytes={} events={events} parts={parts} text_bytes={text_bytes} \
+                 argument_bytes={argument_bytes} snapshot_bytes={snapshot_bytes} \
+                 opaque_bytes={} tail_us={} tail_ms={:.3} margin_ms={margin_ms}",
+                shape.name,
+                if shape.incomplete {
+                    "incomplete"
+                } else {
+                    "completed"
+                },
+                body.len(),
+                canonical.len(),
+                max_frame,
+                shape.opaque.iter().map(String::len).sum::<usize>(),
+                elapsed.as_micros(),
+                elapsed.as_secs_f64() * 1e3,
+            );
+            assert!(
+                elapsed.as_millis() < u128::from(margin_ms),
+                "{} tail exceeds the client timeout margin",
+                shape.name
+            );
+            if worst.as_ref().map_or(true, |(_, w, _)| elapsed > *w) {
+                worst = Some((shape.name, elapsed, body));
+            }
+        }
+
+        // Up to `concurrent_streams` tails may hold runtime workers at once.
+        // Bound it conservatively: that many worst-case tails back to back on
+        // one thread, every collector filled before the timer.
+        let (name, single, body) = worst.unwrap();
+        let collectors: Vec<_> = (0..ResponsesStreamConfig::DEFAULT_CONCURRENT_STREAMS)
+            .map(|_| collected(&stream, &body))
+            .collect();
+        drop(body);
+        let start = Clock::now();
+        for collector in collectors {
+            let outcome = tail(collector, &config, &evaluator);
+            assert!(matches!(outcome, ResponsesStreamOutcome::Release(_)));
+        }
+        let sequential = start.elapsed();
+        println!(
+            "N-R4b1-2 worst_case={name} worst_tail_us={} worst_tail_ms={:.3} \
+             sequential_tails={} sequential_us={} sequential_ms={:.3} margin_ms={margin_ms} \
+             sequential_fits_margin={}",
+            single.as_micros(),
+            single.as_secs_f64() * 1e3,
+            ResponsesStreamConfig::DEFAULT_CONCURRENT_STREAMS,
+            sequential.as_micros(),
+            sequential.as_secs_f64() * 1e3,
+            sequential.as_millis() < u128::from(margin_ms),
+        );
+        assert!(single.as_millis() < u128::from(margin_ms));
     }
 
     // -- reachability ---------------------------------------------------------

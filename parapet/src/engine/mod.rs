@@ -2061,9 +2061,9 @@ impl EngineUpstreamClient {
     /// the executor calls it only after admission. Nothing is spawned;
     /// dropping this future cancels the upstream request and frees its slot.
     ///
-    /// N-R4b1-2 remains open: the max-size release benchmark of the
-    /// synchronous collector/policy tail against the 300 s client timeout
-    /// minus `wall_clock` has not been run, so R4b2 is not closed.
+    /// N-R4b1-2: the synchronous collector/policy tail is gated against the
+    /// 300 s client timeout minus `wall_clock` by the ignored release
+    /// benchmark in `responses_stream_exec` (run with `--release --ignored`).
     #[allow(clippy::too_many_arguments)]
     async fn forward_responses_stream(
         &self,

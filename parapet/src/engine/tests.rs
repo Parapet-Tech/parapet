@@ -8697,8 +8697,8 @@ async fn deterministic_offline_sender_v0_non_stream_regression_preserves_exact_b
 // -------------------------------------------------------------------
 //
 // Every test injects a scripted `HttpSender`; nothing touches the network.
-// N-R4b1-2 stays open: these prove behavior, not the release-build max-size
-// tail benchmark that gates R4b2 closure.
+// These prove behavior; the release-build max-size tail benchmark (N-R4b1-2)
+// is the ignored gate in `responses_stream_exec`.
 
 mod responses_live_stream {
     use super::*;
