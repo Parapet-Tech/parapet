@@ -60,9 +60,11 @@ pub enum Phase {
 /// validated; provider error text never appears here.
 #[derive(Debug, Clone, PartialEq)]
 pub enum StreamEventKind {
-    /// `response.created` / `response.in_progress`: status `queued` or
-    /// `in_progress`, empty `output`.
-    ResponsePending { response: DecodedResponse },
+    /// `response.created`: status `queued` or `in_progress`, empty `output`.
+    ResponseCreated { response: DecodedResponse },
+    /// `response.in_progress`: same shape as `response.created`, kept
+    /// distinct so lifecycle ordering can be enforced.
+    ResponseInProgress { response: DecodedResponse },
     /// `response.completed`: full closed response object.
     ResponseCompleted { response: DecodedResponse },
     /// `response.incomplete`: full closed response object.
@@ -131,6 +133,9 @@ pub struct StreamItem {
     /// Present for `function_call` items. Arguments are strictly parsed; an
     /// empty wire string (typical on `added`) parses as `{}`.
     pub tool_call: Option<ToolCall>,
+    /// Exact `arguments` wire string of a `function_call` item, unparsed, for
+    /// later byte-equality checks against the streamed deltas.
+    pub arguments: Option<String>,
 }
 
 /// Decoder for OpenAI Responses SSE event payloads.
@@ -220,14 +225,15 @@ impl<P: JsonParser> OpenAiResponsesStreamDecoder<P> {
         obj: &mut Map<String, Value>,
     ) -> Result<StreamEventKind, ProviderError> {
         let lifecycle = match event_type {
-            "response.created" | "response.in_progress" => Some(ResponseStatus::Pending),
-            "response.completed" => Some(ResponseStatus::Completed),
-            "response.incomplete" => Some(ResponseStatus::Incomplete),
-            "response.failed" => Some(ResponseStatus::Failed),
+            "response.created" => Some(Lifecycle::Created),
+            "response.in_progress" => Some(Lifecycle::InProgress),
+            "response.completed" => Some(Lifecycle::Completed),
+            "response.incomplete" => Some(Lifecycle::Incomplete),
+            "response.failed" => Some(Lifecycle::Failed),
             _ => None,
         };
-        if let Some(status) = lifecycle {
-            return self.decode_lifecycle(obj, status);
+        if let Some(lifecycle) = lifecycle {
+            return self.decode_lifecycle(obj, lifecycle);
         }
         let added_done = |prefix: &str| match event_type.strip_prefix(prefix) {
             Some(".added") => Some(Phase::Added),
@@ -258,19 +264,25 @@ impl<P: JsonParser> OpenAiResponsesStreamDecoder<P> {
     fn decode_lifecycle(
         &self,
         obj: &mut Map<String, Value>,
-        status: ResponseStatus,
+        lifecycle: Lifecycle,
     ) -> Result<StreamEventKind, ProviderError> {
         allow_keys(obj, &["type", "sequence_number", "response"], "event")?;
         let root = obj
             .remove("response")
             .ok_or_else(|| ProviderError::MissingField("event.response".to_string()))?;
+        let status = match lifecycle {
+            Lifecycle::Created | Lifecycle::InProgress => ResponseStatus::Pending,
+            Lifecycle::Completed => ResponseStatus::Completed,
+            Lifecycle::Incomplete => ResponseStatus::Incomplete,
+            Lifecycle::Failed => ResponseStatus::Failed,
+        };
         let response = decode_response_value(&self.parser, root, status)?;
-        Ok(match status {
-            ResponseStatus::Pending => StreamEventKind::ResponsePending { response },
-            ResponseStatus::Completed => StreamEventKind::ResponseCompleted { response },
-            ResponseStatus::Incomplete => StreamEventKind::ResponseIncomplete { response },
-            ResponseStatus::Failed => StreamEventKind::ResponseFailed,
-            ResponseStatus::Final => unreachable!("Final is not a stream lifecycle status"),
+        Ok(match lifecycle {
+            Lifecycle::Created => StreamEventKind::ResponseCreated { response },
+            Lifecycle::InProgress => StreamEventKind::ResponseInProgress { response },
+            Lifecycle::Completed => StreamEventKind::ResponseCompleted { response },
+            Lifecycle::Incomplete => StreamEventKind::ResponseIncomplete { response },
+            Lifecycle::Failed => StreamEventKind::ResponseFailed,
         })
     }
 
@@ -290,12 +302,15 @@ impl<P: JsonParser> OpenAiResponsesStreamDecoder<P> {
             .ok_or_else(|| ProviderError::MissingField("event.item".to_string()))?;
         let mut view = OutputView::default();
         let kind = view.decode_item(&self.parser, item, output_index)?;
+        let obj = item.as_object().expect("decode_item accepted an object");
         // Stream items are addressed by `item_id` in later events.
-        let id = item
-            .as_object()
-            .map(|o| non_empty_string(o, "id", "event.item"))
-            .expect("decode_item accepted an object")?
-            .to_string();
+        let id = non_empty_string(obj, "id", "event.item")?.to_string();
+        let arguments = match kind {
+            OutputItemKind::FunctionCall => {
+                Some(required_string(obj, "arguments", "event.item")?.to_string())
+            }
+            _ => None,
+        };
         Ok(StreamEventKind::OutputItem {
             phase,
             output_index,
@@ -304,9 +319,20 @@ impl<P: JsonParser> OpenAiResponsesStreamDecoder<P> {
                 id,
                 texts: view.texts,
                 tool_call: view.tool_calls.pop(),
+                arguments,
             },
         })
     }
+}
+
+/// Which lifecycle event a `response.*` payload arrived as.
+#[derive(Clone, Copy)]
+enum Lifecycle {
+    Created,
+    InProgress,
+    Completed,
+    Incomplete,
+    Failed,
 }
 
 fn decode_content_part(
@@ -557,13 +583,13 @@ mod tests {
 
         let created = ev("response.created");
         assert_eq!(created.sequence_number, 0);
-        let ResponsePending { response } = created.kind else {
+        let ResponseCreated { response } = created.kind else {
             panic!("created")
         };
         assert!(response.texts().is_empty() && response.tool_calls().is_empty());
         assert!(matches!(
             ev("response.in_progress").kind,
-            ResponsePending { .. }
+            ResponseInProgress { .. }
         ));
 
         let ResponseCompleted { response } = ev("response.completed").kind else {
@@ -589,6 +615,7 @@ mod tests {
                     id: "msg_1".into(),
                     texts: vec![],
                     tool_call: None,
+                    arguments: None,
                 },
             }
         );
@@ -612,6 +639,7 @@ mod tests {
                 arguments: json!({"a": 1}),
             })
         );
+        assert_eq!(item.arguments.as_deref(), Some("{\"a\":1}"));
 
         assert_eq!(
             ev("response.content_part.done").kind,
@@ -687,6 +715,34 @@ mod tests {
                 delta: "{\"a\"".into(),
             }
         );
+    }
+
+    #[test]
+    fn output_item_keeps_exact_function_arguments_wire_string() {
+        let raw = " { \"b\" : [1, 2] , \"a\" : \"\\u0041\" } ";
+        let mut v = fixture_value("response.output_item.done");
+        v["item"]["arguments"] = json!(raw);
+        let StreamEventKind::OutputItem { item, .. } =
+            decode_value("response.output_item.done", &v).unwrap().kind
+        else {
+            panic!("item")
+        };
+        assert_eq!(item.arguments.as_deref(), Some(raw));
+        assert_eq!(
+            item.tool_call.unwrap().arguments,
+            json!({"a": "A", "b": [1, 2]})
+        );
+
+        let StreamEventKind::OutputItem { item, .. } = decode(
+            Some("response.output_item.added"),
+            &fixture("response.output_item.added"),
+        )
+        .unwrap()
+        .kind
+        else {
+            panic!("item")
+        };
+        assert_eq!(item.arguments, None, "message items carry no arguments");
     }
 
     #[test]

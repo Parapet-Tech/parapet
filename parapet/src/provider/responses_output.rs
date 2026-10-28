@@ -122,6 +122,30 @@ impl DecodedResponse {
         &self.tool_calls
     }
 
+    /// Provider-assigned response `id`, if present and non-null.
+    pub(super) fn response_id(&self) -> Option<&str> {
+        self.root.get("id").and_then(Value::as_str)
+    }
+
+    /// `(kind, id)` of every `output[]` item in array order. Decoding already
+    /// restricted `type` to the accepted kinds.
+    pub(super) fn output_identities(&self) -> Vec<(OutputItemKind, Option<&str>)> {
+        let items = self.root.get("output").and_then(Value::as_array);
+        items
+            .into_iter()
+            .flatten()
+            .map(|item| {
+                let kind = match item.get("type").and_then(Value::as_str) {
+                    Some("message") => OutputItemKind::Message,
+                    Some("function_call") => OutputItemKind::FunctionCall,
+                    Some("reasoning") => OutputItemKind::Reasoning,
+                    _ => unreachable!("decode_response_value accepted only known item types"),
+                };
+                (kind, item.get("id").and_then(Value::as_str))
+            })
+            .collect()
+    }
+
     /// Replace every text segment, in [`Self::texts`] order, with the
     /// matching entry of `replacements`. Exactly one replacement per segment
     /// is required; nothing outside the addressed text fields changes.

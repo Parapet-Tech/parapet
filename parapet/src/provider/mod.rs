@@ -11,13 +11,15 @@
 // - Handle edge cases: empty messages, null arguments, content arrays, etc.
 // - OpenAI Responses request decoding lives in `responses`; non-stream
 //   response inspection/rewrite lives in `responses_output`; single SSE
-//   event decoding lives in `responses_stream`
+//   event decoding lives in `responses_stream`; cross-event lifecycle
+//   assembly lives in `responses_stream_state`
 
 use crate::message::{Message, Role, ToolCall, TrustLevel};
 
 pub mod responses;
 pub mod responses_output;
 pub mod responses_stream;
+pub mod responses_stream_state;
 
 // ---------------------------------------------------------------------------
 // Error type
