@@ -1789,13 +1789,19 @@ mod tests {
             ),
             (
                 "root key spelled with an escape",
-                format!(r#"{{"input":"hi","input":"{s}"}}"#),
+                format!(r#"{{"input":"hi","\u0069nput":"{s}"}}"#),
                 r#"{"input":"hi"}"#.to_string(),
                 body.clone(),
             ),
             (
                 "tool description",
                 tool(&format!(r#""name":"f","description":"ok","description":"{s}""#)),
+                tool(r#""name":"f","description":"ok""#),
+                body.clone(),
+            ),
+            (
+                "tool description spelled with an escape",
+                tool(&format!(r#""name":"f","description":"ok","descr\u0069ption":"{s}""#)),
                 tool(r#""name":"f","description":"ok""#),
                 body.clone(),
             ),
