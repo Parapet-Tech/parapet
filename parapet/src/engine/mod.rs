@@ -65,6 +65,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 mod projected;
+mod responses;
 pub use projected::{
     derive_projected_views, scan_projected_l3, L0ViewDeriver, L1ViewScorer, ProjectedEngineStage,
     ProjectedL3Block, ProjectedL3Match, ProjectedL3Result, ProjectedL3Source,
