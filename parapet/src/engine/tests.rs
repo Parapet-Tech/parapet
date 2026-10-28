@@ -8,6 +8,7 @@ use crate::config::{
     CompiledPattern, ContentPolicy, EngineConfig, LayerConfig, LayerConfigs, PolicyConfig,
     RuntimeConfig, ToolConfig, TrustConfig,
 };
+use crate::layers::l1_harness::threshold_outcome;
 use crate::message::{Message, Role, TrustLevel};
 use crate::session::SessionStore;
 use futures_util::stream;
@@ -1444,16 +1445,32 @@ async fn responses_and_chat_run_the_same_shipped_default_l1_blocking_path() {
             }),
         ),
     ];
+    let shipped_threshold = crate::config::load_config(&crate::config::StringSource {
+        content: "parapet: v1\n".to_string(),
+    })
+    .expect("shipped default config")
+    .policy
+    .layers
+    .l1
+    .expect("shipped L1 config")
+    .threshold;
 
     for (label, expected_layer, body) in responses_cases {
         let sender = Arc::new(CountingRecordingSender::new());
         let engine = shipped_default_l1_engine(sender.clone());
+        let request_body = serde_json::to_vec(&body).unwrap();
+        let tool_definition_index = OpenAiResponsesDecoder::new()
+            .decode_request_with_classes(&request_body)
+            .unwrap()
+            .scan_classes
+            .iter()
+            .position(|class| *class == ScanContentClass::ToolDefinition);
         let response = engine
             .forward(
                 Provider::OpenAi,
                 responses_request(
                     "/v1/responses",
-                    Bytes::from(serde_json::to_vec(&body).unwrap()),
+                    Bytes::from(request_body),
                     HeaderMap::new(),
                 ),
             )
@@ -1477,13 +1494,17 @@ async fn responses_and_chat_run_the_same_shipped_default_l1_blocking_path() {
                     .expect("tool-definition shadow signals must be recorded"),
             )
             .unwrap();
+            let tool_definition_index =
+                tool_definition_index.expect("L3 tool case must have a tool definition");
+            let tool_signal = signals
+                .iter()
+                .find(|signal| signal.message_index == tool_definition_index)
+                .expect("tool-definition L1 signal must be recorded");
+            let outcome = threshold_outcome(tool_signal, shipped_threshold);
             assert!(
-                signals.iter().any(|signal| {
-                    signal.raw_score >= 0.0
-                        || signal.raw_unquoted_score >= 0.0
-                        || signal.raw_squash_score >= 0.0
-                }),
-                "{label}: tool-definition L1 threshold hit not recorded"
+                outcome.threshold_breached,
+                "{label}: tool-definition unit did not cross shipped threshold; effective_raw={}",
+                outcome.effective_raw
             );
         }
         assert_eq!(sender.call_count(), 0, "{label}");
