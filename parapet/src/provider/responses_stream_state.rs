@@ -1,7 +1,7 @@
 // Copyright 2026 The Parapet Project
 // SPDX-License-Identifier: Apache-2.0
 
-// OpenAI Responses API stream lifecycle assembler -- D-0027 Stage 2C2a
+// OpenAI Responses API stream lifecycle assembler -- D-0027 Stage 2C2a/2C2b
 //
 // Responsibilities:
 // - Consume decoded [`StreamEvent`]s in arrival order and enforce ordering,
@@ -21,19 +21,31 @@
 //   - function-call argument events only on function-call items, done once
 // - Enforce injected hard bounds on events, items, parts, accumulated delta
 //   bytes, and stored snapshot bytes
-// - Keep every exact string later stages need for byte-equality closure
-//   (concatenated deltas, every done layer, the terminal snapshot)
+// - Enforce exact byte equality across every layer of every content address
+//   (item, container, part index, kind), so the terminal snapshot is the
+//   single content authority:
+//   - `output_item.added` texts, `content_part.added` text, and
+//     `output_item.added` arguments are empty
+//   - concat(text deltas) == text done == `content_part.done` (where
+//     wrapped) == the `output_item.done` segment at the same address == the
+//     terminal snapshot segment at the same address
+//   - concat(argument deltas) == arguments done == `output_item.done`
+//     arguments == terminal snapshot arguments, compared as raw wire strings;
+//     the done string must strictly parse as a JSON object
+//   - function-call `call_id` and `name` agree across added, done (name),
+//     item done, and the terminal snapshot
 // - Release nothing model-controlled until a terminal event was validated:
 //   [`StreamAssembler::push`] reports structure only, and assembled content
 //   is reachable only through [`StreamAssembler::finish`]
 //
-// Not in scope (Stage 2C2b / 2D): cross-layer content equality (deltas vs
-// done vs item done vs terminal snapshot), L5a/L3-outbound policy, rewriting,
-// SSE framing, and route activation. An accepted terminal here does NOT mean
-// the stream content is consistent or safe.
+// Not in scope (Stage 2D): L5a/L3-outbound policy, rewriting, SSE framing,
+// and route activation. An accepted terminal here means the stream content
+// is self-consistent, NOT that it is safe.
 
+use super::responses::{parse_arguments, JsonParser, StrictJsonParser};
 use super::responses_output::{DecodedResponse, OutputItemKind, TextSegmentKind};
 use super::responses_stream::{Phase, StreamEvent, StreamEventKind, StreamItem};
+use crate::message::ToolCall;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -170,10 +182,36 @@ pub enum StreamStateError {
     ItemsOpen,
     #[error("stream: terminal response output does not match streamed items")]
     SnapshotIdentityMismatch,
+    #[error("stream: output_item.added text is not empty")]
+    ItemAddedTextNotEmpty,
+    #[error("stream: content_part.added text is not empty")]
+    PartAddedTextNotEmpty,
+    #[error("stream: text done does not equal its deltas")]
+    TextDoneMismatch,
+    #[error("stream: content_part.done text does not equal its text done")]
+    PartDoneMismatch,
+    #[error("stream: output_item.done text does not equal its streamed parts")]
+    ItemDoneTextMismatch,
+    #[error("stream: terminal response text does not equal output_item.done")]
+    SnapshotTextMismatch,
+    #[error("stream: output_item.added arguments are not empty")]
+    ItemAddedArgumentsNotEmpty,
+    #[error("stream: function_call_arguments.done does not equal its deltas")]
+    ArgumentsDoneMismatch,
+    #[error("stream: function_call_arguments.done is not a strict JSON object")]
+    ArgumentsInvalid,
+    #[error("stream: function call name does not match output_item.added")]
+    FunctionNameMismatch,
+    #[error("stream: function call call_id does not match output_item.added")]
+    CallIdMismatch,
+    #[error("stream: output_item.done arguments do not equal function_call_arguments.done")]
+    ItemDoneArgumentsMismatch,
+    #[error("stream: terminal response function call does not equal output_item.done")]
+    SnapshotFunctionCallMismatch,
 }
 
-/// One validated, terminal-checked output item. Exact strings are kept for
-/// later equality closure; nothing here asserts they agree.
+/// One validated, terminal-checked output item. Every exact layer is kept;
+/// they were checked byte-equal before the item could be assembled.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AssembledItem {
     output_index: usize,
@@ -400,9 +438,13 @@ enum Slot {
 
 /// Reference [`StreamAssembler`] for OpenAI Responses streams.
 ///
+/// Final function-call arguments are parsed through the injected
+/// [`JsonParser`] (strict, duplicate-rejecting by default).
+///
 /// `Debug` is redacted: it shows stage, counters, and limits only, so
 /// buffered stream content cannot leak before terminal validation.
-pub struct ResponsesStreamAssembler {
+pub struct ResponsesStreamAssembler<P: JsonParser = StrictJsonParser> {
+    parser: P,
     limits: StreamLimits,
     stage: Stage,
     /// Next expected `sequence_number`; `None` once `u64::MAX` was consumed.
@@ -420,7 +462,14 @@ impl ResponsesStreamAssembler {
     }
 
     pub fn with_limits(limits: StreamLimits) -> Self {
+        Self::with_parser(limits, StrictJsonParser)
+    }
+}
+
+impl<P: JsonParser> ResponsesStreamAssembler<P> {
+    pub fn with_parser(limits: StreamLimits, parser: P) -> Self {
         Self {
+            parser,
             limits,
             stage: Stage::Start,
             next_sequence: Some(0),
@@ -438,7 +487,7 @@ impl Default for ResponsesStreamAssembler {
     }
 }
 
-impl fmt::Debug for ResponsesStreamAssembler {
+impl<P: JsonParser> fmt::Debug for ResponsesStreamAssembler<P> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let stage = match self.stage {
             Stage::Start => "start",
@@ -457,7 +506,7 @@ impl fmt::Debug for ResponsesStreamAssembler {
     }
 }
 
-impl StreamAssembler for ResponsesStreamAssembler {
+impl<P: JsonParser> StreamAssembler for ResponsesStreamAssembler<P> {
     fn push(&mut self, event: StreamEvent) -> Result<Progress, StreamStateError> {
         let result = self.accept(event);
         if result.is_err() {
@@ -505,7 +554,7 @@ impl StreamAssembler for ResponsesStreamAssembler {
     }
 }
 
-impl ResponsesStreamAssembler {
+impl<P: JsonParser> ResponsesStreamAssembler<P> {
     fn accept(&mut self, event: StreamEvent) -> Result<Progress, StreamStateError> {
         match self.stage {
             Stage::Poisoned => return Err(StreamStateError::Poisoned),
@@ -610,7 +659,11 @@ impl ResponsesStreamAssembler {
             } => {
                 let (index, slot) = self.text_part(kind, &item_id, output_index, part_index)?;
                 self.snapshot(text.len())?;
-                parts_mut(&mut self.items[index], slot)[part_index].text_done = Some(text);
+                let part = &mut parts_mut(&mut self.items[index], slot)[part_index];
+                if text != part.deltas {
+                    return Err(StreamStateError::TextDoneMismatch);
+                }
+                part.text_done = Some(text);
             }
             FunctionCallArgumentsDelta {
                 item_id,
@@ -636,6 +689,21 @@ impl ResponsesStreamAssembler {
             } => {
                 let index = self.arguments_target(&item_id, output_index)?;
                 self.snapshot(arguments.len() + name.as_ref().map_or(0, String::len))?;
+                if arguments != arguments_of(&self.items[index]).deltas {
+                    return Err(StreamStateError::ArgumentsDoneMismatch);
+                }
+                if name
+                    .as_deref()
+                    .is_some_and(|n| n != added_call(&self.items[index]).name)
+                {
+                    return Err(StreamStateError::FunctionNameMismatch);
+                }
+                // The raw string itself stays the authority; the parsed value
+                // is only a validity witness and is discarded.
+                match parse_arguments(&self.parser, &arguments, "stream") {
+                    Ok(value) if value.is_object() => {}
+                    _ => return Err(StreamStateError::ArgumentsInvalid),
+                }
                 let state = arguments_mut(&mut self.items[index]);
                 state.done = Some(arguments);
                 state.done_name = name;
@@ -691,6 +759,21 @@ impl ResponsesStreamAssembler {
         if !streamed.eq(response.output_identities()) {
             return Err(StreamStateError::SnapshotIdentityMismatch);
         }
+        for (index, item) in self.items.iter().enumerate() {
+            let done = item.done.as_ref().expect("checked above");
+            // Full segment equality: kind, text, and exact address.
+            let snapshot = response.texts().iter().filter(|s| s.item_index() == index);
+            if !done.texts.iter().eq(snapshot) {
+                return Err(StreamStateError::SnapshotTextMismatch);
+            }
+            if let Some(call) = &done.tool_call {
+                let raw = done.arguments.as_deref().expect("function-call item");
+                let expected = (call.id.as_str(), call.name.as_str(), raw);
+                if response.raw_function_call(index) != Some(expected) {
+                    return Err(StreamStateError::SnapshotFunctionCallMismatch);
+                }
+            }
+        }
         self.snapshot(response.to_json_bytes().len())
     }
 
@@ -707,6 +790,13 @@ impl ResponsesStreamAssembler {
         }
         if self.items.len() >= self.limits.max_items {
             return Err(StreamStateError::LimitExceeded(StreamLimit::Items));
+        }
+        // Content arrives only through deltas; the added snapshot is empty.
+        if item.texts.iter().any(|t| !t.text().is_empty()) {
+            return Err(StreamStateError::ItemAddedTextNotEmpty);
+        }
+        if item.arguments.as_deref().is_some_and(|a| !a.is_empty()) {
+            return Err(StreamStateError::ItemAddedArgumentsNotEmpty);
         }
         // The id is stored twice: in the snapshot and as the lookup key.
         self.snapshot(item_bytes(&item) + item.id.len())?;
@@ -730,6 +820,21 @@ impl ResponsesStreamAssembler {
         }
         if !state.children_closed() {
             return Err(StreamStateError::ChildrenOpen);
+        }
+        if item_segments(&item) != streamed_segments(state) {
+            return Err(StreamStateError::ItemDoneTextMismatch);
+        }
+        if let (Some(added), Some(done)) = (&state.added.tool_call, &item.tool_call) {
+            if done.id != added.id {
+                return Err(StreamStateError::CallIdMismatch);
+            }
+            if done.name != added.name {
+                return Err(StreamStateError::FunctionNameMismatch);
+            }
+            let streamed = arguments_of(state).done.as_deref();
+            if item.arguments.as_deref() != streamed {
+                return Err(StreamStateError::ItemDoneArgumentsMismatch);
+            }
         }
         self.snapshot(item_bytes(&item))?;
         self.items[index].done = Some(item);
@@ -776,7 +881,9 @@ impl ResponsesStreamAssembler {
                     self.limits.max_parts,
                     StreamLimit::Parts,
                 )?;
-                self.snapshot(text.len())?;
+                if !text.is_empty() {
+                    return Err(StreamStateError::PartAddedTextNotEmpty);
+                }
                 self.items[index].content.push(PartState {
                     kind,
                     added_text: Some(text),
@@ -796,8 +903,10 @@ impl ResponsesStreamAssembler {
                 if part.part_done_text.is_some() {
                     return Err(StreamStateError::AfterDone);
                 }
-                if part.text_done.is_none() {
-                    return Err(StreamStateError::PartTextOpen);
+                match part.text_done.as_deref() {
+                    None => return Err(StreamStateError::PartTextOpen),
+                    Some(done) if done != text => return Err(StreamStateError::PartDoneMismatch),
+                    Some(_) => {}
                 }
                 self.snapshot(text.len())?;
                 self.items[index].content[content_index].part_done_text = Some(text);
@@ -899,6 +1008,42 @@ fn arguments_mut(item: &mut ItemState) -> &mut ArgumentsState {
     item.arguments
         .as_mut()
         .expect("arguments_target accepted a function-call item")
+}
+
+fn arguments_of(item: &ItemState) -> &ArgumentsState {
+    item.arguments
+        .as_ref()
+        .expect("arguments_target accepted a function-call item")
+}
+
+/// The `output_item.added` call of a function-call item.
+fn added_call(item: &ItemState) -> &ToolCall {
+    item.added
+        .tool_call
+        .as_ref()
+        .expect("the decoder attaches a tool call to every function-call item")
+}
+
+/// `(kind, part index, text)` of every streamed part of an item, in the
+/// order the decoder emits item segments: message content; reasoning summary
+/// then content.
+fn streamed_segments(item: &ItemState) -> Vec<(TextSegmentKind, usize, &str)> {
+    item.summary
+        .iter()
+        .enumerate()
+        .chain(item.content.iter().enumerate())
+        .map(|(i, p)| {
+            let text = p.text_done.as_deref().expect("children closed");
+            (p.kind, i, text)
+        })
+        .collect()
+}
+
+fn item_segments(item: &StreamItem) -> Vec<(TextSegmentKind, usize, &str)> {
+    item.texts
+        .iter()
+        .map(|s| (s.kind(), s.part_index(), s.text()))
+        .collect()
 }
 
 /// Stored bytes of an item snapshot: id, texts, and raw arguments (counted
@@ -1087,18 +1232,30 @@ mod tests {
     // -- valid streams ------------------------------------------------------
 
     fn message_stream() -> Vec<Value> {
-        vec![
+        message_stream_of(&["He", "llo"])
+    }
+
+    /// Consistent single-part `output_text` stream streaming `deltas`.
+    fn message_stream_of(deltas: &[&str]) -> Vec<Value> {
+        let full = deltas.concat();
+        let mut events = vec![
             created(),
             in_progress(),
             item("added", 0, msg("msg_1", vec![])),
             part("added", "msg_1", 0, 0, text_part("")),
-            text("output_text", "delta", "msg_1", 0, 0, "He"),
-            text("output_text", "delta", "msg_1", 0, 0, "llo"),
-            text("output_text", "done", "msg_1", 0, 0, "Hello"),
-            part("done", "msg_1", 0, 0, text_part("Hello")),
-            item("done", 0, msg("msg_1", vec![text_part("Hello")])),
-            completed(vec![msg("msg_1", vec![text_part("Hello")])]),
-        ]
+        ];
+        events.extend(
+            deltas
+                .iter()
+                .map(|d| text("output_text", "delta", "msg_1", 0, 0, d)),
+        );
+        events.extend([
+            text("output_text", "done", "msg_1", 0, 0, &full),
+            part("done", "msg_1", 0, 0, text_part(&full)),
+            item("done", 0, msg("msg_1", vec![text_part(&full)])),
+            completed(vec![msg("msg_1", vec![text_part(&full)])]),
+        ]);
+        events
     }
 
     #[test]
@@ -1156,11 +1313,12 @@ mod tests {
             item("added", 0, rs("rs_1", &[], &[])),
             text("reasoning_summary_text", "delta", "rs_1", 0, 0, "S"),
             text("reasoning_summary_text", "done", "rs_1", 0, 0, "S"),
-            text("reasoning_summary_text", "done", "rs_1", 0, 1, "T"),
+            // Zero deltas concatenate to the empty string.
+            text("reasoning_summary_text", "done", "rs_1", 0, 1, ""),
             text("reasoning_text", "delta", "rs_1", 0, 0, "R"),
             text("reasoning_text", "done", "rs_1", 0, 0, "R"),
-            item("done", 0, rs("rs_1", &["S", "T"], &["R"])),
-            completed(vec![rs("rs_1", &["S", "T"], &["R"])]),
+            item("done", 0, rs("rs_1", &["S", ""], &["R"])),
+            completed(vec![rs("rs_1", &["S", ""], &["R"])]),
         ]);
         let Terminal::Completed(stream) = terminal else {
             panic!("completed")
@@ -1175,7 +1333,7 @@ mod tests {
             summary,
             [
                 (TextSegmentKind::ReasoningSummary, "S", "S"),
-                (TextSegmentKind::ReasoningSummary, "", "T")
+                (TextSegmentKind::ReasoningSummary, "", "")
             ]
         );
         let content = &item.content_parts()[0];
@@ -1219,23 +1377,6 @@ mod tests {
     }
 
     #[test]
-    fn equality_is_not_enforced_in_this_stage() {
-        // Disagreeing layers are stored verbatim for Stage 2C2b to reject.
-        let Terminal::Completed(stream) = finish_ok(vec![
-            created(),
-            item("added", 0, fc("fc_1", "")),
-            args_delta("fc_1", 0, "{\"x\":1}"),
-            args_done("fc_1", 0, "{\"y\":2}"),
-            item("done", 0, fc("fc_1", "{\"z\":3}")),
-            completed(vec![fc("fc_1", "{\"w\":4}")]),
-        ]) else {
-            panic!("completed")
-        };
-        let args = stream.items()[0].arguments().unwrap();
-        assert_eq!((args.deltas(), args.done()), ("{\"x\":1}", "{\"y\":2}"));
-    }
-
-    #[test]
     fn incomplete_failed_and_error_terminals_are_explicit() {
         let mut events = message_stream();
         events.pop();
@@ -1259,13 +1400,8 @@ mod tests {
 
     #[test]
     fn nothing_is_released_before_terminal() {
-        let mut events = message_stream();
+        let mut events = message_stream_of(&[MARKER, MARKER]);
         events.pop();
-        for v in &mut events {
-            if let Some(s) = v.get_mut("delta") {
-                *s = json!(MARKER);
-            }
-        }
         let mut a = ResponsesStreamAssembler::new();
         for (seq, v) in events.into_iter().enumerate() {
             let progress = a.push(decode(seq as u64, v));
@@ -1627,32 +1763,39 @@ mod tests {
         let text_done = || text("output_text", "done", "msg_1", 0, 0, "x");
         let part_done = || part("done", "msg_1", 0, 0, text_part("x"));
         let item_done = || item("done", 0, msg("msg_1", vec![text_part("x")]));
-        let closed = || with(open_message(), vec![text_done(), part_done(), item_done()]);
+        // Open part already holding the "x" its done layers must equal.
+        let open = || {
+            with(
+                open_message(),
+                vec![text("output_text", "delta", "msg_1", 0, 0, "x")],
+            )
+        };
+        let closed = || with(open(), vec![text_done(), part_done(), item_done()]);
         let cases = [
             (
                 "part done before text done",
-                with(open_message(), vec![part_done()]),
+                with(open(), vec![part_done()]),
                 E::PartTextOpen,
             ),
             (
                 "item done with open part",
-                with(open_message(), vec![item_done()]),
+                with(open(), vec![item_done()]),
                 E::ChildrenOpen,
             ),
             (
                 "item done after text only",
-                with(open_message(), vec![text_done(), item_done()]),
+                with(open(), vec![text_done(), item_done()]),
                 E::ChildrenOpen,
             ),
             (
                 "duplicate text done",
-                with(open_message(), vec![text_done(), text_done()]),
+                with(open(), vec![text_done(), text_done()]),
                 E::AfterDone,
             ),
             (
                 "delta after text done",
                 with(
-                    open_message(),
+                    open(),
                     vec![
                         text_done(),
                         text("output_text", "delta", "msg_1", 0, 0, "y"),
@@ -1662,13 +1805,13 @@ mod tests {
             ),
             (
                 "duplicate part done",
-                with(open_message(), vec![text_done(), part_done(), part_done()]),
+                with(open(), vec![text_done(), part_done(), part_done()]),
                 E::AfterDone,
             ),
             (
                 "delta after part done",
                 with(
-                    open_message(),
+                    open(),
                     vec![
                         text_done(),
                         part_done(),
@@ -1700,7 +1843,13 @@ mod tests {
             assert_eq!(run(events).1, Err(expected), "{label}");
         }
 
-        let fc_open = || vec![created(), item("added", 0, fc("fc_1", ""))];
+        let fc_open = || {
+            vec![
+                created(),
+                item("added", 0, fc("fc_1", "")),
+                args_delta("fc_1", 0, "{}"),
+            ]
+        };
         let fc_cases = [
             (
                 "item done without args done",
@@ -1756,12 +1905,12 @@ mod tests {
             ),
             (
                 "duplicate summary done",
-                with(rs_open(), vec![summary("done", "x"), summary("done", "x")]),
+                with(rs_open(), vec![summary("done", ""), summary("done", "")]),
                 E::AfterDone,
             ),
             (
                 "delta after summary done",
-                with(rs_open(), vec![summary("done", "x"), summary("delta", "y")]),
+                with(rs_open(), vec![summary("done", ""), summary("delta", "y")]),
                 E::AfterDone,
             ),
             (
@@ -1804,6 +1953,709 @@ mod tests {
             .map(|i| i.arguments().unwrap().deltas())
             .collect();
         assert_eq!(deltas, ["{\"a\":1}", "{}"]);
+    }
+
+    // -- content equality ---------------------------------------------------
+
+    /// Multi-byte text: accents, CJK, emoji, and a combining mark.
+    const TEXT: &str = "H\u{e9}llo, \u{4e16}\u{754c} \u{1f44b}e\u{301}";
+    /// Whitespace-rich arguments with JSON escapes; deltas split mid-escape.
+    const ARGS: &str =
+        "{ \"path\" : \"C:\\\\tmp\\\\a b\" ,\n\t\"q\": \"\\\"hi\\\" \\u00e9\\n\", \"n\":[1, 2.50] }";
+
+    /// One delta per char, plus empty deltas.
+    fn text_deltas() -> Vec<String> {
+        let mut deltas: Vec<String> = TEXT.chars().map(String::from).collect();
+        deltas.insert(0, String::new());
+        deltas.insert(4, String::new());
+        deltas
+    }
+
+    /// Three-byte chunks of [`ARGS`] (ASCII), plus an empty delta.
+    fn arg_deltas() -> Vec<&'static str> {
+        let mut deltas: Vec<&str> = ARGS
+            .as_bytes()
+            .chunks(3)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect();
+        deltas.insert(2, "");
+        deltas
+    }
+
+    fn full_output() -> Vec<Value> {
+        vec![
+            msg("msg_1", vec![text_part(TEXT), refusal_part("Nope")]),
+            rs("rs_1", &["Sum"], &["Rea"]),
+            fc("fc_1", ARGS),
+        ]
+    }
+
+    /// Every content kind with every layer present and agreeing.
+    fn full_stream() -> Vec<Value> {
+        let out = full_output();
+        let mut e = vec![
+            created(),
+            in_progress(),
+            item("added", 0, msg("msg_1", vec![])),
+            part("added", "msg_1", 0, 0, text_part("")),
+        ];
+        for d in text_deltas() {
+            e.push(text("output_text", "delta", "msg_1", 0, 0, &d));
+        }
+        e.extend([
+            text("output_text", "done", "msg_1", 0, 0, TEXT),
+            part("done", "msg_1", 0, 0, text_part(TEXT)),
+            part("added", "msg_1", 0, 1, refusal_part("")),
+            text("refusal", "delta", "msg_1", 0, 1, "No"),
+            text("refusal", "delta", "msg_1", 0, 1, ""),
+            text("refusal", "delta", "msg_1", 0, 1, "pe"),
+            text("refusal", "done", "msg_1", 0, 1, "Nope"),
+            part("done", "msg_1", 0, 1, refusal_part("Nope")),
+            item("done", 0, out[0].clone()),
+            item("added", 1, rs("rs_1", &[], &[])),
+            text("reasoning_summary_text", "delta", "rs_1", 1, 0, "Su"),
+            text("reasoning_summary_text", "delta", "rs_1", 1, 0, "m"),
+            text("reasoning_summary_text", "done", "rs_1", 1, 0, "Sum"),
+            text("reasoning_text", "delta", "rs_1", 1, 0, "Re"),
+            text("reasoning_text", "delta", "rs_1", 1, 0, "a"),
+            text("reasoning_text", "done", "rs_1", 1, 0, "Rea"),
+            item("done", 1, out[1].clone()),
+            item("added", 2, fc("fc_1", "")),
+        ]);
+        for d in arg_deltas() {
+            e.push(args_delta("fc_1", 2, d));
+        }
+        e.extend([
+            args_done("fc_1", 2, ARGS),
+            item("done", 2, out[2].clone()),
+            completed(out),
+        ]);
+        e
+    }
+
+    /// The `n`th event of `ty` (without the `response.` prefix).
+    fn at<'a>(events: &'a mut [Value], ty: &str, n: usize) -> &'a mut Value {
+        let ty = format!("response.{ty}");
+        events
+            .iter_mut()
+            .filter(|v| v["type"] == ty.as_str())
+            .nth(n)
+            .unwrap_or_else(|| panic!("no event {ty} #{n}"))
+    }
+
+    fn remove(events: &mut Vec<Value>, ty: &str, n: usize) {
+        let target = at(events, ty, n).clone();
+        let i = events.iter().position(|v| *v == target).unwrap();
+        events.remove(i);
+    }
+
+    #[test]
+    fn every_content_kind_assembles_when_all_layers_agree() {
+        let Terminal::Completed(stream) = finish_ok(full_stream()) else {
+            panic!("completed")
+        };
+        let [m, r, f] = stream.items() else {
+            panic!("three items")
+        };
+        let layers = |p: &AssembledPart| {
+            (
+                p.kind(),
+                p.added_text().map(str::to_string),
+                p.deltas().to_string(),
+                p.text_done().to_string(),
+                p.part_done_text().map(str::to_string),
+            )
+        };
+        use TextSegmentKind::*;
+        let message: Vec<_> = m.content_parts().iter().map(layers).collect();
+        assert_eq!(
+            message,
+            [
+                (
+                    OutputText,
+                    Some("".into()),
+                    TEXT.into(),
+                    TEXT.into(),
+                    Some(TEXT.into())
+                ),
+                (
+                    Refusal,
+                    Some("".into()),
+                    "Nope".into(),
+                    "Nope".into(),
+                    Some("Nope".into())
+                ),
+            ]
+        );
+        let summary: Vec<_> = r.summary_parts().iter().map(layers).collect();
+        let content: Vec<_> = r.content_parts().iter().map(layers).collect();
+        assert_eq!(
+            summary,
+            [(ReasoningSummary, None, "Sum".into(), "Sum".into(), None)]
+        );
+        assert_eq!(
+            content,
+            [(ReasoningContent, None, "Rea".into(), "Rea".into(), None)]
+        );
+        let args = f.arguments().unwrap();
+        assert_eq!((args.deltas(), args.done()), (ARGS, ARGS));
+        assert_eq!(f.added().arguments.as_deref(), Some(""));
+        assert_eq!(f.done().arguments.as_deref(), Some(ARGS));
+        let texts: Vec<_> = stream
+            .response()
+            .texts()
+            .iter()
+            .map(|s| (s.kind(), s.item_index(), s.text()))
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                (OutputText, 0, TEXT),
+                (Refusal, 0, "Nope"),
+                (ReasoningSummary, 1, "Sum"),
+                (ReasoningContent, 1, "Rea"),
+            ]
+        );
+        assert_eq!(
+            stream.response().raw_function_call(2),
+            Some(("call_fc_1", "get", ARGS))
+        );
+    }
+
+    #[test]
+    fn every_text_layer_mismatch_fails_closed_without_echo() {
+        type Mutation = fn(&mut Vec<Value>);
+        let cases: Vec<(&str, Mutation, E)> = vec![
+            (
+                "message added text",
+                |e| at(e, "output_item.added", 0)["item"]["content"] = json!([text_part(MARKER)]),
+                E::ItemAddedTextNotEmpty,
+            ),
+            (
+                "reasoning added summary",
+                |e| {
+                    at(e, "output_item.added", 1)["item"]["summary"] =
+                        json!([{"type": "summary_text", "text": MARKER}])
+                },
+                E::ItemAddedTextNotEmpty,
+            ),
+            (
+                "reasoning added content",
+                |e| {
+                    at(e, "output_item.added", 1)["item"]["content"] =
+                        json!([{"type": "reasoning_text", "text": MARKER}])
+                },
+                E::ItemAddedTextNotEmpty,
+            ),
+            (
+                "text part added",
+                |e| at(e, "content_part.added", 0)["part"]["text"] = json!(MARKER),
+                E::PartAddedTextNotEmpty,
+            ),
+            (
+                "refusal part added",
+                |e| at(e, "content_part.added", 1)["part"]["refusal"] = json!(MARKER),
+                E::PartAddedTextNotEmpty,
+            ),
+            (
+                "text delta changed",
+                |e| at(e, "output_text.delta", 2)["delta"] = json!(MARKER),
+                E::TextDoneMismatch,
+            ),
+            (
+                "text delta dropped",
+                |e| remove(e, "output_text.delta", 2),
+                E::TextDoneMismatch,
+            ),
+            (
+                "text delta extra",
+                |e| {
+                    let mut extra = at(e, "output_text.delta", 0).clone();
+                    extra["delta"] = json!(MARKER);
+                    e.insert(5, extra);
+                },
+                E::TextDoneMismatch,
+            ),
+            (
+                "text deltas reordered",
+                |e| {
+                    let a = at(e, "output_text.delta", 1)["delta"].take();
+                    let b = at(e, "output_text.delta", 2)["delta"].take();
+                    at(e, "output_text.delta", 1)["delta"] = b;
+                    at(e, "output_text.delta", 2)["delta"] = a;
+                },
+                E::TextDoneMismatch,
+            ),
+            (
+                "text done",
+                |e| at(e, "output_text.done", 0)["text"] = json!(MARKER),
+                E::TextDoneMismatch,
+            ),
+            (
+                "refusal delta",
+                |e| at(e, "refusal.delta", 1)["delta"] = json!(MARKER),
+                E::TextDoneMismatch,
+            ),
+            (
+                "refusal done",
+                |e| at(e, "refusal.done", 0)["refusal"] = json!(MARKER),
+                E::TextDoneMismatch,
+            ),
+            (
+                "summary delta",
+                |e| at(e, "reasoning_summary_text.delta", 0)["delta"] = json!(MARKER),
+                E::TextDoneMismatch,
+            ),
+            (
+                "summary done",
+                |e| at(e, "reasoning_summary_text.done", 0)["text"] = json!(MARKER),
+                E::TextDoneMismatch,
+            ),
+            (
+                "reasoning text delta",
+                |e| at(e, "reasoning_text.delta", 1)["delta"] = json!(MARKER),
+                E::TextDoneMismatch,
+            ),
+            (
+                "reasoning text done",
+                |e| at(e, "reasoning_text.done", 0)["text"] = json!(MARKER),
+                E::TextDoneMismatch,
+            ),
+            (
+                "text part done",
+                |e| at(e, "content_part.done", 0)["part"]["text"] = json!(MARKER),
+                E::PartDoneMismatch,
+            ),
+            (
+                "refusal part done",
+                |e| at(e, "content_part.done", 1)["part"]["refusal"] = json!(MARKER),
+                E::PartDoneMismatch,
+            ),
+            (
+                "message item done text",
+                |e| at(e, "output_item.done", 0)["item"]["content"][0]["text"] = json!(MARKER),
+                E::ItemDoneTextMismatch,
+            ),
+            (
+                "message item done refusal",
+                |e| at(e, "output_item.done", 0)["item"]["content"][1]["refusal"] = json!(MARKER),
+                E::ItemDoneTextMismatch,
+            ),
+            (
+                "message item done drops a part",
+                |e| at(e, "output_item.done", 0)["item"]["content"] = json!([text_part(TEXT)]),
+                E::ItemDoneTextMismatch,
+            ),
+            (
+                "message item done extra part",
+                |e| {
+                    at(e, "output_item.done", 0)["item"]["content"] =
+                        json!([text_part(TEXT), refusal_part("Nope"), text_part(MARKER)])
+                },
+                E::ItemDoneTextMismatch,
+            ),
+            (
+                "message item done swaps parts",
+                |e| {
+                    at(e, "output_item.done", 0)["item"]["content"] =
+                        json!([refusal_part("Nope"), text_part(TEXT)])
+                },
+                E::ItemDoneTextMismatch,
+            ),
+            (
+                "message item done refusal as output_text",
+                |e| {
+                    at(e, "output_item.done", 0)["item"]["content"] =
+                        json!([text_part(TEXT), text_part("Nope")])
+                },
+                E::ItemDoneTextMismatch,
+            ),
+            (
+                "reasoning item done summary",
+                |e| at(e, "output_item.done", 1)["item"] = rs("rs_1", &[MARKER], &["Rea"]),
+                E::ItemDoneTextMismatch,
+            ),
+            (
+                "reasoning item done content",
+                |e| at(e, "output_item.done", 1)["item"] = rs("rs_1", &["Sum"], &[MARKER]),
+                E::ItemDoneTextMismatch,
+            ),
+            (
+                "reasoning item done swaps containers",
+                |e| at(e, "output_item.done", 1)["item"] = rs("rs_1", &["Rea"], &["Sum"]),
+                E::ItemDoneTextMismatch,
+            ),
+            (
+                "reasoning item done collapses summary into content",
+                |e| at(e, "output_item.done", 1)["item"] = rs("rs_1", &[], &["Sum", "Rea"]),
+                E::ItemDoneTextMismatch,
+            ),
+            (
+                "terminal message text",
+                |e| {
+                    at(e, "completed", 0)["response"]["output"][0]["content"][0]["text"] =
+                        json!(MARKER)
+                },
+                E::SnapshotTextMismatch,
+            ),
+            (
+                "terminal message refusal",
+                |e| {
+                    at(e, "completed", 0)["response"]["output"][0]["content"][1]["refusal"] =
+                        json!(MARKER)
+                },
+                E::SnapshotTextMismatch,
+            ),
+            (
+                "terminal message drops a part",
+                |e| {
+                    at(e, "completed", 0)["response"]["output"][0]["content"] =
+                        json!([text_part(TEXT)])
+                },
+                E::SnapshotTextMismatch,
+            ),
+            (
+                "terminal reasoning summary",
+                |e| {
+                    at(e, "completed", 0)["response"]["output"][1] = rs("rs_1", &[MARKER], &["Rea"])
+                },
+                E::SnapshotTextMismatch,
+            ),
+            (
+                "terminal reasoning swaps containers",
+                |e| at(e, "completed", 0)["response"]["output"][1] = rs("rs_1", &["Rea"], &["Sum"]),
+                E::SnapshotTextMismatch,
+            ),
+        ];
+        assert!(matches!(finish_ok(full_stream()), Terminal::Completed(_)));
+        for (label, mutate, expected) in cases {
+            let mut events = full_stream();
+            mutate(&mut events);
+            let (a, r) = run(events);
+            let err = r.expect_err(label);
+            assert_eq!(err, expected, "{label}");
+            assert_no_echo(label, &format!("{err} {err:?} {a:?}"));
+            assert_eq!(a.finish().unwrap_err(), E::Poisoned, "{label}");
+        }
+    }
+
+    #[test]
+    fn every_function_call_layer_mismatch_fails_closed_without_echo() {
+        // Same object as `ARGS`, but different bytes: no layer may be
+        // satisfied by a reserialized or normalized equivalent.
+        fn compact() -> String {
+            serde_json::to_string(&serde_json::from_str::<Value>(ARGS).unwrap()).unwrap()
+        }
+        type Mutation = fn(&mut Vec<Value>);
+        let cases: Vec<(&str, Mutation, E)> = vec![
+            (
+                "added arguments",
+                |e| at(e, "output_item.added", 2)["item"]["arguments"] = json!("{}"),
+                E::ItemAddedArgumentsNotEmpty,
+            ),
+            (
+                "added arguments carry content",
+                |e| {
+                    at(e, "output_item.added", 2)["item"]["arguments"] =
+                        json!(json!({ "k": MARKER }).to_string())
+                },
+                E::ItemAddedArgumentsNotEmpty,
+            ),
+            (
+                "argument delta changed",
+                |e| at(e, "function_call_arguments.delta", 4)["delta"] = json!(MARKER),
+                E::ArgumentsDoneMismatch,
+            ),
+            (
+                "argument delta dropped",
+                |e| remove(e, "function_call_arguments.delta", 4),
+                E::ArgumentsDoneMismatch,
+            ),
+            (
+                "arguments done compact",
+                |e| at(e, "function_call_arguments.done", 0)["arguments"] = json!(compact()),
+                E::ArgumentsDoneMismatch,
+            ),
+            (
+                "arguments done name",
+                |e| at(e, "function_call_arguments.done", 0)["name"] = json!(MARKER),
+                E::FunctionNameMismatch,
+            ),
+            (
+                "added name",
+                |e| at(e, "output_item.added", 2)["item"]["name"] = json!(MARKER),
+                E::FunctionNameMismatch,
+            ),
+            (
+                "item done arguments compact",
+                |e| at(e, "output_item.done", 2)["item"]["arguments"] = json!(compact()),
+                E::ItemDoneArgumentsMismatch,
+            ),
+            (
+                "item done arguments other object",
+                |e| {
+                    at(e, "output_item.done", 2)["item"]["arguments"] =
+                        json!(json!({ "k": MARKER }).to_string())
+                },
+                E::ItemDoneArgumentsMismatch,
+            ),
+            (
+                "item done call_id",
+                |e| at(e, "output_item.done", 2)["item"]["call_id"] = json!(MARKER),
+                E::CallIdMismatch,
+            ),
+            (
+                "added call_id",
+                |e| at(e, "output_item.added", 2)["item"]["call_id"] = json!(MARKER),
+                E::CallIdMismatch,
+            ),
+            (
+                "item done name",
+                |e| at(e, "output_item.done", 2)["item"]["name"] = json!(MARKER),
+                E::FunctionNameMismatch,
+            ),
+            (
+                "terminal arguments compact",
+                |e| at(e, "completed", 0)["response"]["output"][2]["arguments"] = json!(compact()),
+                E::SnapshotFunctionCallMismatch,
+            ),
+            (
+                "terminal call_id",
+                |e| at(e, "completed", 0)["response"]["output"][2]["call_id"] = json!(MARKER),
+                E::SnapshotFunctionCallMismatch,
+            ),
+            (
+                "terminal name",
+                |e| at(e, "completed", 0)["response"]["output"][2]["name"] = json!(MARKER),
+                E::SnapshotFunctionCallMismatch,
+            ),
+        ];
+        for (label, mutate, expected) in cases {
+            let mut events = full_stream();
+            mutate(&mut events);
+            let (a, r) = run(events);
+            let err = r.expect_err(label);
+            assert_eq!(err, expected, "{label}");
+            assert_no_echo(label, &format!("{err} {err:?} {a:?}"));
+            assert_eq!(a.finish().unwrap_err(), E::Poisoned, "{label}");
+        }
+
+        // Omitting the optional done name is not a mismatch.
+        let mut events = full_stream();
+        at(&mut events, "function_call_arguments.done", 0)
+            .as_object_mut()
+            .unwrap()
+            .remove("name");
+        assert!(matches!(finish_ok(events), Terminal::Completed(_)));
+    }
+
+    /// Events for one consistent message item at `oi` whose parts are
+    /// `(is_refusal, text)`. Returns the events and the done item.
+    fn message_item(id: &str, oi: usize, parts: &[(bool, &str)]) -> (Vec<Value>, Value) {
+        let wire = |refusal: bool, s: &str| {
+            if refusal {
+                refusal_part(s)
+            } else {
+                text_part(s)
+            }
+        };
+        let mut e = vec![item("added", oi, msg(id, vec![]))];
+        for (i, &(refusal, s)) in parts.iter().enumerate() {
+            let family = if refusal { "refusal" } else { "output_text" };
+            e.extend([
+                part("added", id, oi, i, wire(refusal, "")),
+                text(family, "delta", id, oi, i, s),
+                text(family, "done", id, oi, i, s),
+                part("done", id, oi, i, wire(refusal, s)),
+            ]);
+        }
+        let done = msg(id, parts.iter().map(|&(r, s)| wire(r, s)).collect());
+        e.push(item("done", oi, done.clone()));
+        (e, done)
+    }
+
+    #[test]
+    fn same_text_at_another_address_cannot_cross_satisfy() {
+        let stream = |items: Vec<(Vec<Value>, Value)>, terminal: Option<Vec<Value>>| {
+            let mut e = vec![created()];
+            let mut out = Vec::new();
+            for (events, done) in items {
+                e.extend(events);
+                out.push(done);
+            }
+            e.push(completed(terminal.unwrap_or(out)));
+            e
+        };
+
+        // Same text in two parts and in two items is fine at its own address.
+        let ok = stream(
+            vec![
+                message_item("m1", 0, &[(false, "Same"), (false, "Same")]),
+                message_item("m2", 1, &[(false, "Same")]),
+            ],
+            None,
+        );
+        assert!(matches!(finish_ok(ok), Terminal::Completed(_)));
+
+        // Item done must not collapse or reorder parts.
+        let (mut events, _) = message_item("m1", 0, &[(false, "Same"), (false, "Same")]);
+        *events.last_mut().unwrap() = item("done", 0, msg("m1", vec![text_part("Same")]));
+        expect_err(
+            stream(vec![(events, msg("m1", vec![]))], None),
+            E::ItemDoneTextMismatch,
+        );
+        let (mut events, _) = message_item("m1", 0, &[(false, "A"), (false, "B")]);
+        *events.last_mut().unwrap() =
+            item("done", 0, msg("m1", vec![text_part("B"), text_part("A")]));
+        expect_err(
+            stream(vec![(events, msg("m1", vec![]))], None),
+            E::ItemDoneTextMismatch,
+        );
+        let (mut events, _) = message_item("m1", 0, &[(false, "A"), (false, "")]);
+        *events.last_mut().unwrap() =
+            item("done", 0, msg("m1", vec![text_part(""), text_part("A")]));
+        expect_err(
+            stream(vec![(events, msg("m1", vec![]))], None),
+            E::ItemDoneTextMismatch,
+        );
+
+        // Terminal snapshot texts are bound to their own item.
+        let swapped = Some(vec![
+            msg("m1", vec![text_part("B")]),
+            msg("m2", vec![text_part("A")]),
+        ]);
+        expect_err(
+            stream(
+                vec![
+                    message_item("m1", 0, &[(false, "A")]),
+                    message_item("m2", 1, &[(false, "B")]),
+                ],
+                swapped,
+            ),
+            E::SnapshotTextMismatch,
+        );
+        // Moving a part to the other item keeps the flat text order.
+        let moved = Some(vec![
+            msg("m1", vec![text_part("A"), text_part("B")]),
+            msg("m2", vec![]),
+        ]);
+        expect_err(
+            stream(
+                vec![
+                    message_item("m1", 0, &[(false, "A")]),
+                    message_item("m2", 1, &[(false, "B")]),
+                ],
+                moved,
+            ),
+            E::SnapshotTextMismatch,
+        );
+
+        // Reasoning summary parts are bound by index.
+        let reasoning = |done: Value| {
+            vec![
+                created(),
+                item("added", 0, rs("rs_1", &[], &[])),
+                text("reasoning_summary_text", "delta", "rs_1", 0, 0, "X"),
+                text("reasoning_summary_text", "done", "rs_1", 0, 0, "X"),
+                text("reasoning_summary_text", "delta", "rs_1", 0, 1, "Y"),
+                text("reasoning_summary_text", "done", "rs_1", 0, 1, "Y"),
+                item("done", 0, done.clone()),
+                completed(vec![done]),
+            ]
+        };
+        assert!(matches!(
+            finish_ok(reasoning(rs("rs_1", &["X", "Y"], &[]))),
+            Terminal::Completed(_)
+        ));
+        expect_err(
+            reasoning(rs("rs_1", &["Y", "X"], &[])),
+            E::ItemDoneTextMismatch,
+        );
+        expect_err(
+            reasoning(rs("rs_1", &["X"], &["Y"])),
+            E::ItemDoneTextMismatch,
+        );
+    }
+
+    fn function_call_with(arguments: &str) -> Vec<Value> {
+        vec![
+            created(),
+            item("added", 0, fc("fc_1", "")),
+            args_delta("fc_1", 0, arguments),
+            args_done("fc_1", 0, arguments),
+            item("done", 0, fc("fc_1", arguments)),
+            completed(vec![fc("fc_1", arguments)]),
+        ]
+    }
+
+    #[test]
+    fn final_arguments_must_be_a_strict_json_object() {
+        let m = MARKER;
+        let bad = [
+            format!(r#"{{"a":"{m}","a":1}}"#),
+            format!(r#"{{"a":1,"\u0061":"{m}"}}"#),
+            format!(r#"{{"o":{{"b":1,"b":"{m}"}}}}"#),
+            format!(r#"["{m}"]"#),
+            format!(r#""{m}""#),
+            "1".to_string(),
+            "null".to_string(),
+            format!(r#"{{"a":"{m}""#),
+            format!("{{}} {m}"),
+            " ".to_string(),
+        ];
+        for arguments in &bad {
+            // Fails at `arguments.done`, before any item done is decoded.
+            let mut events = function_call_with(arguments);
+            events.truncate(4);
+            expect_err(events, E::ArgumentsInvalid);
+        }
+        // An empty argument string is the decoder's `{}`.
+        let Terminal::Completed(stream) = finish_ok(function_call_with("")) else {
+            panic!("completed")
+        };
+        assert_eq!(stream.items()[0].arguments().unwrap().done(), "");
+    }
+
+    struct RecordingParser(std::sync::Mutex<Vec<Vec<u8>>>);
+
+    impl JsonParser for RecordingParser {
+        fn parse(&self, bytes: &[u8]) -> Result<Value, crate::provider::responses::JsonParseError> {
+            self.0.lock().unwrap().push(bytes.to_vec());
+            StrictJsonParser.parse(bytes)
+        }
+    }
+
+    #[test]
+    fn final_arguments_are_parsed_through_the_injected_parser() {
+        let mut a = ResponsesStreamAssembler::with_parser(
+            StreamLimits::default(),
+            RecordingParser(Default::default()),
+        );
+        for (seq, v) in full_stream().into_iter().enumerate() {
+            a.push(decode(seq as u64, v)).unwrap();
+        }
+        assert_eq!(*a.parser.0.lock().unwrap(), vec![ARGS.as_bytes().to_vec()]);
+        assert!(matches!(a.finish(), Ok(Terminal::Completed(_))));
+    }
+
+    #[test]
+    fn mismatched_layers_before_failed_or_error_release_nothing() {
+        for terminal in [failed(), error()] {
+            let mut events = full_stream();
+            events.truncate(6);
+            // A stray delta never reconciled with any done layer.
+            let mut stray = at(&mut events, "output_text.delta", 0).clone();
+            stray["delta"] = json!(MARKER);
+            events.push(stray);
+            events.push(terminal);
+            let (a, r) = run(events);
+            assert_eq!(r, Ok(Progress::Terminal));
+            assert_no_echo("assembler", &format!("{a:?}"));
+            assert!(matches!(
+                a.finish(),
+                Ok(Terminal::Failed | Terminal::Errored)
+            ));
+        }
     }
 
     // -- bounds -------------------------------------------------------------

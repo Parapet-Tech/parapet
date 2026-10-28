@@ -88,6 +88,12 @@ impl TextSegment {
     pub fn item_index(&self) -> usize {
         self.location.item
     }
+
+    /// Index of the part inside its container (`content` or `summary`, which
+    /// [`Self::kind`] determines).
+    pub(super) fn part_index(&self) -> usize {
+        self.location.part
+    }
 }
 
 /// Why [`DecodedResponse::with_replaced_texts`] refused. Never carries text.
@@ -144,6 +150,18 @@ impl DecodedResponse {
                 (kind, item.get("id").and_then(Value::as_str))
             })
             .collect()
+    }
+
+    /// Exact wire `(call_id, name, arguments)` of the `function_call` item at
+    /// `output[index]`; `None` for any other item or index. Decoding already
+    /// validated all three as strings.
+    pub(super) fn raw_function_call(&self, index: usize) -> Option<(&str, &str, &str)> {
+        let item = self.root.get("output")?.get(index)?;
+        if item.get("type").and_then(Value::as_str) != Some("function_call") {
+            return None;
+        }
+        let field = |key| item.get(key).and_then(Value::as_str);
+        Some((field("call_id")?, field("name")?, field("arguments")?))
     }
 
     /// Replace every text segment, in [`Self::texts`] order, with the
