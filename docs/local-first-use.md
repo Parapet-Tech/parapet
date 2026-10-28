@@ -211,6 +211,42 @@ Human output does not echo paths or the control token. JSON output for these
 commands is unchanged, including the `a6_booking_required` field of
 `parapet-cli-restore/v0`.
 
+## Stock OpenAI-compatible clients with a local loopback server
+
+An unmodified OpenAI-compatible client can use Parapet in ordinary
+whole-message mode in front of a local OpenAI-compatible model server. No SDK,
+provenance profile, or Parapet-specific request header is required.
+
+```bash
+parapet run --state-dir <state-dir> --config <config> --json \
+  --upstream openai=http://127.0.0.1:<server-port>/v1 \
+  --allow-loopback-http-upstream
+```
+
+Point the client's base URL at `http://127.0.0.1:<parapet-port>/v1` and keep
+the server's model name and API key as the client normally sends them. Parapet
+accepts `POST /v1/chat/completions`, forwards it to
+`<upstream-base>/chat/completions`, and returns JSON or SSE streaming responses.
+Client headers, including `Authorization` and application headers, are
+forwarded unchanged except `Host`, `x-parapet-original-host`,
+`x-parapet-provenance`, and `x-guard-trust*`. A request blocked by the
+configured layers returns HTTP 403 with `x-parapet-blocked-by` and is never
+sent upstream.
+
+Prerequisites:
+
+- The upstream must be a literal loopback IP (`127.0.0.0/8` or `[::1]`), passed
+  through `--upstream` or `PARAPET_OPENAI_BASE_URL` together with
+  `--allow-loopback-http-upstream`. `localhost`, LAN addresses, and plain-HTTP
+  URLs without the opt-in flag fail closed with `upstream_config_invalid`.
+  The ambient `OPENAI_BASE_URL` fallback never enables plain HTTP.
+- The upstream base URL includes the server's API prefix (usually `/v1`);
+  Parapet appends only `/chat/completions`.
+- `GET /v1/models` is not proxied (HTTP 501). Configure the model name in the
+  client directly instead of relying on model discovery.
+
+Regression coverage: `parapet/tests/stock_openai_loopback_v0.rs`.
+
 ## Rust CLI acceptance with the offline fixture
 
 This is **Rust CLI acceptance**: the installed Rust `parapet` CLI is the only
