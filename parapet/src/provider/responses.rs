@@ -1,25 +1,27 @@
 // Copyright 2026 The Parapet Project
 // SPDX-License-Identifier: Apache-2.0
 
-// OpenAI Responses API request decoder -- D-0027 Stage 1
+// OpenAI Responses API request decoder -- D-0027 Stage 2A
 //
 // Responsibilities:
 // - Decode `POST /v1/responses` request JSON into Vec<Message> for ordinary
 //   whole-message scanning, separate from the Chat Completions adapter
-// - Extract every human-authored text field from top-level `instructions` and
-//   `input` in stable wire order (instructions first, then input items in
-//   array order, then content parts in array order)
-// - Fail closed on unknown or malformed text-bearing shapes, on request
-//   fields that pull unscannable server-side context into the model, on
-//   `input_file` parts, and on non-empty top-level `tools`
+// - Extract every model-visible text field in stable order: `instructions`,
+//   then one projection per function tool in `tools` array order, then
+//   `input` items in array order (content parts in array order)
+// - Accept only a closed set of top-level fields, each shape-checked so that
+//   no object or array can smuggle unscanned model-visible strings
+// - Fail closed without echoing request bytes on unknown or malformed shapes,
+//   on server-side context references (`previous_response_id`,
+//   `conversation`, `prompt`), on every `input_image` / `input_file` part, on
+//   reasoning `encrypted_content`, and on any tool type other than `function`
 //
-// Not in scope (Stage 2): response/SSE decoding, output filtering, tool
-// definition and file decoding, and tool-call enforcement. The route seam in
-// `proxy` keeps forwarding disabled.
+// Not in scope: response/SSE decoding, output filtering, and tool-call
+// enforcement. The route seam in `proxy` keeps forwarding disabled.
 //
-// Stage 2 activation condition: decoded messages must pass through the
-// shipped-default `RoleTrustAssigner`, under which every decoded role
-// (instructions/system/developer/user/tool) is Untrusted. See the
+// Activation condition: decoded messages, including tool-definition
+// projections, must pass through the shipped-default `RoleTrustAssigner`,
+// under which every decoded role is Untrusted. See the
 // `shipped_default_trust_marks_decoded_roles_untrusted` regression below.
 
 use super::ProviderError;
@@ -44,6 +46,10 @@ const SERVER_SIDE_CONTEXT_FIELDS: &[&str] = &["previous_response_id", "conversat
 /// at decode time exactly like the Chat Completions and Anthropic adapters, and
 /// trust is assigned later by role):
 /// - `instructions` (string) -> `Role::System`
+/// - `tools[]` function tool -> `Role::System` whose content is the compact
+///   JSON of the entire validated definition (name, description, strict, and
+///   the full parameter schema). `tool_name` stays unset so no per-tool trust
+///   override can apply.
 /// - `input` (string) -> `Role::User`
 /// - `input[]` message item (`type: "message"` or omitted with `role`) ->
 ///   one message whose content concatenates its text parts with `""`;
@@ -54,11 +60,16 @@ const SERVER_SIDE_CONTEXT_FIELDS: &[&str] = &["previous_response_id", "conversat
 /// - `input[]` `reasoning` -> `Role::Assistant` with summary/content text
 ///
 /// Text parts: `input_text.text`, `output_text.text`, `refusal.refusal`,
-/// `summary_text.text`, `reasoning_text.text`. Image parts are validated but
-/// their identifiers, URLs, and base64 payloads are not scanned as text;
-/// reasoning `encrypted_content` is opaque provider ciphertext and not scanned.
-/// `input_file` parts and non-empty top-level `tools` fail closed because the
-/// upstream model would see content Parapet cannot inspect.
+/// `summary_text.text`, `reasoning_text.text`.
+///
+/// Threat rulings (fail closed, never silently dropped):
+/// - `input_image` and `input_file` parts: the model sees pixels or file
+///   contents Parapet cannot inspect.
+/// - reasoning `encrypted_content`: opaque provider ciphertext that the
+///   upstream decrypts back into model context. Any non-null value is refused
+///   until it becomes inspectable.
+/// - non-`function` tools: hosted/custom/namespace tools carry model-visible
+///   text or server-side behavior outside this decoder.
 pub struct OpenAiResponsesDecoder;
 
 impl OpenAiResponsesDecoder {
@@ -81,13 +92,7 @@ impl RequestDecoder for OpenAiResponsesDecoder {
             .as_object()
             .ok_or_else(|| invalid("request body must be a JSON object"))?;
 
-        for field in SERVER_SIDE_CONTEXT_FIELDS {
-            if root.get(*field).is_some_and(|v| !v.is_null()) {
-                return Err(invalid(format!(
-                    "{field} references server-side context that cannot be inspected"
-                )));
-            }
-        }
+        validate_control_fields(root)?;
 
         let mut messages = Vec::new();
 
@@ -101,18 +106,22 @@ impl RequestDecoder for OpenAiResponsesDecoder {
             Some(_) => return Err(invalid("instructions must be a string or null")),
         }
 
-        // Tool and namespace descriptions and JSON Schema `description` fields
-        // are model-visible. Until they are recursively decoded and scanned,
-        // only absent/null/empty `tools` is accepted.
+        let mut tool_names = Vec::new();
         match root.get("tools") {
             None | Some(Value::Null) => {}
-            Some(Value::Array(tools)) if tools.is_empty() => {}
-            Some(_) => {
-                return Err(invalid(
-                    "tools definitions cannot be inspected; only absent, null, or empty tools is supported",
-                ))
+            Some(Value::Array(tools)) => {
+                for (i, tool) in tools.iter().enumerate() {
+                    let (name, msg) = decode_function_tool(tool, &format!("tools[{i}]"))?;
+                    if tool_names.contains(&name) {
+                        return Err(invalid(format!("tools[{i}].name is a duplicate")));
+                    }
+                    tool_names.push(name);
+                    messages.push(msg);
+                }
             }
+            Some(_) => return Err(invalid("tools must be an array or null")),
         }
+        validate_tool_choice(root.get("tool_choice"), &tool_names)?;
 
         match root.get("input") {
             None | Some(Value::Null) => {}
@@ -126,6 +135,215 @@ impl RequestDecoder for OpenAiResponsesDecoder {
         }
 
         Ok(messages)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Top-level control fields
+// ---------------------------------------------------------------------------
+
+/// Closed allowlist of top-level fields. Text-bearing fields (`instructions`,
+/// `tools`, `tool_choice`, `input`) are validated by their decoders; every
+/// other accepted field is restricted to scalars, enums, or fixed-key objects
+/// that the upstream does not render into model context.
+fn validate_control_fields(root: &Map<String, Value>) -> Result<(), ProviderError> {
+    for (key, value) in root {
+        let key = key.as_str();
+        match key {
+            "instructions" | "tools" | "tool_choice" | "input" => {}
+            k if SERVER_SIDE_CONTEXT_FIELDS.contains(&k) => {
+                if !value.is_null() {
+                    return Err(invalid(format!(
+                        "{k} references server-side context that cannot be inspected"
+                    )));
+                }
+            }
+            "model" | "user" | "safety_identifier" | "prompt_cache_key" => {
+                nullable_string(value, key)?
+            }
+            "stream" | "store" | "parallel_tool_calls" => nullable_bool(value, key)?,
+            // Background responses are retrieved later outside this route.
+            "background" => {
+                if !matches!(value, Value::Null | Value::Bool(false)) {
+                    return Err(invalid("background must be false or null"));
+                }
+            }
+            "max_output_tokens" | "max_tool_calls" | "top_logprobs" => {
+                if !(value.is_null() || value.is_u64()) {
+                    return Err(invalid(format!(
+                        "{key} must be a non-negative integer or null"
+                    )));
+                }
+            }
+            "temperature" | "top_p" => {
+                if !(value.is_null() || value.is_number()) {
+                    return Err(invalid(format!("{key} must be a number or null")));
+                }
+            }
+            "truncation" => nullable_enum(value, &["auto", "disabled"], key)?,
+            "service_tier" => nullable_enum(
+                value,
+                &["auto", "default", "flex", "scale", "priority"],
+                key,
+            )?,
+            "prompt_cache_retention" => nullable_enum(value, &["in-memory", "24h"], key)?,
+            "metadata" => validate_metadata(value)?,
+            "include" => validate_include(value)?,
+            "reasoning" => validate_reasoning_config(value)?,
+            "text" => validate_text_config(value)?,
+            "stream_options" => {
+                if let Some(obj) = nullable_object(value, key)? {
+                    allow_keys(obj, &["include_obfuscation"], key)?;
+                    nullable_bool(
+                        obj.get("include_obfuscation").unwrap_or(&Value::Null),
+                        "stream_options.include_obfuscation",
+                    )?;
+                }
+            }
+            _ => return Err(invalid("request has an unsupported top-level field")),
+        }
+    }
+    Ok(())
+}
+
+/// `metadata` is a flat string-to-string map stored with the response and
+/// not shown to the model.
+fn validate_metadata(value: &Value) -> Result<(), ProviderError> {
+    if let Some(obj) = nullable_object(value, "metadata")? {
+        if !obj.values().all(Value::is_string) {
+            return Err(invalid("metadata values must be strings"));
+        }
+    }
+    Ok(())
+}
+
+const INCLUDE_VALUES: &[&str] = &[
+    "web_search_call.action.sources",
+    "code_interpreter_call.outputs",
+    "computer_call_output.output.image_url",
+    "file_search_call.results",
+    "message.input_image.image_url",
+    "message.output_text.logprobs",
+    "reasoning.encrypted_content",
+];
+
+fn validate_include(value: &Value) -> Result<(), ProviderError> {
+    match value {
+        Value::Null => Ok(()),
+        Value::Array(items) => {
+            for (i, item) in items.iter().enumerate() {
+                enum_value(item, INCLUDE_VALUES, &format!("include[{i}]"))?;
+            }
+            Ok(())
+        }
+        _ => Err(invalid("include must be an array or null")),
+    }
+}
+
+fn validate_reasoning_config(value: &Value) -> Result<(), ProviderError> {
+    let Some(obj) = nullable_object(value, "reasoning")? else {
+        return Ok(());
+    };
+    allow_keys(obj, &["effort", "summary", "generate_summary"], "reasoning")?;
+    nullable_enum(
+        obj.get("effort").unwrap_or(&Value::Null),
+        &["none", "minimal", "low", "medium", "high", "xhigh"],
+        "reasoning.effort",
+    )?;
+    for key in ["summary", "generate_summary"] {
+        nullable_enum(
+            obj.get(key).unwrap_or(&Value::Null),
+            &["auto", "concise", "detailed"],
+            &format!("reasoning.{key}"),
+        )?;
+    }
+    Ok(())
+}
+
+/// Only plain-text and JSON-object output formats are accepted. A
+/// `json_schema` format carries a model-visible schema that is not decoded.
+fn validate_text_config(value: &Value) -> Result<(), ProviderError> {
+    let Some(obj) = nullable_object(value, "text")? else {
+        return Ok(());
+    };
+    allow_keys(obj, &["format", "verbosity"], "text")?;
+    nullable_enum(
+        obj.get("verbosity").unwrap_or(&Value::Null),
+        &["low", "medium", "high"],
+        "text.verbosity",
+    )?;
+    if let Some(format) = nullable_object(obj.get("format").unwrap_or(&Value::Null), "text.format")?
+    {
+        allow_keys(format, &["type"], "text.format")?;
+        enum_value(
+            format.get("type").unwrap_or(&Value::Null),
+            &["text", "json_object"],
+            "text.format.type",
+        )?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tools
+// ---------------------------------------------------------------------------
+
+/// Validate one function tool and project the whole definition into a
+/// `Role::System` message as compact JSON, so every model-visible byte (name,
+/// description, schema keys, and nested schema strings) is scanned.
+fn decode_function_tool(tool: &Value, at: &str) -> Result<(String, Message), ProviderError> {
+    let obj = tool
+        .as_object()
+        .ok_or_else(|| invalid(format!("{at} must be an object")))?;
+    if required_string(obj, "type", at)? != "function" {
+        return Err(invalid(format!("{at} has an unsupported tool type")));
+    }
+    allow_keys(
+        obj,
+        &["type", "name", "description", "parameters", "strict"],
+        at,
+    )?;
+    let name = required_string(obj, "name", at)?;
+    if name.is_empty() {
+        return Err(invalid(format!("{at}.name must be non-empty")));
+    }
+    optional_string(obj, "description", at)?;
+    match obj.get("parameters") {
+        None | Some(Value::Null) | Some(Value::Object(_)) => {}
+        Some(_) => {
+            return Err(invalid(format!(
+                "{at}.parameters must be an object or null"
+            )))
+        }
+    }
+    match obj.get("strict") {
+        None | Some(Value::Null) | Some(Value::Bool(_)) => {}
+        Some(_) => return Err(invalid(format!("{at}.strict must be a boolean or null"))),
+    }
+
+    let projection =
+        serde_json::to_string(tool).map_err(|_| invalid(format!("{at} could not be projected")))?;
+    Ok((name.to_string(), Message::new(Role::System, projection)))
+}
+
+/// `tool_choice` may only name a mode or a function already declared in
+/// `tools`, so it cannot introduce unscanned model-visible text.
+fn validate_tool_choice(value: Option<&Value>, tool_names: &[String]) -> Result<(), ProviderError> {
+    match value {
+        None | Some(Value::Null) => Ok(()),
+        Some(v @ Value::String(_)) => enum_value(v, &["none", "auto", "required"], "tool_choice"),
+        Some(Value::Object(obj)) => {
+            if required_string(obj, "type", "tool_choice")? != "function" {
+                return Err(invalid("tool_choice has an unsupported type"));
+            }
+            allow_keys(obj, &["type", "name"], "tool_choice")?;
+            let name = required_string(obj, "name", "tool_choice")?;
+            if !tool_names.iter().any(|n| n == name) {
+                return Err(invalid("tool_choice.name does not match a declared tool"));
+            }
+            Ok(())
+        }
+        Some(_) => Err(invalid("tool_choice must be a string, object, or null")),
     }
 }
 
@@ -145,9 +363,7 @@ fn decode_item(item: &Value, at: &str) -> Result<Message, ProviderError> {
             "function_call" => decode_function_call(obj, at),
             "function_call_output" => decode_function_call_output(obj, at),
             "reasoning" => decode_reasoning(obj, at),
-            other => Err(invalid(format!(
-                "{at} has unsupported item type \"{other}\""
-            ))),
+            _ => Err(invalid(format!("{at} has an unsupported item type"))),
         },
         Some(_) => Err(invalid(format!("{at}.type must be a string"))),
     }
@@ -162,7 +378,7 @@ fn decode_message_item(obj: &Map<String, Value>, at: &str) -> Result<Message, Pr
         "user" => Role::User,
         "assistant" => Role::Assistant,
         "system" | "developer" => Role::System,
-        other => return Err(ProviderError::InvalidRole(other.to_string())),
+        _ => return Err(ProviderError::InvalidRole(format!("{at}.role"))),
     };
 
     let content = match obj.get("content") {
@@ -190,7 +406,7 @@ fn decode_function_call(obj: &Map<String, Value>, at: &str) -> Result<Message, P
         serde_json::json!({})
     } else {
         serde_json::from_str(raw_arguments)
-            .map_err(|e| invalid(format!("{at}.arguments is not valid JSON: {e}")))?
+            .map_err(|_| invalid(format!("{at}.arguments is not valid JSON")))?
     };
 
     let mut msg = Message::new(Role::Assistant, String::new());
@@ -237,7 +453,13 @@ fn decode_reasoning(obj: &Map<String, Value>, at: &str) -> Result<Message, Provi
     )?;
     optional_string(obj, "id", at)?;
     optional_string(obj, "status", at)?;
-    optional_string(obj, "encrypted_content", at)?;
+    // Ciphertext the upstream decrypts back into model context; refuse any
+    // non-null value (including "") until it is inspectable.
+    if obj.get("encrypted_content").is_some_and(|v| !v.is_null()) {
+        return Err(invalid(format!(
+            "{at}.encrypted_content cannot be inspected"
+        )));
+    }
 
     let mut text = String::new();
     match obj.get("summary") {
@@ -295,24 +517,20 @@ fn decode_parts(parts: &[Value], at: &str) -> Result<String, ProviderError> {
                 allow_keys(obj, &["type", "refusal"], &at)?;
                 text.push_str(required_string(obj, "refusal", &at)?);
             }
+            // Image pixels and file contents (inline, by URL, or by uploaded
+            // id) reach the model but cannot be inspected; refuse rather
+            // than drop.
             "input_image" => {
-                allow_keys(obj, &["type", "image_url", "file_id", "detail"], &at)?;
-                for key in ["image_url", "file_id", "detail"] {
-                    optional_string(obj, key, &at)?;
-                }
+                return Err(invalid(format!(
+                    "{at} input_image content cannot be inspected"
+                )))
             }
-            // File contents (inline, by URL, or by uploaded id) reach the
-            // model but are not decoded here; refuse rather than drop.
             "input_file" => {
                 return Err(invalid(format!(
                     "{at} input_file content cannot be inspected"
                 )))
             }
-            other => {
-                return Err(invalid(format!(
-                    "{at} has unsupported content type \"{other}\""
-                )))
-            }
+            _ => return Err(invalid(format!("{at} has an unsupported content type"))),
         }
     }
     Ok(text)
@@ -331,11 +549,8 @@ fn decode_typed_text_parts(
             .as_object()
             .ok_or_else(|| invalid(format!("{at} must be an object")))?;
         allow_keys(obj, &["type", "text"], &at)?;
-        let part_type = required_string(obj, "type", &at)?;
-        if part_type != expected_type {
-            return Err(invalid(format!(
-                "{at}.type must be \"{expected_type}\", got \"{part_type}\""
-            )));
+        if required_string(obj, "type", &at)? != expected_type {
+            return Err(invalid(format!("{at}.type must be \"{expected_type}\"")));
         }
         text.push_str(required_string(obj, "text", &at)?);
     }
@@ -344,6 +559,9 @@ fn decode_typed_text_parts(
 
 // ---------------------------------------------------------------------------
 // Field helpers
+//
+// Error messages name only decoder-owned paths and constants; they never echo
+// request keys or values.
 // ---------------------------------------------------------------------------
 
 fn invalid(msg: impl Into<String>) -> ProviderError {
@@ -351,9 +569,10 @@ fn invalid(msg: impl Into<String>) -> ProviderError {
 }
 
 fn allow_keys(obj: &Map<String, Value>, allowed: &[&str], at: &str) -> Result<(), ProviderError> {
-    match obj.keys().find(|k| !allowed.contains(&k.as_str())) {
-        Some(key) => Err(invalid(format!("{at} has unsupported field: {key}"))),
-        None => Ok(()),
+    if obj.keys().all(|k| allowed.contains(&k.as_str())) {
+        Ok(())
+    } else {
+        Err(invalid(format!("{at} has an unsupported field")))
     }
 }
 
@@ -370,9 +589,46 @@ fn required_string<'a>(
 }
 
 fn optional_string(obj: &Map<String, Value>, key: &str, at: &str) -> Result<(), ProviderError> {
-    match obj.get(key) {
-        None | Some(Value::Null) | Some(Value::String(_)) => Ok(()),
-        Some(_) => Err(invalid(format!("{at}.{key} must be a string or null"))),
+    nullable_string(obj.get(key).unwrap_or(&Value::Null), &format!("{at}.{key}"))
+}
+
+fn nullable_string(value: &Value, at: &str) -> Result<(), ProviderError> {
+    match value {
+        Value::Null | Value::String(_) => Ok(()),
+        _ => Err(invalid(format!("{at} must be a string or null"))),
+    }
+}
+
+fn nullable_bool(value: &Value, at: &str) -> Result<(), ProviderError> {
+    match value {
+        Value::Null | Value::Bool(_) => Ok(()),
+        _ => Err(invalid(format!("{at} must be a boolean or null"))),
+    }
+}
+
+fn nullable_object<'a>(
+    value: &'a Value,
+    at: &str,
+) -> Result<Option<&'a Map<String, Value>>, ProviderError> {
+    match value {
+        Value::Null => Ok(None),
+        Value::Object(obj) => Ok(Some(obj)),
+        _ => Err(invalid(format!("{at} must be an object or null"))),
+    }
+}
+
+fn enum_value(value: &Value, allowed: &[&str], at: &str) -> Result<(), ProviderError> {
+    match value {
+        Value::String(s) if allowed.contains(&s.as_str()) => Ok(()),
+        _ => Err(invalid(format!("{at} is not a supported value"))),
+    }
+}
+
+fn nullable_enum(value: &Value, allowed: &[&str], at: &str) -> Result<(), ProviderError> {
+    if value.is_null() {
+        Ok(())
+    } else {
+        enum_value(value, allowed, at)
     }
 }
 
@@ -440,7 +696,6 @@ mod tests {
                 {"role": "developer", "content": "dev"},
                 {"type": "message", "role": "user", "content": [
                     {"type": "input_text", "text": "a"},
-                    {"type": "input_image", "image_url": "https://img.invalid/x.png", "detail": "auto"},
                     {"type": "input_text", "text": "b"}
                 ]},
                 {"type": "message", "role": "assistant", "id": "msg_1", "status": "completed", "content": [
@@ -448,7 +703,7 @@ mod tests {
                     {"type": "refusal", "refusal": "d"}
                 ]},
                 {"type": "reasoning", "id": "rs_1", "summary": [{"type": "summary_text", "text": "e"}],
-                 "encrypted_content": "opaque"},
+                 "encrypted_content": null},
                 {"type": "function_call", "call_id": "call_1", "name": "read_file",
                  "arguments": "{\"path\":\"/tmp/x\"}"},
                 {"type": "function_call_output", "call_id": "call_1", "output": "f"},
@@ -542,27 +797,6 @@ mod tests {
                 "{label}: injection not surfaced in decoded content"
             );
         }
-    }
-
-    #[test]
-    fn image_identifiers_and_ciphertext_are_not_scanned_as_text() {
-        let msgs = decode(json!({
-            "input": [
-                {"type": "message", "role": "user", "content": [
-                    {"type": "input_image", "image_url": format!("data:image/png;base64,{INJECTION}"),
-                     "file_id": INJECTION, "detail": "high"}
-                ]},
-                {"type": "reasoning", "summary": [], "encrypted_content": INJECTION}
-            ]
-        }))
-        .unwrap();
-        assert_eq!(
-            roles_and_content(&msgs),
-            vec![
-                (Role::User, String::new()),
-                (Role::Assistant, String::new())
-            ]
-        );
     }
 
     #[test]
@@ -791,6 +1025,18 @@ mod tests {
         }
     }
 
+    fn tool_projections(msgs: &[Message]) -> Vec<Value> {
+        msgs.iter()
+            .filter(|m| m.role == Role::System && m.content.starts_with('{'))
+            .map(|m| serde_json::from_str(&m.content).unwrap())
+            .collect()
+    }
+
+    fn function_tool(name: &str, description: &str, parameters: Value) -> Value {
+        json!({"type": "function", "name": name, "description": description,
+            "parameters": parameters, "strict": true})
+    }
+
     #[test]
     fn absent_null_and_empty_tools_are_accepted() {
         for body in [
@@ -803,34 +1049,201 @@ mod tests {
     }
 
     #[test]
-    fn non_empty_tools_fail_closed_without_echo() {
+    fn function_tools_are_projected_in_order_between_instructions_and_input() {
+        let read_file = function_tool(
+            "read_file",
+            "Read a file from the workspace.",
+            json!({"type": "object", "properties": {
+                "path": {"type": "string", "description": "Workspace-relative path."},
+                "range": {"type": "object", "properties": {
+                    "start": {"type": "integer"},
+                    "end": {"type": "integer"}
+                }}
+            }, "required": ["path"], "additionalProperties": false}),
+        );
+        let run_shell = json!({"type": "function", "name": "run_shell",
+        "parameters": {"type": "object", "properties": {
+            "argv": {"type": "array", "items": {"type": "string",
+                "enum": ["ls", "cat"]}}
+        }}});
+        let bare = json!({"type": "function", "name": "noop", "parameters": null,
+            "description": null, "strict": null});
+
+        let msgs = decode(json!({
+            "instructions": "sys",
+            "tools": [read_file, run_shell, bare],
+            "tool_choice": {"type": "function", "name": "run_shell"},
+            "input": "hi"
+        }))
+        .unwrap();
+
+        assert_eq!(msgs.len(), 5);
+        assert_eq!(roles_and_content(&msgs)[0], (Role::System, "sys".into()));
+        assert_eq!(roles_and_content(&msgs)[4], (Role::User, "hi".into()));
+        // Each projection is the whole validated definition, unchanged.
+        assert_eq!(tool_projections(&msgs), vec![read_file, run_shell, bare]);
+        for m in &msgs[1..4] {
+            assert!(!m.content.contains('\n'), "projection must be compact");
+            assert!(m.tool_name.is_none() && m.tool_call_id.is_none());
+        }
+        // Deterministic: identical input yields identical projections.
+        let again = decode(json!({
+            "instructions": "sys",
+            "tools": [msgs[1].content.parse::<Value>().unwrap(),
+                      msgs[2].content.parse::<Value>().unwrap(),
+                      msgs[3].content.parse::<Value>().unwrap()],
+            "input": "hi"
+        }))
+        .unwrap();
+        assert_eq!(roles_and_content(&again), roles_and_content(&msgs));
+    }
+
+    #[test]
+    fn injection_in_every_function_tool_position_reaches_decoded_messages() {
+        let schema = |inner: Value| json!({"type": "object", "properties": inner});
         let cases: Vec<(&str, Value)> = vec![
+            ("name", function_tool(INJECTION, "d", schema(json!({})))),
             (
-                "function description",
-                json!([{"type": "function", "name": "f", "description": INJECTION,
-                    "parameters": {"type": "object", "properties": {}}}]),
+                "description",
+                function_tool("f", INJECTION, schema(json!({}))),
             ),
             (
-                "function parameter description",
-                json!([{"type": "function", "name": "f",
-                    "parameters": {"type": "object", "properties": {
-                        "path": {"type": "string", "description": INJECTION}}}}]),
+                "property name",
+                function_tool("f", "d", schema(json!({INJECTION: {"type": "string"}}))),
             ),
             (
-                "namespace description",
-                json!([{"type": "namespace", "name": "ns", "description": INJECTION,
-                    "tools": []}]),
+                "property description",
+                function_tool(
+                    "f",
+                    "d",
+                    schema(json!({"p": {"type": "string", "description": INJECTION}})),
+                ),
             ),
             (
-                "custom tool description",
-                json!([{"type": "custom", "name": "c", "description": INJECTION}]),
+                "nested property description",
+                function_tool(
+                    "f",
+                    "d",
+                    schema(json!({"outer": {"type": "object", "properties": {
+                        "inner": {"type": "array", "items": {"type": "string",
+                            "description": INJECTION}}}}})),
+                ),
             ),
             (
-                "benign function",
-                json!([{"type": "function", "name": "f"}]),
+                "enum string value",
+                function_tool(
+                    "f",
+                    "d",
+                    schema(json!({"p": {"type": "string", "enum": ["a", INJECTION]}})),
+                ),
             ),
+            (
+                "default / title / examples",
+                function_tool(
+                    "f",
+                    "d",
+                    schema(json!({"p": {"type": "string", "title": INJECTION,
+                        "default": INJECTION, "examples": [INJECTION]}})),
+                ),
+            ),
+            (
+                "unknown schema keyword",
+                json!({"type": "function", "name": "f",
+                    "parameters": {"type": "object", "x-note": INJECTION}}),
+            ),
+            (
+                "$defs",
+                json!({"type": "function", "name": "f",
+                    "parameters": {"type": "object", "$defs": {"d": {"description": INJECTION}}}}),
+            ),
+        ];
+        for (label, tool) in cases {
+            let msgs = decode(json!({"tools": [tool], "input": "hi"}))
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            assert!(
+                msgs.iter()
+                    .any(|m| m.role == Role::System && m.content.contains(INJECTION)),
+                "{label}: injection not surfaced in a System projection"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_and_malformed_tools_fail_closed_without_echo() {
+        let ok_params = json!({"type": "object", "properties": {}});
+        let cases: Vec<(&str, Value)> = vec![
             ("tools object", json!({"type": "function", "name": "f"})),
             ("tools string", json!(INJECTION)),
+            ("tool not object", json!([INJECTION])),
+            ("tool missing type", json!([{"name": INJECTION}])),
+            ("tool type non-string", json!([{"type": 1, "name": "f"}])),
+            (
+                "injected tool type",
+                json!([{"type": INJECTION, "name": "f"}]),
+            ),
+            (
+                "namespace tool",
+                json!([{"type": "namespace", "name": "ns", "description": INJECTION, "tools": []}]),
+            ),
+            (
+                "custom tool",
+                json!([{"type": "custom", "name": "c", "description": INJECTION}]),
+            ),
+            ("web_search tool", json!([{"type": "web_search"}])),
+            (
+                "file_search tool",
+                json!([{"type": "file_search", "vector_store_ids": [INJECTION]}]),
+            ),
+            (
+                "mcp tool",
+                json!([{"type": "mcp", "server_label": INJECTION, "server_url": "https://x.invalid"}]),
+            ),
+            (
+                "code_interpreter tool",
+                json!([{"type": "code_interpreter"}]),
+            ),
+            (
+                "missing name",
+                json!([{"type": "function", "parameters": ok_params}]),
+            ),
+            ("empty name", json!([{"type": "function", "name": ""}])),
+            (
+                "name non-string",
+                json!([{"type": "function", "name": [INJECTION]}]),
+            ),
+            (
+                "description object",
+                json!([{"type": "function", "name": "f", "description": {"text": INJECTION}}]),
+            ),
+            (
+                "parameters array",
+                json!([{"type": "function", "name": "f", "parameters": [INJECTION]}]),
+            ),
+            (
+                "parameters string",
+                json!([{"type": "function", "name": "f", "parameters": INJECTION}]),
+            ),
+            (
+                "strict string",
+                json!([{"type": "function", "name": "f", "strict": INJECTION}]),
+            ),
+            (
+                "unknown function key",
+                json!([{"type": "function", "name": "f", INJECTION: "x"}]),
+            ),
+            (
+                "chat-completions nested function shape",
+                json!([{"type": "function", "function": {"name": "f", "description": INJECTION}}]),
+            ),
+            (
+                "duplicate names",
+                json!([{"type": "function", "name": INJECTION},
+                       {"type": "function", "name": INJECTION}]),
+            ),
+            (
+                "valid function then hosted tool",
+                json!([{"type": "function", "name": "f"}, {"type": "web_search"}]),
+            ),
         ];
         for (label, tools) in cases {
             let err = decode(json!({"input": "hi", "tools": tools}))
@@ -840,9 +1253,314 @@ mod tests {
         }
     }
 
-    /// Stage 2 activation condition: the Responses route must run the
-    /// shipped-default `RoleTrustAssigner`, which marks every decoded role
-    /// Untrusted. This pins that outcome without wiring the route.
+    #[test]
+    fn tool_choice_only_names_modes_or_declared_functions() {
+        let tools = json!([{"type": "function", "name": "f"}]);
+        for choice in [
+            json!(null),
+            json!("none"),
+            json!("auto"),
+            json!("required"),
+            json!({"type": "function", "name": "f"}),
+        ] {
+            decode(json!({"tools": tools, "tool_choice": choice, "input": "hi"}))
+                .unwrap_or_else(|e| panic!("{choice}: {e}"));
+        }
+        for choice in [
+            json!(INJECTION),
+            json!({"type": "function", "name": INJECTION}),
+            json!({"type": "function"}),
+            json!({"type": "function", "name": "f", "note": INJECTION}),
+            json!({"type": "allowed_tools", "mode": "auto", "tools": [{"type": "function", "name": "f"}]}),
+            json!({"type": "web_search"}),
+            json!({"type": INJECTION}),
+            json!(["f"]),
+            json!(true),
+        ] {
+            let err = decode(json!({"tools": tools, "tool_choice": choice, "input": "hi"}))
+                .expect_err("tool_choice")
+                .to_string();
+            assert!(!err.contains(INJECTION), "{err}");
+        }
+        // Naming a function without declaring any tools also fails.
+        assert!(decode(json!({"tool_choice": {"type": "function", "name": "f"}})).is_err());
+    }
+
+    #[test]
+    fn documented_control_fields_with_valid_shapes_are_accepted() {
+        let msgs = decode(json!({
+            "model": "gpt-test",
+            "instructions": "sys",
+            "input": "hi",
+            "tools": [{"type": "function", "name": "f"}],
+            "tool_choice": "auto",
+            "parallel_tool_calls": true,
+            "max_output_tokens": 1024,
+            "max_tool_calls": 4,
+            "temperature": 0.2,
+            "top_p": 1,
+            "top_logprobs": 0,
+            "truncation": "auto",
+            "stream": true,
+            "stream_options": {"include_obfuscation": false},
+            "store": false,
+            "background": false,
+            "metadata": {"run": "r1"},
+            "user": "u",
+            "safety_identifier": "s",
+            "prompt_cache_key": "k",
+            "prompt_cache_retention": "24h",
+            "service_tier": "auto",
+            "include": ["reasoning.encrypted_content", "message.output_text.logprobs"],
+            "reasoning": {"effort": "high", "summary": "auto"},
+            "text": {"format": {"type": "text"}, "verbosity": "low"},
+            "previous_response_id": null,
+            "conversation": null,
+            "prompt": null
+        }))
+        .unwrap();
+        assert_eq!(msgs.len(), 3);
+
+        // Every accepted control field also accepts null.
+        for key in [
+            "model",
+            "tool_choice",
+            "parallel_tool_calls",
+            "max_output_tokens",
+            "max_tool_calls",
+            "temperature",
+            "top_p",
+            "top_logprobs",
+            "truncation",
+            "stream",
+            "stream_options",
+            "store",
+            "background",
+            "metadata",
+            "user",
+            "safety_identifier",
+            "prompt_cache_key",
+            "prompt_cache_retention",
+            "service_tier",
+            "include",
+            "reasoning",
+            "text",
+        ] {
+            let mut body = Map::new();
+            body.insert(key.to_string(), Value::Null);
+            decode(Value::Object(body)).unwrap_or_else(|e| panic!("{key}: {e}"));
+        }
+        decode(json!({"text": {"format": {"type": "json_object"}}})).unwrap();
+        decode(json!({"reasoning": {"effort": null, "summary": null}})).unwrap();
+    }
+
+    #[test]
+    fn unknown_top_level_fields_and_smuggling_control_shapes_fail_without_echo() {
+        let cases: Vec<(&str, Value)> = vec![
+            ("unknown field", json!({INJECTION: "x", "input": "hi"})),
+            ("unknown field value", json!({"extra_body": INJECTION})),
+            (
+                "messages (chat shape)",
+                json!({"messages": [{"role": "user", "content": INJECTION}]}),
+            ),
+            (
+                "context_management",
+                json!({"context_management": [{"type": "compaction"}]}),
+            ),
+            (
+                "previous_response_id",
+                json!({"previous_response_id": INJECTION}),
+            ),
+            (
+                "previous_response_id empty",
+                json!({"previous_response_id": ""}),
+            ),
+            ("conversation id", json!({"conversation": INJECTION})),
+            (
+                "conversation object",
+                json!({"conversation": {"id": INJECTION}}),
+            ),
+            (
+                "prompt template",
+                json!({"prompt": {"id": "p", "variables": {"v": INJECTION}}}),
+            ),
+            ("model object", json!({"model": {"name": INJECTION}})),
+            ("user array", json!({"user": [INJECTION]})),
+            (
+                "metadata nested",
+                json!({"metadata": {"k": {"v": INJECTION}}}),
+            ),
+            ("metadata array", json!({"metadata": [INJECTION]})),
+            ("stream string", json!({"stream": INJECTION})),
+            ("background true", json!({"background": true})),
+            (
+                "max_output_tokens negative",
+                json!({"max_output_tokens": -1}),
+            ),
+            (
+                "max_output_tokens string",
+                json!({"max_output_tokens": INJECTION}),
+            ),
+            ("temperature string", json!({"temperature": INJECTION})),
+            ("truncation unknown", json!({"truncation": INJECTION})),
+            ("service_tier unknown", json!({"service_tier": INJECTION})),
+            ("include unknown", json!({"include": [INJECTION]})),
+            (
+                "include string",
+                json!({"include": "reasoning.encrypted_content"}),
+            ),
+            (
+                "reasoning extra key",
+                json!({"reasoning": {"effort": "low", INJECTION: "x"}}),
+            ),
+            (
+                "reasoning effort unknown",
+                json!({"reasoning": {"effort": INJECTION}}),
+            ),
+            ("reasoning string", json!({"reasoning": INJECTION})),
+            (
+                "text json_schema",
+                json!({"text": {"format": {"type": "json_schema", "name": "s",
+                    "schema": {"description": INJECTION}}}}),
+            ),
+            (
+                "text format extra key",
+                json!({"text": {"format": {"type": "text", "note": INJECTION}}}),
+            ),
+            ("text format missing type", json!({"text": {"format": {}}})),
+            (
+                "text extra key",
+                json!({"text": {"instructions": INJECTION}}),
+            ),
+            (
+                "text verbosity unknown",
+                json!({"text": {"verbosity": INJECTION}}),
+            ),
+            (
+                "stream_options extra",
+                json!({"stream_options": {"include_usage": INJECTION}}),
+            ),
+            (
+                "stream_options string",
+                json!({"stream_options": INJECTION}),
+            ),
+        ];
+        for (label, body) in cases {
+            let err = decode(body).expect_err(label).to_string();
+            assert!(!err.contains(INJECTION), "{label}: {err}");
+        }
+    }
+
+    #[test]
+    fn every_input_image_form_fails_closed_without_echo() {
+        let cases: Vec<(&str, Value)> = vec![
+            (
+                "https image_url",
+                json!({"type": "input_image", "image_url": format!("https://img.invalid/{INJECTION}.png"), "detail": "auto"}),
+            ),
+            (
+                "data url",
+                json!({"type": "input_image", "image_url": format!("data:image/png;base64,{INJECTION}")}),
+            ),
+            (
+                "file_id",
+                json!({"type": "input_image", "file_id": INJECTION}),
+            ),
+            (
+                "detail only",
+                json!({"type": "input_image", "detail": "high"}),
+            ),
+            ("bare input_image", json!({"type": "input_image"})),
+            (
+                "object image_url",
+                json!({"type": "input_image", "image_url": {"url": INJECTION}}),
+            ),
+            (
+                "text key",
+                json!({"type": "input_image", "text": INJECTION}),
+            ),
+        ];
+        for (label, part) in cases {
+            let err = decode(user_parts(part.clone()))
+                .expect_err(label)
+                .to_string();
+            assert!(!err.contains(INJECTION), "{label}: {err}");
+            // Interleaved with text parts: still refused, never dropped.
+            let err = decode(
+                json!({"input": [{"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "a"}, part.clone(),
+                {"type": "input_text", "text": "b"}]}]}),
+            )
+            .expect_err(label)
+            .to_string();
+            assert!(!err.contains(INJECTION), "{label} (interleaved): {err}");
+            let err = decode(json!({"input": [{"type": "function_call_output",
+                "call_id": "c", "output": [part]}]}))
+            .expect_err(label)
+            .to_string();
+            assert!(!err.contains(INJECTION), "{label} (tool output): {err}");
+        }
+    }
+
+    #[test]
+    fn reasoning_encrypted_content_fails_closed_unless_null() {
+        for value in [
+            json!(INJECTION),
+            json!(""),
+            json!("gAAAAB"),
+            json!(["x"]),
+            json!({}),
+        ] {
+            let err = decode(json!({"input": [{"type": "reasoning", "summary": [],
+                "encrypted_content": value}]}))
+            .expect_err("encrypted_content")
+            .to_string();
+            assert!(!err.contains(INJECTION), "{err}");
+        }
+        for body in [
+            json!({"input": [{"type": "reasoning", "summary": [], "encrypted_content": null}]}),
+            json!({"input": [{"type": "reasoning", "summary": []}]}),
+        ] {
+            assert_eq!(decode(body).unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn input_item_errors_do_not_echo_request_bytes() {
+        let cases: Vec<(&str, Value)> = vec![
+            (
+                "unknown message key",
+                json!({"input": [{"role": "user", "content": "x", INJECTION: 1}]}),
+            ),
+            ("unknown item type", json!({"input": [{"type": INJECTION}]})),
+            (
+                "unknown part type",
+                json!({"input": [{"role": "user", "content": [{"type": INJECTION}]}]}),
+            ),
+            (
+                "unknown role",
+                json!({"input": [{"role": INJECTION, "content": "x"}]}),
+            ),
+            (
+                "wrong reasoning part type",
+                json!({"input": [{"type": "reasoning", "summary": [{"type": INJECTION, "text": "x"}]}]}),
+            ),
+            (
+                "invalid function_call arguments",
+                json!({"input": [{"type": "function_call", "call_id": "c", "name": "f",
+                    "arguments": format!("{{\"{INJECTION}\" {INJECTION}")}]}),
+            ),
+        ];
+        for (label, body) in cases {
+            let err = decode(body).expect_err(label).to_string();
+            assert!(!err.contains(INJECTION), "{label}: {err}");
+        }
+    }
+
+    /// Activation condition: the Responses route must run the shipped-default
+    /// `RoleTrustAssigner`, which marks every decoded role, including tool
+    /// definition projections, Untrusted. This pins that outcome without
+    /// wiring the route.
     #[test]
     fn shipped_default_trust_marks_decoded_roles_untrusted() {
         use crate::config::{load_config, StringSource};
@@ -854,6 +1572,8 @@ mod tests {
         .unwrap();
         let mut msgs = decode(json!({
             "instructions": "i",
+            "tools": [{"type": "function", "name": "f", "description": "x",
+                "parameters": {"type": "object", "properties": {}}}],
             "input": [
                 {"role": "system", "content": "s"},
                 {"role": "developer", "content": "d"},
@@ -868,11 +1588,13 @@ mod tests {
                 Role::System,
                 Role::System,
                 Role::System,
+                Role::System,
                 Role::User,
                 Role::Tool
             ]
         );
         RoleTrustAssigner.assign_trust(&mut msgs, &config);
+        assert!(msgs.iter().all(|m| m.tool_name.is_none()));
         for m in &msgs {
             assert_eq!(
                 m.trust,
