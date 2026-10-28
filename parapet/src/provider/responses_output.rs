@@ -388,7 +388,7 @@ fn validate_top_level(
         None | Some(Value::Null) => {}
         Some(Value::Array(tools)) => {
             for (i, tool) in tools.iter().enumerate() {
-                let (name, _) = decode_function_tool(tool, &format!("tools[{i}]"))?;
+                let name = decode_function_tool(tool, &format!("tools[{i}]"))?.name;
                 if tool_names.contains(&name) {
                     return Err(invalid(format!("tools[{i}].name is a duplicate")));
                 }

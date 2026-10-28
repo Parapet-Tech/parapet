@@ -37,7 +37,9 @@ use crate::message::ToolCall;
 use crate::normalize::{
     normalize_messages_dual_view, L0DualScanView, L0Normalizer, L0ScanViews, Normalizer,
 };
-use crate::provider::responses::{OpenAiResponsesDecoder, RequestDecoder};
+use crate::provider::responses::{OpenAiResponsesDecoder, ScanContentClass};
+#[cfg(test)]
+use crate::provider::responses::RequestDecoder;
 use crate::provider::{adapter_for, ProviderAdapter, ProviderType};
 use crate::proxy::{Provider, ProxyError, ProxyRequest, ProxyResponse, UpstreamClient};
 use crate::routing::{
@@ -857,12 +859,17 @@ impl EngineUpstreamClient {
 
         // 1) Parse request into messages
         let decoded_messages = if responses_wire {
-            OpenAiResponsesDecoder::new().decode_request(&request.body)
+            OpenAiResponsesDecoder::new()
+                .decode_request_with_classes(&request.body)
+                .map(|decoded| (decoded.messages, decoded.scan_classes))
         } else {
-            adapter.parse_request(&request.body)
+            adapter.parse_request(&request.body).map(|messages| {
+                let scan_classes = vec![ScanContentClass::Conversation; messages.len()];
+                (messages, scan_classes)
+            })
         };
-        let mut messages = match decoded_messages {
-            Ok(msgs) => msgs,
+        let (mut messages, scan_classes) = match decoded_messages {
+            Ok(decoded) => decoded,
             Err(_) => {
                 if let Some(t) = projected_tracker.as_deref_mut() {
                     t.pre_scan_error = true;
@@ -1040,7 +1047,44 @@ impl EngineUpstreamClient {
 
             match l1_scan {
                 Ok(Ok(dual_result)) => {
-                    let verdict = if let Some(ref breached) = dual_result.breached {
+                    // Tool-definition projections are a distinct deterministic
+                    // content class. Shipped L1 is not calibrated for that
+                    // class, so threshold hits remain normal recorded signals
+                    // but cannot enforce. Conversation messages retain the
+                    // configured L1 mode and threshold unchanged.
+                    let shadow_breached = dual_result.selections.iter().find(|selected| {
+                        selected.outcome.threshold_breached
+                            && scan_classes
+                                .get(selected.signal.message_index)
+                                .is_some_and(|class| {
+                                    *class == ScanContentClass::ToolDefinition
+                                })
+                    });
+                    let enforced_breached = dual_result.selections.iter().find(|selected| {
+                        selected.outcome.threshold_breached
+                            && !scan_classes
+                                .get(selected.signal.message_index)
+                                .is_some_and(|class| {
+                                    *class == ScanContentClass::ToolDefinition
+                                })
+                    });
+                    if let Some(shadow) = shadow_breached {
+                        tracing::info!(
+                            request_id = %ctx.request_id,
+                            contract_hash = %ctx.contract_hash,
+                            provider = ctx.provider_str,
+                            model = %ctx.model,
+                            layer = "L1",
+                            verdict = "shadow_block",
+                            content_class = "tool_definition",
+                            role = ?shadow.signal.role,
+                            message_index = shadow.signal.message_index,
+                            score = shadow.outcome.effective_raw,
+                            latency_ms = l1_ms,
+                            "L1 classifier detected in shadow-only content class"
+                        );
+                    }
+                    let verdict = if let Some(breached) = enforced_breached {
                         let eff = breached.outcome.effective_raw;
                         let mention = breached.outcome.outcome_view == OutcomeView::Unquoted;
                                 let score_label = if mention { "unquoted_score" } else { "score" };
@@ -1188,7 +1232,14 @@ impl EngineUpstreamClient {
 
             if let Some(ref l1_result) = l1_result_opt {
                 match &l1_result.verdict {
-                    L1Verdict::Block(block) if l1_config.mode == crate::config::L1Mode::Block => {
+                    L1Verdict::Block(block)
+                        if l1_config.mode == crate::config::L1Mode::Block
+                            && !scan_classes
+                                .get(block.message_index)
+                                .is_some_and(|class| {
+                                    *class == ScanContentClass::ToolDefinition
+                                }) =>
+                    {
                         tracing::info!(
                             request_id = %ctx.request_id,
                             contract_hash = %ctx.contract_hash,

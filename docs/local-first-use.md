@@ -247,6 +247,35 @@ Prerequisites:
 
 Regression coverage: `parapet/tests/stock_openai_loopback_v0.rs`.
 
+### OpenAI Responses API activation and tool-definition policy
+
+Ordinary-mode Parapet also accepts exact `POST /v1/responses` and
+`POST /responses` requests. Non-streaming requests use the same upstream base
+and whole-message policy pipeline as Chat Completions. Responses streaming is
+currently rejected with HTTP 501 before upstream I/O.
+
+Responses function-tool definitions are decoded into one scan-internal,
+untrusted System message per tool. The message contains a deterministic
+newline projection of every object key and string value, followed by the
+canonical JSON definition. These scan messages never change the request bytes
+forwarded upstream. Their expansion is bounded; oversized definitions fail
+with a fixed HTTP 400 response.
+
+The shipped L1 model is not calibrated on tool-definition text. L1 therefore
+scores these messages and emits its normal evidence, but a tool-definition L1
+threshold hit is shadow-only and cannot block. L1 enforcement is unchanged for
+instructions and conversation messages. L3-inbound evaluates the decoded tool
+projection normally, so a configured block pattern in a tool name,
+description, schema key, or schema string still returns HTTP 403 with zero
+upstream I/O.
+
+Residual risk: a tool-definition injection that crosses L1 but matches no
+configured L3 pattern is recorded but allowed. Promoting tool-definition L1
+from shadow to blocking requires a separately calibrated tool-definition
+content class and a security review; it must not be approximated with a trust
+exception, client allowlist, omitted schema fields, or a global threshold
+change.
+
 ## Rust CLI acceptance with the offline fixture
 
 This is **Rust CLI acceptance**: the installed Rust `parapet` CLI is the only

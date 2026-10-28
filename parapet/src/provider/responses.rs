@@ -39,9 +39,32 @@ pub trait RequestDecoder: Send + Sync {
     fn decode_request(&self, body: &[u8]) -> Result<Vec<Message>, ProviderError>;
 }
 
+/// Deterministic content class for each scan-internal decoded message.
+///
+/// This is separate from trust: all Responses request content still receives
+/// the shipped role-based trust assignment. The engine uses the class only to
+/// select enforcement behavior appropriate to a model-input representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanContentClass {
+    Conversation,
+    ToolDefinition,
+}
+
+/// Responses request messages plus their index-aligned scan content classes.
+pub struct DecodedResponsesRequest {
+    pub messages: Vec<Message>,
+    pub scan_classes: Vec<ScanContentClass>,
+}
+
 /// Top-level request fields that make the upstream model see server-side
 /// content Parapet cannot scan. Any non-null value fails closed.
 const SERVER_SIDE_CONTEXT_FIELDS: &[&str] = &["previous_response_id", "conversation", "prompt"];
+
+/// Bound scan-internal expansion of function-tool definitions. These limits
+/// cover the aggregate projection plus the individual key/string scan units;
+/// request bytes forwarded upstream are never rewritten.
+const MAX_TOOL_PROJECTION_UNITS: usize = 4_096;
+const MAX_TOOL_PROJECTION_BYTES: usize = 1_048_576;
 
 /// Decoder for the OpenAI Responses API request format.
 ///
@@ -100,8 +123,11 @@ impl Default for OpenAiResponsesDecoder {
     }
 }
 
-impl<P: JsonParser> RequestDecoder for OpenAiResponsesDecoder<P> {
-    fn decode_request(&self, body: &[u8]) -> Result<Vec<Message>, ProviderError> {
+impl<P: JsonParser> OpenAiResponsesDecoder<P> {
+    pub fn decode_request_with_classes(
+        &self,
+        body: &[u8],
+    ) -> Result<DecodedResponsesRequest, ProviderError> {
         let root = self.parser.parse(body).map_err(|e| match e {
             JsonParseError::Syntax(msg) => ProviderError::InvalidJson(msg),
             JsonParseError::DuplicateKey => {
@@ -115,6 +141,7 @@ impl<P: JsonParser> RequestDecoder for OpenAiResponsesDecoder<P> {
         validate_control_fields(root)?;
 
         let mut messages = Vec::new();
+        let mut tool_definition_indices = Vec::new();
 
         match root.get("instructions") {
             None | Some(Value::Null) => {}
@@ -127,16 +154,27 @@ impl<P: JsonParser> RequestDecoder for OpenAiResponsesDecoder<P> {
         }
 
         let mut tool_names = Vec::new();
+        let mut tool_projection_units = 0usize;
+        let mut tool_projection_bytes = 0usize;
         match root.get("tools") {
             None | Some(Value::Null) => {}
             Some(Value::Array(tools)) => {
                 for (i, tool) in tools.iter().enumerate() {
-                    let (name, msg) = decode_function_tool(tool, &format!("tools[{i}]"))?;
-                    if tool_names.contains(&name) {
+                    let projection = decode_function_tool(tool, &format!("tools[{i}]"))?;
+                    if tool_names.contains(&projection.name) {
                         return Err(invalid(format!("tools[{i}].name is a duplicate")));
                     }
-                    tool_names.push(name);
-                    messages.push(msg);
+                    tool_projection_units = tool_projection_units
+                        .checked_add(projection.unit_count)
+                        .filter(|count| *count <= MAX_TOOL_PROJECTION_UNITS)
+                        .ok_or_else(|| invalid("tool projection exceeds unit limit"))?;
+                    tool_projection_bytes = tool_projection_bytes
+                        .checked_add(projection.projected_bytes)
+                        .filter(|count| *count <= MAX_TOOL_PROJECTION_BYTES)
+                        .ok_or_else(|| invalid("tool projection exceeds byte limit"))?;
+                    tool_names.push(projection.name);
+                    tool_definition_indices.push(messages.len());
+                    messages.push(projection.message);
                 }
             }
             Some(_) => return Err(invalid("tools must be an array or null")),
@@ -154,7 +192,21 @@ impl<P: JsonParser> RequestDecoder for OpenAiResponsesDecoder<P> {
             Some(_) => return Err(invalid("input must be a string, array, or null")),
         }
 
-        Ok(messages)
+        let mut scan_classes = vec![ScanContentClass::Conversation; messages.len()];
+        for index in tool_definition_indices {
+            scan_classes[index] = ScanContentClass::ToolDefinition;
+        }
+        Ok(DecodedResponsesRequest {
+            messages,
+            scan_classes,
+        })
+    }
+}
+
+impl<P: JsonParser> RequestDecoder for OpenAiResponsesDecoder<P> {
+    fn decode_request(&self, body: &[u8]) -> Result<Vec<Message>, ProviderError> {
+        self.decode_request_with_classes(body)
+            .map(|decoded| decoded.messages)
     }
 }
 
@@ -308,13 +360,23 @@ pub(super) fn validate_text_config(value: &Value) -> Result<(), ProviderError> {
 // Tools
 // ---------------------------------------------------------------------------
 
-/// Validate one function tool and project the whole definition into a
-/// `Role::System` message as compact JSON, so every model-visible byte (name,
-/// description, schema keys, and nested schema strings) is scanned.
+/// Scan-internal representation of one validated function tool.
+pub(super) struct FunctionToolProjection {
+    pub(super) name: String,
+    message: Message,
+    unit_count: usize,
+    projected_bytes: usize,
+}
+
+/// Validate one function tool and project the whole definition into an
+/// aggregate `Role::System` message. Its deterministic unquoted leading block
+/// keeps every object key and string leaf visible to mention-aware L1 and
+/// decoded L3 scanning. The compact canonical JSON remains in the same message
+/// for structural coverage.
 pub(super) fn decode_function_tool(
     tool: &Value,
     at: &str,
-) -> Result<(String, Message), ProviderError> {
+) -> Result<FunctionToolProjection, ProviderError> {
     let obj = tool
         .as_object()
         .ok_or_else(|| invalid(format!("{at} must be an object")))?;
@@ -344,9 +406,43 @@ pub(super) fn decode_function_tool(
         Some(_) => return Err(invalid(format!("{at}.strict must be a boolean or null"))),
     }
 
-    let projection =
+    let canonical =
         serde_json::to_string(tool).map_err(|_| invalid(format!("{at} could not be projected")))?;
-    Ok((name.to_string(), Message::new(Role::System, projection)))
+    let mut text = Vec::new();
+    project_json_text(tool, &mut text);
+    let projection = format!("{}\n\n{canonical}", text.join("\n"));
+    let projected_bytes = projection.len();
+    let unit_count = text.len();
+    Ok(FunctionToolProjection {
+        name: name.to_string(),
+        message: Message::new(Role::System, projection),
+        unit_count,
+        projected_bytes,
+    })
+}
+
+/// Deterministic depth-first text projection. `serde_json::Map` iteration is
+/// sorted in this build, so object traversal is stable. Parapet adds only line
+/// separators: it does not quote or wrap caller-provided strings.
+fn project_json_text(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::Object(fields) => {
+            for (key, value) in fields {
+                if !key.is_empty() {
+                    out.push(key.clone());
+                }
+                project_json_text(value, out);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                project_json_text(value, out);
+            }
+        }
+        Value::String(text) if !text.is_empty() => out.push(text.clone()),
+        Value::String(_) => {}
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
 }
 
 /// `tool_choice` may only name a mode or a function already declared in
@@ -1202,14 +1298,97 @@ mod tests {
 
     fn tool_projections(msgs: &[Message]) -> Vec<Value> {
         msgs.iter()
-            .filter(|m| m.role == Role::System && m.content.starts_with('{'))
-            .map(|m| serde_json::from_str(&m.content).unwrap())
+            .filter(|m| m.role == Role::System && m.content.contains("\n\n{"))
+            .map(|m| serde_json::from_str(m.content.split_once("\n\n").unwrap().1).unwrap())
             .collect()
     }
 
     fn function_tool(name: &str, description: &str, parameters: Value) -> Value {
         json!({"type": "function", "name": name, "description": description,
             "parameters": parameters, "strict": true})
+    }
+
+    #[test]
+    fn function_tool_text_projection_is_deterministic_unquoted_dfs() {
+        let tool = function_tool(
+            "safe_tool",
+            "describe it",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "where",
+                        "enum": ["a", "b"]
+                    }
+                },
+                "required": ["path"]
+            }),
+        );
+        let projection = decode_function_tool(&tool, "tools[0]").unwrap();
+        let (plain, canonical) = projection.message.content.split_once("\n\n").unwrap();
+        let expected_units = [
+            "description",
+            "describe it",
+            "name",
+            "safe_tool",
+            "parameters",
+            "properties",
+            "path",
+            "description",
+            "where",
+            "enum",
+            "a",
+            "b",
+            "type",
+            "string",
+            "required",
+            "path",
+            "type",
+            "object",
+            "strict",
+            "type",
+            "function",
+        ];
+        assert_eq!(
+            plain,
+            expected_units.join("\n")
+        );
+        assert_eq!(serde_json::from_str::<Value>(canonical).unwrap(), tool);
+    }
+
+    #[test]
+    fn function_tool_projection_limits_bound_total_scan_expansion() {
+        let within = "x".repeat(MAX_TOOL_PROJECTION_BYTES / 8);
+        decode(json!({
+            "tools": [{"type": "function", "name": "f", "description": within}],
+            "input": "hi"
+        }))
+        .expect("bounded projection should decode");
+
+        let oversized = "x".repeat(MAX_TOOL_PROJECTION_BYTES / 2 + 1);
+        let err = decode(json!({
+            "tools": [{"type": "function", "name": "f", "description": oversized}],
+            "input": "hi"
+        }))
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            err,
+            "invalid message format: tool projection exceeds byte limit"
+        );
+
+        let too_many = vec![Value::String("x".to_string()); MAX_TOOL_PROJECTION_UNITS];
+        let err = decode(json!({
+            "tools": [{"type": "function", "name": "f", "parameters": {"values": too_many}}],
+            "input": "hi"
+        }))
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            err,
+            "invalid message format: tool projection exceeds unit limit"
+        );
     }
 
     #[test]
@@ -1221,6 +1400,32 @@ mod tests {
         ] {
             assert_eq!(decode(body).unwrap().len(), 1);
         }
+    }
+
+    #[test]
+    fn scan_content_classes_are_index_aligned_and_tool_only() {
+        let body = serde_json::to_vec(&json!({
+            "instructions": "sys",
+            "tools": [
+                {"type": "function", "name": "a"},
+                {"type": "function", "name": "b"}
+            ],
+            "input": "hi"
+        }))
+        .unwrap();
+        let decoded = OpenAiResponsesDecoder::new()
+            .decode_request_with_classes(&body)
+            .unwrap();
+        assert_eq!(decoded.messages.len(), decoded.scan_classes.len());
+        assert_eq!(
+            decoded.scan_classes,
+            vec![
+                ScanContentClass::Conversation,
+                ScanContentClass::ToolDefinition,
+                ScanContentClass::ToolDefinition,
+                ScanContentClass::Conversation,
+            ]
+        );
     }
 
     #[test]
@@ -1252,21 +1457,29 @@ mod tests {
         }))
         .unwrap();
 
-        assert_eq!(msgs.len(), 5);
         assert_eq!(roles_and_content(&msgs)[0], (Role::System, "sys".into()));
-        assert_eq!(roles_and_content(&msgs)[4], (Role::User, "hi".into()));
-        // Each projection is the whole validated definition, unchanged.
-        assert_eq!(tool_projections(&msgs), vec![read_file, run_shell, bare]);
-        for m in &msgs[1..4] {
-            assert!(!m.content.contains('\n'), "projection must be compact");
+        assert_eq!(
+            roles_and_content(&msgs).last(),
+            Some(&(Role::User, "hi".into()))
+        );
+        // Each projection ends with the whole validated definition, unchanged.
+        assert_eq!(
+            tool_projections(&msgs),
+            vec![read_file.clone(), run_shell.clone(), bare.clone()]
+        );
+        for m in msgs.iter().filter(|m| m.content.contains("\n\n{")) {
+            let (plain, canonical) = m.content.split_once("\n\n").unwrap();
+            assert!(!plain.contains('"'), "Parapet adds no quoting to text projection");
+            assert!(!plain.is_empty() && canonical.starts_with('{'));
             assert!(m.tool_name.is_none() && m.tool_call_id.is_none());
         }
+        assert!(msgs[1..msgs.len() - 1]
+            .iter()
+            .all(|message| message.role == Role::System));
         // Deterministic: identical input yields identical projections.
         let again = decode(json!({
             "instructions": "sys",
-            "tools": [msgs[1].content.parse::<Value>().unwrap(),
-                      msgs[2].content.parse::<Value>().unwrap(),
-                      msgs[3].content.parse::<Value>().unwrap()],
+            "tools": [read_file, run_shell, bare],
             "input": "hi"
         }))
         .unwrap();
@@ -1494,7 +1707,9 @@ mod tests {
             "prompt": null
         }))
         .unwrap();
-        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs.first().map(|m| m.content.as_str()), Some("sys"));
+        assert_eq!(msgs.last().map(|m| m.content.as_str()), Some("hi"));
+        assert_eq!(tool_projections(&msgs).len(), 1);
 
         // Every accepted control field also accepts null.
         for key in [
@@ -1757,17 +1972,12 @@ mod tests {
             ]
         }))
         .unwrap();
+        assert_eq!(msgs.first().map(|m| m.content.as_str()), Some("i"));
         assert_eq!(
-            msgs.iter().map(|m| m.role.clone()).collect::<Vec<_>>(),
-            vec![
-                Role::System,
-                Role::System,
-                Role::System,
-                Role::System,
-                Role::User,
-                Role::Tool
-            ]
+            msgs.iter().rev().take(4).map(|m| m.role.clone()).collect::<Vec<_>>(),
+            vec![Role::Tool, Role::User, Role::System, Role::System]
         );
+        assert_eq!(tool_projections(&msgs).len(), 1);
         RoleTrustAssigner.assign_trust(&mut msgs, &config);
         assert!(msgs.iter().all(|m| m.tool_name.is_none()));
         for m in &msgs {
@@ -1947,10 +2157,14 @@ mod tests {
             ]
         }"#;
         let msgs = decode_raw(body).unwrap();
-        assert_eq!(msgs.len(), 4);
-        assert_eq!(msgs[2].content, "onetwo");
+        let user = msgs.iter().find(|message| message.content == "onetwo").unwrap();
+        assert_eq!(user.role, Role::User);
+        let function_call = msgs
+            .iter()
+            .find(|message| !message.tool_calls.is_empty())
+            .unwrap();
         assert_eq!(
-            msgs[3].tool_calls[0].arguments,
+            function_call.tool_calls[0].arguments,
             json!({"x": {"x": 1}, "y": [{"x": 2}, {"x": 3}]})
         );
     }
