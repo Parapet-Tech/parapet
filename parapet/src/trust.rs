@@ -209,6 +209,7 @@ mod tests {
             runtime: RuntimeConfig {
                 engine: EngineConfig::default(),
                 environment: String::new(),
+                responses_stream: crate::config::ResponsesStreamConfig::default(),
             },
             contract_hash: String::new(),
         }
@@ -348,6 +349,7 @@ mod tests {
             runtime: RuntimeConfig {
                 engine: EngineConfig::default(),
                 environment: String::new(),
+                responses_stream: crate::config::ResponsesStreamConfig::default(),
             },
             contract_hash: String::new(),
         };

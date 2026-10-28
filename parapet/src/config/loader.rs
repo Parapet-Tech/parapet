@@ -15,6 +15,7 @@ use super::error::ConfigError;
 use super::interpolation::resolve_variables;
 use super::pattern::CompiledPattern;
 use super::raw;
+use super::responses_stream::ResponsesStreamConfig;
 use super::source::ConfigSource;
 use super::types::*;
 
@@ -112,6 +113,9 @@ pub fn load_config(source: &dyn ConfigSource) -> Result<Config, ConfigError> {
     // Layers
     let layers = build_layer_configs(raw.layers)?;
 
+    // Responses streaming runtime settings
+    let responses_stream = ResponsesStreamConfig::resolve(raw.responses_stream)?;
+
     Ok(Config {
         policy: PolicyConfig {
             version: raw.parapet,
@@ -126,6 +130,7 @@ pub fn load_config(source: &dyn ConfigSource) -> Result<Config, ConfigError> {
         runtime: RuntimeConfig {
             engine,
             environment: raw.environment.unwrap_or_default(),
+            responses_stream,
         },
         contract_hash,
     })

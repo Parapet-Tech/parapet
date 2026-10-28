@@ -70,12 +70,17 @@ pub struct SseLimits {
     pub max_frame_bytes: usize,
 }
 
+impl SseLimits {
+    /// Reviewed defaults; also the ceiling the runtime config may tighten.
+    pub const DEFAULT: Self = Self {
+        max_stream_bytes: 40 * 1024 * 1024,
+        max_frame_bytes: 16 * 1024 * 1024,
+    };
+}
+
 impl Default for SseLimits {
     fn default() -> Self {
-        Self {
-            max_stream_bytes: 40 * 1024 * 1024,
-            max_frame_bytes: 16 * 1024 * 1024,
-        }
+        Self::DEFAULT
     }
 }
 

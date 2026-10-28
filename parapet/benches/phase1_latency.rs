@@ -57,6 +57,7 @@ fn bench_config() -> Config {
         runtime: RuntimeConfig {
             engine: EngineConfig::default(),
             environment: String::new(),
+            responses_stream: parapet::config::ResponsesStreamConfig::default(),
         },
         contract_hash: "sha256:bench".to_string(),
     }

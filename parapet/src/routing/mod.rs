@@ -260,6 +260,7 @@ mod tests {
             runtime: RuntimeConfig {
                 engine: EngineConfig::default(),
                 environment: "test".to_string(),
+                responses_stream: crate::config::ResponsesStreamConfig::default(),
             },
             contract_hash: "sha256:test".to_string(),
         }

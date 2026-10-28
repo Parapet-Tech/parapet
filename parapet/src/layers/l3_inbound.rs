@@ -888,6 +888,7 @@ mod tests {
             runtime: RuntimeConfig {
                 engine: EngineConfig::default(),
                 environment: String::new(),
+                responses_stream: crate::config::ResponsesStreamConfig::default(),
             },
             contract_hash: "sha256:test".to_string(),
         }

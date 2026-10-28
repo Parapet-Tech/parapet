@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use crate::message::TrustLevel;
 
 use super::pattern::CompiledPattern;
+use super::responses_stream::ResponsesStreamConfig;
 
 // ---------------------------------------------------------------------------
 // Top-level config (combines policy + runtime)
@@ -67,6 +68,9 @@ pub struct RuntimeConfig {
     pub engine: EngineConfig,
     /// Environment label (e.g. "internal", "production").
     pub environment: String,
+    /// OpenAI Responses streaming settings. Resolved and validated only;
+    /// nothing reads them yet.
+    pub responses_stream: ResponsesStreamConfig,
 }
 
 // ---------------------------------------------------------------------------

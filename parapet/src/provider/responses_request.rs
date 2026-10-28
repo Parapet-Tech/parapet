@@ -64,13 +64,18 @@ pub struct StreamRequestLimits {
     pub max_opaque_total_bytes: usize,
 }
 
+impl StreamRequestLimits {
+    /// Reviewed defaults; also the ceiling the runtime config may tighten.
+    pub const DEFAULT: Self = Self {
+        max_body_bytes: 10 * 1024 * 1024,
+        max_opaque_field_bytes: 4 * 1024 * 1024,
+        max_opaque_total_bytes: 32 * 1024 * 1024,
+    };
+}
+
 impl Default for StreamRequestLimits {
     fn default() -> Self {
-        Self {
-            max_body_bytes: 10 * 1024 * 1024,
-            max_opaque_field_bytes: 4 * 1024 * 1024,
-            max_opaque_total_bytes: 32 * 1024 * 1024,
-        }
+        Self::DEFAULT
     }
 }
 

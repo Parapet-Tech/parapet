@@ -135,12 +135,17 @@ pub struct OpaqueReasoningLimits {
     pub max_total_bytes: usize,
 }
 
+impl OpaqueReasoningLimits {
+    /// Reviewed defaults; also the ceiling the runtime config may tighten.
+    pub const DEFAULT: Self = Self {
+        max_field_bytes: 4 * 1024 * 1024,
+        max_total_bytes: 32 * 1024 * 1024,
+    };
+}
+
 impl Default for OpaqueReasoningLimits {
     fn default() -> Self {
-        Self {
-            max_field_bytes: 4 * 1024 * 1024,
-            max_total_bytes: 32 * 1024 * 1024,
-        }
+        Self::DEFAULT
     }
 }
 

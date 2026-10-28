@@ -126,16 +126,21 @@ pub struct StreamLimits {
     pub max_snapshot_bytes: usize,
 }
 
+impl StreamLimits {
+    /// Reviewed defaults; also the ceiling the runtime config may tighten.
+    pub const DEFAULT: Self = Self {
+        max_events: 262_144,
+        max_items: 256,
+        max_parts: 1_024,
+        max_text_bytes: 4 * 1024 * 1024,
+        max_argument_bytes: 4 * 1024 * 1024,
+        max_snapshot_bytes: 32 * 1024 * 1024,
+    };
+}
+
 impl Default for StreamLimits {
     fn default() -> Self {
-        Self {
-            max_events: 262_144,
-            max_items: 256,
-            max_parts: 1_024,
-            max_text_bytes: 4 * 1024 * 1024,
-            max_argument_bytes: 4 * 1024 * 1024,
-            max_snapshot_bytes: 32 * 1024 * 1024,
-        }
+        Self::DEFAULT
     }
 }
 

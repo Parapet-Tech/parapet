@@ -29,6 +29,7 @@ fn base_config_with_canary(canary: &str) -> Config {
         runtime: RuntimeConfig {
             engine: EngineConfig::default(),
             environment: String::new(),
+            responses_stream: crate::config::ResponsesStreamConfig::default(),
         },
         contract_hash: "sha256:test".to_string(),
     }
@@ -49,6 +50,7 @@ fn base_config_with_sensitive(pattern: &str) -> Config {
         runtime: RuntimeConfig {
             engine: EngineConfig::default(),
             environment: String::new(),
+            responses_stream: crate::config::ResponsesStreamConfig::default(),
         },
         contract_hash: "sha256:test".to_string(),
     }
@@ -350,6 +352,7 @@ fn config_with_l3_outbound(block_action: &str) -> Config {
         runtime: RuntimeConfig {
             engine: EngineConfig::default(),
             environment: String::new(),
+            responses_stream: crate::config::ResponsesStreamConfig::default(),
         },
         contract_hash: "sha256:test".to_string(),
     }

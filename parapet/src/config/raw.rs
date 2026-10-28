@@ -57,6 +57,7 @@ pub struct RawConfig {
     pub engine: Option<RawEngineConfig>,
     pub environment: Option<String>,
     pub layers: Option<RawLayerConfigs>,
+    pub responses_stream: Option<RawResponsesStreamConfig>,
     /// If false, skip embedding default block patterns. Default: true.
     pub use_default_block_patterns: Option<bool>,
     /// If false, skip embedding default sensitive patterns. Default: true.
@@ -103,6 +104,27 @@ pub struct RawTrustConfig {
 pub struct RawEngineConfig {
     pub on_failure: Option<String>,
     pub timeout_ms: Option<u64>,
+}
+
+/// OpenAI Responses streaming runtime block. Every field is optional; an
+/// omitted field takes its reviewed default.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawResponsesStreamConfig {
+    pub concurrent_streams: Option<u64>,
+    pub wall_clock_ms: Option<u64>,
+    pub upstream_idle_ms: Option<u64>,
+    pub max_body_bytes: Option<u64>,
+    pub max_opaque_field_bytes: Option<u64>,
+    pub max_opaque_total_bytes: Option<u64>,
+    pub max_sse_stream_bytes: Option<u64>,
+    pub max_sse_frame_bytes: Option<u64>,
+    pub max_events: Option<u64>,
+    pub max_items: Option<u64>,
+    pub max_parts: Option<u64>,
+    pub max_text_bytes: Option<u64>,
+    pub max_argument_bytes: Option<u64>,
+    pub max_snapshot_bytes: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]

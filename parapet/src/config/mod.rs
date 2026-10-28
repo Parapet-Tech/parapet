@@ -12,6 +12,7 @@ mod interpolation;
 mod loader;
 mod pattern;
 pub(crate) mod raw;
+mod responses_stream;
 mod source;
 mod types;
 
@@ -22,6 +23,7 @@ pub use defaults::{
 pub use error::ConfigError;
 pub use loader::{compute_hash, load_config};
 pub use pattern::{CompiledPattern, PatternAction};
+pub use responses_stream::ResponsesStreamConfig;
 pub use source::{ConfigSource, FileSource, StringSource};
 pub use types::{
     ArgumentConstraints, Config, ContentPolicy, EngineConfig, FailureMode, L1Config, L1Mode,
