@@ -13,6 +13,11 @@
 // - Fail closed without echoing payload bytes on `[DONE]`, unknown event
 //   types, hosted-tool/audio/image/file events, `obfuscation` padding, and
 //   any unexpected model-visible field
+// - Apply an injected [`EncryptedReasoningPolicy`] to reasoning
+//   `encrypted_content` on output items and terminal snapshots (OA-R2b1).
+//   The default accepts capped opaque strings: an item event records
+//   presence only, a terminal snapshot withholds each value as its
+//   continuation authority, and no value ever becomes text
 //
 // Not in scope: SSE framing, cross-event state (delta assembly, index/id
 // continuity, sequence ordering), L5a/L3-outbound policy, rewriting,
@@ -24,8 +29,9 @@ use super::responses::{
     JsonParser, StrictJsonParser,
 };
 use super::responses_output::{
-    decode_message_part, decode_response_value, non_empty_string, DecodedResponse, OutputItemKind,
-    OutputView, ResponseStatus, TextSegment, TextSegmentKind,
+    decode_message_part, decode_response_value, non_empty_string, DecodedResponse,
+    EncryptedReasoningPolicy, OpaqueReasoningLimits, OutputItemKind, OutputView, ResponseStatus,
+    TextSegment, TextSegmentKind,
 };
 use super::ProviderError;
 use crate::message::ToolCall;
@@ -190,14 +196,21 @@ pub struct StreamItem {
     /// Exact `arguments` wire string of a `function_call` item, unparsed, for
     /// later byte-equality checks against the streamed deltas.
     pub arguments: Option<String>,
+    /// Whether a reasoning item carried a non-null `encrypted_content`
+    /// (`""` included). Presence only: item-event values may rotate and are
+    /// never retained here; the payload keeps them.
+    pub has_encrypted_content: bool,
 }
 
 /// Decoder for OpenAI Responses SSE event payloads.
 pub struct OpenAiResponsesStreamDecoder<P: JsonParser = StrictJsonParser> {
     parser: P,
+    encrypted_policy: EncryptedReasoningPolicy,
 }
 
 impl OpenAiResponsesStreamDecoder {
+    /// Strict parser; opaque `encrypted_content` accepted within
+    /// [`OpaqueReasoningLimits::default`].
     pub fn new() -> Self {
         Self::with_parser(StrictJsonParser)
     }
@@ -205,7 +218,17 @@ impl OpenAiResponsesStreamDecoder {
 
 impl<P: JsonParser> OpenAiResponsesStreamDecoder<P> {
     pub fn with_parser(parser: P) -> Self {
-        Self { parser }
+        Self::with_policy(
+            parser,
+            EncryptedReasoningPolicy::AcceptOpaque(OpaqueReasoningLimits::default()),
+        )
+    }
+
+    pub fn with_policy(parser: P, encrypted_policy: EncryptedReasoningPolicy) -> Self {
+        Self {
+            parser,
+            encrypted_policy,
+        }
     }
 }
 
@@ -330,7 +353,7 @@ impl<P: JsonParser> OpenAiResponsesStreamDecoder<P> {
             Lifecycle::Incomplete => ResponseStatus::Incomplete,
             Lifecycle::Failed => ResponseStatus::Failed,
         };
-        let response = decode_response_value(&self.parser, root, status)?;
+        let response = decode_response_value(&self.parser, root, status, self.encrypted_policy)?;
         Ok(match lifecycle {
             Lifecycle::Created => StreamEventKind::ResponseCreated { response },
             Lifecycle::InProgress => StreamEventKind::ResponseInProgress { response },
@@ -354,7 +377,7 @@ impl<P: JsonParser> OpenAiResponsesStreamDecoder<P> {
         let item = obj
             .get("item")
             .ok_or_else(|| ProviderError::MissingField("event.item".to_string()))?;
-        let mut view = OutputView::default();
+        let mut view = OutputView::new(self.encrypted_policy);
         let kind = view.decode_item(&self.parser, item, output_index)?;
         let obj = item.as_object().expect("decode_item accepted an object");
         // Stream items are addressed by `item_id` in later events.
@@ -374,6 +397,7 @@ impl<P: JsonParser> OpenAiResponsesStreamDecoder<P> {
                 texts: view.texts,
                 tool_call: view.tool_calls.pop(),
                 arguments,
+                has_encrypted_content: !view.encrypted.is_empty(),
             },
         })
     }
@@ -671,6 +695,7 @@ mod tests {
                     texts: vec![],
                     tool_call: None,
                     arguments: None,
+                    has_encrypted_content: false,
                 },
             }
         );
@@ -1115,7 +1140,7 @@ mod tests {
         }
         let mut v = fixture_value("response.output_item.done");
         v["item"] = json!({"type": "reasoning", "id": "rs_1", "summary": [],
-            "encrypted_content": MARKER});
+            "encrypted_content": format!("{MARKER}!")});
         assert_fails_without_echo(decode_value("response.output_item.done", &v), "encrypted");
 
         for part in [
@@ -1130,6 +1155,151 @@ mod tests {
             v["part"] = part;
             assert_fails_without_echo(decode_value("response.content_part.added", &v), "part");
         }
+    }
+
+    // -- opaque encrypted_content -------------------------------------------
+
+    fn reasoning_item_event(name: &str, enc: Value) -> Value {
+        json!({"type": name, "sequence_number": 2, "output_index": 0,
+            "item": {"type": "reasoning", "id": "rs_1", "summary": [],
+                "encrypted_content": enc}})
+    }
+
+    fn decoded_item(v: &Value, name: &str) -> StreamItem {
+        match decode_value(name, v).unwrap().kind {
+            StreamEventKind::OutputItem { item, .. } => item,
+            other => panic!("{name}: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reasoning_item_events_record_opaque_presence_only() {
+        for name in ["response.output_item.added", "response.output_item.done"] {
+            for (enc, present) in [
+                (json!(MARKER), true),
+                (json!(""), true),
+                (json!(null), false),
+            ] {
+                let item = decoded_item(&reasoning_item_event(name, enc), name);
+                assert_eq!(item.has_encrypted_content, present, "{name}");
+                assert!(item.texts.is_empty());
+                assert!(!format!("{item:?}").contains(MARKER), "{name} Debug");
+            }
+            let mut missing = reasoning_item_event(name, json!(null));
+            missing["item"]
+                .as_object_mut()
+                .unwrap()
+                .remove("encrypted_content");
+            assert!(!decoded_item(&missing, name).has_encrypted_content);
+        }
+    }
+
+    #[test]
+    fn refuse_policy_keeps_stream_decoder_inert() {
+        let decoder = OpenAiResponsesStreamDecoder::with_policy(
+            StrictJsonParser,
+            EncryptedReasoningPolicy::Refuse,
+        );
+        for enc in [json!(MARKER), json!("")] {
+            let v = reasoning_item_event("response.output_item.done", enc);
+            let result = decoder.decode_event(None, v.to_string().as_bytes());
+            assert_fails_without_echo(result, "refuse policy");
+        }
+    }
+
+    #[test]
+    fn injected_opaque_limits_bound_each_item_occurrence() {
+        let limits = OpaqueReasoningLimits {
+            max_field_bytes: 4,
+            max_total_bytes: 4,
+        };
+        let decoder = OpenAiResponsesStreamDecoder::with_policy(
+            StrictJsonParser,
+            EncryptedReasoningPolicy::AcceptOpaque(limits),
+        );
+        let name = "response.output_item.added";
+        let at = |enc: &str| {
+            decoder.decode_event(
+                None,
+                reasoning_item_event(name, json!(enc))
+                    .to_string()
+                    .as_bytes(),
+            )
+        };
+        assert!(at("AAAA").is_ok(), "exact field bound");
+        assert_fails_without_echo(at("AAAAA"), "+1 field");
+        assert_fails_without_echo(at(&format!("{MARKER}.")), "charset");
+        for enc in [
+            json!(1),
+            json!([MARKER]),
+            json!({"v": MARKER}),
+            json!(false),
+        ] {
+            let result =
+                decoder.decode_event(None, reasoning_item_event(name, enc).to_string().as_bytes());
+            assert_fails_without_echo(result, "non-string");
+        }
+    }
+
+    #[test]
+    fn opaque_outside_reasoning_output_items_fails_closed() {
+        let pending = |name: &str| {
+            let mut v = fixture_value(name);
+            v["response"]["output"] = json!([{"type": "reasoning", "id": "rs_1",
+                "summary": [], "encrypted_content": MARKER}]);
+            v
+        };
+        let mut top_level = fixture_value("response.created");
+        top_level["response"]["encrypted_content"] = json!(MARKER);
+        let mut on_event = reasoning_item_event("response.output_item.added", json!(null));
+        on_event["encrypted_content"] = json!(MARKER);
+        let mut on_message = fixture_value("response.output_item.added");
+        on_message["item"]["encrypted_content"] = json!(MARKER);
+        let mut on_call = fixture_value("response.output_item.done");
+        on_call["item"]["encrypted_content"] = json!(MARKER);
+        let mut on_part = fixture_value("response.content_part.added");
+        on_part["part"]["encrypted_content"] = json!(MARKER);
+        let mut on_delta = fixture_value("response.reasoning_summary_text.delta");
+        on_delta["encrypted_content"] = json!(MARKER);
+        let mut on_message_snapshot = fixture_value("response.completed");
+        on_message_snapshot["response"]["output"][0]["encrypted_content"] = json!(MARKER);
+        for (label, v) in [
+            ("created output", pending("response.created")),
+            ("in_progress output", pending("response.in_progress")),
+            ("created top level", top_level),
+            ("event top level", on_event),
+            ("message item", on_message),
+            ("function_call item", on_call),
+            ("content part", on_part),
+            ("summary delta", on_delta),
+            ("terminal message", on_message_snapshot),
+        ] {
+            let name = v["type"].as_str().unwrap().to_string();
+            assert_fails_without_echo(decode_value(&name, &v), label);
+        }
+    }
+
+    #[test]
+    fn terminal_snapshot_withholds_opaque_as_continuation() {
+        let mut v = fixture_value("response.completed");
+        v["response"]["output"] = json!([{"type": "reasoning", "id": "rs_1",
+            "summary": [{"type": "summary_text", "text": "S"}], "encrypted_content": MARKER}]);
+        let StreamEventKind::ResponseCompleted { response } =
+            decode_value("response.completed", &v).unwrap().kind
+        else {
+            panic!("completed")
+        };
+        assert_eq!(
+            response
+                .encrypted_continuation(0)
+                .map(|c| c.expose_ciphertext()),
+            Some(MARKER)
+        );
+        assert_eq!(response.texts()[0].text(), "S");
+        assert!(!format!("{response:?}").contains(MARKER));
+        assert!(!String::from_utf8(response.to_json_bytes())
+            .unwrap()
+            .contains(MARKER));
     }
 
     #[test]

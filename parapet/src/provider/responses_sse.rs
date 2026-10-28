@@ -20,7 +20,9 @@
 // - Retain only canonical validated frames, never upstream bytes: each
 //   accepted event becomes `event: <payload type>` plus its joined data
 //   payload, in event order; comments, `id:`, `retry:`, and line-ending
-//   choices disappear
+//   choices disappear. Opaque reasoning `encrypted_content` accepted by the
+//   default decoder stays only inside these original payloads (and the
+//   assembler's withheld terminal continuation); it is never rewritten
 // - Release canonical frames from [`SseCollector::finish`] only for a
 //   `response.completed` or `response.incomplete` terminal; `response.failed`
 //   and top-level `error` finish with a fixed refusal and release nothing
@@ -1075,5 +1077,110 @@ mod tests {
             sse(&number(evs), true, "\n").as_bytes(),
             E::Assembly(StreamStateError::ResponseIdMismatch),
         );
+    }
+
+    // -- opaque encrypted_content (OA-R2b1) ---------------------------------
+
+    const ADDED_ENC: &str = "EncAddedAAAA";
+    const DONE_ENC: &str = "EncDoneBBBBBBBB+/==";
+    const TERM_ENC: &str = "EncTermCCCCCCCC-_==";
+
+    fn reasoning(enc: &str, summary: &[&str]) -> Value {
+        let summary: Vec<Value> = summary
+            .iter()
+            .map(|t| json!({"type": "summary_text", "text": t}))
+            .collect();
+        json!({"type": "reasoning", "id": "rs_1", "summary": summary, "encrypted_content": enc})
+    }
+
+    /// Reasoning item whose opaque value rotates across added, done, and the
+    /// terminal snapshot; `last` replaces the terminal event when given.
+    fn encrypted_events(last: Option<Value>) -> Vec<Value> {
+        let mut evs = vec![
+            json!({"type": "response.created", "response": response("queued", vec![])}),
+            json!({"type": "response.output_item.added", "output_index": 0,
+                "item": reasoning(ADDED_ENC, &[])}),
+            json!({"type": "response.reasoning_summary_text.delta", "item_id": "rs_1",
+                "output_index": 0, "summary_index": 0, "delta": "S"}),
+            json!({"type": "response.reasoning_summary_text.done", "item_id": "rs_1",
+                "output_index": 0, "summary_index": 0, "text": "S"}),
+            json!({"type": "response.output_item.done", "output_index": 0,
+                "item": reasoning(DONE_ENC, &["S"])}),
+        ];
+        evs.push(last.unwrap_or_else(|| {
+            json!({"type": "response.completed",
+                "response": response("completed", vec![reasoning(TERM_ENC, &["S"])])})
+        }));
+        number(evs)
+    }
+
+    #[test]
+    fn canonical_frames_keep_every_original_opaque_value_unchanged() {
+        let evs = encrypted_events(None);
+        let bytes = sse(&evs, false, "\r\n");
+        let collected = collect(bytes.as_bytes()).expect("rotation is accepted");
+        // Each released frame is the original validated payload, so every
+        // snapshot keeps its own value; nothing is merged or rewritten.
+        assert_eq!(
+            collected.canonical().as_ref(),
+            sse(&evs, true, "\n").as_bytes()
+        );
+        let canonical = std::str::from_utf8(collected.canonical()).unwrap();
+        for enc in [ADDED_ENC, DONE_ENC, TERM_ENC] {
+            assert_eq!(canonical.matches(enc).count(), 1, "{enc}");
+        }
+        let debug = format!("{collected:?}");
+        let Terminal::Completed(stream) = collected.terminal() else {
+            panic!("completed")
+        };
+        assert_eq!(
+            stream
+                .response()
+                .encrypted_continuation(0)
+                .map(|c| c.expose_ciphertext()),
+            Some(TERM_ENC)
+        );
+        assert_eq!(stream.response().texts()[0].text(), "S");
+        let terminal_debug = format!("{:?}", collected.terminal());
+        for enc in [ADDED_ENC, DONE_ENC, TERM_ENC] {
+            assert!(!debug.contains(enc) && !terminal_debug.contains(enc));
+        }
+    }
+
+    #[test]
+    fn failed_and_error_after_opaque_release_nothing() {
+        let failed = json!({"type": "response.failed", "response": {"id": "resp_1",
+            "object": "response", "status": "failed",
+            "error": {"code": "server_error", "message": MARKER}, "output": []}});
+        let errored = json!({"type": "error", "code": "server_error", "message": MARKER,
+            "param": null});
+        for (last, expected) in [(failed, E::UpstreamFailed), (errored, E::UpstreamError)] {
+            let bytes = sse(&encrypted_events(Some(last)), true, "\n");
+            let mut c = ResponsesSseCollector::new();
+            assert_eq!(c.push(bytes.as_bytes()), Ok(Progress::Terminal));
+            let debug = format!("{c:?}");
+            assert!(debug.contains("canonical_bytes: 0"), "{debug}");
+            let err = c.finish().unwrap_err();
+            assert_eq!(err, expected);
+            for enc in [ADDED_ENC, DONE_ENC, TERM_ENC] {
+                assert!(!format!("{err} {err:?} {debug}").contains(enc));
+            }
+        }
+    }
+
+    #[test]
+    fn opaque_presence_mismatch_poisons_and_releases_nothing() {
+        let last = json!({"type": "response.completed",
+            "response": response("completed", vec![json!({"type": "reasoning", "id": "rs_1",
+                "summary": [{"type": "summary_text", "text": "S"}]})])});
+        let bytes = sse(&encrypted_events(Some(last)), true, "\n");
+        let mut c = ResponsesSseCollector::new();
+        let err = c.push(bytes.as_bytes()).unwrap_err();
+        assert_eq!(
+            err,
+            E::Assembly(StreamStateError::EncryptedPresenceMismatch)
+        );
+        assert!(format!("{c:?}").contains("canonical_bytes: 0"));
+        assert_eq!(c.finish().unwrap_err(), E::Poisoned);
     }
 }

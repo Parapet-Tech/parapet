@@ -16,9 +16,15 @@
 // - Fail closed without echoing response bytes on any unknown or malformed
 //   item, part, or top-level field, on non-empty annotations/logprobs, on
 //   reasoning `encrypted_content`, and on non-success status/error shapes
+// - Under an injected [`EncryptedReasoningPolicy::AcceptOpaque`] (the inert
+//   stream path only; D-0027 OA-R2b1), accept reasoning `encrypted_content`
+//   as a capped base64/base64url string. The value is withheld from the
+//   validated object, never projected into text, and reachable only through
+//   [`DecodedResponse::encrypted_continuation`]
 //
 // Not in scope: SSE, L5a/L3-outbound policy, and route activation. This is a
-// pure seam; the `/v1/responses` route still refuses to forward.
+// pure seam; the `/v1/responses` route still refuses to forward, and the
+// non-stream decoder always refuses non-null `encrypted_content`.
 
 use super::responses::{
     allow_keys, decode_function_tool, empty_array_or_absent, enum_value, invalid, nullable_bool,
@@ -29,6 +35,7 @@ use super::responses::{
 use super::ProviderError;
 use crate::message::ToolCall;
 use serde_json::{Map, Value};
+use std::fmt;
 
 /// Decodes a provider response body into an inspectable, rewritable value.
 pub trait ResponseDecoder: Send + Sync {
@@ -105,19 +112,96 @@ pub enum RewriteError {
     UnaddressableSegment(usize),
 }
 
+/// How a decoder treats reasoning `encrypted_content`. Null or missing is
+/// always absent; this only governs a non-null value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncryptedReasoningPolicy {
+    /// Any non-null value, including `""`, fails closed.
+    Refuse,
+    /// Accept a JSON string (including `""`) of ASCII `[A-Za-z0-9+/=_-]`
+    /// within the given bounds. The value is opaque and unscanned (N-OA-1).
+    AcceptOpaque(OpaqueReasoningLimits),
+}
+
+/// Inclusive byte bounds on accepted `encrypted_content`: exactly `max` is
+/// accepted, `max + 1` fails closed. Deployments may only tighten the
+/// defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpaqueReasoningLimits {
+    /// One `encrypted_content` occurrence, wherever it appears.
+    pub max_field_bytes: usize,
+    /// Sum over one response object's `output[]` (the terminal snapshot on a
+    /// stream; item events carry one occurrence each).
+    pub max_total_bytes: usize,
+}
+
+impl Default for OpaqueReasoningLimits {
+    fn default() -> Self {
+        Self {
+            max_field_bytes: 4 * 1024 * 1024,
+            max_total_bytes: 32 * 1024 * 1024,
+        }
+    }
+}
+
+/// One accepted reasoning `encrypted_content` value: opaque provider
+/// ciphertext that Parapet neither scans, trusts, nor interprets.
+///
+/// `Debug` shows the byte count only, and there is no `Display`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct EncryptedReasoningContent(String);
+
+impl EncryptedReasoningContent {
+    /// Byte length; `0` for a present empty string.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// SENSITIVE: the unscanned opaque value (N-OA-1). Only for deliberate
+    /// continuation forwarding; never log, scan, project, or trust it.
+    pub fn expose_ciphertext(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for EncryptedReasoningContent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EncryptedReasoningContent")
+            .field("bytes", &self.0.len())
+            .finish()
+    }
+}
+
 /// A validated non-stream Responses object plus its inspection view.
 ///
-/// The full wire object is kept as validated; texts and tool calls are
-/// read-only projections of it. Rewriting yields a new value and leaves this
-/// one untouched.
+/// The full wire object is kept as validated, except that accepted
+/// `encrypted_content` strings are withheld (left `null` in the object) and
+/// held separately; texts and tool calls are read-only projections of it.
+/// Rewriting yields a new value and leaves this one untouched.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecodedResponse {
     root: Value,
     texts: Vec<TextSegment>,
     tool_calls: Vec<ToolCall>,
+    /// Withheld `encrypted_content` by `output[]` index, in array order.
+    encrypted: Vec<(usize, EncryptedReasoningContent)>,
 }
 
 impl DecodedResponse {
+    /// The `encrypted_content` of the reasoning item at `output[index]`;
+    /// `None` when absent or null. On a stream terminal snapshot this is the
+    /// continuation authority (E-4e).
+    pub fn encrypted_continuation(&self, index: usize) -> Option<&EncryptedReasoningContent> {
+        self.encrypted
+            .iter()
+            .find(|(i, _)| *i == index)
+            .map(|(_, value)| value)
+    }
+
     /// Model-produced text segments in wire order.
     pub fn texts(&self) -> &[TextSegment] {
         &self.texts
@@ -187,6 +271,7 @@ impl DecodedResponse {
             root,
             texts,
             tool_calls: self.tool_calls.clone(),
+            encrypted: self.encrypted.clone(),
         })
     }
 
@@ -241,7 +326,12 @@ impl<P: JsonParser> ResponseDecoder for OpenAiResponsesOutputDecoder<P> {
                 invalid("response body contains a duplicate object key")
             }
         })?;
-        decode_response_value(&self.parser, root, ResponseStatus::Final)
+        decode_response_value(
+            &self.parser,
+            root,
+            ResponseStatus::Final,
+            EncryptedReasoningPolicy::Refuse,
+        )
     }
 }
 
@@ -277,8 +367,9 @@ impl ResponseStatus {
 /// Validate an already-parsed response object and build its inspection view.
 pub(super) fn decode_response_value(
     parser: &dyn JsonParser,
-    root: Value,
+    mut root: Value,
     expected: ResponseStatus,
+    encrypted_policy: EncryptedReasoningPolicy,
 ) -> Result<DecodedResponse, ProviderError> {
     let obj = root
         .as_object()
@@ -296,16 +387,46 @@ pub(super) fn decode_response_value(
             "output must be empty while the response is pending",
         ));
     }
-    let mut view = OutputView::default();
+    let mut view = OutputView::new(encrypted_policy);
     for (i, item) in items.iter().enumerate() {
         view.decode_item(parser, item, i)?;
     }
+    if let EncryptedReasoningPolicy::AcceptOpaque(limits) = encrypted_policy {
+        let total = view
+            .encrypted
+            .iter()
+            .try_fold(0usize, |total, (_, bytes)| total.checked_add(*bytes))
+            .filter(|total| *total <= limits.max_total_bytes);
+        if total.is_none() {
+            return Err(invalid(
+                "output encrypted_content aggregate byte limit exceeded",
+            ));
+        }
+    }
+    let encrypted = view
+        .encrypted
+        .iter()
+        .map(|&(index, _)| (index, withhold_encrypted(&mut root, index)))
+        .collect();
 
     Ok(DecodedResponse {
         root,
         texts: view.texts,
         tool_calls: view.tool_calls,
+        encrypted,
     })
+}
+
+/// Take the already-validated `encrypted_content` string out of
+/// `output[index]`, leaving `null` in its place.
+fn withhold_encrypted(root: &mut Value, index: usize) -> EncryptedReasoningContent {
+    let slot = root
+        .pointer_mut(&format!("/output/{index}/encrypted_content"))
+        .map(Value::take);
+    match slot {
+        Some(Value::String(opaque)) => EncryptedReasoningContent(opaque),
+        _ => unreachable!("decode_item recorded only string encrypted_content"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -473,13 +594,25 @@ fn nullable_count(value: &Value, at: &str) -> Result<(), ProviderError> {
 const ITEM_STATUSES: &[&str] = &["in_progress", "completed", "incomplete"];
 
 /// Inspection view accumulated over one or more output items.
-#[derive(Default)]
 pub(super) struct OutputView {
     pub(super) texts: Vec<TextSegment>,
     pub(super) tool_calls: Vec<ToolCall>,
+    /// `(output index, byte length)` of every accepted non-null
+    /// `encrypted_content`, in item order. The value stays in the item.
+    pub(super) encrypted: Vec<(usize, usize)>,
+    encrypted_policy: EncryptedReasoningPolicy,
 }
 
 impl OutputView {
+    pub(super) fn new(encrypted_policy: EncryptedReasoningPolicy) -> Self {
+        Self {
+            texts: Vec::new(),
+            tool_calls: Vec::new(),
+            encrypted: Vec::new(),
+            encrypted_policy,
+        }
+    }
+
     /// Validate one `output[]` item at `index`, appending its text segments
     /// and tool call. Returns the item kind.
     pub(super) fn decode_item(
@@ -573,11 +706,18 @@ impl OutputView {
             at,
         )?;
         validate_item_meta(obj, at)?;
-        // Opaque ciphertext; refuse any non-null value (including "").
-        if obj.get("encrypted_content").is_some_and(|v| !v.is_null()) {
-            return Err(invalid(format!(
-                "{at}.encrypted_content cannot be inspected"
-            )));
+        match (obj.get("encrypted_content"), self.encrypted_policy) {
+            (None | Some(Value::Null), _) => {}
+            // Opaque ciphertext; refuse any non-null value (including "").
+            (Some(_), EncryptedReasoningPolicy::Refuse) => {
+                return Err(invalid(format!(
+                    "{at}.encrypted_content cannot be inspected"
+                )));
+            }
+            (Some(value), EncryptedReasoningPolicy::AcceptOpaque(limits)) => {
+                let bytes = validate_opaque(value, &limits, at)?;
+                self.encrypted.push((index, bytes));
+            }
         }
         let summary = required_array(obj, "summary", at)?;
         self.decode_reasoning_parts(
@@ -647,6 +787,37 @@ impl OutputView {
             },
         });
     }
+}
+
+/// Check one non-null `encrypted_content` occurrence: a string within the
+/// per-field bound, of opaque characters only. Returns its byte length.
+/// Errors name the location only, never the value.
+fn validate_opaque(
+    value: &Value,
+    limits: &OpaqueReasoningLimits,
+    at: &str,
+) -> Result<usize, ProviderError> {
+    let Value::String(opaque) = value else {
+        return Err(invalid(format!(
+            "{at}.encrypted_content must be a string or null"
+        )));
+    };
+    if opaque.len() > limits.max_field_bytes {
+        return Err(invalid(format!(
+            "{at}.encrypted_content field byte limit exceeded"
+        )));
+    }
+    if !opaque.bytes().all(is_opaque_byte) {
+        return Err(invalid(format!(
+            "{at}.encrypted_content has an unsupported character"
+        )));
+    }
+    Ok(opaque.len())
+}
+
+/// Base64 and base64url alphabets plus padding.
+pub(super) fn is_opaque_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'_' | b'-')
 }
 
 /// Which accepted `output[]` item type was decoded.
@@ -1052,6 +1223,175 @@ mod tests {
         }
         let ok = minimal(json!([{"type": "reasoning", "summary": [], "encrypted_content": null}]));
         assert!(decode(&ok).unwrap().texts().is_empty());
+    }
+
+    // -- opaque encrypted_content (stream policy only) -----------------------
+
+    const OPAQUE: &str = "EncMarker+/=_-0123";
+
+    fn decode_opaque(
+        body: &Value,
+        limits: OpaqueReasoningLimits,
+    ) -> Result<DecodedResponse, ProviderError> {
+        decode_response_value(
+            &StrictJsonParser,
+            body.clone(),
+            ResponseStatus::Final,
+            EncryptedReasoningPolicy::AcceptOpaque(limits),
+        )
+    }
+
+    fn reasoning_with(enc: Value) -> Value {
+        json!({"type": "reasoning", "id": "rs_1",
+            "summary": [{"type": "summary_text", "text": "S1"}],
+            "content": [{"type": "reasoning_text", "text": "R1"}],
+            "encrypted_content": enc})
+    }
+
+    #[test]
+    fn default_decoder_refuses_every_value_the_stream_policy_accepts() {
+        for enc in [json!(OPAQUE), json!("")] {
+            let body = minimal(json!([reasoning_with(enc)]));
+            decode_opaque(&body, OpaqueReasoningLimits::default()).expect("stream policy accepts");
+            let err = decode(&body).expect_err("non-stream decoder is inert");
+            assert!(err.to_string().contains("cannot be inspected"), "{err}");
+        }
+    }
+
+    #[test]
+    fn accepted_opaque_is_withheld_from_object_text_and_debug() {
+        let body = minimal(json!([
+            msg_item("T1"),
+            reasoning_with(json!(OPAQUE)),
+            reasoning_with(json!("")),
+            reasoning_with(json!(null)),
+            json!({"type": "reasoning", "summary": []}),
+        ]));
+        let decoded = decode_opaque(&body, OpaqueReasoningLimits::default()).unwrap();
+        let continuation = decoded.encrypted_continuation(1).expect("present");
+        assert_eq!(continuation.expose_ciphertext(), OPAQUE);
+        assert_eq!(continuation.len(), OPAQUE.len());
+        // Empty is present with zero bytes; null and missing are absent.
+        assert!(decoded.encrypted_continuation(2).unwrap().is_empty());
+        for index in [0, 3, 4, 5] {
+            assert!(decoded.encrypted_continuation(index).is_none(), "{index}");
+        }
+        // Summary and reasoning_text stay projected exactly as before.
+        assert_eq!(
+            texts(&decoded),
+            vec![
+                (TextSegmentKind::OutputText, "T1", 0),
+                (TextSegmentKind::ReasoningSummary, "S1", 1),
+                (TextSegmentKind::ReasoningContent, "R1", 1),
+                (TextSegmentKind::ReasoningSummary, "S1", 2),
+                (TextSegmentKind::ReasoningContent, "R1", 2),
+                (TextSegmentKind::ReasoningSummary, "S1", 3),
+                (TextSegmentKind::ReasoningContent, "R1", 3),
+            ]
+        );
+        let json = String::from_utf8(decoded.to_json_bytes()).unwrap();
+        let debug = format!("{decoded:?} {continuation:?}");
+        let rewritten = decoded
+            .with_replaced_texts(&vec![String::new(); decoded.texts().len()])
+            .unwrap();
+        for (label, seen) in [("json", &json), ("debug", &debug)] {
+            assert!(!seen.contains(OPAQUE), "{label} leaks opaque: {seen}");
+        }
+        assert!(decoded.texts().iter().all(|t| !t.text().contains(OPAQUE)));
+        assert_eq!(
+            rewritten
+                .encrypted_continuation(1)
+                .map(|c| c.expose_ciphertext()),
+            Some(OPAQUE)
+        );
+    }
+
+    fn msg_item(text: &str) -> Value {
+        json!({"type": "message", "role": "assistant",
+            "content": [{"type": "output_text", "text": text}]})
+    }
+
+    #[test]
+    fn opaque_type_charset_and_field_bound_fail_closed_without_echo() {
+        let limits = OpaqueReasoningLimits {
+            max_field_bytes: 8,
+            max_total_bytes: 64,
+        };
+        let exact = minimal(json!([reasoning_with(json!("AAAAAAA="))]));
+        assert!(decode_opaque(&exact, limits).is_ok(), "exact field bound");
+        for (label, enc, expected) in [
+            ("+1 field", json!("AAAAAAAA="), "field byte limit"),
+            ("space", json!("AA AA"), "unsupported character"),
+            ("dot", json!("AA.A"), "unsupported character"),
+            ("non-ascii", json!("AA\u{e9}"), "unsupported character"),
+            ("newline", json!("AA\nA"), "unsupported character"),
+            ("number", json!(1), "must be a string"),
+            ("bool", json!(true), "must be a string"),
+            ("object", json!({"v": MARKER}), "must be a string"),
+            ("array", json!([MARKER]), "must be a string"),
+        ] {
+            let body = minimal(json!([reasoning_with(enc)]));
+            let result = decode_opaque(&body, limits);
+            let msg = result.as_ref().err().map(ToString::to_string);
+            assert!(
+                msg.as_deref().unwrap_or("").contains(expected),
+                "{label}: {msg:?}"
+            );
+            assert_fails_without_echo(result, label);
+        }
+        // A charset-violating marker never echoes either.
+        let body = minimal(json!([reasoning_with(json!(format!("{MARKER} !")))]));
+        assert_fails_without_echo(decode_opaque(&body, limits), "marker");
+    }
+
+    #[test]
+    fn opaque_aggregate_bound_is_inclusive() {
+        let limits = OpaqueReasoningLimits {
+            max_field_bytes: 8,
+            max_total_bytes: 10,
+        };
+        let body = |second: &str| {
+            minimal(json!([
+                reasoning_with(json!("AAAAAAAA")),
+                reasoning_with(json!("")),
+                reasoning_with(json!(second)),
+            ]))
+        };
+        assert!(
+            decode_opaque(&body("BB"), limits).is_ok(),
+            "exactly the cap"
+        );
+        let err = decode_opaque(&body("BBB"), limits).expect_err("cap + 1");
+        assert!(err.to_string().contains("aggregate byte limit"), "{err}");
+        assert!(!err.to_string().contains("AAAA"));
+    }
+
+    #[test]
+    fn opaque_outside_reasoning_items_still_fails_closed() {
+        let enc = json!("AAAA");
+        let mut message = msg_item("T");
+        message["encrypted_content"] = enc.clone();
+        let mut part = msg_item("T");
+        part["content"][0]["encrypted_content"] = enc.clone();
+        let mut summary = reasoning_with(json!(null));
+        summary["summary"][0]["encrypted_content"] = enc.clone();
+        let call = json!({"type": "function_call", "call_id": "c", "name": "n",
+            "arguments": "{}", "encrypted_content": enc});
+        for (label, item) in [
+            ("message", message),
+            ("message part", part),
+            ("summary part", summary),
+            ("function_call", call),
+        ] {
+            let body = minimal(json!([item]));
+            assert!(
+                decode_opaque(&body, OpaqueReasoningLimits::default()).is_err(),
+                "{label}"
+            );
+        }
+        let mut top = minimal(json!([]));
+        top["encrypted_content"] = json!("AAAA");
+        assert!(decode_opaque(&top, OpaqueReasoningLimits::default()).is_err());
     }
 
     /// Mutation sweep: inject a model-visible-looking field at every object

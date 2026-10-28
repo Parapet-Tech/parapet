@@ -36,6 +36,13 @@
 //     the done string must strictly parse as a JSON object
 //   - function-call `call_id` and `name` agree across added, done (name),
 //     item done, and the terminal snapshot
+// - Bind opaque reasoning `encrypted_content` (OA-R2b1, E-4a..E-4f) without
+//   comparing it: the decoder already restricted it to reasoning items and
+//   checked each occurrence, item identity binds every occurrence to the
+//   item added at its `output_index`, and presence on `output_item.done`
+//   must equal presence on the terminal snapshot item. Values may differ
+//   between snapshots; the terminal value is the continuation authority and
+//   no value is merged, chosen, or rewritten here
 // - Release nothing model-controlled until a terminal event was validated:
 //   [`StreamAssembler::push`] reports structure only, and assembled content
 //   is reachable only through [`StreamAssembler::finish`]
@@ -212,6 +219,10 @@ pub enum StreamStateError {
     ItemDoneArgumentsMismatch,
     #[error("stream: terminal response function call does not equal output_item.done")]
     SnapshotFunctionCallMismatch,
+    #[error(
+        "stream: terminal response encrypted_content presence does not match output_item.done"
+    )]
+    EncryptedPresenceMismatch,
 }
 
 /// One validated, terminal-checked output item. Every exact layer is kept;
@@ -776,7 +787,13 @@ impl<P: JsonParser> ResponsesStreamAssembler<P> {
                     return Err(StreamStateError::SnapshotFunctionCallMismatch);
                 }
             }
+            // Presence only (E-4b); values may rotate (E-4e).
+            if done.has_encrypted_content != response.encrypted_continuation(index).is_some() {
+                return Err(StreamStateError::EncryptedPresenceMismatch);
+            }
         }
+        // Withheld opaque values are bounded by the decoder's aggregate cap,
+        // not counted again here (E-3).
         self.snapshot(response.to_json_bytes().len())
     }
 
@@ -2852,5 +2869,215 @@ mod tests {
         let err = r.unwrap_err();
         assert_eq!(err, E::LimitExceeded(StreamLimit::TextBytes));
         assert_no_echo("limit error", &format!("{err} {err:?} {a:?}"));
+    }
+
+    // -- opaque encrypted_content lifecycle (OA-R2b1) -----------------------
+
+    /// Distinct opaque values per snapshot. `DONE_ENC` and `TERM_ENC` have
+    /// equal length but unequal bytes, as in the stock OpenCode fixture.
+    const ADDED_ENC: &str = "EncAddedAAAA";
+    const DONE_ENC: &str = "EncDoneBBBBBBBB+/==";
+    const TERM_ENC: &str = "EncTermCCCCCCCC-_==";
+
+    fn rs_enc(summary: &[&str], content: &[&str], enc: Option<&str>) -> Value {
+        let mut item = rs("rs_1", summary, content);
+        if let Some(enc) = enc {
+            item["encrypted_content"] = json!(enc);
+        }
+        item
+    }
+
+    /// Reasoning stream with summary "S" and reasoning_text "R", plus a
+    /// trailing message, carrying `encrypted_content` as given on added,
+    /// done, and the terminal snapshot (`None` omits the key).
+    fn encrypted_stream(added: Option<&str>, done: Option<&str>, term: Option<&str>) -> Vec<Value> {
+        let full = rs_enc(&["S"], &["R"], done);
+        vec![
+            created(),
+            item("added", 0, rs_enc(&[], &[], added)),
+            text("reasoning_summary_text", "delta", "rs_1", 0, 0, "S"),
+            text("reasoning_summary_text", "done", "rs_1", 0, 0, "S"),
+            text("reasoning_text", "delta", "rs_1", 0, 0, "R"),
+            text("reasoning_text", "done", "rs_1", 0, 0, "R"),
+            item("done", 0, full),
+            item("added", 1, msg("msg_1", vec![])),
+            part("added", "msg_1", 1, 0, text_part("")),
+            text("output_text", "delta", "msg_1", 1, 0, "T"),
+            text("output_text", "done", "msg_1", 1, 0, "T"),
+            part("done", "msg_1", 1, 0, text_part("T")),
+            item("done", 1, msg("msg_1", vec![text_part("T")])),
+            completed(vec![
+                rs_enc(&["S"], &["R"], term),
+                msg("msg_1", vec![text_part("T")]),
+            ]),
+        ]
+    }
+
+    fn assert_no_opaque(label: &str, text: &str) {
+        for enc in [ADDED_ENC, DONE_ENC, TERM_ENC] {
+            assert!(!text.contains(enc), "{label} leaks opaque bytes: {text}");
+        }
+    }
+
+    #[test]
+    fn rotating_opaque_values_pass_and_terminal_value_is_the_continuation() {
+        assert_eq!(DONE_ENC.len(), TERM_ENC.len());
+        assert_ne!(DONE_ENC, TERM_ENC);
+        let (a, result) = run(encrypted_stream(
+            Some(ADDED_ENC),
+            Some(DONE_ENC),
+            Some(TERM_ENC),
+        ));
+        assert_eq!(result, Ok(Progress::Terminal));
+        assert_no_opaque("assembler", &format!("{a:?}"));
+        let terminal = a.finish().unwrap();
+        assert_no_opaque("terminal", &format!("{terminal:?}"));
+        let Terminal::Completed(stream) = terminal else {
+            panic!("completed")
+        };
+        let item = &stream.items()[0];
+        assert!(item.added().has_encrypted_content && item.done().has_encrypted_content);
+        let continuation = stream.response().encrypted_continuation(0).unwrap();
+        assert_eq!(continuation.expose_ciphertext(), TERM_ENC);
+        assert!(stream.response().encrypted_continuation(1).is_none());
+        // Text equality and projection are unchanged on the same item.
+        let projected: Vec<_> = stream
+            .response()
+            .texts()
+            .iter()
+            .map(|t| (t.kind(), t.text()))
+            .collect();
+        assert_eq!(
+            projected,
+            [
+                (TextSegmentKind::ReasoningSummary, "S"),
+                (TextSegmentKind::ReasoningContent, "R"),
+                (TextSegmentKind::OutputText, "T"),
+            ]
+        );
+        assert_eq!(item.summary_parts()[0].text_done(), "S");
+        assert_eq!(item.content_parts()[0].text_done(), "R");
+        assert_no_opaque(
+            "terminal json",
+            &String::from_utf8(stream.response().to_json_bytes()).unwrap(),
+        );
+    }
+
+    #[test]
+    fn added_presence_is_independent_of_done_and_terminal() {
+        for added in [None, Some(ADDED_ENC), Some("")] {
+            for both in [None, Some(""), Some(DONE_ENC)] {
+                let term = both.map(|d| if d.is_empty() { "" } else { TERM_ENC });
+                let Terminal::Completed(stream) = finish_ok(encrypted_stream(added, both, term))
+                else {
+                    panic!("completed")
+                };
+                assert_eq!(
+                    stream
+                        .response()
+                        .encrypted_continuation(0)
+                        .map(|c| c.expose_ciphertext()),
+                    term,
+                    "{added:?} {both:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn done_and_terminal_presence_must_match() {
+        for (done, term) in [
+            (Some(DONE_ENC), None),
+            (None, Some(TERM_ENC)),
+            (Some(""), None),
+            (None, Some("")),
+        ] {
+            for added in [None, Some(ADDED_ENC)] {
+                let (a, result) = run(encrypted_stream(added, done, term));
+                let err = result.expect_err("presence mismatch");
+                assert_eq!(err, E::EncryptedPresenceMismatch, "{done:?} {term:?}");
+                assert_no_opaque("error", &format!("{err} {err:?} {a:?}"));
+            }
+        }
+        // Terminal null is absent, like a missing key.
+        let mut evs = encrypted_stream(None, Some(DONE_ENC), Some(TERM_ENC));
+        let last = evs.len() - 1;
+        evs[last]["response"]["output"][0]["encrypted_content"] = json!(null);
+        expect_err(evs, E::EncryptedPresenceMismatch);
+    }
+
+    #[test]
+    fn opaque_occurrences_stay_bound_to_their_reasoning_item() {
+        let base = || encrypted_stream(Some(ADDED_ENC), Some(DONE_ENC), Some(TERM_ENC));
+        // Done at another output_index or under another id.
+        let mut evs = base();
+        evs[6]["output_index"] = json!(1);
+        expect_err(evs, E::OutputIndexMismatch);
+        let mut evs = base();
+        evs[6]["item"]["id"] = json!("rs_other");
+        expect_err(evs, E::UnknownItem);
+        // Terminal must name the same item, in the same place.
+        let last = base().len() - 1;
+        let mut evs = base();
+        evs[last]["response"]["output"][0]["id"] = json!("rs_other");
+        expect_err(evs, E::SnapshotIdentityMismatch);
+        let mut evs = base();
+        evs[last]["response"]["output"]
+            .as_array_mut()
+            .unwrap()
+            .swap(0, 1);
+        expect_err(evs, E::SnapshotIdentityMismatch);
+        let mut evs = base();
+        evs[last]["response"]["output"]
+            .as_array_mut()
+            .unwrap()
+            .remove(0);
+        expect_err(evs, E::SnapshotIdentityMismatch);
+        // Moving the opaque value to the message item is refused by the
+        // decoder's closed schema before the assembler sees it.
+        let mut snapshot = completed(vec![
+            rs_enc(&["S"], &["R"], None),
+            msg("msg_1", vec![text_part("T")]),
+        ]);
+        snapshot["response"]["output"][1]["encrypted_content"] = json!(TERM_ENC);
+        snapshot["sequence_number"] = json!(13);
+        let err = OpenAiResponsesStreamDecoder::new()
+            .decode_event(None, snapshot.to_string().as_bytes())
+            .expect_err("message item cannot carry opaque");
+        assert_no_opaque("decode error", &format!("{err} {err:?}"));
+    }
+
+    #[test]
+    fn text_equality_still_binds_reasoning_items_with_opaque() {
+        let base = || encrypted_stream(Some(ADDED_ENC), Some(DONE_ENC), Some(TERM_ENC));
+        let mut evs = base();
+        evs[6]["item"] = rs_enc(&["X"], &["R"], Some(DONE_ENC));
+        expect_err(evs, E::ItemDoneTextMismatch);
+        let mut evs = base();
+        evs[6]["item"] = rs_enc(&["S"], &["X"], Some(DONE_ENC));
+        expect_err(evs, E::ItemDoneTextMismatch);
+        let last = base().len() - 1;
+        let mut evs = base();
+        evs[last]["response"]["output"][0] = rs_enc(&["X"], &["R"], Some(TERM_ENC));
+        expect_err(evs, E::SnapshotTextMismatch);
+        let mut evs = base();
+        evs[last]["response"]["output"][0] = rs_enc(&["S"], &["X"], Some(TERM_ENC));
+        expect_err(evs, E::SnapshotTextMismatch);
+        // Added snapshots still carry no text, opaque or not.
+        let mut evs = base();
+        evs[1]["item"] = rs_enc(&["S"], &[], Some(ADDED_ENC));
+        expect_err(evs, E::ItemAddedTextNotEmpty);
+    }
+
+    #[test]
+    fn terminal_opaque_is_not_counted_as_snapshot_bytes() {
+        // A snapshot bound sized for the text-only stream still accepts large
+        // terminal ciphertext: it is bounded by the decoder's aggregate cap.
+        let probe = |enc: &str| {
+            let (a, result) = run(encrypted_stream(None, Some(enc), Some(enc)));
+            assert_eq!(result, Ok(Progress::Terminal));
+            a.usage.snapshot_bytes
+        };
+        assert_eq!(probe("A"), probe(&"A".repeat(4096)));
     }
 }

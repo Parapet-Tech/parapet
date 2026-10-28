@@ -39,6 +39,7 @@ use super::responses::{
     DecodedResponsesRequest, JsonParseError, JsonParser, OpenAiResponsesDecoder, ScanContentClass,
     StrictJsonParser,
 };
+use super::responses_output::is_opaque_byte;
 use crate::message::Message;
 use serde_json::{Map, Value};
 use std::fmt;
@@ -291,11 +292,6 @@ fn withhold_opaque(
         withheld.push((index, opaque));
     }
     Ok(WithheldOpaque(withheld))
-}
-
-/// Base64 and base64url alphabets plus padding.
-fn is_opaque_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'_' | b'-')
 }
 
 /// Put each withheld string back at the `input` index it was taken from.
