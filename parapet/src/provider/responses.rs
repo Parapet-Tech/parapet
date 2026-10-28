@@ -9,11 +9,18 @@
 // - Extract every human-authored text field from top-level `instructions` and
 //   `input` in stable wire order (instructions first, then input items in
 //   array order, then content parts in array order)
-// - Fail closed on unknown or malformed text-bearing shapes and on request
-//   fields that pull unscannable server-side context into the model
+// - Fail closed on unknown or malformed text-bearing shapes, on request
+//   fields that pull unscannable server-side context into the model, on
+//   `input_file` parts, and on non-empty top-level `tools`
 //
-// Not in scope (Stage 2): response/SSE decoding, output filtering, and
-// tool-call enforcement. The route seam in `proxy` keeps forwarding disabled.
+// Not in scope (Stage 2): response/SSE decoding, output filtering, tool
+// definition and file decoding, and tool-call enforcement. The route seam in
+// `proxy` keeps forwarding disabled.
+//
+// Stage 2 activation condition: decoded messages must pass through the
+// shipped-default `RoleTrustAssigner`, under which every decoded role
+// (instructions/system/developer/user/tool) is Untrusted. See the
+// `shipped_default_trust_marks_decoded_roles_untrusted` regression below.
 
 use super::ProviderError;
 use crate::message::{Message, Role, ToolCall};
@@ -47,9 +54,11 @@ const SERVER_SIDE_CONTEXT_FIELDS: &[&str] = &["previous_response_id", "conversat
 /// - `input[]` `reasoning` -> `Role::Assistant` with summary/content text
 ///
 /// Text parts: `input_text.text`, `output_text.text`, `refusal.refusal`,
-/// `summary_text.text`, `reasoning_text.text`. Image/file parts are validated
-/// but their identifiers, URLs, and base64 payloads are not scanned as text;
+/// `summary_text.text`, `reasoning_text.text`. Image parts are validated but
+/// their identifiers, URLs, and base64 payloads are not scanned as text;
 /// reasoning `encrypted_content` is opaque provider ciphertext and not scanned.
+/// `input_file` parts and non-empty top-level `tools` fail closed because the
+/// upstream model would see content Parapet cannot inspect.
 pub struct OpenAiResponsesDecoder;
 
 impl OpenAiResponsesDecoder {
@@ -90,6 +99,19 @@ impl RequestDecoder for OpenAiResponsesDecoder {
                 }
             }
             Some(_) => return Err(invalid("instructions must be a string or null")),
+        }
+
+        // Tool and namespace descriptions and JSON Schema `description` fields
+        // are model-visible. Until they are recursively decoded and scanned,
+        // only absent/null/empty `tools` is accepted.
+        match root.get("tools") {
+            None | Some(Value::Null) => {}
+            Some(Value::Array(tools)) if tools.is_empty() => {}
+            Some(_) => {
+                return Err(invalid(
+                    "tools definitions cannot be inspected; only absent, null, or empty tools is supported",
+                ))
+            }
         }
 
         match root.get("input") {
@@ -279,15 +301,12 @@ fn decode_parts(parts: &[Value], at: &str) -> Result<String, ProviderError> {
                     optional_string(obj, key, &at)?;
                 }
             }
+            // File contents (inline, by URL, or by uploaded id) reach the
+            // model but are not decoded here; refuse rather than drop.
             "input_file" => {
-                allow_keys(
-                    obj,
-                    &["type", "file_id", "file_data", "file_url", "filename"],
-                    &at,
-                )?;
-                for key in ["file_id", "file_data", "file_url", "filename"] {
-                    optional_string(obj, key, &at)?;
-                }
+                return Err(invalid(format!(
+                    "{at} input_file content cannot be inspected"
+                )))
             }
             other => {
                 return Err(invalid(format!(
@@ -526,14 +545,12 @@ mod tests {
     }
 
     #[test]
-    fn image_and_file_identifiers_are_not_scanned_as_text() {
+    fn image_identifiers_and_ciphertext_are_not_scanned_as_text() {
         let msgs = decode(json!({
             "input": [
                 {"type": "message", "role": "user", "content": [
                     {"type": "input_image", "image_url": format!("data:image/png;base64,{INJECTION}"),
-                     "file_id": INJECTION, "detail": "high"},
-                    {"type": "input_file", "file_id": INJECTION, "file_data": INJECTION,
-                     "file_url": INJECTION, "filename": INJECTION}
+                     "file_id": INJECTION, "detail": "high"}
                 ]},
                 {"type": "reasoning", "summary": [], "encrypted_content": INJECTION}
             ]
@@ -664,10 +681,6 @@ mod tests {
                 json!({"input": [{"role": "user", "content": [{"type": "input_image", "text": "x"}]}]}),
             ),
             (
-                "input_file extra key",
-                json!({"input": [{"role": "user", "content": [{"type": "input_file", "file_id": "f", "text": "x"}]}]}),
-            ),
-            (
                 "function_call missing call_id",
                 json!({"input": [{"type": "function_call", "name": "f", "arguments": "{}"}]}),
             ),
@@ -731,6 +744,143 @@ mod tests {
 
         for (label, body) in cases {
             assert!(decode(body).is_err(), "{label}: expected fail-closed error");
+        }
+    }
+
+    fn user_parts(part: Value) -> Value {
+        json!({"input": [{"type": "message", "role": "user", "content": [part]}]})
+    }
+
+    #[test]
+    fn every_input_file_form_fails_closed_without_echo() {
+        let b64 = format!("data:application/pdf;base64,{INJECTION}");
+        let cases: Vec<(&str, Value)> = vec![
+            (
+                "file_data with injection",
+                json!({"type": "input_file", "filename": "a.txt", "file_data": INJECTION}),
+            ),
+            (
+                "file_data base64 data url",
+                json!({"type": "input_file", "filename": "a.pdf", "file_data": b64}),
+            ),
+            (
+                "file_url",
+                json!({"type": "input_file", "file_url": format!("https://x.invalid/{INJECTION}")}),
+            ),
+            (
+                "file_id",
+                json!({"type": "input_file", "file_id": INJECTION}),
+            ),
+            (
+                "filename only",
+                json!({"type": "input_file", "filename": INJECTION}),
+            ),
+            ("bare input_file", json!({"type": "input_file"})),
+        ];
+        for (label, part) in cases {
+            let err = decode(user_parts(part.clone()))
+                .expect_err(label)
+                .to_string();
+            assert!(!err.contains(INJECTION), "{label}: {err}");
+            // Same refusal inside a function_call_output part array.
+            let err = decode(json!({"input": [{"type": "function_call_output",
+                "call_id": "c", "output": [part]}]}))
+            .expect_err(label)
+            .to_string();
+            assert!(!err.contains(INJECTION), "{label} (tool output): {err}");
+        }
+    }
+
+    #[test]
+    fn absent_null_and_empty_tools_are_accepted() {
+        for body in [
+            json!({"input": "hi"}),
+            json!({"input": "hi", "tools": null}),
+            json!({"input": "hi", "tools": []}),
+        ] {
+            assert_eq!(decode(body).unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn non_empty_tools_fail_closed_without_echo() {
+        let cases: Vec<(&str, Value)> = vec![
+            (
+                "function description",
+                json!([{"type": "function", "name": "f", "description": INJECTION,
+                    "parameters": {"type": "object", "properties": {}}}]),
+            ),
+            (
+                "function parameter description",
+                json!([{"type": "function", "name": "f",
+                    "parameters": {"type": "object", "properties": {
+                        "path": {"type": "string", "description": INJECTION}}}}]),
+            ),
+            (
+                "namespace description",
+                json!([{"type": "namespace", "name": "ns", "description": INJECTION,
+                    "tools": []}]),
+            ),
+            (
+                "custom tool description",
+                json!([{"type": "custom", "name": "c", "description": INJECTION}]),
+            ),
+            (
+                "benign function",
+                json!([{"type": "function", "name": "f"}]),
+            ),
+            ("tools object", json!({"type": "function", "name": "f"})),
+            ("tools string", json!(INJECTION)),
+        ];
+        for (label, tools) in cases {
+            let err = decode(json!({"input": "hi", "tools": tools}))
+                .expect_err(label)
+                .to_string();
+            assert!(!err.contains(INJECTION), "{label}: {err}");
+        }
+    }
+
+    /// Stage 2 activation condition: the Responses route must run the
+    /// shipped-default `RoleTrustAssigner`, which marks every decoded role
+    /// Untrusted. This pins that outcome without wiring the route.
+    #[test]
+    fn shipped_default_trust_marks_decoded_roles_untrusted() {
+        use crate::config::{load_config, StringSource};
+        use crate::trust::{RoleTrustAssigner, TrustAssigner};
+
+        let config = load_config(&StringSource {
+            content: "parapet: v1\n".to_string(),
+        })
+        .unwrap();
+        let mut msgs = decode(json!({
+            "instructions": "i",
+            "input": [
+                {"role": "system", "content": "s"},
+                {"role": "developer", "content": "d"},
+                {"role": "user", "content": "u"},
+                {"type": "function_call_output", "call_id": "c", "output": "t"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            msgs.iter().map(|m| m.role.clone()).collect::<Vec<_>>(),
+            vec![
+                Role::System,
+                Role::System,
+                Role::System,
+                Role::User,
+                Role::Tool
+            ]
+        );
+        RoleTrustAssigner.assign_trust(&mut msgs, &config);
+        for m in &msgs {
+            assert_eq!(
+                m.trust,
+                TrustLevel::Untrusted,
+                "{:?}: {}",
+                m.role,
+                m.content
+            );
         }
     }
 
