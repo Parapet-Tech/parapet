@@ -18,8 +18,9 @@
 // - Reject duplicate JSON object keys at any depth, in the body and in
 //   function_call `arguments`, before any value is used (Stage 2B1)
 //
-// Not in scope: response/SSE decoding, output filtering, and tool-call
-// enforcement. The route seam in `proxy` keeps forwarding disabled.
+// Not in scope: SSE decoding, output filtering, and tool-call enforcement.
+// Non-stream response decoding lives in `responses_output` (Stage 2B2).
+// The route seam in `proxy` keeps forwarding disabled.
 //
 // Activation condition: decoded messages, including tool-definition
 // projections, must pass through the shipped-default `RoleTrustAssigner`,
@@ -227,7 +228,7 @@ fn validate_control_fields(root: &Map<String, Value>) -> Result<(), ProviderErro
 
 /// `metadata` is a flat string-to-string map stored with the response and
 /// not shown to the model.
-fn validate_metadata(value: &Value) -> Result<(), ProviderError> {
+pub(super) fn validate_metadata(value: &Value) -> Result<(), ProviderError> {
     if let Some(obj) = nullable_object(value, "metadata")? {
         if !obj.values().all(Value::is_string) {
             return Err(invalid("metadata values must be strings"));
@@ -259,7 +260,7 @@ fn validate_include(value: &Value) -> Result<(), ProviderError> {
     }
 }
 
-fn validate_reasoning_config(value: &Value) -> Result<(), ProviderError> {
+pub(super) fn validate_reasoning_config(value: &Value) -> Result<(), ProviderError> {
     let Some(obj) = nullable_object(value, "reasoning")? else {
         return Ok(());
     };
@@ -281,7 +282,7 @@ fn validate_reasoning_config(value: &Value) -> Result<(), ProviderError> {
 
 /// Only plain-text and JSON-object output formats are accepted. A
 /// `json_schema` format carries a model-visible schema that is not decoded.
-fn validate_text_config(value: &Value) -> Result<(), ProviderError> {
+pub(super) fn validate_text_config(value: &Value) -> Result<(), ProviderError> {
     let Some(obj) = nullable_object(value, "text")? else {
         return Ok(());
     };
@@ -310,7 +311,10 @@ fn validate_text_config(value: &Value) -> Result<(), ProviderError> {
 /// Validate one function tool and project the whole definition into a
 /// `Role::System` message as compact JSON, so every model-visible byte (name,
 /// description, schema keys, and nested schema strings) is scanned.
-fn decode_function_tool(tool: &Value, at: &str) -> Result<(String, Message), ProviderError> {
+pub(super) fn decode_function_tool(
+    tool: &Value,
+    at: &str,
+) -> Result<(String, Message), ProviderError> {
     let obj = tool
         .as_object()
         .ok_or_else(|| invalid(format!("{at} must be an object")))?;
@@ -347,7 +351,10 @@ fn decode_function_tool(tool: &Value, at: &str) -> Result<(String, Message), Pro
 
 /// `tool_choice` may only name a mode or a function already declared in
 /// `tools`, so it cannot introduce unscanned model-visible text.
-fn validate_tool_choice(value: Option<&Value>, tool_names: &[String]) -> Result<(), ProviderError> {
+pub(super) fn validate_tool_choice(
+    value: Option<&Value>,
+    tool_names: &[String],
+) -> Result<(), ProviderError> {
     match value {
         None | Some(Value::Null) => Ok(()),
         Some(v @ Value::String(_)) => enum_value(v, &["none", "auto", "required"], "tool_choice"),
@@ -428,19 +435,7 @@ fn decode_function_call(
     optional_string(obj, "status", at)?;
     let call_id = required_string(obj, "call_id", at)?.to_string();
     let name = required_string(obj, "name", at)?.to_string();
-    let raw_arguments = required_string(obj, "arguments", at)?;
-    let arguments = if raw_arguments.is_empty() {
-        serde_json::json!({})
-    } else {
-        parser
-            .parse(raw_arguments.as_bytes())
-            .map_err(|e| match e {
-                JsonParseError::Syntax(_) => invalid(format!("{at}.arguments is not valid JSON")),
-                JsonParseError::DuplicateKey => invalid(format!(
-                    "{at}.arguments contains a duplicate object key"
-                )),
-            })?
-    };
+    let arguments = parse_arguments(parser, required_string(obj, "arguments", at)?, at)?;
 
     let mut msg = Message::new(Role::Assistant, String::new());
     msg.tool_calls.push(ToolCall {
@@ -449,6 +444,23 @@ fn decode_function_call(
         arguments,
     });
     Ok(msg)
+}
+
+/// Parse a function_call `arguments` string through `parser`; `""` is `{}`.
+pub(super) fn parse_arguments(
+    parser: &dyn JsonParser,
+    raw: &str,
+    at: &str,
+) -> Result<Value, ProviderError> {
+    if raw.is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    parser.parse(raw.as_bytes()).map_err(|e| match e {
+        JsonParseError::Syntax(_) => invalid(format!("{at}.arguments is not valid JSON")),
+        JsonParseError::DuplicateKey => {
+            invalid(format!("{at}.arguments contains a duplicate object key"))
+        }
+    })
 }
 
 fn decode_function_call_output(
@@ -713,11 +725,16 @@ impl<'de> serde::de::Visitor<'de> for StrictValueSeed<'_> {
 // request keys or values.
 // ---------------------------------------------------------------------------
 
-fn invalid(msg: impl Into<String>) -> ProviderError {
+pub(super) fn invalid(msg: impl Into<String>) -> ProviderError {
     ProviderError::InvalidFormat(msg.into())
 }
 
-fn allow_keys(obj: &Map<String, Value>, allowed: &[&str], at: &str) -> Result<(), ProviderError> {
+pub(super) fn allow_keys(
+    obj: &Map<String,
+    Value>,
+    allowed: &[&str],
+    at: &str,
+) -> Result<(), ProviderError> {
     if obj.keys().all(|k| allowed.contains(&k.as_str())) {
         Ok(())
     } else {
@@ -725,7 +742,7 @@ fn allow_keys(obj: &Map<String, Value>, allowed: &[&str], at: &str) -> Result<()
     }
 }
 
-fn required_string<'a>(
+pub(super) fn required_string<'a>(
     obj: &'a Map<String, Value>,
     key: &str,
     at: &str,
@@ -737,25 +754,30 @@ fn required_string<'a>(
     }
 }
 
-fn optional_string(obj: &Map<String, Value>, key: &str, at: &str) -> Result<(), ProviderError> {
+pub(super) fn optional_string(
+    obj: &Map<String,
+    Value>,
+    key: &str,
+    at: &str,
+) -> Result<(), ProviderError> {
     nullable_string(obj.get(key).unwrap_or(&Value::Null), &format!("{at}.{key}"))
 }
 
-fn nullable_string(value: &Value, at: &str) -> Result<(), ProviderError> {
+pub(super) fn nullable_string(value: &Value, at: &str) -> Result<(), ProviderError> {
     match value {
         Value::Null | Value::String(_) => Ok(()),
         _ => Err(invalid(format!("{at} must be a string or null"))),
     }
 }
 
-fn nullable_bool(value: &Value, at: &str) -> Result<(), ProviderError> {
+pub(super) fn nullable_bool(value: &Value, at: &str) -> Result<(), ProviderError> {
     match value {
         Value::Null | Value::Bool(_) => Ok(()),
         _ => Err(invalid(format!("{at} must be a boolean or null"))),
     }
 }
 
-fn nullable_object<'a>(
+pub(super) fn nullable_object<'a>(
     value: &'a Value,
     at: &str,
 ) -> Result<Option<&'a Map<String, Value>>, ProviderError> {
@@ -766,14 +788,18 @@ fn nullable_object<'a>(
     }
 }
 
-fn enum_value(value: &Value, allowed: &[&str], at: &str) -> Result<(), ProviderError> {
+pub(super) fn enum_value(value: &Value, allowed: &[&str], at: &str) -> Result<(), ProviderError> {
     match value {
         Value::String(s) if allowed.contains(&s.as_str()) => Ok(()),
         _ => Err(invalid(format!("{at} is not a supported value"))),
     }
 }
 
-fn nullable_enum(value: &Value, allowed: &[&str], at: &str) -> Result<(), ProviderError> {
+pub(super) fn nullable_enum(
+    value: &Value,
+    allowed: &[&str],
+    at: &str,
+) -> Result<(), ProviderError> {
     if value.is_null() {
         Ok(())
     } else {
@@ -781,7 +807,7 @@ fn nullable_enum(value: &Value, allowed: &[&str], at: &str) -> Result<(), Provid
     }
 }
 
-fn empty_array_or_absent(
+pub(super) fn empty_array_or_absent(
     obj: &Map<String, Value>,
     key: &str,
     at: &str,
