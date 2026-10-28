@@ -38,6 +38,7 @@ use crate::normalize::{
     normalize_messages_dual_view, L0DualScanView, L0Normalizer, L0ScanViews, Normalizer,
 };
 use crate::provider::responses::{OpenAiResponsesDecoder, ScanContentClass};
+use crate::provider::responses_request::{StreamRequestPreparer, UpstreamAcceptEncoding};
 #[cfg(test)]
 use crate::provider::responses::RequestDecoder;
 use crate::provider::{adapter_for, ProviderAdapter, ProviderType};
@@ -73,6 +74,9 @@ mod responses_stream_exec;
 pub use projected::{
     derive_projected_views, scan_projected_l3, L0ViewDeriver, L1ViewScorer, ProjectedEngineStage,
     ProjectedL3Block, ProjectedL3Match, ProjectedL3Result, ProjectedL3Source,
+};
+use responses_stream_exec::{
+    HttpSenderUpstream, ResponsesStreamExecutor, ResponsesStreamOutcome, StreamPolicy,
 };
 
 // ---------------------------------------------------------------------------
@@ -394,6 +398,10 @@ pub const MAX_RETAINED_CARRIER_RECEIPTS: usize = 64;
 /// Upstream client that runs the full Parapet pipeline.
 pub struct EngineUpstreamClient {
     deps: EngineDeps,
+    /// The one Responses stream executor for every request on this client,
+    /// built once from the same loaded config's stream settings that its
+    /// policy reads; its semaphore is the client-wide stream cap.
+    stream_executor: ResponsesStreamExecutor,
     /// Opt-in effect-receipt runtime envelope; `None` unless explicitly attached.
     #[cfg(not(windows))]
     envelope: Option<Arc<RuntimeEnvelopeV0>>,
@@ -408,14 +416,11 @@ impl EngineUpstreamClient {
     pub const MAX_RETAINED_CARRIER_RECEIPTS: usize = MAX_RETAINED_CARRIER_RECEIPTS;
 
     pub fn new_with(deps: EngineDeps) -> Self {
-        Self {
+        Self::from_parts(
             deps,
             #[cfg(not(windows))]
-            envelope: None,
-            carrier_receipts: std::sync::Mutex::new(std::collections::VecDeque::with_capacity(
-                MAX_RETAINED_CARRIER_RECEIPTS,
-            )),
-        }
+            None,
+        )
     }
 
     /// Additive constructor: attach the runtime envelope (Routing contract
@@ -423,9 +428,19 @@ impl EngineUpstreamClient {
     /// envelope's executor binding is whatever it was constructed with.
     #[cfg(not(windows))]
     pub fn new_with_envelope(deps: EngineDeps, envelope: Arc<RuntimeEnvelopeV0>) -> Self {
+        Self::from_parts(deps, Some(envelope))
+    }
+
+    fn from_parts(
+        deps: EngineDeps,
+        #[cfg(not(windows))] envelope: Option<Arc<RuntimeEnvelopeV0>>,
+    ) -> Self {
+        let stream_executor = ResponsesStreamExecutor::new(deps.config.runtime.responses_stream);
         Self {
             deps,
-            envelope: Some(envelope),
+            stream_executor,
+            #[cfg(not(windows))]
+            envelope,
             carrier_receipts: std::sync::Mutex::new(std::collections::VecDeque::with_capacity(
                 MAX_RETAINED_CARRIER_RECEIPTS,
             )),
@@ -794,10 +809,18 @@ impl EngineUpstreamClient {
         basis: InboundBasis<'_>,
         mut projected_receipt: Option<&mut ProjectedReceiptEmitter<'_>>,
     ) -> Result<ProxyResponse, ProxyError> {
+        // The Responses stream wall-clock budget runs from request receipt.
+        let received_at = tokio::time::Instant::now();
         let mut projected_tracker = projected_receipt.as_deref_mut().map(|e| &mut e.tracker);
         let adapter = self.deps.registry.adapter_for(provider);
         let responses_wire = provider == Provider::OpenAi
             && matches!(request.uri.path(), "/v1/responses" | "/responses");
+        let stream = is_streaming_request(&request.headers, &request.body);
+        // Ordinary-basis Responses streams take the strict preparer and the
+        // shared full-buffer executor. A verified carrier never binds a
+        // Responses route; that basis keeps its fixed 501 below.
+        let live_responses_stream =
+            responses_wire && stream && matches!(basis, InboundBasis::WholeMessage);
 
         // Build request context for structured logging
         let model = extract_model(&request.body);
@@ -859,15 +882,40 @@ impl EngineUpstreamClient {
         }
 
         // 1) Parse request into messages
-        let decoded_messages = if responses_wire {
+        //
+        // A live Responses stream is decoded once, by the strict preparer: its
+        // messages (opaque `encrypted_content` withheld) are the scan basis,
+        // and only its canonical body is ever forwarded.
+        let mut prepared_stream: Option<(Bytes, UpstreamAcceptEncoding)> = None;
+        let decoded_messages = if live_responses_stream {
+            match self
+                .deps
+                .config
+                .runtime
+                .responses_stream
+                .request_preparer()
+                .prepare(&request.body)
+            {
+                Ok(prepared) => {
+                    let (decoded, upstream_body, accept_encoding) = prepared.into_parts();
+                    prepared_stream = Some((Bytes::from(upstream_body), accept_encoding));
+                    Ok((decoded.messages, decoded.scan_classes))
+                }
+                Err(_) => Err(()),
+            }
+        } else if responses_wire {
             OpenAiResponsesDecoder::new()
                 .decode_request_with_classes(&request.body)
                 .map(|decoded| (decoded.messages, decoded.scan_classes))
+                .map_err(|_| ())
         } else {
-            adapter.parse_request(&request.body).map(|messages| {
-                let scan_classes = vec![ScanContentClass::Conversation; messages.len()];
-                (messages, scan_classes)
-            })
+            adapter
+                .parse_request(&request.body)
+                .map(|messages| {
+                    let scan_classes = vec![ScanContentClass::Conversation; messages.len()];
+                    (messages, scan_classes)
+                })
+                .map_err(|_| ())
         };
         let (mut messages, scan_classes) = match decoded_messages {
             Ok(decoded) => decoded,
@@ -1815,7 +1863,30 @@ impl EngineUpstreamClient {
         }
 
         // 6) Forward to upstream
-        let stream = is_streaming_request(&request.headers, &request.body);
+        if let Some((upstream_body, accept_encoding)) = prepared_stream {
+            let mut resp = self
+                .forward_responses_stream(
+                    provider,
+                    &request,
+                    upstream_body,
+                    accept_encoding,
+                    received_at,
+                    adapter.as_ref(),
+                    &ctx,
+                )
+                .await;
+            attach_evidence_headers(&mut resp.headers, evidence_count, &evidence_categories);
+            if self.deps.emit_l1_signals {
+                attach_l1_signal_headers(&mut resp.headers, &l1_signals_opt);
+            }
+            attach_l2a_score_headers(
+                &mut resp.headers,
+                l2a_has_scores,
+                l2a_max_fused,
+                l2a_max_raw,
+            );
+            return Ok(resp);
+        }
         if responses_wire && stream {
             return Ok(responses_error_response(
                 adapter.as_ref(),
@@ -1957,6 +2028,197 @@ impl EngineUpstreamClient {
             headers: resp_headers,
             body: Body::from(processed.body),
         })
+    }
+}
+
+impl EngineUpstreamClient {
+    /// Forward one inbound-allowed ordinary Responses stream through the
+    /// shared full-buffer executor and map its outcome to a fixed local
+    /// response.
+    ///
+    /// Nothing reaches the client until the executor returns: either the
+    /// exact canonical SSE bytes after the whole stream passed policy, or a
+    /// fixed content-free refusal. Upstream headers, status, body, and
+    /// transport errors are never echoed or logged. A resolver refusal or a
+    /// subscription target mismatch returns before the sender is built, and
+    /// the executor calls it only after admission. Nothing is spawned;
+    /// dropping this future cancels the upstream request and frees its slot.
+    ///
+    /// N-R4b1-2 remains open: the max-size release benchmark of the
+    /// synchronous collector/policy tail against the 300 s client timeout
+    /// minus `wall_clock` has not been run, so R4b2 is not closed.
+    #[allow(clippy::too_many_arguments)]
+    async fn forward_responses_stream(
+        &self,
+        provider: Provider,
+        request: &ProxyRequest,
+        upstream_body: Bytes,
+        accept_encoding: UpstreamAcceptEncoding,
+        received_at: tokio::time::Instant,
+        adapter: &dyn ProviderAdapter,
+        ctx: &RequestContext,
+    ) -> ProxyResponse {
+        let url = match build_upstream_url(self.deps.resolver.as_ref(), provider, request) {
+            Ok(url) => url,
+            Err(refusal) => {
+                return upstream_refusal_response(adapter, self.deps.resolver.as_ref(), refusal);
+            }
+        };
+        if has_chatgpt_subscription_headers(&request.headers) && url != CHATGPT_CODEX_RESPONSES_URL
+        {
+            tracing::warn!(
+                request_id = %ctx.request_id,
+                layer = "responses_stream",
+                rule = "subscription_target_mismatch",
+                "Responses stream refused before upstream"
+            );
+            return responses_error_response(
+                adapter,
+                StatusCode::BAD_GATEWAY,
+                "responses_subscription_target_refused",
+                "upstream target is not permitted for this request",
+            );
+        }
+
+        let http_req = HttpRequest {
+            method: request.method.clone(),
+            url,
+            headers: responses_stream_upstream_headers(&request.headers, accept_encoding),
+            body: upstream_body,
+            timeout_ms: self.deps.config.runtime.engine.timeout_ms,
+            stream: true,
+        };
+        let upstream = HttpSenderUpstream::new(Arc::clone(&self.deps.http), http_req);
+        let policy = StreamPolicy {
+            config: &self.deps.config,
+            evaluator: self.deps.constraint_evaluator.as_ref(),
+            scanner: self.deps.output_scanner.as_ref(),
+        };
+        let outcome = self
+            .stream_executor
+            .execute(received_at, upstream, policy)
+            .await;
+        // `Debug` of an outcome is a fixed name or a byte count only.
+        tracing::info!(
+            request_id = %ctx.request_id,
+            layer = "responses_stream",
+            outcome = ?outcome,
+            "Responses stream complete"
+        );
+        responses_stream_outcome_response(adapter, outcome)
+    }
+}
+/// Headers that mark a ChatGPT subscription (Codex) request. Their values are
+/// credentials or account bindings: forwarded byte-for-byte, never logged.
+const CHATGPT_SUBSCRIPTION_HEADERS: [&str; 4] = [
+    "chatgpt-account-id",
+    "originator",
+    "session-id",
+    "x-codex-beta-features",
+];
+
+/// The only upstream a subscription-marked Responses stream may reach.
+const CHATGPT_CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
+
+fn has_chatgpt_subscription_headers(headers: &HeaderMap) -> bool {
+    CHATGPT_SUBSCRIPTION_HEADERS
+        .iter()
+        .any(|name| headers.contains_key(*name))
+}
+
+/// Client headers as sent upstream for a prepared Responses stream.
+///
+/// Every client header is kept byte-for-byte (including `Authorization` and
+/// the subscription headers) except: internal routing, provenance, and
+/// guard-trust headers; `Host`, which the sender derives from the URL; the
+/// framing headers, stale for the canonical body; and `Accept-Encoding`,
+/// replaced by the preparer's required encoding.
+fn responses_stream_upstream_headers(
+    client: &HeaderMap,
+    accept_encoding: UpstreamAcceptEncoding,
+) -> HeaderMap {
+    let mut headers = client.clone();
+    headers.remove("x-parapet-original-host");
+    headers.remove(crate::provenance::PROVENANCE_HEADER);
+    crate::proxy::strip_guard_trust_headers(&mut headers);
+    headers.remove(reqwest::header::HOST);
+    headers.remove(reqwest::header::CONTENT_LENGTH);
+    headers.remove(reqwest::header::TRANSFER_ENCODING);
+    headers.insert(
+        reqwest::header::ACCEPT_ENCODING,
+        HeaderValue::from_static(accept_encoding.header_value()),
+    );
+    headers
+}
+
+/// Fixed local response for each stream outcome. Only `Release` carries
+/// bytes, and those are the executor's canonical SSE bytes unchanged.
+fn responses_stream_outcome_response(
+    adapter: &dyn ProviderAdapter,
+    outcome: ResponsesStreamOutcome,
+) -> ProxyResponse {
+    use ResponsesStreamOutcome as O;
+    let (status, code, layer) = match outcome {
+        O::Release(bytes) => {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                reqwest::header::CONTENT_TYPE,
+                HeaderValue::from_static("text/event-stream"),
+            );
+            return ProxyResponse {
+                status: StatusCode::OK,
+                headers,
+                body: Body::from(bytes),
+            };
+        }
+        O::ConfigMismatch => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "responses_stream_config_mismatch",
+            None,
+        ),
+        O::LayerFailure => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "output_policy_failure",
+            None,
+        ),
+        O::ConcurrencyLimit => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "responses_stream_concurrency_limit",
+            None,
+        ),
+        O::WallClockTimeout => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "responses_stream_wall_clock_timeout",
+            None,
+        ),
+        O::IdleTimeout => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "responses_stream_idle_timeout",
+            None,
+        ),
+        O::UpstreamStatus => (StatusCode::BAD_GATEWAY, "upstream_status_rejected", None),
+        O::UpstreamUnavailable => (StatusCode::BAD_GATEWAY, "upstream_unavailable", None),
+        O::Truncated => (StatusCode::BAD_GATEWAY, "upstream_stream_truncated", None),
+        O::UpstreamFailed => (StatusCode::BAD_GATEWAY, "upstream_response_failed", None),
+        O::InvalidStream => (StatusCode::BAD_GATEWAY, "invalid_upstream_stream", None),
+        O::BlockedByL3Outbound => (
+            StatusCode::FORBIDDEN,
+            "content_policy_block",
+            Some("L3-outbound"),
+        ),
+        O::BlockedByL5a => (StatusCode::FORBIDDEN, "content_policy_block", Some("L5a")),
+    };
+    let message = match status {
+        StatusCode::FORBIDDEN => "request blocked by content policy",
+        StatusCode::SERVICE_UNAVAILABLE => "service unavailable (guardrail layer error)",
+        StatusCode::TOO_MANY_REQUESTS => "too many concurrent Responses streams",
+        StatusCode::GATEWAY_TIMEOUT => "Responses stream timed out",
+        _ => "upstream stream rejected",
+    };
+    ProxyResponse {
+        status,
+        headers: responses_error_headers(code, layer),
+        body: Body::from(adapter.serialize_error(message, status.as_u16())),
     }
 }
 

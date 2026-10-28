@@ -7,8 +7,9 @@
 //! instead of reusing the Chat Completions handler, whose legacy parse failures
 //! pass the upstream body through unchanged.
 //!
-//! The streaming bridge (D-0027 OA-R3) is inert: nothing outside tests calls
-//! it yet. It judges one completed [`CollectedStream`] as a whole and either
+//! The streaming bridge (D-0027 OA-R3) is called only by the R4b1 stream
+//! executor, which the engine's ordinary Responses stream route drives. It
+//! judges one completed [`CollectedStream`] as a whole and either
 //! releases its exact canonical SSE bytes or refuses with a fixed decision.
 //! It never rewrites, re-serializes, or partially releases a stream.
 
@@ -1160,7 +1161,7 @@ mod tests {
         }
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let this = src.join("engine").join("responses.rs");
-        // The R4b1 executor is the bridge's only caller; it is itself inert.
+        // The R4b1 executor is the bridge's only caller.
         let executor = src.join("engine").join("responses_stream_exec.rs");
         let mut files = Vec::new();
         rust_files(&src, &mut files);

@@ -31,9 +31,9 @@
 // redacted to counts and limits.
 //
 // Not in scope: response-side encrypted handling, route/proxy activation,
-// trust, credentials, and provider-host inference. This module is an inert
-// seam; nothing calls it on live traffic, and the live decoder still refuses
-// every non-null `encrypted_content`.
+// trust, credentials, and provider-host inference. The engine's ordinary
+// Responses stream route (D-0027 OA-R4b2a) is the only live caller; the
+// plain live decoder still refuses every non-null `encrypted_content`.
 
 use super::responses::{
     DecodedResponsesRequest, JsonParseError, JsonParser, OpenAiResponsesDecoder, ScanContentClass,

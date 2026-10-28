@@ -14,8 +14,11 @@
 //! future drops the upstream open future or chunk stream and the admission
 //! permit.
 //!
-//! Inert: nothing outside this module and its tests calls it yet.
+//! Live caller (D-0027 OA-R4b2a): `EngineUpstreamClient` owns one shared
+//! executor and drives it for ordinary exact-route Responses streams through
+//! [`HttpSenderUpstream`]. No other production code calls it.
 
+use super::{HttpBody, HttpRequest, HttpSender};
 use crate::config::{Config, ResponsesStreamConfig};
 use crate::constraint::ConstraintEvaluator;
 use crate::layers::l5a::OutputScanner;
@@ -56,6 +59,46 @@ pub(super) trait ResponsesStreamUpstream: Send {
     fn open(self) -> BoxFuture<'static, Result<UpstreamResponse, UpstreamFault>>;
 }
 
+/// One-shot [`ResponsesStreamUpstream`] over the engine's injected
+/// [`HttpSender`] and one prepared request.
+///
+/// The sender is called at most once, and only when the executor opens this
+/// upstream after admission. Every transport or body error becomes the unit
+/// [`UpstreamFault`]; upstream headers are dropped unread, so only the status
+/// and body bytes reach the executor. No task is started: dropping the open
+/// future or the body stream cancels the request.
+pub(super) struct HttpSenderUpstream {
+    http: Arc<dyn HttpSender>,
+    request: HttpRequest,
+}
+
+impl HttpSenderUpstream {
+    pub(super) fn new(http: Arc<dyn HttpSender>, request: HttpRequest) -> Self {
+        Self { http, request }
+    }
+}
+
+impl ResponsesStreamUpstream for HttpSenderUpstream {
+    fn open(self) -> BoxFuture<'static, Result<UpstreamResponse, UpstreamFault>> {
+        let Self { http, request } = self;
+        Box::pin(async move {
+            let response = http.send(request).await.map_err(|_| UpstreamFault)?;
+            let body = match response.body {
+                HttpBody::Full(bytes) => {
+                    futures_util::stream::once(async move { Ok(bytes) }).boxed()
+                }
+                HttpBody::Stream(chunks) => {
+                    chunks.map(|chunk| chunk.map_err(|_| UpstreamFault)).boxed()
+                }
+            };
+            Ok(UpstreamResponse {
+                status: response.status,
+                body,
+            })
+        })
+    }
+}
+
 /// Output policy inputs for the streaming bridge.
 #[derive(Clone, Copy)]
 pub(super) struct StreamPolicy<'a> {
@@ -69,7 +112,6 @@ pub(super) struct StreamPolicy<'a> {
 /// Only `Release` carries bytes: the canonical SSE stream, unchanged. `Debug`
 /// shows its byte count only.
 #[derive(Clone, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) enum ResponsesStreamOutcome {
     Release(Bytes),
     /// The executor's stream bounds differ from the policy config's
@@ -147,19 +189,23 @@ impl From<ResponsesStreamDecision> for ResponsesStreamOutcome {
 
 /// Concurrency gate plus the full-buffer stream pipeline. One instance is
 /// shared by every stream on a route; its semaphore is the stream cap.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct ResponsesStreamExecutor {
     config: ResponsesStreamConfig,
     slots: Arc<Semaphore>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl ResponsesStreamExecutor {
     pub(super) fn new(config: ResponsesStreamConfig) -> Self {
         Self {
             config,
             slots: Arc::new(Semaphore::new(config.concurrent_streams())),
         }
+    }
+
+    /// Free stream slots, for tests that prove the cap is shared and released.
+    #[cfg(test)]
+    pub(super) fn available_permits(&self) -> usize {
+        self.slots.available_permits()
     }
 
     /// Run one stream to a final outcome.
@@ -173,11 +219,13 @@ impl ResponsesStreamExecutor {
     ///
     /// Collector finish and policy run synchronously on the polling runtime
     /// worker and cannot be preempted; a result that completes past the
-    /// deadline is refused, never released. Before a route calls this, R4b2
-    /// must release-benchmark worst-case finish plus policy on a max-size
-    /// stream against the `300 s - wall_clock` margin, and record that up
-    /// to `concurrent_streams` tails can occupy runtime workers at once
-    /// (N-R4b1-2).
+    /// deadline is refused, never released.
+    ///
+    /// N-R4b1-2 (open; gates R4b2 closure): the live route now calls this,
+    /// but worst-case finish plus policy on a max-size stream has not yet
+    /// been release-benchmarked against the `300 s - wall_clock` margin, and
+    /// up to `concurrent_streams` tails can occupy runtime workers at once.
+    /// Defaults are unchanged pending that benchmark.
     pub(super) async fn execute<U: ResponsesStreamUpstream>(
         &self,
         received_at: Instant,
@@ -1361,10 +1409,11 @@ mod tests {
 
     // -- reachability ---------------------------------------------------------
 
-    /// R4b1 is inert: no production code outside this module names the
-    /// executor, and this module spawns nothing.
+    /// The only production caller outside this module is the engine's
+    /// live Responses route in `engine/mod.rs` (test-only `engine/tests.rs`
+    /// may name it too), and this module spawns nothing.
     #[test]
-    fn executor_has_no_production_caller_and_spawns_nothing() {
+    fn executor_has_exactly_the_engine_route_as_production_caller_and_spawns_nothing() {
         fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
             for entry in std::fs::read_dir(dir).unwrap() {
                 let path = entry.unwrap().path();
@@ -1377,17 +1426,24 @@ mod tests {
         }
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let this = src.join("engine").join("responses_stream_exec.rs");
+        let engine = src.join("engine").join("mod.rs");
+        let engine_tests = src.join("engine").join("tests.rs");
         let mut files = Vec::new();
         rust_files(&src, &mut files);
-        assert!(files.contains(&this));
-        for file in files.iter().filter(|file| **file != this) {
+        assert!(files.contains(&this) && files.contains(&engine));
+        let symbols = [
+            "responses_stream_exec::",
+            "ResponsesStreamExecutor",
+            "ResponsesStreamOutcome",
+            "ResponsesStreamUpstream",
+            "HttpSenderUpstream",
+        ];
+        for file in files
+            .iter()
+            .filter(|file| ![&this, &engine, &engine_tests].contains(file))
+        {
             let text = std::fs::read_to_string(file).unwrap();
-            for symbol in [
-                "responses_stream_exec::",
-                "ResponsesStreamExecutor",
-                "ResponsesStreamOutcome",
-                "ResponsesStreamUpstream",
-            ] {
+            for symbol in symbols {
                 assert!(
                     !text.contains(symbol),
                     "{} references {symbol}",
@@ -1395,6 +1451,17 @@ mod tests {
                 );
             }
         }
+        let text = std::fs::read_to_string(&engine).unwrap();
+        let production = text.split("#[cfg(test)]\nmod tests").next().unwrap();
+        assert_eq!(
+            production.matches("ResponsesStreamExecutor::new(").count(),
+            1
+        );
+        // One live call site, however rustfmt wraps it.
+        let squashed: String = production.split_whitespace().collect();
+        assert_eq!(squashed.matches("self.stream_executor").count(), 1);
+        assert_eq!(squashed.matches("self.stream_executor.execute(").count(), 1);
+        assert_eq!(production.matches("HttpSenderUpstream::new(").count(), 1);
         let text = std::fs::read_to_string(&this).unwrap();
         let production = text.split("#[cfg(test)]\nmod tests").next().unwrap();
         for forbidden in ["spawn", "std::thread", "std::process", "reqwest", "hyper"] {

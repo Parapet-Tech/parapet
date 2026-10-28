@@ -8,8 +8,10 @@
 // concurrency, and wall/idle timeouts. Each component is built from the
 // same resolved values, so request and response bounds cannot drift.
 //
-// Inert: resolved during config loading, but nothing outside this module
-// and its tests builds components from it yet.
+// Production readers outside this module: the R4b1 stream executor, and
+// the engine's live Responses stream route (D-0027 OA-R4b2a), which builds
+// the one shared executor and the request preparer from the same loaded
+// `Config`.
 
 use std::time::Duration;
 
@@ -691,14 +693,27 @@ mod tests {
 
     // -- reachability ---------------------------------------------------------
 
-    /// R4a is inert: outside the config module, only the inert R4b1 stream
-    /// executor reads the resolved streaming settings or calls the factory
-    /// in production code.
+    /// Outside the config module, only the R4b1 stream executor and the
+    /// engine's live Responses route read the resolved streaming settings
+    /// or call the factory in production code; the engine does so at
+    /// exactly two sites (shared executor, request preparer).
     #[test]
-    fn factory_has_no_production_caller() {
+    fn factory_has_only_the_executor_and_engine_route_as_production_callers() {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let executor = src.join("engine").join("responses_stream_exec.rs");
-        assert!(executor.is_file());
+        let engine = src.join("engine").join("mod.rs");
+        assert!(executor.is_file() && engine.is_file());
+        let engine_text = std::fs::read_to_string(&engine).unwrap();
+        let engine_production = engine_text.split("#[cfg(test)]\nmod tests").next().unwrap();
+        assert_eq!(
+            engine_production
+                .matches("deps.config.runtime.responses_stream)")
+                .count(),
+            1
+        );
+        assert_eq!(engine_production.matches(".request_preparer()").count(), 1);
+        assert_eq!(engine_production.matches(".responses_stream").count(), 2);
+        assert!(!engine_production.contains("ResponsesStreamConfig"));
         let mut stack = vec![src.clone()];
         let mut offenders = Vec::new();
         while let Some(dir) = stack.pop() {
@@ -714,6 +729,7 @@ mod tests {
                 if path.extension().and_then(|e| e.to_str()) != Some("rs")
                     || path.file_name().and_then(|n| n.to_str()) == Some("tests.rs")
                     || path == executor
+                    || path == engine
                 {
                     continue;
                 }
