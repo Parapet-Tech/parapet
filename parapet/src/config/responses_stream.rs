@@ -691,11 +691,14 @@ mod tests {
 
     // -- reachability ---------------------------------------------------------
 
-    /// R4a is inert: outside the config module, nothing reads the resolved
-    /// streaming settings or calls the factory in production code.
+    /// R4a is inert: outside the config module, only the inert R4b1 stream
+    /// executor reads the resolved streaming settings or calls the factory
+    /// in production code.
     #[test]
     fn factory_has_no_production_caller() {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let executor = src.join("engine").join("responses_stream_exec.rs");
+        assert!(executor.is_file());
         let mut stack = vec![src.clone()];
         let mut offenders = Vec::new();
         while let Some(dir) = stack.pop() {
@@ -710,6 +713,7 @@ mod tests {
                 // `tests.rs` files are `#[cfg(test)]` modules in their entirety.
                 if path.extension().and_then(|e| e.to_str()) != Some("rs")
                     || path.file_name().and_then(|n| n.to_str()) == Some("tests.rs")
+                    || path == executor
                 {
                     continue;
                 }

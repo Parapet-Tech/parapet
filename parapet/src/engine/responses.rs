@@ -1160,10 +1160,15 @@ mod tests {
         }
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let this = src.join("engine").join("responses.rs");
+        // The R4b1 executor is the bridge's only caller; it is itself inert.
+        let executor = src.join("engine").join("responses_stream_exec.rs");
         let mut files = Vec::new();
         rust_files(&src, &mut files);
-        assert!(files.contains(&this));
-        for file in files.iter().filter(|file| **file != this) {
+        assert!(files.contains(&this) && files.contains(&executor));
+        for file in files
+            .iter()
+            .filter(|file| **file != this && **file != executor)
+        {
             let text = std::fs::read_to_string(file).unwrap();
             for symbol in ["enforce_streaming_responses", "ResponsesStreamDecision"] {
                 assert!(
@@ -1174,6 +1179,12 @@ mod tests {
             }
         }
         let text = std::fs::read_to_string(&this).unwrap();
+        let production = text.split("#[cfg(test)]\nmod tests").next().unwrap();
+        assert_eq!(
+            production.matches("enforce_streaming_responses(").count(),
+            1
+        );
+        let text = std::fs::read_to_string(&executor).unwrap();
         let production = text.split("#[cfg(test)]\nmod tests").next().unwrap();
         assert_eq!(
             production.matches("enforce_streaming_responses(").count(),
