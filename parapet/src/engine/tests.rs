@@ -812,13 +812,21 @@ impl RecordingHttpSender {
     }
 
     fn with_full_response(headers: HeaderMap, body: Bytes) -> Self {
+        Self::with_full_status(StatusCode::OK, headers, body)
+    }
+
+    fn with_full_status(status: StatusCode, headers: HeaderMap, body: Bytes) -> Self {
         Self {
             captured: std::sync::Mutex::new(Vec::new()),
-            status: StatusCode::OK,
+            status,
             headers,
             response_full: Some(body),
             response_chunks: None,
         }
+    }
+
+    fn call_count(&self) -> usize {
+        self.captured.lock().unwrap().len()
     }
 
     fn captured_request(&self) -> HttpRequest {
@@ -953,6 +961,317 @@ async fn collect_proxy_body(response: ProxyResponse) -> Bytes {
     axum::body::to_bytes(response.body, 10 * 1024 * 1024)
         .await
         .expect("body should be readable")
+}
+
+fn responses_request(path: &'static str, body: Bytes, headers: HeaderMap) -> ProxyRequest {
+    ProxyRequest {
+        method: Method::POST,
+        uri: Uri::from_static(path),
+        headers,
+        body,
+    }
+}
+
+fn valid_responses_request(stream: bool) -> Bytes {
+    Bytes::from(
+        serde_json::to_vec(&serde_json::json!({
+            "model": "gpt-test",
+            "input": "hello",
+            "stream": stream
+        }))
+        .unwrap(),
+    )
+}
+
+fn valid_responses_output(text: &str) -> Bytes {
+    Bytes::from(
+        serde_json::to_vec(&serde_json::json!({
+            "id": "resp_1",
+            "object": "response",
+            "status": "completed",
+            "error": null,
+            "output": [{
+                "type": "message",
+                "id": "msg_1",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": text,
+                    "annotations": [],
+                    "logprobs": []
+                }]
+            }]
+        }))
+        .unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn responses_non_streaming_exact_routes_use_strict_request_and_output_paths() {
+    for path in ["/v1/responses", "/responses"] {
+        let mut upstream_headers = HeaderMap::new();
+        upstream_headers.insert("content-type", HeaderValue::from_static("application/json"));
+        let sender = Arc::new(RecordingHttpSender::with_full_response(
+            upstream_headers,
+            valid_responses_output("safe output"),
+        ));
+        let engine =
+            engine_with_http_sender(base_config_with_canary("NEVER_MATCH"), sender.clone());
+
+        let mut request_headers = HeaderMap::new();
+        request_headers.insert("content-type", HeaderValue::from_static("application/json"));
+        request_headers.insert(
+            "x-guard-trust",
+            HeaderValue::from_static("inline:dW50cnVzdGVk"),
+        );
+        let response = engine
+            .forward(
+                Provider::OpenAi,
+                responses_request(path, valid_responses_request(false), request_headers),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status, StatusCode::OK, "path={path}");
+        assert_eq!(sender.call_count(), 1, "path={path}");
+        let captured = sender.captured_request();
+        assert_eq!(captured.url, format!("https://example.com{path}"));
+        assert!(!captured.stream);
+        assert!(captured.headers.get("x-guard-trust").is_none());
+        let body = collect_proxy_body(response).await;
+        let decoded: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(decoded["output"][0]["content"][0]["text"], "safe output");
+    }
+}
+
+#[tokio::test]
+async fn responses_streaming_is_refused_before_upstream_for_body_or_accept_header() {
+    for (body, accept_sse) in [
+        (valid_responses_request(true), false),
+        (valid_responses_request(false), true),
+    ] {
+        let sender = Arc::new(RecordingHttpSender::with_full_response(
+            HeaderMap::new(),
+            valid_responses_output("must not be reached"),
+        ));
+        let engine =
+            engine_with_http_sender(base_config_with_canary("NEVER_MATCH"), sender.clone());
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        if accept_sse {
+            headers.insert(
+                reqwest::header::ACCEPT,
+                HeaderValue::from_static("text/event-stream"),
+            );
+        }
+
+        let response = engine
+            .forward(
+                Provider::OpenAi,
+                responses_request("/v1/responses", body, headers),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(sender.call_count(), 0);
+        assert_eq!(
+            response
+                .headers
+                .get("x-parapet-error")
+                .and_then(|value| value.to_str().ok()),
+            Some("responses_streaming_not_implemented")
+        );
+    }
+}
+
+#[tokio::test]
+async fn responses_malformed_or_duplicate_request_fails_before_upstream_without_echo() {
+    let marker = "REQUEST_SECRET_97";
+    for body in [
+        Bytes::from(format!("not json {marker}")),
+        Bytes::from(format!(
+            r#"{{"model":"gpt-test","input":"{marker}","input":"duplicate"}}"#
+        )),
+    ] {
+        let sender = Arc::new(RecordingHttpSender::with_full_response(
+            HeaderMap::new(),
+            valid_responses_output("must not be reached"),
+        ));
+        let engine =
+            engine_with_http_sender(base_config_with_canary("NEVER_MATCH"), sender.clone());
+        let response = engine
+            .forward(
+                Provider::OpenAi,
+                responses_request("/v1/responses", body, HeaderMap::new()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status, StatusCode::BAD_REQUEST);
+        assert_eq!(sender.call_count(), 0);
+        assert_eq!(
+            response
+                .headers
+                .get("x-parapet-error")
+                .and_then(|value| value.to_str().ok()),
+            Some("invalid_responses_request")
+        );
+        let response_body = collect_proxy_body(response).await;
+        assert!(!String::from_utf8_lossy(&response_body).contains(marker));
+    }
+}
+
+#[tokio::test]
+async fn responses_invalid_upstream_is_fixed_502_and_clears_provider_headers() {
+    let marker = "UPSTREAM_SECRET_53";
+    for (status, body) in [
+        (StatusCode::UNAUTHORIZED, Bytes::from(marker)),
+        (StatusCode::OK, Bytes::from(format!("not json {marker}"))),
+    ] {
+        let mut upstream_headers = HeaderMap::new();
+        upstream_headers.insert("x-upstream-secret", HeaderValue::from_static(marker));
+        upstream_headers.insert(
+            reqwest::header::CONTENT_ENCODING,
+            HeaderValue::from_static("br"),
+        );
+        upstream_headers.insert(
+            reqwest::header::CONTENT_LENGTH,
+            HeaderValue::from_static("999"),
+        );
+        let sender = Arc::new(RecordingHttpSender::with_full_status(
+            status,
+            upstream_headers,
+            body,
+        ));
+        let engine = engine_with_http_sender(base_config_with_canary("NEVER_MATCH"), sender);
+        let response = engine
+            .forward(
+                Provider::OpenAi,
+                responses_request(
+                    "/v1/responses",
+                    valid_responses_request(false),
+                    HeaderMap::new(),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status, StatusCode::BAD_GATEWAY);
+        assert!(response.headers.get("x-upstream-secret").is_none());
+        assert!(response
+            .headers
+            .get(reqwest::header::CONTENT_ENCODING)
+            .is_none());
+        assert!(response
+            .headers
+            .get(reqwest::header::CONTENT_LENGTH)
+            .is_none());
+        assert_eq!(
+            response
+                .headers
+                .get("x-parapet-error")
+                .and_then(|value| value.to_str().ok()),
+            Some("invalid_upstream_response")
+        );
+        let response_body = collect_proxy_body(response).await;
+        assert!(!String::from_utf8_lossy(&response_body).contains(marker));
+    }
+}
+
+#[tokio::test]
+async fn responses_gzip_body_is_decoded_rewritten_and_has_no_stale_framing() {
+    let marker = "RESPONSES_SECRET_61";
+    let compressed = gzip_compress(&valid_responses_output(marker));
+    let mut upstream_headers = HeaderMap::new();
+    upstream_headers.insert(
+        reqwest::header::CONTENT_ENCODING,
+        HeaderValue::from_static("gzip"),
+    );
+    upstream_headers.insert(
+        reqwest::header::CONTENT_LENGTH,
+        HeaderValue::from_str(&compressed.len().to_string()).unwrap(),
+    );
+    let sender = Arc::new(RecordingHttpSender::with_full_response(
+        upstream_headers,
+        Bytes::from(compressed),
+    ));
+    let mut config = base_config_with_canary(marker);
+    config.policy.layers.l5a = Some(LayerConfig {
+        mode: "redact".to_string(),
+        block_action: None,
+        window_chars: None,
+    });
+    let engine = engine_with_http_sender(config, sender);
+    let response = engine
+        .forward(
+            Provider::OpenAi,
+            responses_request(
+                "/v1/responses",
+                valid_responses_request(false),
+                HeaderMap::new(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status, StatusCode::OK);
+    assert!(response
+        .headers
+        .get(reqwest::header::CONTENT_ENCODING)
+        .is_none());
+    assert!(response
+        .headers
+        .get(reqwest::header::CONTENT_LENGTH)
+        .is_none());
+    let response_body = collect_proxy_body(response).await;
+    let response_text = String::from_utf8(response_body.to_vec()).unwrap();
+    assert!(!response_text.contains(marker));
+    assert!(response_text.contains("[REDACTED]"));
+}
+
+#[tokio::test]
+async fn responses_complete_disallowed_tool_call_is_suppressed_by_l3() {
+    let upstream = Bytes::from(
+        serde_json::to_vec(&serde_json::json!({
+            "id": "resp_1",
+            "object": "response",
+            "status": "completed",
+            "error": null,
+            "output": [{
+                "type": "function_call",
+                "id": "fc_1",
+                "status": "completed",
+                "call_id": "call_1",
+                "name": "exec_command",
+                "arguments": "{\"cmd\":\"do not echo\"}"
+            }]
+        }))
+        .unwrap(),
+    );
+    let sender = Arc::new(RecordingHttpSender::with_full_response(
+        HeaderMap::new(),
+        upstream,
+    ));
+    let engine = engine_with_http_sender(config_with_l3_outbound("rewrite"), sender);
+    let response = engine
+        .forward(
+            Provider::OpenAi,
+            responses_request(
+                "/v1/responses",
+                valid_responses_request(false),
+                HeaderMap::new(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        response
+            .headers
+            .get("x-parapet-blocked-by")
+            .and_then(|value| value.to_str().ok()),
+        Some("L3-outbound")
+    );
+    let response_body = collect_proxy_body(response).await;
+    assert!(!String::from_utf8_lossy(&response_body).contains("do not echo"));
 }
 
 #[tokio::test]

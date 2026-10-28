@@ -125,8 +125,9 @@ pub enum PathClass {
     Unknown,
 }
 
-/// Wire formats with an exact route and a request decoder, but no response/SSE
-/// safety path yet. Requests are refused locally and never forwarded.
+/// Wire formats with an exact route whose support is narrower than the legacy
+/// provider route family. Their handler branch owns the additional admission
+/// rules before selecting a provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StagedRoute {
     /// OpenAI Responses API (`crate::provider::responses`).
@@ -885,7 +886,7 @@ pub async fn proxy_handler(
                 "path_not_canonical",
             );
         }
-        PathClass::Staged(_) => {
+        PathClass::Staged(StagedRoute::OpenAiResponses) => {
             if state.admission.mode() == ProfileMode::RequiredOpenCode {
                 return carrier_rejection_response(
                     &state.admission.fail(VerificationOutcome::SchemaMismatch),
@@ -894,14 +895,10 @@ pub async fn proxy_handler(
             if method != Method::POST {
                 return method_not_allowed_response(path, &method);
             }
-            // Request decoding exists, but response/SSE output filtering and
-            // tool-call enforcement do not: refuse before reading the body.
-            return path_refusal_response(
-                path,
-                StatusCode::NOT_IMPLEMENTED,
-                "parapet_unsupported_path",
-                "unsupported_wire_format",
-            );
+            // Ordinary-mode Responses requests enter the engine's dedicated
+            // strict request/output path. Streaming remains locally refused
+            // by the engine until its stateful policy seam is activated.
+            Provider::OpenAi
         }
         PathClass::KnownUnsupported => {
             if state.admission.mode() == ProfileMode::RequiredOpenCode {
@@ -1721,7 +1718,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn responses_routes_refuse_locally_and_never_forward() {
+    async fn responses_routes_forward_only_exact_post_in_ordinary_mode() {
         let client = Arc::new(CapturingClient::new());
         let app = build_router(client.clone());
         let valid_body = r#"{"model":"gpt-test","instructions":"be brief","input":"hi"}"#;
@@ -1732,12 +1729,10 @@ mod tests {
                 .oneshot(json_request("POST", path, valid_body))
                 .await
                 .unwrap();
-            assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED, "path={path}");
+            assert_eq!(resp.status(), StatusCode::OK, "path={path}");
             assert_eq!(
-                resp.headers()
-                    .get("x-parapet-error")
-                    .and_then(|v| v.to_str().ok()),
-                Some("unsupported_wire_format"),
+                *client.captured_provider.lock().await,
+                Some(Provider::OpenAi),
                 "path={path}"
             );
 
@@ -1759,6 +1754,8 @@ mod tests {
             }
         }
 
+        *client.captured_provider.lock().await = None;
+
         for (path, status) in [
             ("/responses/", StatusCode::NOT_FOUND),
             ("/openai/responses", StatusCode::NOT_FOUND),
@@ -1776,7 +1773,7 @@ mod tests {
 
         assert!(
             client.captured_provider.lock().await.is_none(),
-            "Responses routes must never reach the upstream client in Stage 1"
+            "Responses aliases, subpaths, and non-canonical paths must not forward"
         );
     }
 
@@ -1790,7 +1787,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v1/responses?secret_query=should_not_echo")
+                    .uri("/openai/v1/responses?secret_query=should_not_echo")
                     .body(Body::from("not even json"))
                     .unwrap(),
             )
@@ -1811,7 +1808,7 @@ mod tests {
         assert_eq!(json_501["error"]["type"], "parapet_unsupported_path");
         assert_eq!(json_501["error"]["code"], "unsupported_wire_format");
         let msg_501 = json_501["error"]["message"].as_str().unwrap();
-        assert!(msg_501.contains("Parapet does not inspect /v1/responses."));
+        assert!(msg_501.contains("Parapet does not inspect /openai/v1/responses."));
         assert!(!msg_501.contains("secret_query"));
 
         for non_canonical_path in [

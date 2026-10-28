@@ -37,6 +37,7 @@ use crate::message::ToolCall;
 use crate::normalize::{
     normalize_messages_dual_view, L0DualScanView, L0Normalizer, L0ScanViews, Normalizer,
 };
+use crate::provider::responses::{OpenAiResponsesDecoder, RequestDecoder};
 use crate::provider::{adapter_for, ProviderAdapter, ProviderType};
 use crate::proxy::{Provider, ProxyError, ProxyRequest, ProxyResponse, UpstreamClient};
 use crate::routing::{
@@ -792,6 +793,8 @@ impl EngineUpstreamClient {
     ) -> Result<ProxyResponse, ProxyError> {
         let mut projected_tracker = projected_receipt.as_deref_mut().map(|e| &mut e.tracker);
         let adapter = self.deps.registry.adapter_for(provider);
+        let responses_wire = provider == Provider::OpenAi
+            && matches!(request.uri.path(), "/v1/responses" | "/responses");
 
         // Build request context for structured logging
         let model = extract_model(&request.body);
@@ -811,6 +814,18 @@ impl EngineUpstreamClient {
             model = %ctx.model,
             "processing request"
         );
+
+        // The optional effect runtime is bound to Chat Completions/Anthropic
+        // output shapes. Never reinterpret a Responses body through it.
+        #[cfg(not(windows))]
+        if responses_wire && self.envelope.is_some() {
+            return Ok(responses_error_response(
+                adapter.as_ref(),
+                StatusCode::BAD_REQUEST,
+                "responses_effect_runtime_unsupported",
+                "Responses requests are unavailable with the effect runtime",
+            ));
+        }
 
         // 0.5) C2.2 one-shot effect run: streaming never consumes it, and only
         // the first non-streaming request claims it, before parsing or upstream.
@@ -841,20 +856,33 @@ impl EngineUpstreamClient {
         }
 
         // 1) Parse request into messages
-        let mut messages = match adapter.parse_request(&request.body) {
+        let decoded_messages = if responses_wire {
+            OpenAiResponsesDecoder::new().decode_request(&request.body)
+        } else {
+            adapter.parse_request(&request.body)
+        };
+        let mut messages = match decoded_messages {
             Ok(msgs) => msgs,
-            Err(e) => {
+            Err(_) => {
                 if let Some(t) = projected_tracker.as_deref_mut() {
                     t.pre_scan_error = true;
                 }
-                let body = adapter.serialize_error(&format!("invalid request: {e}"), 400);
+                if responses_wire {
+                    return Ok(responses_error_response(
+                        adapter.as_ref(),
+                        StatusCode::BAD_REQUEST,
+                        "invalid_responses_request",
+                        "invalid request body",
+                    ));
+                }
+                let body = adapter.serialize_error("invalid request body", 400);
                 return Ok(ProxyResponse::from_bytes(StatusCode::BAD_REQUEST, body));
             }
         };
 
         // 1.5) Parse trust header spans from SDK (X-Guard-Trust). A verified
         // carrier is the only provenance source on the projected basis.
-        if matches!(basis, InboundBasis::WholeMessage) {
+        if matches!(basis, InboundBasis::WholeMessage) && !responses_wire {
             parse_trust_header(&request.headers, &request.body, &mut messages);
         }
 
@@ -1736,6 +1764,14 @@ impl EngineUpstreamClient {
 
         // 6) Forward to upstream
         let stream = is_streaming_request(&request.headers, &request.body);
+        if responses_wire && stream {
+            return Ok(responses_error_response(
+                adapter.as_ref(),
+                StatusCode::NOT_IMPLEMENTED,
+                "responses_streaming_not_implemented",
+                "Responses streaming is not implemented",
+            ));
+        }
         let url = match build_upstream_url(self.deps.resolver.as_ref(), provider, &request) {
             Ok(u) => u,
             Err(refusal) => {
@@ -1824,8 +1860,11 @@ impl EngineUpstreamClient {
         // Strips Content-Encoding/Content-Length from forwarded headers.
         let body_bytes = maybe_decompress(&mut resp_headers, body_bytes)?;
 
-        let processed =
-            self.handle_non_streaming_response_with(provider, &body_bytes, &ctx, capture.as_ref());
+        let processed = if responses_wire {
+            self.handle_responses_non_streaming_response(upstream.status, &body_bytes)
+        } else {
+            self.handle_non_streaming_response_with(provider, &body_bytes, &ctx, capture.as_ref())
+        };
 
         // The body was re-serialized (JSON parse → process → to_vec), so
         // the upstream framing headers are stale.  Strip them and let
@@ -1835,6 +1874,16 @@ impl EngineUpstreamClient {
         // passthrough (e.g. JSON parse failure) would be incorrect.
         resp_headers.remove(reqwest::header::CONTENT_LENGTH);
         resp_headers.remove(reqwest::header::TRANSFER_ENCODING);
+        if responses_wire {
+            // Every accepted Responses body is deterministically reserialized;
+            // every refusal is a new local JSON body. Neither retains upstream
+            // content encoding. Failure responses also retain no upstream
+            // headers, which may contain provider-controlled diagnostics.
+            resp_headers.remove(reqwest::header::CONTENT_ENCODING);
+            if processed.status_override.is_some() {
+                resp_headers.clear();
+            }
+        }
 
         attach_evidence_headers(&mut resp_headers, evidence_count, &evidence_categories);
         if self.deps.emit_l1_signals {
@@ -2520,6 +2569,53 @@ impl EngineUpstreamClient {
             extra_headers: None,
         }
     }
+
+    fn handle_responses_non_streaming_response(
+        &self,
+        upstream_status: StatusCode,
+        body: &Bytes,
+    ) -> ProcessedResponse {
+        use responses::{enforce_non_streaming_responses, ResponsesOutputDecision};
+
+        let adapter = self.deps.registry.adapter_for(Provider::OpenAi);
+        match enforce_non_streaming_responses(
+            upstream_status,
+            body,
+            &self.deps.config,
+            self.deps.constraint_evaluator.as_ref(),
+            self.deps.output_scanner.as_ref(),
+        ) {
+            ResponsesOutputDecision::Allowed(body) => ProcessedResponse {
+                status_override: None,
+                body: Bytes::from(body),
+                extra_headers: None,
+            },
+            ResponsesOutputDecision::InvalidUpstream => responses_processed_error(
+                adapter.as_ref(),
+                StatusCode::BAD_GATEWAY,
+                "invalid_upstream_response",
+                None,
+            ),
+            ResponsesOutputDecision::BlockedByL3Outbound => responses_processed_error(
+                adapter.as_ref(),
+                StatusCode::FORBIDDEN,
+                "content_policy_block",
+                Some("L3-outbound"),
+            ),
+            ResponsesOutputDecision::BlockedByL5aToolArguments => responses_processed_error(
+                adapter.as_ref(),
+                StatusCode::FORBIDDEN,
+                "content_policy_block",
+                Some("L5a"),
+            ),
+            ResponsesOutputDecision::LayerFailure => responses_processed_error(
+                adapter.as_ref(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "output_policy_failure",
+                None,
+            ),
+        }
+    }
 }
 
 struct ProcessedResponse {
@@ -2527,6 +2623,52 @@ struct ProcessedResponse {
     body: Bytes,
     /// Extra headers to merge into the final response (e.g. error metadata from on_failure).
     extra_headers: Option<HeaderMap>,
+}
+
+fn responses_error_headers(code: &'static str, layer: Option<&'static str>) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        reqwest::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    headers.insert("x-parapet-error", HeaderValue::from_static(code));
+    if let Some(layer) = layer {
+        headers.insert("x-parapet-blocked-by", HeaderValue::from_static(layer));
+    }
+    headers
+}
+
+fn responses_processed_error(
+    adapter: &dyn ProviderAdapter,
+    status: StatusCode,
+    code: &'static str,
+    layer: Option<&'static str>,
+) -> ProcessedResponse {
+    let message = if status == StatusCode::FORBIDDEN {
+        "request blocked by content policy"
+    } else if status == StatusCode::SERVICE_UNAVAILABLE {
+        "service unavailable (guardrail layer error)"
+    } else {
+        "upstream response rejected by output policy"
+    };
+    ProcessedResponse {
+        status_override: Some(status),
+        body: Bytes::from(adapter.serialize_error(message, status.as_u16())),
+        extra_headers: Some(responses_error_headers(code, layer)),
+    }
+}
+
+fn responses_error_response(
+    adapter: &dyn ProviderAdapter,
+    status: StatusCode,
+    code: &'static str,
+    message: &'static str,
+) -> ProxyResponse {
+    ProxyResponse {
+        status,
+        headers: responses_error_headers(code, None),
+        body: Body::from(adapter.serialize_error(message, status.as_u16())),
+    }
 }
 
 // ---------------------------------------------------------------------------

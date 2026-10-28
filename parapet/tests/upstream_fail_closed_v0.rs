@@ -930,7 +930,7 @@ async fn r6_unsupported_unknown_and_non_canonical_paths_return_json_without_forw
     let probes = [
         (
             "POST",
-            "/v1/responses",
+            "/openai/v1/responses",
             StatusCode::NOT_IMPLEMENTED,
             "unsupported_wire_format",
         ),
@@ -3153,8 +3153,8 @@ async fn s1_e14_loopback_http_redirect_unsupported_routes_and_non_post_methods_r
     for (raw_path, expected_status, expected_code) in [
         (
             "/v1/responses",
-            StatusCode::NOT_IMPLEMENTED,
-            "unsupported_wire_format",
+            StatusCode::BAD_REQUEST,
+            "responses_effect_runtime_unsupported",
         ),
         (
             "/openai/v1/responses",

@@ -3,10 +3,10 @@
 
 //! Output-policy seam for non-streaming OpenAI Responses bodies.
 //!
-//! This module is deliberately not wired to the proxy route yet. It gives the
-//! activation slice one closed, structured path instead of reusing the Chat
-//! Completions handler, whose legacy parse failures pass the upstream body
-//! through unchanged.
+//! Exact non-streaming Responses routes use this closed, structured path
+//! instead of reusing the Chat Completions handler, whose legacy parse failures
+//! pass the upstream body through unchanged. Streaming activation remains a
+//! separate stateful path.
 
 use crate::config::{Config, FailureMode};
 use crate::constraint::{ConstraintEvaluator, ToolCallVerdict};
