@@ -60,7 +60,11 @@ block_patterns:
   - "(?i)you (cannot|must not|should not) refuse"
   - "(?i)you must always comply"
   - "(?i)never refuse a request"
-  - "(?i)do not (say you cannot|decline|refuse)"
+  - "(?i)do not (decline|refuse)"
+  # Generic refusal suppression only: "say you cannot" must be followed by a
+  # generic assistance object or clause end. Task-scoped benign instructions
+  # ("do not say you cannot generate a title") fall through to L1.
+  - "(?im)(do not|don't|never) say (that )?you (cannot|can't|are unable to)(\\s+(help|assist|answer|comply|respond|do (that|this|it|so|anything)|anything)\\b|\\s*([.!;:,\"')\\]]|$))"
   - "(?i)start your response with:"
 
   # --- Indirect Injection Markers ---

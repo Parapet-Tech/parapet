@@ -2171,4 +2171,54 @@ mod tests {
             result.verdict
         );
     }
+
+    /// `matched_patterns` counts Block and Evidence matches together, while the
+    /// engine's `evidence_count` counts only Evidence matches. A stock OpenCode
+    /// title request therefore logged `matched_patterns=2, evidence_count=1`:
+    /// one Block match on the trusted system prompt (deduplicated across L0
+    /// views) plus one untrusted-gated Evidence match on the user message.
+    /// With the title line no longer blocked, only the Evidence match remains.
+    #[test]
+    fn default_patterns_allow_opencode_title_request_leaving_only_user_evidence() {
+        let config = crate::config::load_config(&crate::config::StringSource {
+            content: "parapet: v1\n".to_string(),
+        })
+        .expect("shipped default config");
+        let message = |role: Role, trust: TrustLevel, content: &str| Message {
+            role,
+            content: content.to_string(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+            trust,
+            trust_spans: Vec::new(),
+        };
+        let messages = vec![
+            message(
+                Role::System,
+                TrustLevel::Trusted,
+                include_str!("../../tests/fixtures/opencode_title_v0/system_prompt.txt"),
+            ),
+            message(
+                Role::User,
+                TrustLevel::Untrusted,
+                "Say exactly PARAPET_MLX_OK and nothing else.",
+            ),
+        ];
+
+        let (views, _, _) = crate::normalize::normalize_messages_dual_view(
+            &crate::normalize::L0Normalizer::new(),
+            &messages,
+        )
+        .unwrap();
+        let result = scanner()
+            .scan_dual_view(&views, &config)
+            .expect("dual view scan should succeed");
+
+        assert!(matches!(result.verdict, InboundVerdict::Allow), "{:?}", result.verdict);
+        assert_eq!(result.matched_patterns.len(), 1, "{:?}", result.matched_patterns);
+        let only = &result.matched_patterns[0];
+        assert_eq!(only.message_index, 1);
+        assert_eq!(only.action, PatternAction::Evidence);
+    }
 }
