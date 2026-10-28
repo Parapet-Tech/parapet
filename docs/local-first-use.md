@@ -260,8 +260,13 @@ L3-outbound, and (when enabled) L5a all pass. Every other outcome returns a
 fixed, content-free local refusal (for example `content_policy_block`,
 `responses_stream_idle_timeout`, `responses_stream_wall_clock_timeout`, or
 `upstream_stream_truncated`); upstream status, headers, and body are never
-echoed. Responses requests on a verified provenance carrier (projected basis)
-are still rejected with HTTP 501 before upstream I/O.
+echoed.
+
+Responses routes are not activated under the `RequiredOpenCode` provenance
+profile: `POST /v1/responses` and `POST /responses` are rejected at the HTTP
+admission boundary with HTTP 403 (`parapet_carrier_rejected`) before upstream
+I/O. The engine's internal projected-basis streaming guard still returns HTTP
+501 if invoked directly, but that is not the public `RequiredOpenCode` result.
 
 #### Stock OpenCode with a ChatGPT subscription
 
@@ -279,11 +284,15 @@ such as `127.0.0.1:9800`; point OpenCode's provider base URL at that listener
 through OpenCode's normal configuration. OpenCode owns and sends its
 subscription credentials; Parapet forwards them unchanged and never logs them.
 
-Requests carrying a ChatGPT subscription marker header (`chatgpt-account-id`,
+For ordinary-mode streaming Responses requests (`POST /responses` or
+`POST /v1/responses` with `"stream": true`, the path stock OpenCode uses),
+a request carrying a ChatGPT subscription marker header (`chatgpt-account-id`,
 `originator`, `session-id`, or `x-codex-beta-features`) may reach only the
 exact upstream URL `https://chatgpt.com/backend-api/codex/responses`. Any other
 resolved target is refused with HTTP 502
-`responses_subscription_target_refused` before upstream I/O.
+`responses_subscription_target_refused` before upstream I/O. This check is
+scoped to that streaming path: non-streaming Responses and Chat Completions
+requests do not run it, and it is not a global credential target pin.
 
 Status: this path is activated and validated by static review and tests, but
 the operator-credential R5 run has not yet been performed. Still open: the
