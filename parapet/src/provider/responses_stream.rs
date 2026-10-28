@@ -122,6 +122,60 @@ pub enum StreamEventKind {
     Error,
 }
 
+impl StreamEventKind {
+    /// The payload `type` this event was decoded from.
+    pub fn wire_type(&self) -> &'static str {
+        use StreamEventKind::*;
+        let text = |kind: &TextSegmentKind, done: bool| {
+            let (delta, done_ty) = match kind {
+                TextSegmentKind::OutputText => {
+                    ("response.output_text.delta", "response.output_text.done")
+                }
+                TextSegmentKind::Refusal => ("response.refusal.delta", "response.refusal.done"),
+                TextSegmentKind::ReasoningSummary => (
+                    "response.reasoning_summary_text.delta",
+                    "response.reasoning_summary_text.done",
+                ),
+                TextSegmentKind::ReasoningContent => (
+                    "response.reasoning_text.delta",
+                    "response.reasoning_text.done",
+                ),
+            };
+            if done {
+                done_ty
+            } else {
+                delta
+            }
+        };
+        match self {
+            ResponseCreated { .. } => "response.created",
+            ResponseInProgress { .. } => "response.in_progress",
+            ResponseCompleted { .. } => "response.completed",
+            ResponseIncomplete { .. } => "response.incomplete",
+            ResponseFailed => "response.failed",
+            OutputItem {
+                phase: Phase::Added,
+                ..
+            } => "response.output_item.added",
+            OutputItem {
+                phase: Phase::Done, ..
+            } => "response.output_item.done",
+            ContentPart {
+                phase: Phase::Added,
+                ..
+            } => "response.content_part.added",
+            ContentPart {
+                phase: Phase::Done, ..
+            } => "response.content_part.done",
+            TextDelta { kind, .. } => text(kind, false),
+            TextDone { kind, .. } => text(kind, true),
+            FunctionCallArgumentsDelta { .. } => "response.function_call_arguments.delta",
+            FunctionCallArgumentsDone { .. } => "response.function_call_arguments.done",
+            Error => "error",
+        }
+    }
+}
+
 /// A validated `output_item.added` / `.done` item.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StreamItem {
@@ -572,6 +626,7 @@ mod tests {
             let named = decode(Some(name), &data).unwrap_or_else(|e| panic!("{name}: {e}"));
             let unnamed = decode(None, &data).unwrap_or_else(|e| panic!("{name}: {e}"));
             assert_eq!(named, unnamed, "{name}");
+            assert_eq!(named.kind.wire_type(), name);
         }
     }
 

@@ -12,12 +12,15 @@
 // - OpenAI Responses request decoding lives in `responses`; non-stream
 //   response inspection/rewrite lives in `responses_output`; single SSE
 //   event decoding lives in `responses_stream`; cross-event lifecycle
-//   assembly lives in `responses_stream_state`
+//   assembly lives in `responses_stream_state`; bounded SSE framing and
+//   bounded canonical SSE collection over both lives in `responses_sse` (inert seam,
+//   not wired to any route)
 
 use crate::message::{Message, Role, ToolCall, TrustLevel};
 
 pub mod responses;
 pub mod responses_output;
+pub mod responses_sse;
 pub mod responses_stream;
 pub mod responses_stream_state;
 

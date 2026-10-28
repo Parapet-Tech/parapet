@@ -10,6 +10,8 @@
 //     wrapping
 //   - `response.created` first, at most one `response.in_progress` before any
 //     output item, exactly one terminal, nothing after it
+//   - `response.created` carries a non-empty `response.id`; `in_progress`,
+//     `completed`, and `incomplete` carry the exact same non-empty id
 //   - every `item_id` bound to one `output_index` and one item kind; items
 //     added at contiguous indexes before any child event, done exactly once,
 //     with no child after done and every child closed before done
@@ -154,6 +156,8 @@ pub enum StreamStateError {
     LifecycleNotStarted,
     #[error("stream: lifecycle event is out of order or duplicated")]
     LifecycleOrder,
+    #[error("stream.response.id is missing, null, or empty")]
+    MissingResponseId,
     #[error("stream.response.id does not match response.created")]
     ResponseIdMismatch,
     #[error("stream.item_id does not name an added item")]
@@ -449,6 +453,7 @@ pub struct ResponsesStreamAssembler<P: JsonParser = StrictJsonParser> {
     stage: Stage,
     /// Next expected `sequence_number`; `None` once `u64::MAX` was consumed.
     next_sequence: Option<u64>,
+    /// Non-empty id bound by `response.created`; `None` only before it.
     response_id: Option<String>,
     items: Vec<ItemState>,
     by_id: HashMap<String, usize>,
@@ -579,10 +584,9 @@ impl<P: JsonParser> ResponsesStreamAssembler<P> {
                 if !matches!(self.stage, Stage::Start) {
                     return Err(StreamStateError::LifecycleOrder);
                 }
-                if let Some(id) = response.response_id() {
-                    self.snapshot(id.len())?;
-                    self.response_id = Some(id.to_string());
-                }
+                let id = nonempty_response_id(&response)?;
+                self.snapshot(id.len())?;
+                self.response_id = Some(id.to_string());
                 self.stage = Stage::Created;
                 return Ok(Progress::Open);
             }
@@ -734,11 +738,10 @@ impl<P: JsonParser> ResponsesStreamAssembler<P> {
     }
 
     fn check_response_id(&self, response: &DecodedResponse) -> Result<(), StreamStateError> {
-        match (self.response_id.as_deref(), response.response_id()) {
-            (Some(created), Some(later)) if created != later => {
-                Err(StreamStateError::ResponseIdMismatch)
-            }
-            _ => Ok(()),
+        let later = nonempty_response_id(response)?;
+        match self.response_id.as_deref() {
+            Some(created) if created == later => Ok(()),
+            _ => Err(StreamStateError::ResponseIdMismatch),
         }
     }
 
@@ -1056,6 +1059,14 @@ fn item_bytes(item: &StreamItem) -> usize {
         .as_ref()
         .map_or(0, |c| c.id.len() + c.name.len());
     item.id.len() + texts + 2 * arguments + call
+}
+
+/// `response.id` as a non-empty string; missing, null, and empty all fail.
+fn nonempty_response_id(response: &DecodedResponse) -> Result<&str, StreamStateError> {
+    response
+        .response_id()
+        .filter(|id| !id.is_empty())
+        .ok_or(StreamStateError::MissingResponseId)
 }
 
 /// Add `amount` to a counter, failing once it would exceed `max`.
@@ -1516,6 +1527,46 @@ mod tests {
         let mut other = in_progress();
         other["response"]["id"] = json!("resp_2");
         expect_err(vec![created(), other], E::ResponseIdMismatch);
+        let mut other = incomplete(vec![]);
+        other["response"]["id"] = json!("resp_2");
+        expect_err(vec![created(), other], E::ResponseIdMismatch);
+        // Prefix and case variants are not equal.
+        for id in ["resp_", "resp_10", "RESP_1"] {
+            let mut other = completed(vec![]);
+            other["response"]["id"] = json!(id);
+            expect_err(vec![created(), other], E::ResponseIdMismatch);
+        }
+    }
+
+    #[test]
+    fn response_id_must_be_present_and_non_empty() {
+        /// Apply each missing/null/empty id form to `event`.
+        fn variants(event: Value) -> Vec<(&'static str, Value)> {
+            let mut missing = event.clone();
+            missing["response"].as_object_mut().unwrap().remove("id");
+            let mut null = event.clone();
+            null["response"]["id"] = Value::Null;
+            let mut empty = event;
+            empty["response"]["id"] = json!("");
+            vec![("missing", missing), ("null", null), ("empty", empty)]
+        }
+        for (label, bad) in variants(created()) {
+            let (a, r) = run(vec![bad, completed(vec![])]);
+            assert_eq!(r, Err(E::MissingResponseId), "created {label}");
+            assert_eq!(a.finish().unwrap_err(), E::Poisoned);
+        }
+        for later in [in_progress(), completed(vec![]), incomplete(vec![])] {
+            let ty = later["type"].clone();
+            for (label, bad) in variants(later.clone()) {
+                let (_, r) = run(vec![created(), bad]);
+                assert_eq!(r, Err(E::MissingResponseId), "{ty} {label}");
+            }
+        }
+        // in_progress then a terminal both bind to the same id.
+        assert!(matches!(
+            finish_ok(vec![created(), in_progress(), completed(vec![])]),
+            Terminal::Completed(_)
+        ));
     }
 
     #[test]
