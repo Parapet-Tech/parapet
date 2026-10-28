@@ -229,9 +229,9 @@ accepts `POST /v1/chat/completions`, forwards it to
 `<upstream-base>/chat/completions`, and returns JSON or SSE streaming responses.
 Client headers, including `Authorization` and application headers, are
 forwarded unchanged except `Host`, `x-parapet-original-host`,
-`x-parapet-provenance`, and `x-guard-trust*`. A request blocked by the
-configured layers returns HTTP 403 with `x-parapet-blocked-by` and is never
-sent upstream.
+`x-parapet-provenance`, and `x-guard-trust*`; streaming requests also force
+`Accept-Encoding: identity` upstream. A request blocked by the configured
+layers returns HTTP 403 with `x-parapet-blocked-by` and is never sent upstream.
 
 Prerequisites:
 

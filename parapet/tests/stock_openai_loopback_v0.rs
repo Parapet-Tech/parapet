@@ -25,16 +25,9 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-/// Ordinary config: default block patterns stay on (no
-/// `use_default_block_patterns: false`), L1 keeps its shipped defaults, and no
-/// provenance profile or trust override is configured.
-const ORDINARY_YAML: &str = r#"parapet: v1
-layers:
-  L0: { mode: sanitize }
-  L3_inbound: { mode: block }
-  L3_outbound: { mode: block, block_action: rewrite }
-  L5a: { mode: redact }
-"#;
+/// Minimal ordinary config: all layers, including blocking L1, use their
+/// shipped defaults. No provenance profile or trust override is configured.
+const ORDINARY_YAML: &str = "parapet: v1\n";
 
 const LOCAL_MODEL: &str = "local-community/Example-3B-Instruct-4bit";
 const CLIENT_KEY: &str = "sk-local-placeholder-key";
@@ -449,9 +442,12 @@ async fn stock_client_injected_request_blocks_with_zero_upstream_calls() {
         .await
         .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN, "stream={stream}");
-        assert!(
-            resp.headers().get("x-parapet-blocked-by").is_some(),
-            "stream={stream}: block must name the deciding layer"
+        assert_eq!(
+            resp.headers()
+                .get("x-parapet-blocked-by")
+                .and_then(|value| value.to_str().ok()),
+            Some("L1"),
+            "stream={stream}: shipped-default L1 must decide the block"
         );
         let body: serde_json::Value = resp.json().await.unwrap();
         assert!(
