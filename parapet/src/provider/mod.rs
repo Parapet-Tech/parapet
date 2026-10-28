@@ -20,6 +20,7 @@ use crate::message::{Message, Role, ToolCall, TrustLevel};
 
 pub mod responses;
 pub mod responses_output;
+pub mod responses_request;
 pub mod responses_sse;
 pub mod responses_stream;
 pub mod responses_stream_state;

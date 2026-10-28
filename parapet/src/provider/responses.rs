@@ -134,6 +134,22 @@ impl<P: JsonParser> OpenAiResponsesDecoder<P> {
                 invalid("request body contains a duplicate object key")
             }
         })?;
+        self.decode_value(&root)
+    }
+
+    /// The injected parser, for callers that must parse the body themselves
+    /// before handing the validated value to [`Self::decode_value`].
+    pub(super) fn parser(&self) -> &P {
+        &self.parser
+    }
+
+    /// Decode an already strictly parsed request body. `root` must come from
+    /// this decoder's [`JsonParser`]; a duplicate-tolerant parse would let a
+    /// caller scan a different view than the upstream reads.
+    pub(super) fn decode_value(
+        &self,
+        root: &Value,
+    ) -> Result<DecodedResponsesRequest, ProviderError> {
         let root = root
             .as_object()
             .ok_or_else(|| invalid("request body must be a JSON object"))?;
