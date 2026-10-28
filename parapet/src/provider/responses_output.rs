@@ -199,35 +199,81 @@ impl<P: JsonParser> ResponseDecoder for OpenAiResponsesOutputDecoder<P> {
                 invalid("response body contains a duplicate object key")
             }
         })?;
-        let obj = root
-            .as_object()
-            .ok_or_else(|| invalid("response body must be a JSON object"))?;
-
-        validate_top_level(obj)?;
-
-        let items = match obj.get("output") {
-            Some(Value::Array(items)) => items,
-            Some(_) => return Err(invalid("output must be an array")),
-            None => return Err(ProviderError::MissingField("output".to_string())),
-        };
-        let mut view = OutputView::default();
-        for (i, item) in items.iter().enumerate() {
-            view.decode_item(&self.parser, item, i)?;
-        }
-
-        Ok(DecodedResponse {
-            root,
-            texts: view.texts,
-            tool_calls: view.tool_calls,
-        })
+        decode_response_value(&self.parser, root, ResponseStatus::Final)
     }
+}
+
+/// Which `status` / `error` combination a response object may carry. The
+/// non-stream body is always [`ResponseStatus::Final`]; SSE lifecycle events
+/// carry the others.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ResponseStatus {
+    /// `queued` or `in_progress`, `error` null, `output` empty.
+    Pending,
+    /// `completed` or `incomplete`, `error` null.
+    Final,
+    /// Exactly `completed`, `error` null.
+    Completed,
+    /// Exactly `incomplete`, `error` null.
+    Incomplete,
+    /// `failed` with a non-null `{code, message}` error object.
+    Failed,
+}
+
+impl ResponseStatus {
+    fn statuses(self) -> &'static [&'static str] {
+        match self {
+            Self::Pending => &["queued", "in_progress"],
+            Self::Final => &["completed", "incomplete"],
+            Self::Completed => &["completed"],
+            Self::Incomplete => &["incomplete"],
+            Self::Failed => &["failed"],
+        }
+    }
+}
+
+/// Validate an already-parsed response object and build its inspection view.
+pub(super) fn decode_response_value(
+    parser: &dyn JsonParser,
+    root: Value,
+    expected: ResponseStatus,
+) -> Result<DecodedResponse, ProviderError> {
+    let obj = root
+        .as_object()
+        .ok_or_else(|| invalid("response body must be a JSON object"))?;
+
+    validate_top_level(obj, expected)?;
+
+    let items = match obj.get("output") {
+        Some(Value::Array(items)) => items,
+        Some(_) => return Err(invalid("output must be an array")),
+        None => return Err(ProviderError::MissingField("output".to_string())),
+    };
+    if expected == ResponseStatus::Pending && !items.is_empty() {
+        return Err(invalid(
+            "output must be empty while the response is pending",
+        ));
+    }
+    let mut view = OutputView::default();
+    for (i, item) in items.iter().enumerate() {
+        view.decode_item(parser, item, i)?;
+    }
+
+    Ok(DecodedResponse {
+        root,
+        texts: view.texts,
+        tool_calls: view.tool_calls,
+    })
 }
 
 // ---------------------------------------------------------------------------
 // Top-level fields
 // ---------------------------------------------------------------------------
 
-fn validate_top_level(root: &Map<String, Value>) -> Result<(), ProviderError> {
+fn validate_top_level(
+    root: &Map<String, Value>,
+    expected: ResponseStatus,
+) -> Result<(), ProviderError> {
     enum_value(
         root.get("object").unwrap_or(&Value::Null),
         &["response"],
@@ -247,8 +293,9 @@ fn validate_top_level(root: &Map<String, Value>) -> Result<(), ProviderError> {
                     return Err(invalid(format!("{key} must be a number or null")));
                 }
             }
-            "status" => enum_value(value, &["completed", "incomplete"], key)?,
-            "error" | "previous_response_id" | "conversation" | "prompt" => {
+            "status" => enum_value(value, expected.statuses(), key)?,
+            "error" => validate_error(value, expected)?,
+            "previous_response_id" | "conversation" | "prompt" => {
                 if !value.is_null() {
                     return Err(invalid(format!("{key} must be null")));
                 }
@@ -284,6 +331,15 @@ fn validate_top_level(root: &Map<String, Value>) -> Result<(), ProviderError> {
         }
     }
 
+    // Stream lifecycle events bind their phase to an explicit status; a
+    // failed response must also say why.
+    if expected != ResponseStatus::Final && !root.contains_key("status") {
+        return Err(ProviderError::MissingField("status".to_string()));
+    }
+    if expected == ResponseStatus::Failed && !root.contains_key("error") {
+        return Err(ProviderError::MissingField("error".to_string()));
+    }
+
     // Request echo: same shapes the request decoder accepts.
     let mut tool_names = Vec::new();
     match root.get("tools") {
@@ -300,6 +356,25 @@ fn validate_top_level(root: &Map<String, Value>) -> Result<(), ProviderError> {
         Some(_) => return Err(invalid("tools must be an array or null")),
     }
     validate_tool_choice(root.get("tool_choice"), &tool_names)
+}
+
+/// `error` is null except on a failed response, where it must be a
+/// `{code, message}` object. Provider error text is validated, never exposed.
+fn validate_error(value: &Value, expected: ResponseStatus) -> Result<(), ProviderError> {
+    if expected != ResponseStatus::Failed {
+        return if value.is_null() {
+            Ok(())
+        } else {
+            Err(invalid("error must be null"))
+        };
+    }
+    let obj = value
+        .as_object()
+        .ok_or_else(|| invalid("error must be an object on a failed response"))?;
+    allow_keys(obj, &["code", "message"], "error")?;
+    optional_string(obj, "code", "error")?;
+    required_string(obj, "message", "error")?;
+    Ok(())
 }
 
 fn validate_usage(value: &Value) -> Result<(), ProviderError> {
@@ -355,27 +430,36 @@ fn nullable_count(value: &Value, at: &str) -> Result<(), ProviderError> {
 
 const ITEM_STATUSES: &[&str] = &["in_progress", "completed", "incomplete"];
 
+/// Inspection view accumulated over one or more output items.
 #[derive(Default)]
-struct OutputView {
-    texts: Vec<TextSegment>,
-    tool_calls: Vec<ToolCall>,
+pub(super) struct OutputView {
+    pub(super) texts: Vec<TextSegment>,
+    pub(super) tool_calls: Vec<ToolCall>,
 }
 
 impl OutputView {
-    fn decode_item(
+    /// Validate one `output[]` item at `index`, appending its text segments
+    /// and tool call. Returns the item kind.
+    pub(super) fn decode_item(
         &mut self,
         parser: &dyn JsonParser,
         item: &Value,
         index: usize,
-    ) -> Result<(), ProviderError> {
+    ) -> Result<OutputItemKind, ProviderError> {
         let at = format!("output[{index}]");
         let obj = item
             .as_object()
             .ok_or_else(|| invalid(format!("{at} must be an object")))?;
         match required_string(obj, "type", &at)? {
-            "message" => self.decode_message(obj, index, &at),
-            "function_call" => self.decode_function_call(parser, obj, &at),
-            "reasoning" => self.decode_reasoning(obj, index, &at),
+            "message" => self
+                .decode_message(obj, index, &at)
+                .map(|()| OutputItemKind::Message),
+            "function_call" => self
+                .decode_function_call(parser, obj, &at)
+                .map(|()| OutputItemKind::FunctionCall),
+            "reasoning" => self
+                .decode_reasoning(obj, index, &at)
+                .map(|()| OutputItemKind::Reasoning),
             _ => Err(invalid(format!("{at} has an unsupported output item type"))),
         }
     }
@@ -393,26 +477,7 @@ impl OutputView {
         }
         let parts = required_array(obj, "content", at)?;
         for (p, part) in parts.iter().enumerate() {
-            let at = format!("{at}.content[{p}]");
-            let part = part
-                .as_object()
-                .ok_or_else(|| invalid(format!("{at} must be an object")))?;
-            let (kind, field) = match required_string(part, "type", &at)? {
-                "output_text" => {
-                    allow_keys(part, &["type", "text", "annotations", "logprobs"], &at)?;
-                    // Annotation titles/URLs and logprob tokens are
-                    // text-bearing and not segmented; only empty forms pass.
-                    empty_array_or_absent(part, "annotations", &at)?;
-                    empty_array_or_absent(part, "logprobs", &at)?;
-                    (TextSegmentKind::OutputText, "text")
-                }
-                "refusal" => {
-                    allow_keys(part, &["type", "refusal"], &at)?;
-                    (TextSegmentKind::Refusal, "refusal")
-                }
-                _ => return Err(invalid(format!("{at} has an unsupported content type"))),
-            };
-            let text = required_string(part, field, &at)?;
+            let (kind, field, text) = decode_message_part(part, &format!("{at}.content[{p}]"))?;
             self.push_text(kind, text, index, "content", p, field);
         }
         Ok(())
@@ -542,6 +607,41 @@ impl OutputView {
     }
 }
 
+/// Which accepted `output[]` item type was decoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputItemKind {
+    Message,
+    FunctionCall,
+    Reasoning,
+}
+
+/// Validate one assistant `message` content part. Returns its segment kind,
+/// text field name, and text.
+pub(super) fn decode_message_part<'a>(
+    part: &'a Value,
+    at: &str,
+) -> Result<(TextSegmentKind, &'static str, &'a str), ProviderError> {
+    let part = part
+        .as_object()
+        .ok_or_else(|| invalid(format!("{at} must be an object")))?;
+    let (kind, field) = match required_string(part, "type", at)? {
+        "output_text" => {
+            allow_keys(part, &["type", "text", "annotations", "logprobs"], at)?;
+            // Annotation titles/URLs and logprob tokens are text-bearing and
+            // not segmented; only empty forms pass.
+            empty_array_or_absent(part, "annotations", at)?;
+            empty_array_or_absent(part, "logprobs", at)?;
+            (TextSegmentKind::OutputText, "text")
+        }
+        "refusal" => {
+            allow_keys(part, &["type", "refusal"], at)?;
+            (TextSegmentKind::Refusal, "refusal")
+        }
+        _ => return Err(invalid(format!("{at} has an unsupported content type"))),
+    };
+    Ok((kind, field, required_string(part, field, at)?))
+}
+
 /// `id` and `status` on every output item: provider-assigned, not model text.
 fn validate_item_meta(obj: &Map<String, Value>, at: &str) -> Result<(), ProviderError> {
     optional_string(obj, "id", at)?;
@@ -564,7 +664,7 @@ fn required_array<'a>(
     }
 }
 
-fn non_empty_string<'a>(
+pub(super) fn non_empty_string<'a>(
     obj: &'a Map<String, Value>,
     key: &str,
     at: &str,

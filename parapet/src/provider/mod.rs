@@ -10,12 +10,14 @@
 // - Serialize error responses in provider-specific format
 // - Handle edge cases: empty messages, null arguments, content arrays, etc.
 // - OpenAI Responses request decoding lives in `responses`; non-stream
-//   response inspection/rewrite lives in `responses_output`
+//   response inspection/rewrite lives in `responses_output`; single SSE
+//   event decoding lives in `responses_stream`
 
 use crate::message::{Message, Role, ToolCall, TrustLevel};
 
 pub mod responses;
 pub mod responses_output;
+pub mod responses_stream;
 
 // ---------------------------------------------------------------------------
 // Error type
