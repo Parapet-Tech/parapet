@@ -15,6 +15,8 @@
 //   on server-side context references (`previous_response_id`,
 //   `conversation`, `prompt`), on every `input_image` / `input_file` part, on
 //   reasoning `encrypted_content`, and on any tool type other than `function`
+// - Reject duplicate JSON object keys at any depth, in the body and in
+//   function_call `arguments`, before any value is used (Stage 2B1)
 //
 // Not in scope: response/SSE decoding, output filtering, and tool-call
 // enforcement. The route seam in `proxy` keeps forwarding disabled.
@@ -70,11 +72,24 @@ const SERVER_SIDE_CONTEXT_FIELDS: &[&str] = &["previous_response_id", "conversat
 ///   until it becomes inspectable.
 /// - non-`function` tools: hosted/custom/namespace tools carry model-visible
 ///   text or server-side behavior outside this decoder.
-pub struct OpenAiResponsesDecoder;
+///
+/// JSON bytes (the body and every function_call `arguments` string) are read
+/// through the injected [`JsonParser`]; the default [`StrictJsonParser`]
+/// rejects duplicate object keys so Parapet never scans a last-wins view of a
+/// request that an upstream might read first-wins.
+pub struct OpenAiResponsesDecoder<P: JsonParser = StrictJsonParser> {
+    parser: P,
+}
 
 impl OpenAiResponsesDecoder {
     pub fn new() -> Self {
-        Self
+        Self::with_parser(StrictJsonParser)
+    }
+}
+
+impl<P: JsonParser> OpenAiResponsesDecoder<P> {
+    pub fn with_parser(parser: P) -> Self {
+        Self { parser }
     }
 }
 
@@ -84,10 +99,14 @@ impl Default for OpenAiResponsesDecoder {
     }
 }
 
-impl RequestDecoder for OpenAiResponsesDecoder {
+impl<P: JsonParser> RequestDecoder for OpenAiResponsesDecoder<P> {
     fn decode_request(&self, body: &[u8]) -> Result<Vec<Message>, ProviderError> {
-        let root: Value =
-            serde_json::from_slice(body).map_err(|e| ProviderError::InvalidJson(e.to_string()))?;
+        let root = self.parser.parse(body).map_err(|e| match e {
+            JsonParseError::Syntax(msg) => ProviderError::InvalidJson(msg),
+            JsonParseError::DuplicateKey => {
+                invalid("request body contains a duplicate object key")
+            }
+        })?;
         let root = root
             .as_object()
             .ok_or_else(|| invalid("request body must be a JSON object"))?;
@@ -128,7 +147,7 @@ impl RequestDecoder for OpenAiResponsesDecoder {
             Some(Value::String(s)) => messages.push(Message::new(Role::User, s.clone())),
             Some(Value::Array(items)) => {
                 for (i, item) in items.iter().enumerate() {
-                    messages.push(decode_item(item, &format!("input[{i}]"))?);
+                    messages.push(decode_item(&self.parser, item, &format!("input[{i}]"))?);
                 }
             }
             Some(_) => return Err(invalid("input must be a string, array, or null")),
@@ -351,7 +370,11 @@ fn validate_tool_choice(value: Option<&Value>, tool_names: &[String]) -> Result<
 // Input items
 // ---------------------------------------------------------------------------
 
-fn decode_item(item: &Value, at: &str) -> Result<Message, ProviderError> {
+fn decode_item(
+    parser: &dyn JsonParser,
+    item: &Value,
+    at: &str,
+) -> Result<Message, ProviderError> {
     let obj = item
         .as_object()
         .ok_or_else(|| invalid(format!("{at} must be an object")))?;
@@ -360,7 +383,7 @@ fn decode_item(item: &Value, at: &str) -> Result<Message, ProviderError> {
         None => Err(ProviderError::MissingField(format!("{at}.type"))),
         Some(Value::String(t)) => match t.as_str() {
             "message" => decode_message_item(obj, at),
-            "function_call" => decode_function_call(obj, at),
+            "function_call" => decode_function_call(parser, obj, at),
             "function_call_output" => decode_function_call_output(obj, at),
             "reasoning" => decode_reasoning(obj, at),
             _ => Err(invalid(format!("{at} has an unsupported item type"))),
@@ -391,7 +414,11 @@ fn decode_message_item(obj: &Map<String, Value>, at: &str) -> Result<Message, Pr
     Ok(Message::new(role, content))
 }
 
-fn decode_function_call(obj: &Map<String, Value>, at: &str) -> Result<Message, ProviderError> {
+fn decode_function_call(
+    parser: &dyn JsonParser,
+    obj: &Map<String, Value>,
+    at: &str,
+) -> Result<Message, ProviderError> {
     allow_keys(
         obj,
         &["type", "call_id", "name", "arguments", "id", "status"],
@@ -405,8 +432,14 @@ fn decode_function_call(obj: &Map<String, Value>, at: &str) -> Result<Message, P
     let arguments = if raw_arguments.is_empty() {
         serde_json::json!({})
     } else {
-        serde_json::from_str(raw_arguments)
-            .map_err(|_| invalid(format!("{at}.arguments is not valid JSON")))?
+        parser
+            .parse(raw_arguments.as_bytes())
+            .map_err(|e| match e {
+                JsonParseError::Syntax(_) => invalid(format!("{at}.arguments is not valid JSON")),
+                JsonParseError::DuplicateKey => invalid(format!(
+                    "{at}.arguments contains a duplicate object key"
+                )),
+            })?
     };
 
     let mut msg = Message::new(Role::Assistant, String::new());
@@ -555,6 +588,122 @@ fn decode_typed_text_parts(
         text.push_str(required_string(obj, "text", &at)?);
     }
     Ok(text)
+}
+
+// ---------------------------------------------------------------------------
+// JSON parsing
+// ---------------------------------------------------------------------------
+
+/// Parses JSON bytes into a [`Value`].
+pub trait JsonParser: Send + Sync {
+    fn parse(&self, bytes: &[u8]) -> Result<Value, JsonParseError>;
+}
+
+/// Why a [`JsonParser`] refused its input. Neither variant carries request
+/// keys or values.
+#[derive(Debug, PartialEq)]
+pub enum JsonParseError {
+    /// Not well-formed JSON; holds serde_json's position-only message.
+    Syntax(String),
+    /// Some object, at any nesting depth, repeats a key (compared after
+    /// escape decoding).
+    DuplicateKey,
+}
+
+/// RFC 8259 parser that rejects duplicate object keys at every depth instead
+/// of silently keeping the last occurrence the way `serde_json::Value` does.
+/// Nesting depth is bounded by serde_json's recursion limit.
+pub struct StrictJsonParser;
+
+impl JsonParser for StrictJsonParser {
+    fn parse(&self, bytes: &[u8]) -> Result<Value, JsonParseError> {
+        use serde::de::DeserializeSeed;
+
+        let duplicate = std::cell::Cell::new(false);
+        let mut de = serde_json::Deserializer::from_slice(bytes);
+        let parsed = StrictValueSeed {
+            duplicate: &duplicate,
+        }
+        .deserialize(&mut de)
+        .and_then(|value| de.end().map(|()| value));
+        match parsed {
+            Ok(value) => Ok(value),
+            Err(_) if duplicate.get() => Err(JsonParseError::DuplicateKey),
+            Err(e) => Err(JsonParseError::Syntax(e.to_string())),
+        }
+    }
+}
+
+/// Builds a [`Value`] like serde_json's own visitor, but flags and aborts on
+/// the first repeated key within any single object.
+#[derive(Clone, Copy)]
+struct StrictValueSeed<'a> {
+    duplicate: &'a std::cell::Cell<bool>,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for StrictValueSeed<'_> {
+    type Value = Value;
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, de: D) -> Result<Value, D::Error> {
+        de.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for StrictValueSeed<'_> {
+    type Value = Value;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("any JSON value")
+    }
+
+    fn visit_bool<E>(self, v: bool) -> Result<Value, E> {
+        Ok(Value::Bool(v))
+    }
+
+    fn visit_i64<E>(self, v: i64) -> Result<Value, E> {
+        Ok(Value::from(v))
+    }
+
+    fn visit_u64<E>(self, v: u64) -> Result<Value, E> {
+        Ok(Value::from(v))
+    }
+
+    fn visit_f64<E>(self, v: f64) -> Result<Value, E> {
+        Ok(serde_json::Number::from_f64(v).map_or(Value::Null, Value::Number))
+    }
+
+    fn visit_str<E>(self, v: &str) -> Result<Value, E> {
+        Ok(Value::String(v.to_owned()))
+    }
+
+    fn visit_string<E>(self, v: String) -> Result<Value, E> {
+        Ok(Value::String(v))
+    }
+
+    fn visit_unit<E>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
+        let mut items = Vec::new();
+        while let Some(item) = seq.next_element_seed(self)? {
+            items.push(item);
+        }
+        Ok(Value::Array(items))
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
+        let mut obj = Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if obj.contains_key(&key) {
+                self.duplicate.set(true);
+                return Err(serde::de::Error::custom("duplicate object key"));
+            }
+            let value = map.next_value_seed(self)?;
+            obj.insert(key, value);
+        }
+        Ok(Value::Object(obj))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1612,6 +1761,208 @@ mod tests {
             .decode_request(b"{not json")
             .unwrap_err();
         assert!(matches!(err, ProviderError::InvalidJson(_)));
+    }
+
+    // Raw byte fixtures: `json!` cannot represent duplicate keys.
+    const DUP_SENTINEL: &str = "DUPKEY_SENTINEL_7f3a";
+
+    const BODY_DUPLICATE: &str = "request body contains a duplicate object key";
+
+    fn decode_raw(body: &str) -> Result<Vec<Message>, ProviderError> {
+        OpenAiResponsesDecoder::new().decode_request(body.as_bytes())
+    }
+
+    /// (label, duplicate-key body, same body with the duplicate removed,
+    /// expected fixed error for the duplicate body)
+    fn duplicate_key_cases() -> Vec<(&'static str, String, String, String)> {
+        let s = DUP_SENTINEL;
+        let tool = |fields: &str| {
+            format!(r#"{{"tools":[{{"type":"function",{fields}}}],"input":"hi"}}"#)
+        };
+        let body = BODY_DUPLICATE.to_string();
+        vec![
+            (
+                "root",
+                format!(r#"{{"input":"hi","input":"{s}"}}"#),
+                r#"{"input":"hi"}"#.to_string(),
+                body.clone(),
+            ),
+            (
+                "root key spelled with an escape",
+                format!(r#"{{"input":"hi","input":"{s}"}}"#),
+                r#"{"input":"hi"}"#.to_string(),
+                body.clone(),
+            ),
+            (
+                "tool description",
+                tool(&format!(r#""name":"f","description":"ok","description":"{s}""#)),
+                tool(r#""name":"f","description":"ok""#),
+                body.clone(),
+            ),
+            (
+                "tool name",
+                tool(&format!(r#""name":"f","name":"{s}""#)),
+                tool(r#""name":"f""#),
+                body.clone(),
+            ),
+            (
+                "nested schema property",
+                tool(&format!(
+                    r#""name":"f","parameters":{{"type":"object","properties":{{"{s}":{{"type":"string"}},"{s}":{{"type":"number"}}}}}}"#
+                )),
+                tool(&format!(
+                    r#""name":"f","parameters":{{"type":"object","properties":{{"{s}":{{"type":"string"}}}}}}"#
+                )),
+                body.clone(),
+            ),
+            (
+                "deep schema description",
+                tool(&format!(
+                    r#""name":"f","parameters":{{"properties":{{"x":{{"items":{{"description":"ok","description":"{s}"}}}}}}}}"#
+                )),
+                tool(r#""name":"f","parameters":{"properties":{"x":{"items":{"description":"ok"}}}}"#),
+                body.clone(),
+            ),
+            (
+                "$defs",
+                tool(&format!(
+                    r#""name":"f","parameters":{{"$defs":{{"d":{{"type":"string"}},"d":{{"description":"{s}"}}}}}}"#
+                )),
+                tool(r#""name":"f","parameters":{"$defs":{"d":{"type":"string"}}}"#),
+                body.clone(),
+            ),
+            (
+                "input text part",
+                format!(
+                    r#"{{"input":[{{"role":"user","content":[{{"type":"input_text","text":"ok","text":"{s}"}}]}}]}}"#
+                ),
+                r#"{"input":[{"role":"user","content":[{"type":"input_text","text":"ok"}]}]}"#
+                    .to_string(),
+                body.clone(),
+            ),
+            (
+                "input message role",
+                format!(r#"{{"input":[{{"role":"user","role":"system","content":"{s}"}}]}}"#),
+                format!(r#"{{"input":[{{"role":"user","content":"{s}"}}]}}"#),
+                body.clone(),
+            ),
+            (
+                "reasoning config",
+                r#"{"input":"hi","reasoning":{"effort":"low","effort":"high"}}"#.to_string(),
+                r#"{"input":"hi","reasoning":{"effort":"low"}}"#.to_string(),
+                body.clone(),
+            ),
+            (
+                "text config",
+                r#"{"input":"hi","text":{"format":{"type":"text","type":"json_object"}}}"#
+                    .to_string(),
+                r#"{"input":"hi","text":{"format":{"type":"text"}}}"#.to_string(),
+                body.clone(),
+            ),
+            (
+                "metadata",
+                format!(r#"{{"input":"hi","metadata":{{"k":"v","k":"{s}"}}}}"#),
+                r#"{"input":"hi","metadata":{"k":"v"}}"#.to_string(),
+                body.clone(),
+            ),
+            (
+                "function_call arguments",
+                format!(
+                    r#"{{"input":[{{"type":"function_call","call_id":"c","name":"f","arguments":"{{\"a\":1,\"a\":\"{s}\"}}"}}]}}"#
+                ),
+                format!(
+                    r#"{{"input":[{{"type":"function_call","call_id":"c","name":"f","arguments":"{{\"a\":\"{s}\"}}"}}]}}"#
+                ),
+                "input[0].arguments contains a duplicate object key".to_string(),
+            ),
+            (
+                "nested function_call arguments",
+                format!(
+                    r#"{{"input":[{{"type":"function_call","call_id":"c","name":"f","arguments":"{{\"o\":[{{\"b\":1,\"b\":\"{s}\"}}]}}"}}]}}"#
+                ),
+                format!(
+                    r#"{{"input":[{{"type":"function_call","call_id":"c","name":"f","arguments":"{{\"o\":[{{\"b\":\"{s}\"}}]}}"}}]}}"#
+                ),
+                "input[0].arguments contains a duplicate object key".to_string(),
+            ),
+        ]
+    }
+
+    #[test]
+    fn duplicate_object_keys_fail_closed_at_every_depth_without_echo() {
+        for (label, duplicate, unique, expected) in duplicate_key_cases() {
+            decode_raw(&unique).unwrap_or_else(|e| panic!("{label}: unique control: {e}"));
+            match decode_raw(&duplicate) {
+                Err(ProviderError::InvalidFormat(msg)) => {
+                    assert_eq!(msg, expected, "{label}");
+                    assert!(!msg.contains(DUP_SENTINEL), "{label}: {msg}");
+                }
+                other => panic!("{label}: expected duplicate-key refusal, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn same_key_in_sibling_objects_is_accepted() {
+        let body = r#"{
+            "tools": [
+                {"type":"function","name":"a","parameters":{"properties":{"x":{"type":"string"}}}},
+                {"type":"function","name":"b","parameters":{"properties":{"x":{"type":"string"}}}}
+            ],
+            "input": [
+                {"role":"user","content":[{"type":"input_text","text":"one"},{"type":"input_text","text":"two"}]},
+                {"type":"function_call","call_id":"c","name":"a","arguments":"{\"x\":{\"x\":1},\"y\":[{\"x\":2},{\"x\":3}]}"}
+            ]
+        }"#;
+        let msgs = decode_raw(body).unwrap();
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[2].content, "onetwo");
+        assert_eq!(
+            msgs[3].tool_calls[0].arguments,
+            json!({"x": {"x": 1}, "y": [{"x": 2}, {"x": 3}]})
+        );
+    }
+
+    #[test]
+    fn strict_parser_matches_serde_json_on_unique_documents() {
+        for doc in [
+            r#"{"a":[1,-2,3.5,1e400,true,false,null,"s"],"b":{"c":{}},"d":[]}"#,
+            r#"[{"a":1},{"a":2}]"#,
+            r#""é""#,
+            "18446744073709551615",
+        ] {
+            let expected = serde_json::from_str::<Value>(doc);
+            let actual = StrictJsonParser.parse(doc.as_bytes());
+            match expected {
+                Ok(v) => assert_eq!(actual, Ok(v), "{doc}"),
+                Err(_) => assert!(matches!(actual, Err(JsonParseError::Syntax(_))), "{doc}"),
+            }
+        }
+        for bad in ["{} x", "{\"a\":}", "", "[1,]"] {
+            assert!(
+                matches!(StrictJsonParser.parse(bad.as_bytes()), Err(JsonParseError::Syntax(_))),
+                "{bad:?}"
+            );
+        }
+    }
+
+    struct RefusingParser;
+
+    impl JsonParser for RefusingParser {
+        fn parse(&self, _bytes: &[u8]) -> Result<Value, JsonParseError> {
+            Err(JsonParseError::DuplicateKey)
+        }
+    }
+
+    #[test]
+    fn decoder_reads_bytes_through_the_injected_parser() {
+        let err = OpenAiResponsesDecoder::with_parser(RefusingParser)
+            .decode_request(br#"{"input":"hi"}"#)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            invalid(BODY_DUPLICATE).to_string()
+        );
     }
 
     #[test]
