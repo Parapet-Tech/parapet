@@ -81,20 +81,25 @@ pub(super) fn enforce_non_streaming_responses(
         return ResponsesOutputDecision::Allowed(decoded.to_json_bytes());
     }
 
-    // Arguments are complete, strictly parsed objects here. Scan their
-    // canonical JSON for detection, but never splice scanner output back into
-    // an executable tool call. Any finding suppresses the entire response.
+    // Arguments are complete, strictly parsed objects here. Keep the
+    // canonical JSON scan for patterns that span structure, and also scan the
+    // tool name plus every object key and string leaf. Canonical JSON escaping
+    // must not hide quote- or whitespace-separated secrets from L5a. Never
+    // splice scanner output back into an executable tool call: any finding
+    // suppresses the entire response.
     for tool_call in decoded.tool_calls() {
         let arguments = serde_json::to_string(&tool_call.arguments)
             .expect("serializing a serde_json::Value cannot fail");
-        match scan(scanner, &arguments, config) {
-            Ok(Some(result)) if !result.redactions.is_empty() => {
-                return ResponsesOutputDecision::BlockedByL5aToolArguments;
+        for content in [&*tool_call.name, &*arguments] {
+            match scan_detects(scanner, content, config) {
+                Ok(true) => return ResponsesOutputDecision::BlockedByL5aToolArguments,
+                Ok(false) => {}
+                Err(()) => return ResponsesOutputDecision::LayerFailure,
             }
-            Ok(Some(result)) if result.content != arguments => {
-                return ResponsesOutputDecision::LayerFailure;
-            }
-            Ok(_) => {}
+        }
+        match json_strings_detected(&tool_call.arguments, scanner, config) {
+            Ok(true) => return ResponsesOutputDecision::BlockedByL5aToolArguments,
+            Ok(false) => {}
             Err(()) => return ResponsesOutputDecision::LayerFailure,
         }
     }
@@ -134,6 +139,43 @@ fn scan(
         Ok(result) => Ok(Some(result)),
         Err(_) if config.runtime.engine.on_failure == FailureMode::Open => Ok(None),
         Err(_) => Err(()),
+    }
+}
+
+fn scan_detects(scanner: &dyn OutputScanner, content: &str, config: &Config) -> Result<bool, ()> {
+    match scan(scanner, content, config)? {
+        Some(result) if result.redactions.is_empty() && result.content != content => Err(()),
+        Some(result) => Ok(!result.redactions.is_empty()),
+        None => Ok(false),
+    }
+}
+
+fn json_strings_detected(
+    value: &serde_json::Value,
+    scanner: &dyn OutputScanner,
+    config: &Config,
+) -> Result<bool, ()> {
+    match value {
+        serde_json::Value::Object(fields) => {
+            for (key, value) in fields {
+                if scan_detects(scanner, key, config)?
+                    || json_strings_detected(value, scanner, config)?
+                {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                if json_strings_detected(value, scanner, config)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        serde_json::Value::String(text) => scan_detects(scanner, text, config),
+        _ => Ok(false),
     }
 }
 
@@ -197,6 +239,13 @@ mod tests {
         }
     }
 
+    fn config_with_default_sensitive_patterns() -> Config {
+        let mut config = config(false, true, FailureMode::Open);
+        config.policy.canary_tokens.clear();
+        config.policy.sensitive_patterns = crate::config::default_sensitive_patterns();
+        config
+    }
+
     fn response(text_marker: bool, argument_marker: bool) -> Vec<u8> {
         let text = if text_marker { MARKER } else { "safe" };
         let argument = if argument_marker { MARKER } else { "note.txt" };
@@ -221,6 +270,13 @@ mod tests {
             ]
         }))
         .unwrap()
+    }
+
+    fn response_with_arguments(arguments: Value) -> Vec<u8> {
+        let mut response: Value = serde_json::from_slice(&response(false, false)).unwrap();
+        response["output"][2]["arguments"] =
+            Value::String(serde_json::to_string(&arguments).unwrap());
+        serde_json::to_vec(&response).unwrap()
     }
 
     struct PanicScanner;
@@ -325,6 +381,34 @@ mod tests {
         );
         assert_eq!(result, ResponsesOutputDecision::BlockedByL5aToolArguments);
         assert!(!format!("{result:?}").contains(MARKER));
+    }
+
+    #[test]
+    fn l5a_scans_tool_argument_keys_and_nested_string_leaves_before_json_escaping() {
+        let hex64 = "a".repeat(64);
+        let aws40 = "A".repeat(40);
+        let bearer = "B".repeat(24);
+        let cases = [
+            serde_json::json!({"value": format!("password=\"{hex64}")}),
+            serde_json::json!({"value": format!("password:\n{hex64}")}),
+            serde_json::json!({"value": format!("Bearer\t{bearer}")}),
+            serde_json::json!({"value": format!("aws_secret_access_key=\"{aws40}")}),
+            serde_json::json!({format!("password={hex64}"): "value"}),
+            serde_json::json!({"nested": ["safe", {"value": format!("token={hex64}")}]}),
+        ];
+
+        for arguments in cases {
+            let body = response_with_arguments(arguments);
+            let result = enforce_non_streaming_responses(
+                StatusCode::OK,
+                &body,
+                &config_with_default_sensitive_patterns(),
+                &DslConstraintEvaluator::new(),
+                &L5aScanner,
+            );
+            assert_eq!(result, ResponsesOutputDecision::BlockedByL5aToolArguments);
+            assert!(!format!("{result:?}").contains(&hex64));
+        }
     }
 
     #[test]
