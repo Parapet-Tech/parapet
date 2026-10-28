@@ -393,8 +393,8 @@ mod tests {
             serde_json::json!({"value": format!("password:\n{hex64}")}),
             serde_json::json!({"value": format!("Bearer\t{bearer}")}),
             serde_json::json!({"value": format!("aws_secret_access_key=\"{aws40}")}),
-            serde_json::json!({format!("password={hex64}"): "value"}),
-            serde_json::json!({"nested": ["safe", {"value": format!("token={hex64}")}]}),
+            serde_json::json!({format!("password=\"{hex64}"): "value"}),
+            serde_json::json!({"nested": ["safe", {"value": format!("token:\n{hex64}")}]}),
         ];
 
         for arguments in cases {
