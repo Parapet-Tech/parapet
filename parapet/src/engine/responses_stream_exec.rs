@@ -224,9 +224,10 @@ impl ResponsesStreamExecutor {
     /// N-R4b1-2: up to `concurrent_streams` tails can occupy runtime workers
     /// at once. The ignored release gate
     /// `n_r4b1_2_release_tail_fits_client_timeout_margin` times finish plus
-    /// policy on accepted max-size streams and requires each tail to stay
-    /// strictly below the `300 s - DEFAULT_WALL_CLOCK_MS` margin; it also
-    /// reports that many worst-case tails run back to back.
+    /// policy on accepted max-size streams and requires each tail, and that
+    /// many worst-case tails run back to back, to stay strictly below the
+    /// `300 s - MAX_WALL_CLOCK_MS` margin, the smallest any accepted config
+    /// leaves (so also below the `300 s - DEFAULT_WALL_CLOCK_MS` margin).
     pub(super) async fn execute<U: ResponsesStreamUpstream>(
         &self,
         received_at: Instant,
@@ -1437,6 +1438,11 @@ mod tests {
     ///   bound with four opaque reasoning values; largest decoded terminal
     ///   and opaque payload dropped inside the tail.
     ///
+    /// Each case pins the bounds it claims to fill. Every tail, and the
+    /// conservative sequential bound, must stay strictly below the minimum
+    /// accepted margin (`300 s - MAX_WALL_CLOCK_MS`), which is tighter than
+    /// the default margin (`300 s - DEFAULT_WALL_CLOCK_MS`).
+    ///
     /// Only setup runs before the timer. Output is content-free numbers.
     #[test]
     #[ignore = "N-R4b1-2 release benchmark; run with --release -- --ignored"]
@@ -1458,7 +1464,13 @@ mod tests {
             sk_test_ab -----BEGIN RSA KEY Bearer ab xoxb-1 api_key=ab postgres://u:p \
             SG.ab.cd npm_ab shpat_ab lorem ipsum ";
 
-        let margin_ms = CLIENT_HEADER_TIMEOUT_MS - ResponsesStreamConfig::DEFAULT_WALL_CLOCK_MS;
+        let default_margin_ms =
+            CLIENT_HEADER_TIMEOUT_MS - ResponsesStreamConfig::DEFAULT_WALL_CLOCK_MS;
+        let minimum_accepted_margin_ms =
+            CLIENT_HEADER_TIMEOUT_MS - ResponsesStreamConfig::MAX_WALL_CLOCK_MS;
+        assert_eq!(default_margin_ms, 5_000);
+        assert_eq!(minimum_accepted_margin_ms, 1_000);
+        assert!(minimum_accepted_margin_ms <= default_margin_ms);
         let config = load_config(&StringSource {
             content: "parapet: v1\n".to_string(),
         })
@@ -1650,6 +1662,7 @@ mod tests {
         // leaf as long as the snapshot bound allows: each leaf byte is
         // stored four times (arguments done, item done twice, terminal).
         let part_bytes = limits.max_text_bytes / limits.max_parts;
+        assert_eq!(part_bytes * limits.max_parts, limits.max_text_bytes);
         let mut text_and_arguments = Shape {
             name: "max_text_and_snapshot_bytes",
             incomplete: false,
@@ -1670,6 +1683,8 @@ mod tests {
         // `{"k":[` + n+1 `""` joined by `,` + `]}` = 3n + 10 bytes.
         let leaves = (limits.max_argument_bytes - 10) / 3 + 1;
         assert_eq!((leaves - 1) * 3 + 10, limits.max_argument_bytes);
+        assert_eq!(leaves, 1_398_099, "scanner-unit shape changed");
+        const EMPTY_LEAF: &str = r#""""#;
         let scan_units = Shape {
             name: "max_argument_scan_units",
             incomplete: true,
@@ -1686,8 +1701,9 @@ mod tests {
             opaque: vec![String::new(); 4],
         };
         let unfilled = frame_bytes(frames(&frame_and_opaque).last().unwrap());
-        let opaque_bytes = ((sse_limits.max_frame_bytes - unfilled) / 4)
-            .min(stream.opaque_limits().max_field_bytes);
+        let opaque_limits = stream.opaque_limits();
+        let opaque_bytes =
+            ((sse_limits.max_frame_bytes - unfilled) / 4).min(opaque_limits.max_field_bytes);
         frame_and_opaque.opaque = vec!["Q".repeat(opaque_bytes); 4];
 
         let mut worst: Option<(&'static str, std::time::Duration, String)> = None;
@@ -1700,6 +1716,38 @@ mod tests {
             let [events, parts, text_bytes, argument_bytes, snapshot_bytes] =
                 usage(&stream, &frames);
             assert!(snapshot_bytes <= limits.max_snapshot_bytes);
+            assert!(events <= limits.max_events);
+            assert!(parts <= limits.max_parts);
+            assert!(text_bytes <= limits.max_text_bytes);
+            assert!(argument_bytes <= limits.max_argument_bytes);
+            let opaque_total: usize = shape.opaque.iter().map(String::len).sum();
+            assert!(shape
+                .opaque
+                .iter()
+                .all(|o| o.len() <= opaque_limits.max_field_bytes));
+            assert!(opaque_total <= opaque_limits.max_total_bytes);
+            match shape.name {
+                "max_text_and_snapshot_bytes" => {
+                    assert_eq!(text_bytes, limits.max_text_bytes);
+                    assert_eq!(parts, limits.max_parts);
+                    assert_eq!(snapshot_bytes, limits.max_snapshot_bytes);
+                }
+                "max_argument_scan_units" => {
+                    assert_eq!(argument_bytes, limits.max_argument_bytes);
+                    assert_eq!(shape.arguments.len(), limits.max_argument_bytes);
+                    assert_eq!(shape.arguments.matches(EMPTY_LEAF).count(), leaves);
+                }
+                "max_frame_and_opaque" => {
+                    // Largest frame an equal four-way opaque split reaches.
+                    assert!(opaque_bytes < opaque_limits.max_field_bytes);
+                    assert_eq!(max_frame, frame_bytes(frames.last().unwrap()));
+                    assert!(sse_limits.max_frame_bytes - max_frame < 4);
+                    assert_eq!(shape.opaque.len(), 4);
+                    assert!(shape.opaque.iter().all(|o| o.len() == opaque_bytes));
+                    assert_eq!(opaque_total, 4 * opaque_bytes);
+                }
+                other => panic!("unpinned case {other}"),
+            }
             drop(frames);
             let collector = collected(&stream, &body);
 
@@ -1715,7 +1763,9 @@ mod tests {
                 "N-R4b1-2 case={} terminal={} stream_bytes={} canonical_bytes={} \
                  max_frame_bytes={} events={events} parts={parts} text_bytes={text_bytes} \
                  argument_bytes={argument_bytes} snapshot_bytes={snapshot_bytes} \
-                 opaque_bytes={} tail_us={} tail_ms={:.3} margin_ms={margin_ms}",
+                 opaque_bytes={opaque_total} tail_us={} tail_ms={:.3} \
+                 default_margin_ms={default_margin_ms} \
+                 minimum_accepted_margin_ms={minimum_accepted_margin_ms}",
                 shape.name,
                 if shape.incomplete {
                     "incomplete"
@@ -1725,13 +1775,17 @@ mod tests {
                 body.len(),
                 canonical.len(),
                 max_frame,
-                shape.opaque.iter().map(String::len).sum::<usize>(),
                 elapsed.as_micros(),
                 elapsed.as_secs_f64() * 1e3,
             );
             assert!(
-                elapsed.as_millis() < u128::from(margin_ms),
-                "{} tail exceeds the client timeout margin",
+                elapsed.as_millis() < u128::from(default_margin_ms),
+                "{} tail exceeds the default client timeout margin",
+                shape.name
+            );
+            assert!(
+                elapsed.as_millis() < u128::from(minimum_accepted_margin_ms),
+                "{} tail exceeds the minimum accepted client timeout margin",
                 shape.name
             );
             if worst.as_ref().map_or(true, |(_, w, _)| elapsed > *w) {
@@ -1755,16 +1809,24 @@ mod tests {
         let sequential = start.elapsed();
         println!(
             "N-R4b1-2 worst_case={name} worst_tail_us={} worst_tail_ms={:.3} \
-             sequential_tails={} sequential_us={} sequential_ms={:.3} margin_ms={margin_ms} \
-             sequential_fits_margin={}",
+             sequential_tails={} sequential_us={} sequential_ms={:.3} \
+             default_margin_ms={default_margin_ms} \
+             minimum_accepted_margin_ms={minimum_accepted_margin_ms} \
+             sequential_fits_default_margin={} sequential_fits_minimum_accepted_margin={}",
             single.as_micros(),
             single.as_secs_f64() * 1e3,
             ResponsesStreamConfig::DEFAULT_CONCURRENT_STREAMS,
             sequential.as_micros(),
             sequential.as_secs_f64() * 1e3,
-            sequential.as_millis() < u128::from(margin_ms),
+            sequential.as_millis() < u128::from(default_margin_ms),
+            sequential.as_millis() < u128::from(minimum_accepted_margin_ms),
         );
-        assert!(single.as_millis() < u128::from(margin_ms));
+        assert!(single.as_millis() < u128::from(minimum_accepted_margin_ms));
+        assert!(sequential.as_millis() < u128::from(default_margin_ms));
+        assert!(
+            sequential.as_millis() < u128::from(minimum_accepted_margin_ms),
+            "sequential bound exceeds the minimum accepted client timeout margin"
+        );
     }
 
     // -- reachability ---------------------------------------------------------
