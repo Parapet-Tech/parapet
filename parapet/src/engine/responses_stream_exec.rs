@@ -72,6 +72,9 @@ pub(super) struct StreamPolicy<'a> {
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) enum ResponsesStreamOutcome {
     Release(Bytes),
+    /// The executor's stream bounds differ from the policy config's
+    /// `runtime.responses_stream`; nothing was admitted or opened.
+    ConfigMismatch,
     /// Every stream slot was taken; upstream was not called.
     ConcurrencyLimit,
     /// The wall-clock budget, measured from request receipt, ran out.
@@ -102,6 +105,7 @@ impl fmt::Debug for ResponsesStreamOutcome {
                     .field("bytes", &bytes.len())
                     .finish()
             }
+            Self::ConfigMismatch => "ConfigMismatch",
             Self::ConcurrencyLimit => "ConcurrencyLimit",
             Self::WallClockTimeout => "WallClockTimeout",
             Self::IdleTimeout => "IdleTimeout",
@@ -161,15 +165,28 @@ impl ResponsesStreamExecutor {
     /// Run one stream to a final outcome.
     ///
     /// `received_at` is when the client request arrived; the wall-clock
-    /// budget runs from it, not from this call. An expired budget or a full
-    /// gate returns before `upstream` is opened. The permit is held until
-    /// this future completes or is dropped.
+    /// budget runs from it, not from this call. A policy config whose
+    /// `runtime.responses_stream` differs from the executor's bounds (for
+    /// example a later snapshot than the one that built the executor), an
+    /// expired budget, or a full gate returns before `upstream` is opened.
+    /// The permit is held until this future completes or is dropped.
+    ///
+    /// Collector finish and policy run synchronously on the polling runtime
+    /// worker and cannot be preempted; a result that completes past the
+    /// deadline is refused, never released. Before a route calls this, R4b2
+    /// must release-benchmark worst-case finish plus policy on a max-size
+    /// stream against the `300 s - wall_clock` margin, and record that up
+    /// to `concurrent_streams` tails can occupy runtime workers at once
+    /// (N-R4b1-2).
     pub(super) async fn execute<U: ResponsesStreamUpstream>(
         &self,
         received_at: Instant,
         upstream: U,
         policy: StreamPolicy<'_>,
     ) -> ResponsesStreamOutcome {
+        if self.config != policy.config.runtime.responses_stream {
+            return ResponsesStreamOutcome::ConfigMismatch;
+        }
         let deadline = received_at + self.config.wall_clock();
         if Instant::now() >= deadline {
             return ResponsesStreamOutcome::WallClockTimeout;
@@ -303,6 +320,19 @@ mod tests {
             },
             contract_hash: "sha256:test".to_string(),
         }
+    }
+
+    /// A policy config whose stream bounds are `fields`, as one loaded
+    /// `Config` would carry them.
+    fn bound_config(l3: bool, l5a: bool, fields: &[(&str, u64)]) -> Config {
+        let mut config = policy_config(l3, l5a);
+        config.runtime.responses_stream = stream_config(fields);
+        config
+    }
+
+    /// The executor a route builds from the same `Config` it enforces.
+    fn executor_for(config: &Config) -> ResponsesStreamExecutor {
+        ResponsesStreamExecutor::new(config.runtime.responses_stream)
     }
 
     // -- policy doubles -------------------------------------------------------
@@ -822,7 +852,6 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn configured_collector_limits_apply() {
         let body = sse(&Spec::safe());
-        let config = policy_config(false, false);
         for (fields, expected) in [
             (
                 vec![("max_sse_stream_bytes", body.len() as u64 - 1)],
@@ -837,7 +866,8 @@ mod tests {
                 ResponsesStreamOutcome::InvalidStream,
             ),
         ] {
-            let executor = ResponsesStreamExecutor::new(stream_config(&fields));
+            let config = bound_config(false, false, &fields);
+            let executor = executor_for(&config);
             let (outcome, _) = run_with(
                 &executor,
                 Scripted::chunks(&body, 64),
@@ -848,10 +878,15 @@ mod tests {
             .await;
             assert_refused(&outcome, expected);
         }
-        let exact = ResponsesStreamExecutor::new(stream_config(&[
-            ("max_sse_stream_bytes", body.len() as u64),
-            ("max_events", 14),
-        ]));
+        let config = bound_config(
+            false,
+            false,
+            &[
+                ("max_sse_stream_bytes", body.len() as u64),
+                ("max_events", 14),
+            ],
+        );
+        let exact = executor_for(&config);
         let (outcome, _) = run_with(
             &exact,
             Scripted::chunks(&body, 64),
@@ -867,8 +902,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn full_gate_refuses_before_upstream_and_releases_on_completion() {
-        let executor = ResponsesStreamExecutor::new(stream_config(&[("concurrent_streams", 1)]));
-        let config = policy_config(true, true);
+        let config = bound_config(true, true, &[("concurrent_streams", 1)]);
+        let executor = executor_for(&config);
         let evaluator = DslConstraintEvaluator::new();
         let body = sse(&Spec::safe());
 
@@ -932,12 +967,139 @@ mod tests {
         assert_eq!(executor.slots.available_permits(), 1);
     }
 
+    // -- config coherence -----------------------------------------------------
+
+    #[tokio::test(start_paused = true)]
+    async fn config_mismatch_refuses_before_admission_and_upstream() {
+        let config = policy_config(true, true);
+        let body = sse(&Spec::safe());
+        for fields in [
+            vec![("concurrent_streams", 1)],
+            vec![("wall_clock_ms", 1_000)],
+            vec![("max_events", 13)],
+        ] {
+            let executor = ResponsesStreamExecutor::new(stream_config(&fields));
+            let (outcome, opens) = run_with(
+                &executor,
+                Scripted::chunks(&body, 64),
+                &config,
+                &DslConstraintEvaluator::new(),
+                &L5aScanner,
+            )
+            .await;
+            assert_eq!(opens, 0, "mismatch must not call upstream");
+            assert_refused(&outcome, ResponsesStreamOutcome::ConfigMismatch);
+            assert_eq!(format!("{outcome:?}"), "ConfigMismatch");
+            assert_eq!(
+                executor.slots.available_permits(),
+                executor.config.concurrent_streams(),
+                "mismatch must not take a permit"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn config_mismatch_precedes_expired_budget_and_full_gate() {
+        let bound = bound_config(false, false, &[("concurrent_streams", 1)]);
+        let executor = executor_for(&bound);
+        let other = policy_config(false, false);
+        let evaluator = DslConstraintEvaluator::new();
+        let body = sse(&Spec::safe());
+
+        // Fill the only slot with a matching stream parked mid-body.
+        let mut parked = Scripted::chunks(&body[..10], 64);
+        parked.steps.push(Step::Pending);
+        let mut first = Box::pin(executor.execute(
+            Instant::now(),
+            parked,
+            policy(&bound, &evaluator, &L5aScanner),
+        ));
+        assert!(futures_util::poll!(first.as_mut()).is_pending());
+        assert_eq!(executor.slots.available_permits(), 0);
+
+        // A full gate and an expired budget would each refuse; the
+        // mismatch is reported first, without touching upstream.
+        let received_at = Instant::now();
+        tokio::time::advance(executor.config.wall_clock()).await;
+        let upstream = Scripted::chunks(&body, 64);
+        let opens = Arc::clone(&upstream.opens);
+        let outcome = executor
+            .execute(
+                received_at,
+                upstream,
+                policy(&other, &evaluator, &L5aScanner),
+            )
+            .await;
+        assert_eq!(opens.load(Ordering::SeqCst), 0);
+        assert_refused(&outcome, ResponsesStreamOutcome::ConfigMismatch);
+        assert_eq!(executor.slots.available_permits(), 0);
+
+        // The same full gate refuses a matching config as ConcurrencyLimit.
+        let (outcome, opens) = run_with(
+            &executor,
+            Scripted::chunks(&body, 64),
+            &bound,
+            &evaluator,
+            &L5aScanner,
+        )
+        .await;
+        assert_eq!(opens, 0);
+        assert_refused(&outcome, ResponsesStreamOutcome::ConcurrencyLimit);
+
+        drop(first);
+        assert_eq!(executor.slots.available_permits(), 1);
+    }
+
+    /// Every refusal prints a fixed name only. The match is exhaustive, so a
+    /// new outcome cannot be added without listing it here (and in R4b2's
+    /// status mapping).
+    #[test]
+    fn every_refusal_debug_is_a_fixed_name() {
+        use ResponsesStreamOutcome as O;
+        let refusals = [
+            (O::ConfigMismatch, "ConfigMismatch"),
+            (O::ConcurrencyLimit, "ConcurrencyLimit"),
+            (O::WallClockTimeout, "WallClockTimeout"),
+            (O::IdleTimeout, "IdleTimeout"),
+            (O::UpstreamStatus, "UpstreamStatus"),
+            (O::UpstreamUnavailable, "UpstreamUnavailable"),
+            (O::Truncated, "Truncated"),
+            (O::UpstreamFailed, "UpstreamFailed"),
+            (O::InvalidStream, "InvalidStream"),
+            (O::BlockedByL3Outbound, "BlockedByL3Outbound"),
+            (O::BlockedByL5a, "BlockedByL5a"),
+            (O::LayerFailure, "LayerFailure"),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for (outcome, name) in refusals {
+            match outcome {
+                O::Release(_) => unreachable!("release is not a refusal"),
+                O::ConfigMismatch
+                | O::ConcurrencyLimit
+                | O::WallClockTimeout
+                | O::IdleTimeout
+                | O::UpstreamStatus
+                | O::UpstreamUnavailable
+                | O::Truncated
+                | O::UpstreamFailed
+                | O::InvalidStream
+                | O::BlockedByL3Outbound
+                | O::BlockedByL5a
+                | O::LayerFailure => {}
+            }
+            assert_eq!(format!("{outcome:?}"), name);
+            assert_refused(&outcome, outcome.clone());
+            assert!(seen.insert(name), "duplicate {name}");
+        }
+        assert_eq!(seen.len(), 12);
+    }
+
     // -- wall clock -----------------------------------------------------------
 
     #[tokio::test(start_paused = true)]
     async fn expired_budget_never_calls_upstream() {
-        let executor = ResponsesStreamExecutor::new(stream_config(&[("wall_clock_ms", 1_000)]));
-        let config = policy_config(false, false);
+        let config = bound_config(false, false, &[("wall_clock_ms", 1_000)]);
+        let executor = executor_for(&config);
         let evaluator = DslConstraintEvaluator::new();
         let received_at = Instant::now();
         tokio::time::advance(Duration::from_millis(1_000)).await;
@@ -957,11 +1119,12 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn wall_clock_runs_from_request_receipt_not_executor_entry() {
-        let executor = ResponsesStreamExecutor::new(stream_config(&[
-            ("wall_clock_ms", 1_000),
-            ("upstream_idle_ms", 120_000),
-        ]));
-        let config = policy_config(false, false);
+        let config = bound_config(
+            false,
+            false,
+            &[("wall_clock_ms", 1_000), ("upstream_idle_ms", 120_000)],
+        );
+        let executor = executor_for(&config);
         let evaluator = DslConstraintEvaluator::new();
         let body = sse(&Spec::safe());
         let slow = || {
@@ -998,10 +1161,12 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn wall_clock_expiry_during_establishment_or_chunks_fails_closed() {
-        let executor = ResponsesStreamExecutor::new(stream_config(&[
-            ("wall_clock_ms", 1_000),
-            ("upstream_idle_ms", 120_000),
-        ]));
+        let config = bound_config(
+            false,
+            false,
+            &[("wall_clock_ms", 1_000), ("upstream_idle_ms", 120_000)],
+        );
+        let executor = executor_for(&config);
         let body = sse(&Spec::safe());
 
         let probe = Arc::new(AtomicBool::new(false));
@@ -1027,7 +1192,7 @@ mod tests {
             let (outcome, opens) = run_with(
                 &executor,
                 upstream,
-                &policy_config(false, false),
+                &config,
                 &DslConstraintEvaluator::new(),
                 &L5aScanner,
             )
@@ -1047,8 +1212,8 @@ mod tests {
     /// clock. Sleeps a few hundred milliseconds at most.
     #[tokio::test]
     async fn wall_clock_expiry_during_policy_fails_closed() {
-        let executor = ResponsesStreamExecutor::new(stream_config(&[("wall_clock_ms", 300)]));
-        let config = policy_config(false, true);
+        let config = bound_config(false, true, &[("wall_clock_ms", 300)]);
+        let executor = executor_for(&config);
         let evaluator = DslConstraintEvaluator::new();
         let received_at = Instant::now();
         let scanner = SlowScanner {
@@ -1071,10 +1236,12 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn idle_bound_applies_before_first_byte_and_between_chunks() {
-        let executor = ResponsesStreamExecutor::new(stream_config(&[
-            ("wall_clock_ms", 299_000),
-            ("upstream_idle_ms", 1_000),
-        ]));
+        let config = bound_config(
+            false,
+            false,
+            &[("wall_clock_ms", 299_000), ("upstream_idle_ms", 1_000)],
+        );
+        let executor = executor_for(&config);
         let body = sse(&Spec::safe());
 
         let silent = Scripted::new(vec![Step::Pending]);
@@ -1090,7 +1257,7 @@ mod tests {
             let (outcome, _) = run_with(
                 &executor,
                 upstream,
-                &policy_config(false, false),
+                &config,
                 &DslConstraintEvaluator::new(),
                 &L5aScanner,
             )
@@ -1113,7 +1280,7 @@ mod tests {
         let (outcome, _) = run_with(
             &executor,
             Scripted::new(steps),
-            &policy_config(false, false),
+            &config,
             &DslConstraintEvaluator::new(),
             &L5aScanner,
         )
@@ -1139,8 +1306,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn dropping_the_executor_future_drops_upstream_and_releases_permit() {
-        let executor = ResponsesStreamExecutor::new(stream_config(&[("concurrent_streams", 1)]));
-        let config = policy_config(false, false);
+        let config = bound_config(false, false, &[("concurrent_streams", 1)]);
+        let executor = executor_for(&config);
         let evaluator = DslConstraintEvaluator::new();
         let body = sse(&Spec::safe());
 
