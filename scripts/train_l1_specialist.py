@@ -624,6 +624,8 @@ def train_model(
 
     # L1 penalty lets regularization prune features mathematically
     # rather than choking at the vectorizer. dual=False required for L1.
+    # random_state pins liblinear's coordinate shuffle; without it the solver
+    # seed comes from numpy's global RNG and runs are not reproducible.
     model = LinearSVC(
         C=c,
         penalty="l1",
@@ -632,6 +634,7 @@ def train_model(
         tol=tol,
         verbose=svm_verbose,
         class_weight=class_weight,
+        random_state=seed,
     )
 
     labels_arr = np.array(labels)
@@ -1311,7 +1314,8 @@ def main():
         "train_transform": train_transform,
         "svm": (
             f"LinearSVC(C={args.c}, penalty='l1', class_weight={class_weight}, "
-            f"max_iter={args.max_iter}, tol={args.svm_tol}, verbose={args.svm_verbose})"
+            f"max_iter={args.max_iter}, tol={args.svm_tol}, verbose={args.svm_verbose}, "
+            f"random_state={args.seed})"
         ),
     }
     codegen_phf(bias, weights, out_path, specialist, provenance)
