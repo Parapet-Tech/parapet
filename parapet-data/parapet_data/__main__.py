@@ -547,13 +547,24 @@ def main() -> None:
         help="Path to adjudication ledger YAML file",
     )
 
+    fixed_parser = subparsers.add_parser("fixed-import", help="Compose pinned JSONL inputs without sampling")
+    fixed_parser.add_argument("--spec", required=True)
+    fixed_parser.add_argument("--output", required=True)
+
     add_scope_audit_subparser(subparsers)
     add_scope_rollup_subparser(subparsers)
 
     args = parser.parse_args()
     _setup_logging(args.verbose)
 
-    if args.command == "curate":
+    if args.command == "fixed-import":
+        import yaml
+        from .fixed_import import FixedImportSpec, compose_fixed
+        path = Path(args.spec)
+        spec = FixedImportSpec.model_validate(yaml.safe_load(path.read_text(encoding="utf-8")))
+        manifest = compose_fixed(spec, Path(args.output), path.parent)
+        print(f"Samples: {manifest.total_samples}; benign={manifest.benign_samples}; malicious={manifest.attack_samples}")
+    elif args.command == "curate":
         cmd_curate(args)
     elif args.command == "stage":
         cmd_stage(args)
