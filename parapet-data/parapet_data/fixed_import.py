@@ -115,8 +115,11 @@ def compose_fixed(spec: FixedImportSpec, output: Path, base: Path) -> CurationMa
             if "content" in row and row["content"] != text:
                 raise ValueError("content column conflicts with text column")
             item = dict(row, content=text, label=label)
-            group = row[source.group_column] if source.group_column else identifier
-            if not isinstance(group, str) or not group:
+            group = row.get(source.group_column) if source.group_column else identifier
+            if group is None:
+                # Tag row identities so they cannot collide with real group strings.
+                group = ["row", identifier]
+            elif not isinstance(group, str) or not group:
                 raise ValueError("group must be a nonempty string")
             score = Fraction(int(hashlib.sha256(_json_bytes([spec.seed, group])).hexdigest(), 16), 2**256)
             cumulative = Fraction(0)
@@ -128,12 +131,14 @@ def compose_fixed(spec: FixedImportSpec, output: Path, base: Path) -> CurationMa
             rows.append(item)
         if wanted is not None and found != wanted:
             raise ValueError(f"selected id missing: {sorted(wanted - found)}")
+    if not rows:
+        raise ValueError("selected population must be nonempty")
     counts = Counter(r["label"] for r in rows)
     if spec.expected_counts is not None and any(counts[k] != v for k, v in spec.expected_counts.items()):
         raise ValueError(f"count mismatch: {dict(counts)}")
     output.mkdir(parents=True, exist_ok=True)
     def write(name, entries):
-        data = b"".join((json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n").encode() for r in entries)
+        data = b"".join((json.dumps(r, ensure_ascii=True, sort_keys=True) + "\n").encode() for r in entries)
         (output / f"{name}.jsonl").write_bytes(data)
         return hashlib.sha256(data).hexdigest()
     hashes = lambda entries: sorted(hashlib.sha256(r["content"].strip().encode()).hexdigest() for r in entries)

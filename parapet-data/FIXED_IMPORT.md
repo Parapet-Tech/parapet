@@ -27,20 +27,25 @@ Paths resolve relative to the spec. Each input needs a label column or
 `fixed_label` (`benign` or `malicious`); supplying both asserts agreement.
 Noncanonical labels and conflicting existing `label`/`content` fields fail
 closed. IDs must be nonempty strings and globally unique, including unselected
-rows. Text and configured groups must be nonempty strings. Original fields
+rows. Text and present, non-null groups must be nonempty strings. Original fields
 remain in each output row; `content` and `label` provide the runner contract.
 
 Optional `selection: {path: arms.json, sha256: <pin>, arm: example}` reads
 `{example: {examples: [id1, id2]}}`. Parts must exactly match input names.
 Missing selected IDs, duplicate IDs, bad pins, and expected label count
-mismatches abort before writing artifacts. Expected counts may assert one or
+mismatches abort before writing artifacts. A zero-total selected population also
+aborts; individual selection parts may be empty. Expected counts may assert one or
 both labels. Input order determines output row order.
 
 Splits default to all train, with empty val and holdout artifacts. Otherwise,
 SHA256 of the seed and group determines the split against cumulative fractions
 in train/val/holdout order. Groups share a namespace across inputs, allowing
 leader IDs to bind benign rows to their mirrors. Without a group column the
-row ID is its group. Fractions are probabilistic targets, not exact quotas.
+row ID is its group. With a configured column, absent or null values use a
+tagged row identity, distinct from real groups and other ungrouped rows. Fractions are probabilistic targets, not exact quotas.
+
+JSONL serialization escapes Unicode characters, including all `str.splitlines()`
+boundaries, preserving decoded text and metadata exactly for the runner.
 
 Outputs are `curated.jsonl`, `train.jsonl`, `val.jsonl`, `holdout.jsonl`,
 `manifest.json`, and `composition.json`. The manifest follows CurationManifest

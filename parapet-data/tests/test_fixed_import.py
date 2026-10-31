@@ -83,3 +83,81 @@ def test_all_train_and_own_groups(setup, tmp_path):
     manifest = compose_fixed(FixedImportSpec.model_validate(spec), tmp_path / "out", tmp_path)
     assert manifest.splits["train"].sample_count == len(rows)
     assert manifest.splits["val"].sample_count == manifest.splits["holdout"].sample_count == 0
+
+
+@pytest.mark.parametrize("missing", ["absent", "null"])
+def test_mixed_missing_groups_use_distinct_row_identities(setup, tmp_path, missing):
+    spec, rows = setup
+    for row in rows[20:]:
+        if missing == "absent":
+            row.pop("family")
+        else:
+            row["family"] = None
+    source = Path(spec["inputs"][0]["path"])
+    source.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    spec["inputs"][0]["sha256"] = pin(source)
+    spec["splits"] = {"train": .6, "val": .2, "holdout": .2}
+    out = tmp_path / "out"
+    manifest = compose_fixed(FixedImportSpec.model_validate(spec), out, tmp_path)
+    grouped, ungrouped = {}, set()
+    actual = []
+    for split in manifest.splits:
+        for row in map(json.loads, (out / f"{split}.jsonl").read_text().splitlines()):
+            actual.append(row["id"])
+            if row.get("family") is None:
+                ungrouped.add(split)
+            else:
+                assert grouped.setdefault(row["family"], split) == split
+    assert sorted(actual) == sorted(r["id"] for r in rows)
+    assert len(ungrouped) == 3
+    assert len(set(grouped.values())) > 1
+
+
+def test_splitlines_boundaries_lossless_runner_roundtrip(setup, tmp_path):
+    spec, rows = setup
+    boundaries = "\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029"
+    for row in rows:
+        row["text"] = f"left{boundaries}right"
+        row["metadata"] = {"nested": [f"before{boundaries}after"]}
+    source = Path(spec["inputs"][0]["path"])
+    source.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    spec["inputs"][0]["sha256"] = pin(source)
+    spec["splits"] = {"train": .6, "val": .2, "holdout": .2}
+    out = tmp_path / "out"
+    compose_fixed(FixedImportSpec.model_validate(spec), out, tmp_path)
+    expected = [dict(r, content=r["text"]) for r in rows]
+    assert list(map(json.loads, (out / "curated.jsonl").read_text().splitlines())) == expected
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "parapet-runner"))
+    from parapet_runner.runner import ManifestSplitResolver
+    from parapet_runner.manifest import CurationManifest
+    receipt = CurationManifest.model_validate_json((out / "manifest.json").read_text())
+    resolved = ManifestSplitResolver(root_dir=out).resolve(receipt)
+    assert resolved.train_path == out / "train.jsonl"
+    actual = []
+    for split in receipt.splits:
+        actual.extend(map(json.loads, (out / f"{split}.jsonl").read_text().splitlines()))
+    assert sorted(actual, key=lambda r: r["id"]) == sorted(expected, key=lambda r: r["id"])
+
+
+def test_zero_total_selection_rejected_without_artifacts(setup, tmp_path):
+    spec, _ = setup
+    selection = Path(spec["selection"]["path"])
+    selection.write_text(json.dumps({"arm": {"rows": []}}))
+    spec["selection"]["sha256"] = pin(selection)
+    assert "expected_counts" not in spec
+    out = tmp_path / "out"
+    with pytest.raises(ValueError, match="selected population must be nonempty"):
+        compose_fixed(FixedImportSpec.model_validate(spec), out, tmp_path)
+    assert not out.exists()
+
+
+def test_empty_individual_selection_part_allowed(setup, tmp_path):
+    spec, rows = setup
+    source = tmp_path / "empty.jsonl"
+    source.write_text("")
+    spec["inputs"].append(dict(spec["inputs"][0], name="empty", path=str(source), sha256=pin(source)))
+    selection = Path(spec["selection"]["path"])
+    selection.write_text(json.dumps({"arm": {"rows": [r["id"] for r in rows], "empty": []}}))
+    spec["selection"]["sha256"] = pin(selection)
+    manifest = compose_fixed(FixedImportSpec.model_validate(spec), tmp_path / "out", tmp_path)
+    assert manifest.total_samples == len(rows)
