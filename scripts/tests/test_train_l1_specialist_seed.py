@@ -45,26 +45,31 @@ def _corpus(n: int = 400) -> tuple[list[str], list[int]]:
     return texts, labels
 
 
-def _fit(seed: int, global_state: int) -> np.ndarray:
+def _train(seed: int, global_state: int):
     texts, labels = _corpus()
     np.random.seed(global_state)
     _, model = trainer.train_model(
         texts, labels, ngram_range=(3, 5), max_features=2000, min_df=1,
         c=0.5, class_weight=None, max_iter=100_000, tol=1e-1, cv_folds=0, seed=seed,
     )
+    return model
+
+
+def _weights(model) -> np.ndarray:
     return np.concatenate([model.coef_.ravel(), model.intercept_])
 
 
 class TrainModelSeedTests(unittest.TestCase):
     def test_same_seed_gives_identical_weights_despite_global_rng(self):
-        a = _fit(seed=42, global_state=1)
-        b = _fit(seed=42, global_state=2)
+        a = _weights(_train(seed=42, global_state=1))
+        b = _weights(_train(seed=42, global_state=2))
         self.assertTrue(np.array_equal(a, b))
 
-    def test_seed_is_passed_to_solver(self):
-        a = _fit(seed=42, global_state=1)
-        b = _fit(seed=43, global_state=1)
-        self.assertFalse(np.array_equal(a, b))
+    def test_seed_is_forwarded_to_solver(self):
+        # Distinct seeds need not yield distinct coefficients, so assert the
+        # contract (the solver receives --seed) rather than weight inequality.
+        for seed in (42, 43):
+            self.assertEqual(_train(seed=seed, global_state=1).random_state, seed)
 
 
 if __name__ == "__main__":
