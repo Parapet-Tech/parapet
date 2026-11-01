@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 from .baseline import CommandExecutor, SubprocessCommandExecutor, parse_eval_result_json
 from .budget import BudgetConfigError, JobLockHeld, add_budget_flags, budget_run, executor_from_args
 from .config import ThresholdPolicy, TrainConfig
+from .retention import calibrate_pinned_scores
 from .manifest import (
     BaselineFamily,
     CurationManifest,
@@ -412,6 +413,7 @@ class TrainScriptTrainer:
                 holdout_path=holdout_artifact,
             ),
         ]
+        args.append("--pre-split")
         result = self._executor.run(args, cwd=self._workspace_root)
 
         # Persist training output for reproducibility
@@ -489,6 +491,10 @@ def _install_weights_and_rebuild(
     Returns the SHA-256 hash of the installed weights file.
     Skips the copy + build when the hash matches ``last_installed_hash``.
     """
+    if Path(weights_install_target).name != weights_install_target:
+        raise ValueError("weights install target must be a filename")
+    if model_artifact.name.startswith("l1_weights_") and model_artifact.name != "l1_weights_generalist.rs" and weights_install_target == "l1_weights.rs":
+        raise ValueError("specialist weights require a separate install target")
     current_hash = _sha256_file(model_artifact)
     if current_hash == last_installed_hash:
         return current_hash
@@ -813,6 +819,8 @@ class ProtectAIBaselineProvider:
                 output_dir=baseline_dir,
             )
 
+        if train_config.threshold_policy == ThresholdPolicy.CONSTRAINED_RETENTION:
+            raise ValueError("constrained_retention is supported by the primary experiment runner only")
         eval_result = self._evaluator.evaluate(
             model_artifact=model_artifact,
             split_path=recipe.holdout_path,
@@ -960,6 +968,8 @@ class RandomBaselineProvider:
             )
 
         # Evaluate on candidate holdout
+        if train_config.threshold_policy == ThresholdPolicy.CONSTRAINED_RETENTION:
+            raise ValueError("constrained_retention is supported by the primary experiment runner only")
         eval_result = self._evaluator.evaluate(
             model_artifact=model_artifact,
             split_path=holdout.holdout_path,
@@ -1066,6 +1076,7 @@ class RuntimeIdentityCollector:
         command_executor: CommandExecutor | None = None,
         lockfile_names: Sequence[str] = ("uv.lock", "poetry.lock", "requirements.txt"),
         allow_pip_freeze_fallback: bool = True,
+        python_bin: str = "python",
     ) -> None:
         self._workspace_root = workspace_root
         self._trainer_script = trainer_script
@@ -1075,6 +1086,7 @@ class RuntimeIdentityCollector:
         self._executor = command_executor or SubprocessCommandExecutor()
         self._lockfile_names = tuple(lockfile_names)
         self._allow_pip_freeze_fallback = allow_pip_freeze_fallback
+        self._python_bin = python_bin
 
     def collect(self) -> RuntimeIdentity:
         return RuntimeIdentity(
@@ -1104,7 +1116,7 @@ class RuntimeIdentityCollector:
                 + ", ".join(self._lockfile_names)
             )
 
-        freeze = self._executor.run(["python", "-m", "pip", "freeze", "--all"], cwd=self._workspace_root)
+        freeze = self._executor.run([self._python_bin, "-m", "pip", "freeze", "--all"], cwd=self._workspace_root)
         if freeze.returncode != 0:
             raise RuntimeError(f"pip freeze failed: {freeze.stderr.strip()}")
         normalized = "\n".join(sorted(line.strip() for line in freeze.stdout.splitlines() if line.strip()))
@@ -1179,6 +1191,7 @@ class ExperimentRunner:
         )
 
         threshold = train_config.threshold_value
+        calibration = None
         if train_config.threshold_policy == ThresholdPolicy.CALIBRATE_F1:
             if self._deps.threshold_calibrator is None:
                 raise ValueError("threshold_calibrator is required for CALIBRATE_F1 policy")
@@ -1188,6 +1201,10 @@ class ExperimentRunner:
                 val_split=splits.val_path,
                 output_dir=output_dir,
             )
+
+        if train_config.threshold_policy == ThresholdPolicy.CONSTRAINED_RETENTION:
+            calibration = calibrate_pinned_scores(train_config, _load_labeled_entries(splits.val_path))
+            threshold = calibration["threshold"]
 
         eval_result = self._deps.evaluator.evaluate(
             model_artifact=model_artifact,
@@ -1237,6 +1254,7 @@ class ExperimentRunner:
             baseline_data_size=baseline_run.baseline_data_size,
             error_file=error_file,
             semantic_parity_hash=semantic_hash,
+            calibration=calibration,
         )
         return run_manifest
 
@@ -1333,6 +1351,8 @@ def _cli_run(args: argparse.Namespace) -> int:
         train_config_raw = _load_structured_file(train_config_path)
         curation_manifest = CurationManifest.model_validate(curation_raw)
         train_config = TrainConfig.model_validate(train_config_raw)
+        if train_config.specialist != "generalist" and args.weights_install_target == "l1_weights.rs":
+            raise ValueError("specialist runs require --weights-install-target with a separate filename")
 
         thresholds = _parse_thresholds(args.calibration_thresholds)
         trainer = TrainScriptTrainer(
@@ -1410,6 +1430,7 @@ def _cli_run(args: argparse.Namespace) -> int:
                 workspace_root=workspace_root,
                 trainer_script=trainer_script,
                 parapet_eval_binary=parapet_eval_bin,
+                python_bin=args.python_bin,
                 pg2_model_id=args.pg2_model_id,
                 eval_config=l1_eval_config,
                 command_executor=executor,

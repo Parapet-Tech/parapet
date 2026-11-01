@@ -161,3 +161,45 @@ def test_empty_individual_selection_part_allowed(setup, tmp_path):
     spec["selection"]["sha256"] = pin(selection)
     manifest = compose_fixed(FixedImportSpec.model_validate(spec), tmp_path / "out", tmp_path)
     assert manifest.total_samples == len(rows)
+
+
+def test_weights_stratified_groups_and_frozen_ids(setup, tmp_path):
+    spec, rows = setup
+    source = Path(spec["inputs"][0]["path"])
+    for row in rows:
+        row["weight"] = .25 if row["label"] == "malicious" else 2
+        row["stratum"] = str(int(row["family"]) % 2)
+    source.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    spec["inputs"][0].update(sha256=pin(source), weight_column="weight", stratify_column="stratum")
+    spec["splits"] = {"train": .8, "val": .2, "holdout": 0}
+    out = tmp_path / "out"
+    compose_fixed(FixedImportSpec.model_validate(spec), out, tmp_path)
+    receipt = json.loads((out / "manifest.json").read_text())
+    assert receipt["fixed_import"]["inputs"][0]["weight_column"] == "weight"
+    assert receipt["split_ids"]["sha256"] == pin(out / "split_ids.json")
+    ids = json.loads((out / "split_ids.json").read_text())
+    assert sorted(ids["train"] + ids["val"]) == sorted(r["id"] for r in rows)
+    groups = {}
+    for split, expected_groups in [("train", 8), ("val", 2)]:
+        entries = list(map(json.loads, (out / f"{split}.jsonl").read_text().splitlines()))
+        for r in entries:
+            assert r["sample_weight"] == r["weight"]
+            assert groups.setdefault(r["family"], split) == split
+        for stratum in ("0", "1"):
+            assert len({r["family"] for r in entries if r["stratum"] == stratum}) == expected_groups
+    second = tmp_path / "second"
+    compose_fixed(FixedImportSpec.model_validate(spec), second, tmp_path)
+    assert (second / "split_ids.json").read_bytes() == (out / "split_ids.json").read_bytes()
+
+
+@pytest.mark.parametrize("weight", [0, -1, True, "1", float("nan"), float("inf")])
+def test_invalid_sample_weights_rejected_before_writes(setup, tmp_path, weight):
+    spec, rows = setup
+    for row in rows:
+        row["weight"] = weight
+    source = Path(spec["inputs"][0]["path"])
+    source.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    spec["inputs"][0].update(sha256=pin(source), weight_column="weight")
+    with pytest.raises(ValueError, match="weight"):
+        compose_fixed(FixedImportSpec.model_validate(spec), tmp_path / "out", tmp_path)
+    assert not (tmp_path / "out").exists()

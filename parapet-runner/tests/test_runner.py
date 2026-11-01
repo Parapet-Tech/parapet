@@ -597,3 +597,28 @@ def test_random_baseline_provider_trains_and_evaluates() -> None:
     # Recipe manifest should exist
     manifest_path = base / "output" / "_baseline_random" / "data" / "recipe_manifest.json"
     assert manifest_path.exists()
+
+
+def test_constrained_calibration_reaches_manifest_and_evaluator(tmp_path):
+    import hashlib
+    calls = []
+    validation = tmp_path / "val.jsonl"
+    validation.write_text(json.dumps(dict(id="a", content="synthetic", label="malicious")) + "\n")
+    scores = tmp_path / "scores.jsonl"
+    scores.write_text(json.dumps(dict(id="a", label="malicious", generalist_score=1, specialist_score=2)) + "\n")
+    class Resolver(FakeSplitResolver):
+        def resolve(self, curation):
+            result = super().resolve(curation)
+            return ResolvedSplits(train_path=result.train_path, val_path=validation,
+                holdout_path=result.holdout_path, holdout_source=result.holdout_source,
+                dataset_dir=result.dataset_dir, content_hashes=result.content_hashes,
+                per_cell_counts=result.per_cell_counts)
+    deps = ExperimentDependencies(split_resolver=Resolver(), trainer=FakeTrainer(calls),
+        evaluator=FakeEvaluator(calls), baseline_provider=FakeBaseline(calls),
+        error_analyzer=FakeErrorAnalyzer(), runtime_identity_provider=FakeRuntimeIdentityProvider())
+    manifest = ExperimentRunner(deps).run_experiment(curation_manifest=_make_manifest(),
+        train_config=TrainConfig(threshold_policy="constrained_retention", calibration_scores=scores,
+            calibration_scores_sha256=hashlib.sha256(scores.read_bytes()).hexdigest()), output_dir=tmp_path / "run")
+    assert manifest.calibration["threshold"] == 2
+    assert manifest.calibration["total"]["retention"] == 1
+    assert "eval:holdout:2" in calls

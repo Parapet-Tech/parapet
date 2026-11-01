@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from collections import Counter
 from fractions import Fraction
 from pathlib import Path
@@ -23,6 +24,8 @@ class InputSpec(BaseModel):
     label_column: str | None = None
     fixed_label: Literal["benign", "malicious"] | None = None
     group_column: str | None = None
+    stratify_column: str | None = None
+    weight_column: str | None = None
 
     @model_validator(mode="after")
     def require_label(self):
@@ -87,6 +90,8 @@ def compose_fixed(spec: FixedImportSpec, output: Path, base: Path) -> CurationMa
     rows = []
     seen = set()
     split_rows = {k: [] for k in ("train", "val", "holdout")}
+    grouped = {}
+    row_ids = {}
     for source in spec.inputs:
         wanted = set(selection[source.name]) if selection is not None else None
         found = set()
@@ -115,12 +120,27 @@ def compose_fixed(spec: FixedImportSpec, output: Path, base: Path) -> CurationMa
             if "content" in row and row["content"] != text:
                 raise ValueError("content column conflicts with text column")
             item = dict(row, content=text, label=label)
+            if source.weight_column:
+                weight = row[source.weight_column]
+                if isinstance(weight, bool) or not isinstance(weight, (int, float)) or not math.isfinite(weight) or weight <= 0:
+                    raise ValueError("sample weight must be finite and positive")
+                if "sample_weight" in row and row["sample_weight"] != weight:
+                    raise ValueError("sample_weight conflicts with weight column")
+                item["sample_weight"] = weight
             group = row.get(source.group_column) if source.group_column else identifier
             if group is None:
                 # Tag row identities so they cannot collide with real group strings.
                 group = ["row", identifier]
             elif not isinstance(group, str) or not group:
                 raise ValueError("group must be a nonempty string")
+            row_ids[id(item)] = identifier
+            group_key = json.dumps(group, sort_keys=True)
+            stratum = row[source.stratify_column] if source.stratify_column else None
+            if source.stratify_column and (not isinstance(stratum, str) or not stratum):
+                raise ValueError("stratum must be a nonempty string")
+            if group_key in grouped and grouped[group_key][0] != stratum:
+                raise ValueError("group spans inconsistent strata")
+            grouped.setdefault(group_key, (stratum, []))[1].append(item)
             score = Fraction(int(hashlib.sha256(_json_bytes([spec.seed, group])).hexdigest(), 16), 2**256)
             cumulative = Fraction(0)
             for split in ("train", "val", "holdout"):
@@ -136,6 +156,19 @@ def compose_fixed(spec: FixedImportSpec, output: Path, base: Path) -> CurationMa
     counts = Counter(r["label"] for r in rows)
     if spec.expected_counts is not None and any(counts[k] != v for k, v in spec.expected_counts.items()):
         raise ValueError(f"count mismatch: {dict(counts)}")
+    if any(source.stratify_column for source in spec.inputs):
+        # Allocate whole groups within each stratum, ordered by seeded hashes.
+        split_rows = {k: [] for k in split_rows}
+        strata = {}
+        for key, (stratum, entries) in grouped.items():
+            strata.setdefault(stratum, []).append((key, entries))
+        for groups in strata.values():
+            groups.sort(key=lambda pair: hashlib.sha256(_json_bytes([spec.seed, pair[0]])).digest())
+            train_end = round(len(groups) * spec.splits["train"])
+            val_end = round(len(groups) * (spec.splits["train"] + spec.splits["val"]))
+            for index, (_, entries) in enumerate(groups):
+                name = "train" if index < train_end else "val" if index < val_end else "holdout"
+                split_rows[name].extend(entries)
     output.mkdir(parents=True, exist_ok=True)
     def write(name, entries):
         data = b"".join((json.dumps(r, ensure_ascii=True, sort_keys=True) + "\n").encode() for r in entries)
@@ -154,6 +187,9 @@ def compose_fixed(spec: FixedImportSpec, output: Path, base: Path) -> CurationMa
         splits=splits, cell_fills={}, gaps=[], cross_contamination_dropped=0, output_path=Path("curated.jsonl"),
     )
     receipt = manifest.model_dump(mode="json")
+    split_ids = _json_bytes({name: sorted(row_ids[id(r)] for r in entries) for name, entries in split_rows.items()})
+    (output / "split_ids.json").write_bytes(split_ids)
+    receipt["split_ids"] = {"path": "split_ids.json", "sha256": hashlib.sha256(split_ids).hexdigest()}
     receipt["fixed_import"] = spec.model_dump(mode="json")
     (output / "manifest.json").write_bytes(_json_bytes(receipt))
     (output / "composition.json").write_bytes(_json_bytes({"counts": dict(counts)}))

@@ -306,6 +306,7 @@ def load_yaml_entries(filepaths: list[str], label_filter: str | None = None) -> 
             if label_filter and label != label_filter:
                 continue
             entries.append({
+                **({"sample_weight": entry["sample_weight"]} if "sample_weight" in entry else {}),
                 "id": entry.get("id", ""),
                 "content": content,
                 "label": label,
@@ -595,6 +596,7 @@ def train_model(
     cv_folds=5,
     cv_max_samples=0,
     seed=42,
+    sample_weight=None,
 ):
     """Train binary n-gram + LinearSVC and return vectorizer + model."""
     cw = class_weight if class_weight is not None else "None"
@@ -637,6 +639,12 @@ def train_model(
         random_state=seed,
     )
 
+    if sample_weight is not None:
+        sample_weight = np.asarray(sample_weight, dtype=float)
+        if sample_weight.shape != (len(labels),) or not np.isfinite(sample_weight).all() or (sample_weight <= 0).any():
+            raise ValueError("sample weights must be finite, positive, and match labels")
+        if cv_folds and cv_folds >= 2:
+            raise ValueError("weighted training requires cv_folds=0; use grouped external CV")
     labels_arr = np.array(labels)
     if cv_folds and cv_folds >= 2:
         cv_X = X
@@ -668,7 +676,10 @@ def train_model(
 
     print("  Fitting LinearSVC on full training set...", file=sys.stderr, flush=True)
     fit_start = time.perf_counter()
-    model.fit(X, labels)
+    if sample_weight is None:
+        model.fit(X, labels)
+    else:
+        model.fit(X, labels, sample_weight=sample_weight)
     fit_secs = time.perf_counter() - fit_start
     print(f"  Model fit completed in {fit_secs:.1f}s", file=sys.stderr)
     print(f"  Feature count: {X.shape[1]:,}", file=sys.stderr)
@@ -997,8 +1008,9 @@ def main():
                         help="Min n-gram length (default: 3)")
     parser.add_argument("--ngram-max", type=int, default=5,
                         help="Max n-gram length (default: 5)")
-    parser.add_argument("--max-features", type=int, default=25000,
+    parser.add_argument("--max-features", type=lambda value: None if value.lower() == "none" else int(value), default=25000,
                         help="Max features for CountVectorizer (default: 25000)")
+    parser.add_argument("--pre-split", action="store_true", help="Use every input row for training; splits were frozen upstream")
     parser.add_argument("--min-df", type=int, default=5,
                         help="Minimum document frequency for CountVectorizer (default: 5)")
     parser.add_argument("--analyzer", type=str, default="char_wb",
@@ -1077,6 +1089,8 @@ def main():
     if args.min_df < 1:
         parser.error("--min-df must be >= 1")
 
+    if args.pre_split and (args.max_per_file > 0 or args.split_by_source or args.split_by_source_stress):
+        parser.error("--pre-split cannot be combined with resampling or splitting")
     import random
     rng = random.Random(args.seed)
 
@@ -1105,9 +1119,11 @@ def main():
     # --- 2. Dedup ---
     print(f"\nDeduplication:", file=sys.stderr)
     print(f"  Attacks (raw):", file=sys.stderr)
-    attacks = dedup_entries(attacks)
+    if not args.pre_split:
+        attacks = dedup_entries(attacks)
     print(f"  Benign (raw):", file=sys.stderr)
-    benign = dedup_entries(benign)
+    if not args.pre_split:
+        benign = dedup_entries(benign)
 
     neutralize_role_markers = not args.l0_skip_role_marker_neutralization
     collapse_whitespace = args.l0_collapse_whitespace
@@ -1127,9 +1143,11 @@ def main():
 
     if args.apply_l0_transform:
         print(f"  Attacks (post-L0):", file=sys.stderr)
-        attacks = dedup_entries(attacks, content_key=content_key)
+        if not args.pre_split:
+            attacks = dedup_entries(attacks, content_key=content_key)
         print(f"  Benign (post-L0):", file=sys.stderr)
-        benign = dedup_entries(benign, content_key=content_key)
+        if not args.pre_split:
+            benign = dedup_entries(benign, content_key=content_key)
         role_mode = "enabled" if neutralize_role_markers else "disabled"
         ws_mode = "enabled" if collapse_whitespace else "disabled"
         print(
@@ -1142,6 +1160,8 @@ def main():
 
     attack_hashes = {_content_hash(e[content_key]) for e in attacks}
     benign_before = len(benign)
+    if args.pre_split and any(_content_hash(e[content_key]) in attack_hashes for e in benign):
+        parser.error("pre-split population contains conflicting labels after preprocessing")
     benign = [e for e in benign if _content_hash(e[content_key]) not in attack_hashes]
     conflict_dropped = benign_before - len(benign)
     if conflict_dropped > 0:
@@ -1191,7 +1211,9 @@ def main():
 
     # --- 3. Split ---
     use_source_split = args.split_by_source or args.split_by_source_stress
-    if use_source_split:
+    if args.pre_split:
+        train_entries, holdout_entries = all_entries, []
+    elif use_source_split:
         constrained = args.split_by_source and not args.split_by_source_stress
         mode = "constrained" if constrained else "stress (unconstrained)"
         print(f"\nSource-group split ({mode}):", file=sys.stderr)
@@ -1273,6 +1295,7 @@ def main():
         cv_folds=args.cv_folds,
         cv_max_samples=args.cv_max_samples,
         seed=args.seed,
+        sample_weight=[e.get("sample_weight", 1.0) for e in train_entries] if any("sample_weight" in e for e in train_entries) else None,
     )
 
     # --- 6. Evaluate holdout ---

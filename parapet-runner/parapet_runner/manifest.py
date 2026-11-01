@@ -79,6 +79,7 @@ class RunManifest(BaseModel):
     baseline_data_size: int | None = Field(default=None, ge=0)
     error_file: Path | None = None
     semantic_parity_hash: str | None = None
+    calibration: dict[str, Any] | None = None
 
     @model_validator(mode="after")
     def ensure_delta_consistency(self) -> "RunManifest":

@@ -314,3 +314,33 @@ Job receipts include `cpu_user_s` and `cpu_sys_s`, measured using the
 `resource.getrusage(RUSAGE_CHILDREN)` delta around the job. This counts only
 reaped descendants, not reparented orphans. Run manifests include a final job
 receipt; `eval` writes `budget_receipt.json` before releasing its lease.
+
+### Frozen specialist calibration
+
+Fixed-import inputs accept `group_column`, optional `stratify_column`, and
+optional `weight_column`. Groups stay together across train/val/holdout; with
+stratification, seeded group order is allocated within each stratum using the
+configured fractions. A group must have one consistent stratum. The importer
+writes `split_ids.json` and records its SHA-256 in `manifest.json`. The configured
+weight is validated as finite and positive, then preserved as `sample_weight`.
+The runner trains every row of the frozen training split via `--pre-split`;
+weighted fits require `cv_folds: 0` (perform grouped CV externally).
+
+Use `min_df: 2` and `max_features: null` for an uncapped vocabulary. Standalone
+trainer CLI spelling is `--max-features none`.
+
+For `threshold_policy: constrained_retention`, supply `calibration_scores` (a
+JSONL path) and `calibration_scores_sha256`. Every row must contain `id`, `label`,
+`specialist_score`, and frozen effective `generalist_score`. IDs and labels must
+match the validation split exactly; scores are supplied externally for the
+candidate being calibrated. Parameters default to `retention_floor: 0.99`,
+`generalist_threshold: 0.0`, and `generalist_block_alone: 3.0`. The primary runner
+records the selected threshold, relief count, total and deciding-band retention,
+and Wilson 95% intervals under `calibration` in the run manifest. Empty attack
+denominators cannot calibrate; an empty deciding band reports null statistics.
+Auxiliary random/ProtectAI baseline adapters do not support this policy.
+
+Specialist CLI runs must set `--weights-install-target l1_weights_example.rs`
+(or another separate filename); the shipped generalist target is rejected.
+Installing a separate source file does not register it with the Rust runtime;
+use an evaluation configuration/build that already selects the specialist.

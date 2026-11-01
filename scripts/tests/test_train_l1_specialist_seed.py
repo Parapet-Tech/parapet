@@ -74,3 +74,34 @@ class TrainModelSeedTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SampleWeightTests(unittest.TestCase):
+    def test_absent_weights_preserve_exact_solver_bytes(self):
+        from unittest.mock import patch
+        from sklearn.svm import LinearSVC
+        texts, labels = _corpus()
+        options = dict(min_df=1, c=.5, class_weight=None, cv_folds=0, seed=42)
+        _, actual = trainer.train_model(texts, labels, **options)
+        original_fit = LinearSVC.fit
+        def legacy_fit(model, x, y, **kwargs):
+            return original_fit(model, x, y)
+        with patch.object(LinearSVC, "fit", legacy_fit):
+            _, legacy = trainer.train_model(texts, labels, **options)
+        self.assertEqual(_weights(actual).tobytes(), _weights(legacy).tobytes())
+
+    def test_weights_change_the_fitted_decision_and_survive_loading(self):
+        import tempfile
+        import yaml
+        texts = ["same synthetic text"] * 4
+        labels = [0, 0, 1, 1]
+        options = dict(min_df=1, c=1, class_weight=None, cv_folds=0, seed=42)
+        vectorizer, positive = trainer.train_model(texts, labels, sample_weight=[1, 1, 10, 10], **options)
+        _, negative = trainer.train_model(texts, labels, sample_weight=[10, 10, 1, 1], **options)
+        x = vectorizer.transform(texts[:1])
+        self.assertGreater(positive.decision_function(x)[0], 0)
+        self.assertLess(negative.decision_function(x)[0], 0)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "rows.yaml"
+            path.write_text(yaml.safe_dump([dict(content=texts[0], label="benign", sample_weight=.125)]))
+            self.assertEqual(trainer.load_yaml_entries([str(path)])[0]["sample_weight"], .125)
