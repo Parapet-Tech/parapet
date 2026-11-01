@@ -17,6 +17,9 @@
 #[path = "l1_weights.rs"]
 pub(crate) mod l1_weights;
 
+#[path = "l1_weights_pilot.rs"]
+mod l1_weights_pilot;
+
 #[path = "l1_weights_roleplay_jailbreak.rs"]
 mod l1_weights_roleplay_jailbreak;
 
@@ -445,6 +448,13 @@ type SpecialistEntry = (
 fn compiled_specialists() -> Vec<SpecialistEntry> {
     // Keep each entry pinned to the analyzer/range used for that specialist's training run.
     vec![
+        (
+            "pilot",
+            l1_weights_pilot::BIAS,
+            &l1_weights_pilot::WEIGHTS,
+            NgramAnalyzer::CharWb,
+            (3, 5),
+        ),
         (
             "generalist",
             l1_weights::BIAS,
@@ -1334,6 +1344,61 @@ mod tests {
                 matches!(result.verdict, L1Verdict::Allow),
                 "benign text should not be blocked after squash pass: {text:?}"
             );
+        }
+    }
+
+
+    #[test]
+    fn pilot_pair_uses_anchor_corroboration_and_solo_routes() {
+        let messages = vec![msg(Role::User, "synthetic calibration message")];
+        let mut specialists = HashMap::from([
+            ("generalist".to_string(), L1SpecialistConfig { threshold: -100.0 }),
+            ("pilot".to_string(), L1SpecialistConfig { threshold: 0.0 }),
+        ]);
+        let config = L1Config {
+            mode: crate::config::L1Mode::Block, threshold: 0.0,
+            min_agree: 2, generalist_solo_threshold: Some(100.0),
+            specialists: specialists.clone(),
+        };
+        let scan = |entries: &HashMap<String, L1SpecialistConfig>, solo| {
+            EnsembleL1Scanner::new(entries, 2, Some(solo)).scan(&messages, &config).verdict
+        };
+        assert!(matches!(scan(&specialists, 100.0), L1Verdict::Block(_)));
+        specialists.get_mut("pilot").unwrap().threshold = f64::EPSILON;
+        assert_eq!(scan(&specialists, 100.0), L1Verdict::Allow);
+        assert!(matches!(scan(&specialists, -100.0), L1Verdict::Block(_)));
+        specialists.get_mut("pilot").unwrap().threshold = 0.0;
+        specialists.get_mut("generalist").unwrap().threshold = 100.0;
+        assert_eq!(scan(&specialists, 100.0), L1Verdict::Allow);
+    }
+
+    #[test]
+    fn runtime_float_boundary_and_dual_normalized_views() {
+        use crate::normalize::L0DualScanView;
+        static EMPTY: phf::Map<&'static str, f64> = phf::phf_map! {};
+        static FLOAT: phf::Map<&'static str, f64> = phf::phf_map! {
+            " ab" => 0.2_f64, "ab " => 0.1_f64,
+        };
+        let features = extract_ngrams_with("ab", NgramAnalyzer::CharWb, (3, 5));
+        assert_eq!(score_ngrams(&features, 0.3, &FLOAT), 0.6);
+        assert!(score_ngrams(&features, 0.3, &FLOAT) < 0.6000000000000001);
+        static MARKUP: phf::Map<&'static str, f64> = phf::phf_map! { "b>a" => 1.0_f64 };
+        let scanner = EnsembleL1Scanner {
+            specialists: vec![
+                SpecialistWeights { name: "generalist", bias: 1.0, weights: &EMPTY,
+                    threshold: 0.0, analyzer: NgramAnalyzer::CharWb, ngram_range: (3, 5) },
+                SpecialistWeights { name: "pilot", bias: 0.0, weights: &MARKUP,
+                    threshold: 0.5, analyzer: NgramAnalyzer::CharWb, ngram_range: (3, 5) },
+            ],
+            min_agree: 2, generalist_solo_threshold: Some(3.0),
+        };
+        let (_, config) = asymmetric_config();
+        for content in ["<b>ab</b>", "<b>&#97;b</b>", "<b>\u{200b}ab</b>"] {
+            let messages = vec![msg(Role::User, content)];
+            let (views, _, _) = crate::normalize::normalize_messages_dual_view(
+                &crate::normalize::L0Normalizer::new(), &messages).unwrap();
+            assert_eq!(scanner.scan(views.html_stripped_messages(), &config).verdict, L1Verdict::Allow);
+            assert!(matches!(scanner.scan(views.pre_html_messages(), &config).verdict, L1Verdict::Block(_)));
         }
     }
 

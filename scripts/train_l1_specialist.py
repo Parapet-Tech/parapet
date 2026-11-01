@@ -597,7 +597,7 @@ def train_model(
 ):
     """Train binary n-gram + LinearSVC and return vectorizer + model."""
     from sklearn.feature_extraction.text import CountVectorizer
-    from sklearn.model_selection import cross_val_score
+    from sklearn.model_selection import cross_val_score, train_test_split
     from sklearn.svm import LinearSVC
     cw = class_weight if class_weight is not None else "None"
     print(

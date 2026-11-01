@@ -1,8 +1,7 @@
-"""Calibration contract for a specialist paired with frozen generalist scores."""
+"""Runtime-arbitrated calibration for a specialist paired with the frozen generalist."""
 from __future__ import annotations
 
 import hashlib
-import json
 import math
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -64,7 +63,7 @@ def weights_identity(path: Path) -> str:
 
 
 def score_candidate(path: Path, rows: Sequence[Mapping[str, Any]], config: Any) -> list[float]:
-    """Score the actual pruned Rust artifact, with runtime binary raw/squash features.
+    """Propose thresholds from the pruned artifact using an approximate surrogate.
 
     This calibration path supports char_wb, the runtime specialist contract.
     L0 uses the same transform as the trainer, before both scoring passes.
@@ -85,8 +84,8 @@ def score_candidate(path: Path, rows: Sequence[Mapping[str, Any]], config: Any) 
     for match in re.finditer(r'    "((?:[^"\\]|\\.)*)" => ([-+0-9.eE]+)_f64,', text):
         key = re.sub(r'\\([\\"])', lambda m: m[1], match[1])
         weights[key] = float(match[2])
-    if not weights:
-        raise ValueError("candidate artifact has no weights")
+    if not weights and not re.search(r"pub static WEIGHTS:.*?phf_map!\s*\{\s*\};", text, re.S):
+        raise ValueError("candidate artifact has no valid weight table")
     bias = float(bias_match[1])
     def score(value):
         features = set()
@@ -107,29 +106,75 @@ def score_candidate(path: Path, rows: Sequence[Mapping[str, Any]], config: Any) 
     return results
 
 
-def calibrate_pinned_scores(config: Any, validation_rows: Sequence[Mapping[str, Any]], *,
-                            model_artifact: Path) -> dict[str, Any]:
-    """Bind frozen generalist scores to content, then score the trained candidate."""
+def calibrate_runtime(config: Any, validation_rows: Sequence[Mapping[str, Any]], *,
+                      model_artifact: Path, runtime: Any) -> dict[str, Any]:
+    """The injected runtime supplies ID -> blocked verdicts; surrogate proposes only."""
     if weights_identity(Path(config.generalist_weights)) != config.generalist_weights_sha256:
         raise ValueError("generalist weights identity mismatch")
-    path = Path(config.calibration_scores)
-    data = path.read_bytes()
-    if hashlib.sha256(data).hexdigest() != config.calibration_scores_sha256:
-        raise ValueError("calibration score sha256 mismatch")
-    scores = [json.loads(line) for line in data.splitlines() if line.strip()]
-    expected = {r["id"]: (r["label"], hashlib.sha256(r["content"].encode()).hexdigest()) for r in validation_rows}
-    actual = {r["id"]: (r["label"], r.get("content_sha256")) for r in scores}
-    if len(expected) != len(validation_rows) or len(actual) != len(scores) or actual != expected:
-        raise ValueError("calibration scores must match validation ids, labels and content hashes exactly")
-    if any(r.get("generalist_weights_sha256") != config.generalist_weights_sha256 for r in scores):
-        raise ValueError("generalist score identity mismatch")
-    if any("specialist_score" in r for r in scores):
-        raise ValueError("externally supplied specialist scores are forbidden")
-    by_id = {r["id"]: r for r in scores}
-    candidate_scores = score_candidate(model_artifact, validation_rows, config)
-    joined = [dict(by_id[r["id"]], specialist_score=s) for r, s in zip(validation_rows, candidate_scores)]
-    result = constrained_retention(joined, retention_floor=config.retention_floor,
-        generalist_threshold=config.generalist_threshold, generalist_block_alone=config.generalist_block_alone)
-    return dict(result, scores_sha256=config.calibration_scores_sha256,
-                candidate_weights_sha256=weights_identity(model_artifact),
-                generalist_weights_sha256=config.generalist_weights_sha256)
+    scores = score_candidate(model_artifact, validation_rows, config)
+    candidates = sorted(set(scores))
+    if not candidates or not all(math.isfinite(s) for s in candidates):
+        raise ValueError("no finite calibration candidates")
+    ids = {r["id"] for r in validation_rows}
+    if len(ids) != len(validation_rows):
+        raise ValueError("duplicate validation ids")
+
+    def verdicts(t, generalist_only=False):
+        result = runtime(t, generalist_only=generalist_only)
+        if set(result) != ids or any(type(v) is not bool for v in result.values()):
+            raise ValueError("runtime must return exactly one boolean verdict per validation id")
+        return result
+
+    baseline = verdicts(config.generalist_threshold, True)
+    # A second generalist-only run at the solo cutoff measures score >= cutoff
+    # through the same dual views. Its complement among baseline blocks is [0,3).
+    solo = verdicts(config.generalist_block_alone, True)
+    attacks = [r["id"] for r in validation_rows if r["label"] == "malicious" and baseline[r["id"]]]
+    band = [i for i in attacks if not solo[i]]
+    benign = [r["id"] for r in validation_rows if r["label"] == "benign" and baseline[r["id"]]]
+    if not attacks:
+        raise ValueError("no feasible threshold: no generalist-blocked attacks")
+    evaluations = {}
+
+    def evaluate(index):
+        t = candidates[index]
+        if index not in evaluations:
+            blocked = verdicts(t)
+            evaluations[index] = dict(threshold=t,
+                total=_retention(sum(blocked[i] for i in attacks), len(attacks)),
+                deciding_band=_retention(sum(blocked[i] for i in band), len(band)),
+                relief_count=sum(not blocked[i] for i in benign))
+        return evaluations[index]
+
+    low, high = 0, len(candidates) - 1
+    feasible = None
+    while low <= high:
+        mid = (low + high) // 2
+        if evaluate(mid)["total"]["retention"] >= config.retention_floor:
+            feasible = mid
+            low = mid + 1
+        else:
+            high = mid - 1
+    if feasible is None:
+        raise ValueError("no feasible runtime threshold")
+    relief = evaluate(feasible)["relief_count"]
+    low, high = 0, feasible
+    while low < high:
+        mid = (low + high) // 2
+        if evaluate(mid)["relief_count"] >= relief:
+            high = mid
+        else:
+            low = mid + 1
+    chosen = evaluate(low)
+    # This prediction is diagnostic, never an input to the runtime search.
+    t = chosen["threshold"]
+    prediction = {
+        "retained": sum(s >= t or solo[r["id"]] for r, s in zip(validation_rows, scores)
+                        if r["id"] in attacks),
+        "relief_count": sum(s < t and not solo[r["id"]] for r, s in zip(validation_rows, scores)
+                            if r["id"] in benign),
+    }
+    return dict(chosen, runtime_evaluations=list(evaluations.values()),
+        surrogate_prediction=prediction,
+        candidate_weights_sha256=weights_identity(model_artifact),
+        generalist_weights_sha256=config.generalist_weights_sha256)

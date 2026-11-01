@@ -335,27 +335,24 @@ weighted fits require `cv_folds: 0` (perform grouped CV externally).
 Use `min_df: 2` and `max_features: null` for an uncapped vocabulary. Standalone
 trainer CLI spelling is `--max-features none`.
 
-For `threshold_policy: constrained_retention`, supply `calibration_scores` (a
-JSONL path) and `calibration_scores_sha256`. Every row must contain `id`, `label`,
-`content_sha256` (exact UTF-8 content), `generalist_weights_sha256`, and frozen
-effective `generalist_score`. IDs, labels and content hashes must match the
-validation split exactly. Pin `generalist_weights` and
-`generalist_weights_sha256` (SHA-256 of the weight file excluding only the
-`// Trained:` line). The runner scores the freshly trained, pruned Rust artifact
-itself using char_wb raw/squashed passes and the configured training L0 transform;
-external specialist scores are rejected. Other analyzers are refused for this policy. Parameters default to `retention_floor: 0.99`,
-`generalist_threshold: 0.0`, and `generalist_block_alone: 3.0`. The primary runner
-records the selected threshold, relief count, total and deciding-band retention,
-and Wilson 95% intervals under `calibration` in the run manifest. Empty attack
-denominators cannot calibrate; an empty deciding band reports null statistics.
-Auxiliary random/ProtectAI baseline adapters do not support this policy.
+For `threshold_policy: constrained_retention`, use the compiled `pilot` slot
+(char_wb, ngrams 3–5), `--weights-install-target l1_weights_pilot.rs`, and an
+eval config with exactly `generalist` and `pilot` in `layers.L1.specialists`.
+Pin `generalist_weights` and `generalist_weights_sha256` (SHA-256 excluding
+only the `// Trained:` line). The installed generalist must match this identity.
 
-Specialist CLI runs must set `--weights-install-target l1_weights_example.rs`
-(or another separate filename); the shipped generalist target is rejected.
-Installing a separate source file does not register it with the Rust runtime;
-use an evaluation configuration/build that already selects the specialist.
+Python surrogate scores propose distinct candidate thresholds. After installing
+the candidate and rebuilding, the real engine measures generalist-only verdicts
+and pair verdicts using the configured L0 views. A second generalist-only run at
+the solo cutoff identifies the deciding band. Binary searches select the largest
+feasible threshold, then the lowest threshold giving the same relief.
+Defaults are retention floor 0.99, generalist threshold 0, solo cutoff 3.
+The manifest records runtime total/band retention with Wilson intervals, relief,
+all evaluated thresholds, and a diagnostic surrogate prediction. No feasible
+candidate or no generalist-blocked attacks causes refusal. Empty maps are valid.
+The runner validates both generalist thresholds and changes only the pilot
+threshold. External score files are no longer inputs. Auxiliary baseline adapters
+do not support this policy.
 
-Calibration evaluation requires exactly the named specialist in `layers.L1.specialists`.
-The runner updates its threshold and refuses configs whose generalist `threshold`
-or `generalist_solo_threshold` differs from the policy. Fixed-import manifests
-retain split byte hashes and the typed split-ID receipt; both are verified before training.
+Fixed-import manifests retain split byte hashes and the typed split-ID receipt;
+both are verified before training.

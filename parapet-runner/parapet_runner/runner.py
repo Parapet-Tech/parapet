@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field
 from .baseline import CommandExecutor, SubprocessCommandExecutor, parse_eval_result_json
 from .budget import BudgetConfigError, JobLockHeld, add_budget_flags, budget_run, executor_from_args
 from .config import ThresholdPolicy, TrainConfig
-from .retention import calibrate_pinned_scores
+from .retention import calibrate_runtime, weights_identity
 from .manifest import (
     BaselineFamily,
     CurationManifest,
@@ -91,6 +91,10 @@ class Evaluator(Protocol):
         output_dir: Path,
         calibration_policy: TrainConfig | None = None,
     ) -> EvalResult:
+        ...
+
+    def calibrate(self, *, model_artifact: Path, split_path: Path, config: TrainConfig,
+                  output_dir: Path) -> dict[str, Any]:
         ...
 
 
@@ -487,12 +491,17 @@ def _set_l1_threshold(config: Mapping[str, Any], threshold: float, *, policy: Tr
         raise ValueError("Eval config L1 entry must be a mapping")
     l1 = dict(l1_raw)
     if policy is not None:
-        if l1.get("threshold", 0.0) != policy.generalist_threshold or l1.get("generalist_solo_threshold") != policy.generalist_block_alone:
+        if l1.get("mode") != "block":
+            raise ValueError("runtime calibration requires L1 block mode")
+        if l1.get("generalist_solo_threshold") != policy.generalist_block_alone:
             raise ValueError("eval generalist thresholds disagree with calibration policy")
         specialists = l1.get("specialists")
-        if not isinstance(specialists, Mapping) or set(specialists) != {policy.specialist}:
-            raise ValueError("eval config must select exactly the calibrated specialist")
-        l1["specialists"] = {policy.specialist: dict(specialists[policy.specialist], threshold=float(threshold))}
+        if not isinstance(specialists, Mapping) or set(specialists) != {"generalist", policy.specialist}:
+            raise ValueError("eval config must select exactly generalist and the calibrated specialist")
+        if specialists["generalist"].get("threshold") != policy.generalist_threshold:
+            raise ValueError("eval generalist thresholds disagree with calibration policy")
+        l1["specialists"] = dict(specialists)
+        l1["specialists"][policy.specialist] = dict(specialists[policy.specialist], threshold=float(threshold))
     else:
         l1["threshold"] = float(threshold)
     layers[l1_key] = l1
@@ -582,6 +591,61 @@ class ParapetEvalEvaluator:
         self._model_role = model_role
         self._build_features = tuple(build_features)
         self._last_installed_weights_hash: str | None = None
+
+    def calibrate(self, *, model_artifact: Path, split_path: Path, config: TrainConfig,
+                  output_dir: Path) -> dict[str, Any]:
+        if self._rust_crate_dir is None or self._weights_install_target != "l1_weights_pilot.rs":
+            raise ValueError("runtime calibration requires the compiled pilot install target")
+        if weights_identity(Path(config.generalist_weights)) != config.generalist_weights_sha256:
+            raise ValueError("generalist weights identity mismatch")
+        shipped = self._rust_crate_dir / "src" / "layers" / "l1_weights.rs"
+        if weights_identity(shipped) != config.generalist_weights_sha256:
+            raise ValueError("compiled generalist is not the pinned shipped table")
+        base = yaml.safe_load(self._eval_config.read_text(encoding="utf-8"))
+        if not isinstance(base, Mapping):
+            raise ValueError(f"Invalid eval config format: {self._eval_config}")
+        pair = _set_l1_threshold(base, 0., policy=config)
+        self._last_installed_weights_hash = _install_weights_and_rebuild(
+            model_artifact=model_artifact, rust_crate_dir=self._rust_crate_dir,
+            weights_install_target=self._weights_install_target,
+            last_installed_hash=self._last_installed_weights_hash, executor=self._executor,
+            build_features=self._build_features, model_role="specialist")
+
+        def runtime(threshold, generalist_only=False):
+            import copy
+            payload = copy.deepcopy(pair)
+            l1 = next(v for k, v in payload["layers"].items() if str(k).lower() == "l1")
+            if generalist_only:
+                # Use the legacy singleton ensemble: same scorer and L0 views
+                # as the pair, without the harness's separate quote policy.
+                l1["specialists"] = {"generalist": {"threshold": threshold}}
+                l1["generalist_solo_threshold"] = None
+                l1["min_agree"] = 1
+            else:
+                l1["specialists"]["pilot"]["threshold"] = threshold
+            name = ("generalist" if generalist_only else "pair") + "_" + str(threshold)
+            directory = output_dir / "_calibration" / name
+            directory.mkdir(parents=True, exist_ok=True)
+            path = directory / "config.yaml"
+            path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+            evaluator = ParapetEvalEvaluator(parapet_eval_bin=self._parapet_eval_bin,
+                eval_config=path, workspace_root=self._workspace_root,
+                command_executor=self._executor, accepted_returncodes=self._accepted_returncodes)
+            evaluator.evaluate(model_artifact=model_artifact, split_path=split_path,
+                threshold=threshold, split_name="calibration", output_dir=directory)
+            reports = list(directory.glob("_eval_*/eval.json"))
+            report = json.loads(reports[0].read_text(encoding="utf-8"))
+            rows = _load_labeled_entries(split_path)
+            results = report.get("results", [])
+            by_id = {r["case_id"]: r for r in results}
+            if len(results) != len(rows) or set(by_id) != {r["id"] for r in rows}:
+                raise ValueError("runtime calibration results must match validation ids exactly")
+            if any(r["actual"] not in ("blocked", "allowed") for r in results):
+                raise ValueError("runtime calibration returned an invalid verdict")
+            return {key: value["actual"] == "blocked" for key, value in by_id.items()}
+
+        return calibrate_runtime(config, _load_labeled_entries(split_path),
+            model_artifact=model_artifact, runtime=runtime)
 
     def evaluate(
         self,
@@ -1248,7 +1312,8 @@ class ExperimentRunner:
             )
 
         if train_config.threshold_policy == ThresholdPolicy.CONSTRAINED_RETENTION:
-            calibration = calibrate_pinned_scores(train_config, _load_labeled_entries(splits.val_path), model_artifact=model_artifact)
+            calibration = self._deps.evaluator.calibrate(model_artifact=model_artifact,
+                split_path=splits.val_path, config=train_config, output_dir=output_dir)
             threshold = calibration["threshold"]
 
         eval_result = self._deps.evaluator.evaluate(

@@ -613,12 +613,6 @@ def test_constrained_calibration_reaches_manifest_and_evaluator(tmp_path):
     calls = []
     validation = tmp_path / "val.jsonl"
     validation.write_text(json.dumps(dict(id="a", content="synthetic", label="malicious")) + "\n")
-    scores = tmp_path / "scores.jsonl"
-    generalist = tmp_path / "generalist.rs"
-    generalist.write_text("frozen generalist")
-    identity = weights_identity(generalist)
-    scores.write_text(json.dumps(dict(id="a", label="malicious", generalist_score=1,
-        generalist_weights_sha256=identity, content_sha256=hashlib.sha256(b"synthetic").hexdigest())) + "\n")
     class Resolver(FakeSplitResolver):
         def resolve(self, curation):
             result = super().resolve(curation)
@@ -631,13 +625,15 @@ def test_constrained_calibration_reaches_manifest_and_evaluator(tmp_path):
             path = super().train(**kwargs)
             path.write_text('pub const BIAS: f64 = 2_f64;\n    " syn" => 0_f64,\n')
             return path
+    class RuntimeEvaluator(FakeEvaluator):
+        def calibrate(self, **kwargs):
+            return dict(threshold=2., total={"retention": 1})
     deps = ExperimentDependencies(split_resolver=Resolver(), trainer=CandidateTrainer(calls),
-        evaluator=FakeEvaluator(calls), baseline_provider=FakeBaseline(calls),
+        evaluator=RuntimeEvaluator(calls), baseline_provider=FakeBaseline(calls),
         error_analyzer=FakeErrorAnalyzer(), runtime_identity_provider=FakeRuntimeIdentityProvider())
     manifest = ExperimentRunner(deps).run_experiment(curation_manifest=_make_manifest(),
-        train_config=TrainConfig(specialist="example", generalist_weights=generalist, generalist_weights_sha256=identity,
-            threshold_policy="constrained_retention", calibration_scores=scores,
-            calibration_scores_sha256=hashlib.sha256(scores.read_bytes()).hexdigest()), output_dir=tmp_path / "run")
+        train_config=TrainConfig(specialist="pilot", generalist_weights=Path("generalist.rs"), generalist_weights_sha256="0" * 64,
+            threshold_policy="constrained_retention"), output_dir=tmp_path / "run")
     assert manifest.calibration["threshold"] == 2
     assert manifest.calibration["total"]["retention"] == 1
     assert "eval:holdout:2.0" in calls

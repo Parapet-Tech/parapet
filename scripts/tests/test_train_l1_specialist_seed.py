@@ -117,3 +117,11 @@ class FrozenPopulationTests(unittest.TestCase):
                 trainer.main()
             self.assertEqual(raised.exception.code, 2)
             load.assert_not_called()
+
+class CappedCVTests(unittest.TestCase):
+    def test_capped_unweighted_cv(self):
+        texts, labels = _corpus(80)
+        vectorizer, model = trainer.train_model(
+            texts, labels, cv_folds=2, cv_max_samples=40,
+            min_df=1, max_features=100, seed=42)
+        self.assertEqual(len(model.predict(vectorizer.transform(texts))), len(texts))
