@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import tempfile
 import shutil
 
 import pytest
@@ -23,6 +24,12 @@ from parapet_runner.runner import (
     _iter_labeled_dataset_files,
     assert_no_leakage,
 )
+
+
+@pytest.fixture
+def temp_dir():
+    with tempfile.TemporaryDirectory() as directory:
+        yield Path(directory).resolve()
 
 
 class FakeSplitResolver:
@@ -607,11 +614,11 @@ def test_random_baseline_provider_trains_and_evaluates() -> None:
     assert manifest_path.exists()
 
 
-def test_constrained_calibration_reaches_manifest_and_evaluator(tmp_path):
+def test_constrained_calibration_reaches_manifest_and_evaluator(temp_dir):
     from parapet_runner.retention import weights_identity
     import hashlib
     calls = []
-    validation = tmp_path / "val.jsonl"
+    validation = temp_dir / "val.jsonl"
     validation.write_text(json.dumps(dict(id="a", content="synthetic", label="malicious")) + "\n")
     class Resolver(FakeSplitResolver):
         def resolve(self, curation):
@@ -634,13 +641,13 @@ def test_constrained_calibration_reaches_manifest_and_evaluator(tmp_path):
         error_analyzer=FakeErrorAnalyzer(), runtime_identity_provider=FakeRuntimeIdentityProvider())
     manifest = ExperimentRunner(deps).run_experiment(curation_manifest=_make_manifest(),
         train_config=TrainConfig(specialist="pilot", generalist_weights=Path("generalist.rs"), generalist_weights_sha256="0" * 64,
-            threshold_policy="constrained_retention"), output_dir=tmp_path / "run")
+            threshold_policy="constrained_retention"), output_dir=temp_dir / "run")
     assert manifest.calibration["threshold"] == 2
     assert manifest.calibration["total"]["retention"] == 1
     assert manifest.calibration["candidate_weights_sha256"] == "a" * 64
     assert manifest.calibration["parapet_eval_sha256"] == "b" * 64
     from parapet_runner.runner import write_run_manifest
-    write_run_manifest(tmp_path / "run" / "manifest.json", manifest)
-    saved = json.loads((tmp_path / "run" / "manifest.json").read_text())
+    write_run_manifest(temp_dir / "run" / "manifest.json", manifest)
+    saved = json.loads((temp_dir / "run" / "manifest.json").read_text())
     assert saved["calibration"]["parapet_eval_sha256"] == "b" * 64
     assert "eval:holdout:2.0" in calls

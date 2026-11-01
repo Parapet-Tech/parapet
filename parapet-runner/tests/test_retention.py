@@ -2,12 +2,19 @@
 import hashlib
 import json
 from pathlib import Path
+import tempfile
 
 import pytest
 
 from parapet_runner.config import TrainConfig
 from parapet_runner.retention import constrained_retention, calibrate_runtime, score_candidate
 from parapet_runner.runner import _install_weights_and_rebuild, RuntimeIdentityCollector
+
+
+@pytest.fixture
+def temp_dir():
+    with tempfile.TemporaryDirectory() as directory:
+        yield Path(directory).resolve()
 
 
 def row(label, g, s):
@@ -53,11 +60,11 @@ def test_empty_deciding_band_reports_undefined_interval():
     assert result["deciding_band"] == dict(kept=0, total=0, retention=None, wilson95=None)
 
 
-def calibration_fixture(tmp_path):
+def calibration_fixture(temp_dir):
     from parapet_runner.retention import weights_identity
-    generalist = tmp_path / "generalist.rs"
+    generalist = temp_dir / "generalist.rs"
     generalist.write_text("// Trained: yesterday\nfrozen table")
-    candidate = tmp_path / "candidate.rs"
+    candidate = temp_dir / "candidate.rs"
     candidate.write_text('pub const BIAS: f64 = 1_f64;\n    " a " => 1_f64,\n')
     identity = weights_identity(generalist)
     config = TrainConfig(specialist="pilot", threshold_policy="constrained_retention",
@@ -65,8 +72,8 @@ def calibration_fixture(tmp_path):
     return config, candidate, [dict(id="a", content="a", label="malicious")]
 
 
-def test_runtime_overrides_surrogate_at_float_boundary(tmp_path):
-    config, model, rows = calibration_fixture(tmp_path)
+def test_runtime_overrides_surrogate_at_float_boundary(temp_dir):
+    config, model, rows = calibration_fixture(temp_dir)
     rows[0]["content"] = "ab"
     model.write_text('pub const BIAS: f64 = 0.30000000_f64;\n    " ab" => 0.20000000_f64,\n    "ab " => 0.10000000_f64,\n')
     proposed = score_candidate(model, rows, config)[0]
@@ -80,8 +87,8 @@ def test_runtime_overrides_surrogate_at_float_boundary(tmp_path):
     assert (proposed, False) in calls
 
 
-def test_empty_map_and_runtime_tie_search(tmp_path):
-    config, model, rows = calibration_fixture(tmp_path)
+def test_empty_map_and_runtime_tie_search(temp_dir):
+    config, model, rows = calibration_fixture(temp_dir)
     model.write_text("pub const BIAS: f64 = 1_f64;\npub static WEIGHTS: phf::Map<&'static str, f64> = phf::phf_map! {};\n")
     assert score_candidate(model, rows, config) == [1.]
     def runtime(t, generalist_only=False):
@@ -93,8 +100,8 @@ def test_empty_map_and_runtime_tie_search(tmp_path):
     assert len(result["runtime_evaluations"]) == 1
 
 
-def test_runtime_search_maximizes_relief_and_uses_lowest_tie(tmp_path):
-    config, model, rows = calibration_fixture(tmp_path)
+def test_runtime_search_maximizes_relief_and_uses_lowest_tie(temp_dir):
+    config, model, rows = calibration_fixture(temp_dir)
     rows += [dict(id="b", content="b", label="benign"), dict(id="c", content="c", label="benign")]
     model.write_text('pub const BIAS: f64 = 0_f64;\n    " a " => 3_f64,\n    " b " => 1_f64,\n    " c " => 2_f64,\n')
     def runtime(t, generalist_only=False):
@@ -108,8 +115,8 @@ def test_runtime_search_maximizes_relief_and_uses_lowest_tie(tmp_path):
     assert {r["threshold"] for r in result["runtime_evaluations"]} == {1., 2., 3.}
 
 
-def test_runtime_rejects_generalist_drift(tmp_path):
-    config, model, rows = calibration_fixture(tmp_path)
+def test_runtime_rejects_generalist_drift(temp_dir):
+    config, model, rows = calibration_fixture(temp_dir)
     config.generalist_weights.write_text("changed")
     with pytest.raises(ValueError, match="identity"):
         calibrate_runtime(config, rows, model_artifact=model,
@@ -124,17 +131,17 @@ def test_no_cap_and_min_df_are_expressible():
     assert args[args.index("--min-df") + 1] == "2"
 
 
-def test_specialist_cannot_overwrite_shipped_weights(tmp_path):
-    layers = tmp_path / "src" / "layers"
+def test_specialist_cannot_overwrite_shipped_weights(temp_dir):
+    layers = temp_dir / "src" / "layers"
     layers.mkdir(parents=True)
     shipped = layers / "l1_weights.rs"
     shipped.write_text("generalist")
-    specialist = tmp_path / "l1_weights_example.rs"
+    specialist = temp_dir / "l1_weights_example.rs"
     specialist.write_text("specialist")
     class Executor:
         def run(self, args, **kwargs):
             return type("Result", (), {"returncode": 0})()
-    kwargs = dict(model_artifact=specialist, rust_crate_dir=tmp_path, last_installed_hash=None,
+    kwargs = dict(model_artifact=specialist, rust_crate_dir=temp_dir, last_installed_hash=None,
                   executor=Executor(), build_features=["eval"], model_role="pilot")
     with pytest.raises(ValueError, match="separate"):
         _install_weights_and_rebuild(weights_install_target="l1_weights.rs", **kwargs)
@@ -143,16 +150,16 @@ def test_specialist_cannot_overwrite_shipped_weights(tmp_path):
     assert (layers / "l1_weights_example.rs").read_text() == "specialist"
 
 
-def test_environment_freeze_uses_configured_python(tmp_path):
+def test_environment_freeze_uses_configured_python(temp_dir):
     calls = []
-    binary = tmp_path / "custom-target" / "parapet-eval"
+    binary = temp_dir / "custom-target" / "parapet-eval"
     binary.parent.mkdir()
     binary.write_bytes(b"built evaluator")
     class Executor:
         def run(self, args, **kwargs):
             calls.append(args)
             return type("Result", (), {"returncode": 0, "stdout": "synthetic==1", "stderr": ""})()
-    collector = RuntimeIdentityCollector(workspace_root=tmp_path, trainer_script=Path("trainer"),
+    collector = RuntimeIdentityCollector(workspace_root=temp_dir, trainer_script=Path("trainer"),
         parapet_eval_binary=Path("eval"), pg2_model_id="pilot", eval_config=Path("config"),
         command_executor=Executor(), python_bin="configured-python")
     collector._environment_hash()
@@ -160,14 +167,14 @@ def test_environment_freeze_uses_configured_python(tmp_path):
 
 
 @pytest.mark.parametrize("pre_split", [False, True])
-def test_runner_preserves_weights_and_uses_frozen_split(tmp_path, pre_split):
+def test_runner_preserves_weights_and_uses_frozen_split(temp_dir, pre_split):
     import yaml
     from parapet_runner.runner import TrainScriptTrainer
-    split = tmp_path / "train.jsonl"
+    split = temp_dir / "train.jsonl"
     split.write_text("\n".join(json.dumps(dict(id=str(i), content=f"synthetic {i}",
         label=label, sample_weight=weight)) for i, (label, weight) in enumerate([("malicious", .25), ("benign", 2)])))
     calls = []
-    binary = tmp_path / "custom-target" / "parapet-eval"
+    binary = temp_dir / "custom-target" / "parapet-eval"
     binary.parent.mkdir()
     binary.write_bytes(b"built evaluator")
     class Executor:
@@ -177,9 +184,9 @@ def test_runner_preserves_weights_and_uses_frozen_split(tmp_path, pre_split):
             artifact.parent.mkdir(parents=True)
             artifact.write_text("weights")
             return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
-    trainer = TrainScriptTrainer(trainer_script=Path("trainer"), workspace_root=tmp_path,
+    trainer = TrainScriptTrainer(trainer_script=Path("trainer"), workspace_root=temp_dir,
         command_executor=Executor(), python_bin="configured-python")
-    trainer.train(train_split=split, config=TrainConfig(pre_split=pre_split), output_dir=tmp_path)
+    trainer.train(train_split=split, config=TrainConfig(pre_split=pre_split), output_dir=temp_dir)
     args = calls[0]
     assert args[0] == "configured-python"
     assert ("--pre-split" in args) == pre_split
@@ -190,9 +197,9 @@ def test_runner_preserves_weights_and_uses_frozen_split(tmp_path, pre_split):
 
 
 @pytest.mark.parametrize("alias", ["symlink", "case", "hardlink"])
-def test_install_refuses_generalist_aliases_before_copy_or_build(tmp_path, alias):
+def test_install_refuses_generalist_aliases_before_copy_or_build(temp_dir, alias):
     import os
-    layers = tmp_path / "src" / "layers"
+    layers = temp_dir / "src" / "layers"
     layers.mkdir(parents=True)
     protected = layers / "l1_weights.rs"
     protected.write_text("frozen")
@@ -201,25 +208,25 @@ def test_install_refuses_generalist_aliases_before_copy_or_build(tmp_path, alias
         target.symlink_to(protected)
     elif alias == "hardlink":
         os.link(protected, target)
-    model = tmp_path / "arbitrary.rs"
+    model = temp_dir / "arbitrary.rs"
     model.write_text("candidate")
     class Executor:
         def run(self, *args, **kwargs):
             pytest.fail("must refuse before build")
     with pytest.raises(ValueError):
-        _install_weights_and_rebuild(model_artifact=model, rust_crate_dir=tmp_path,
+        _install_weights_and_rebuild(model_artifact=model, rust_crate_dir=temp_dir,
             weights_install_target=target.name, last_installed_hash=None,
             executor=Executor(), model_role="pilot")
     assert protected.read_text() == "frozen"
 
 
-def test_threshold_yaml_roundtrip_targets_rust_specialist_fields(tmp_path):
+def test_threshold_yaml_roundtrip_targets_rust_specialist_fields(temp_dir):
     import yaml
     from parapet_runner.runner import _set_l1_threshold
-    policy, _, _ = calibration_fixture(tmp_path)
+    policy, _, _ = calibration_fixture(temp_dir)
     source = {"layers": {"L1": {"mode": "block", "threshold": 0.,
         "generalist_solo_threshold": 3., "specialists": {"generalist": {"threshold": 0.}, "pilot": {"threshold": 0.}}}}}
-    path = tmp_path / "eval.yaml"
+    path = temp_dir / "eval.yaml"
     path.write_text(yaml.safe_dump(_set_l1_threshold(source, 2., policy=policy)))
     # These are precisely RawL1Config/RawL1SpecialistConfig's YAML fields.
     l1 = yaml.safe_load(path.read_text())["layers"]["L1"]
@@ -241,13 +248,13 @@ def test_threshold_yaml_roundtrip_targets_rust_specialist_fields(tmp_path):
         _set_l1_threshold(source, 2., policy=policy)
 
 
-def test_evaluator_writes_selected_specialist_threshold(tmp_path):
+def test_evaluator_writes_selected_specialist_threshold(temp_dir):
     import yaml
     from parapet_runner.runner import ParapetEvalEvaluator
-    config, model, rows = calibration_fixture(tmp_path)
-    split = tmp_path / "holdout.jsonl"
+    config, model, rows = calibration_fixture(temp_dir)
+    split = temp_dir / "holdout.jsonl"
     split.write_text(json.dumps(rows[0]) + "\n")
-    source = tmp_path / "eval.yaml"
+    source = temp_dir / "eval.yaml"
     source.write_text(yaml.safe_dump({"layers": {"L1": {"mode": "block", "threshold": 0.,
         "generalist_solo_threshold": 3., "specialists": {"generalist": {"threshold": 0.}, "pilot": {"threshold": 0.}}}}}))
     class Executor:
@@ -261,33 +268,33 @@ def test_evaluator_writes_selected_specialist_threshold(tmp_path):
                 layer="l1", tp=0, fp=0, fn_count=1, tn=0, precision=0., recall=0., f1=0., total=1)]}))
             return type("Result", (), {"returncode": 0})()
     evaluator = ParapetEvalEvaluator(parapet_eval_bin=Path("eval"), eval_config=source,
-        workspace_root=tmp_path, command_executor=Executor(), model_role="pilot")
+        workspace_root=temp_dir, command_executor=Executor(), model_role="pilot")
     result = evaluator.evaluate(model_artifact=model, split_path=split, threshold=2.,
-        split_name="holdout", output_dir=tmp_path / "run", calibration_policy=config)
+        split_name="holdout", output_dir=temp_dir / "run", calibration_policy=config)
     assert result.threshold == 2.
 
 
 @pytest.mark.parametrize("scenario", ["happy", "mismatch", "changed", "no_report", "old_dirs", "stale"])
-def test_runtime_adapter_installs_pair_and_measures_generalist_runs(tmp_path, scenario):
+def test_runtime_adapter_installs_pair_and_measures_generalist_runs(temp_dir, scenario):
     import yaml
     from parapet_runner.retention import weights_identity
     from parapet_runner.runner import ParapetEvalEvaluator
-    layers = tmp_path / "crate" / "src" / "layers"
+    layers = temp_dir / "crate" / "src" / "layers"
     layers.mkdir(parents=True)
     generalist = layers / "l1_weights.rs"
     generalist.write_text("frozen")
     config = TrainConfig(specialist="pilot", threshold_policy="constrained_retention",
         generalist_weights=generalist, generalist_weights_sha256=weights_identity(generalist))
-    model = tmp_path / "candidate.rs"
+    model = temp_dir / "candidate.rs"
     model.write_text("pub const BIAS: f64 = 0_f64;\npub static WEIGHTS: phf::Map<&'static str, f64> = phf::phf_map! {};\n")
-    split = tmp_path / "val.jsonl"
+    split = temp_dir / "val.jsonl"
     split.write_text(json.dumps(dict(id="a", label="malicious", content="<b>ab</b>")) + "\n")
-    source = tmp_path / "source.yaml"
+    source = temp_dir / "source.yaml"
     source.write_text(yaml.safe_dump({"layers": {"L0": {"mode": "sanitize"}, "L1": {
         "mode": "block", "specialists": {"generalist": {"threshold": 0.}, "pilot": {"threshold": 9.}},
         "generalist_solo_threshold": 3.}}}))
     calls = []
-    binary = tmp_path / "custom-target" / "parapet-eval"
+    binary = temp_dir / "custom-target" / "parapet-eval"
     binary.parent.mkdir()
     binary.write_bytes(b"built evaluator")
     class Executor:
@@ -331,41 +338,41 @@ def test_runtime_adapter_installs_pair_and_measures_generalist_runs(tmp_path, sc
             if scenario == "changed":
                 binary.write_bytes(b"replaced after first invocation")
             return type("Result", (), {"returncode": 1})()
-    evaluator = ParapetEvalEvaluator(parapet_eval_bin=(tmp_path / "wrong" if scenario == "mismatch" else binary), eval_config=source,
-        workspace_root=tmp_path, command_executor=Executor(), rust_crate_dir=tmp_path / "crate",
+    evaluator = ParapetEvalEvaluator(parapet_eval_bin=(temp_dir / "wrong" if scenario == "mismatch" else binary), eval_config=source,
+        workspace_root=temp_dir, command_executor=Executor(), rust_crate_dir=temp_dir / "crate",
         weights_install_target="l1_weights_pilot.rs", model_role="specialist")
     if scenario == "stale":
-        stale = tmp_path / "run" / "_calibration" / "1_generalist_0.0" / "_eval_calibration_0p0" / "eval.json"
+        stale = temp_dir / "run" / "_calibration" / "1_generalist_0.0" / "_eval_calibration_0p0" / "eval.json"
         stale.parent.mkdir(parents=True)
         stale.write_text(json.dumps({"results": [{"case_id": "a", "actual": "blocked"}],
             "layers": [dict(layer="l1", tp=1, fp=0, fn_count=0, tn=0,
                 precision=1., recall=1., f1=1., total=1)]}))
         with pytest.raises(FileExistsError):
-            evaluator.calibrate(model_artifact=model, split_path=split, config=config, output_dir=tmp_path / "run")
+            evaluator.calibrate(model_artifact=model, split_path=split, config=config, output_dir=temp_dir / "run")
         assert calls == ["build"]
         return
     if scenario in ("mismatch", "changed", "no_report"):
         error = FileNotFoundError if scenario == "no_report" else ValueError
         pattern = {"mismatch": "does not match Cargo", "changed": "artifact changed", "no_report": "did not produce"}[scenario]
         with pytest.raises(error, match=pattern):
-            evaluator.calibrate(model_artifact=model, split_path=split, config=config, output_dir=tmp_path / "run")
+            evaluator.calibrate(model_artifact=model, split_path=split, config=config, output_dir=temp_dir / "run")
         return
-    result = evaluator.calibrate(model_artifact=model, split_path=split, config=config, output_dir=tmp_path / "run")
+    result = evaluator.calibrate(model_artifact=model, split_path=split, config=config, output_dir=temp_dir / "run")
     assert result["parapet_eval_sha256"] == hashlib.sha256(binary.read_bytes()).hexdigest()
     assert result["total"]["retention"] == 1
     assert result["deciding_band"]["total"] == 1
     assert calls == ["build", {"generalist"}, {"generalist"}, {"generalist", "pilot"}]
     evaluator.evaluate(model_artifact=model, split_path=split, threshold=0., split_name="holdout",
-        output_dir=tmp_path / "holdout-run", calibration_policy=config)
+        output_dir=temp_dir / "holdout-run", calibration_policy=config)
     assert calls.count("build") == 1
     generalist.write_text("drift")
     with pytest.raises(ValueError, match="generalist.*(identity|pinned)"):
-        evaluator.calibrate(model_artifact=model, split_path=split, config=config, output_dir=tmp_path / "other")
+        evaluator.calibrate(model_artifact=model, split_path=split, config=config, output_dir=temp_dir / "other")
 
 @pytest.mark.parametrize("mode", [None, "shadow"])
-def test_calibration_refuses_nonblocking_engine_config(tmp_path, mode):
+def test_calibration_refuses_nonblocking_engine_config(temp_dir, mode):
     from parapet_runner.runner import _set_l1_threshold
-    policy, _, _ = calibration_fixture(tmp_path)
+    policy, _, _ = calibration_fixture(temp_dir)
     l1 = {"generalist_solo_threshold": 3., "specialists": {
         "generalist": {"threshold": 0.}, "pilot": {"threshold": 0.}}}
     if mode is not None:
@@ -375,14 +382,14 @@ def test_calibration_refuses_nonblocking_engine_config(tmp_path, mode):
 
 
 @pytest.mark.parametrize("returncode", [0, 1])
-def test_evaluator_refuses_existing_report_before_command(tmp_path, returncode):
+def test_evaluator_refuses_existing_report_before_command(temp_dir, returncode):
     from parapet_runner.runner import ParapetEvalEvaluator
-    config, model, rows = calibration_fixture(tmp_path)
-    split = tmp_path / "split.jsonl"
+    config, model, rows = calibration_fixture(temp_dir)
+    split = temp_dir / "split.jsonl"
     split.write_text(json.dumps(rows[0]) + "\n")
-    source = tmp_path / "source.yaml"
+    source = temp_dir / "source.yaml"
     source.write_text("layers: {L1: {mode: block}}")
-    stale = tmp_path / "run" / "_eval_calibration_0p0" / "eval.json"
+    stale = temp_dir / "run" / "_eval_calibration_0p0" / "eval.json"
     stale.parent.mkdir(parents=True)
     stale.write_text(json.dumps({"results": [{"case_id": rows[0]["id"], "actual": "blocked"}],
         "layers": [dict(layer="l1", tp=1, fp=0, fn_count=0, tn=0, precision=1., recall=1., f1=1., total=1)]}))
@@ -390,7 +397,7 @@ def test_evaluator_refuses_existing_report_before_command(tmp_path, returncode):
         def run(self, args, **kwargs):
             return type("Result", (), {"returncode": returncode, "args": args, "stdout": "", "stderr": ""})()
     evaluator = ParapetEvalEvaluator(parapet_eval_bin=Path("eval"), eval_config=source,
-        workspace_root=tmp_path, command_executor=Executor())
+        workspace_root=temp_dir, command_executor=Executor())
     with pytest.raises(FileExistsError):
         evaluator.evaluate(model_artifact=model, split_path=split, threshold=0.,
-            split_name="calibration", output_dir=tmp_path / "run")
+            split_name="calibration", output_dir=temp_dir / "run")
