@@ -56,6 +56,7 @@ def test_rejections(setup, tmp_path, failure):
 
 def test_lossless_deterministic_grouped_and_runner_roundtrip(setup, tmp_path):
     spec, rows = setup
+    spec["selection"] = None
     spec["splits"] = {"train": .6, "val": .2, "holdout": .2}
     spec = FixedImportSpec.model_validate(spec)
     first, second = tmp_path / "a", tmp_path / "b"
@@ -96,6 +97,7 @@ def test_mixed_missing_groups_use_distinct_row_identities(setup, tmp_path, missi
     source = Path(spec["inputs"][0]["path"])
     source.write_text("".join(json.dumps(r) + "\n" for r in rows))
     spec["inputs"][0]["sha256"] = pin(source)
+    spec["selection"] = None
     spec["splits"] = {"train": .6, "val": .2, "holdout": .2}
     out = tmp_path / "out"
     manifest = compose_fixed(FixedImportSpec.model_validate(spec), out, tmp_path)
@@ -122,6 +124,7 @@ def test_splitlines_boundaries_lossless_runner_roundtrip(setup, tmp_path):
     source = Path(spec["inputs"][0]["path"])
     source.write_text("".join(json.dumps(r) + "\n" for r in rows))
     spec["inputs"][0]["sha256"] = pin(source)
+    spec["selection"] = None
     spec["splits"] = {"train": .6, "val": .2, "holdout": .2}
     out = tmp_path / "out"
     compose_fixed(FixedImportSpec.model_validate(spec), out, tmp_path)
@@ -171,6 +174,7 @@ def test_weights_stratified_groups_and_frozen_ids(setup, tmp_path):
         row["stratum"] = str(int(row["family"]) % 2)
     source.write_text("".join(json.dumps(r) + "\n" for r in rows))
     spec["inputs"][0].update(sha256=pin(source), weight_column="weight", stratify_column="stratum")
+    spec["selection"] = None
     spec["splits"] = {"train": .8, "val": .2, "holdout": 0}
     out = tmp_path / "out"
     compose_fixed(FixedImportSpec.model_validate(spec), out, tmp_path)
@@ -203,3 +207,74 @@ def test_invalid_sample_weights_rejected_before_writes(setup, tmp_path, weight):
     with pytest.raises(ValueError, match="weight"):
         compose_fixed(FixedImportSpec.model_validate(spec), tmp_path / "out", tmp_path)
     assert not (tmp_path / "out").exists()
+
+
+def test_nested_arm_keeps_full_population_calibration(tmp_path):
+    # Five groups: full population trains groups 1-4, calibrates group 5.
+    rows = [dict(row_id=str(i), text=f"synthetic {i}", label="benign", group=str(i), stratum="same") for i in range(1, 6)]
+    source = tmp_path / "source.jsonl"
+    source.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    assignment = tmp_path / "assignment.json"
+    assignment.write_text(json.dumps({str(i): "calibration" if i == 5 else "train" for i in range(1, 6)}))
+    arms = tmp_path / "arms.json"
+    arms.write_text(json.dumps({"full": {"rows": [str(i) for i in range(1, 6)]}, "nested": {"rows": ["4", "5"]}, "excluded": {"rows": ["4"]}}))
+    common = dict(mode="fixed_import", name="nested", inputs=[dict(name="rows", path=source,
+        sha256=pin(source), text_column="text", id_column="row_id", label_column="label",
+        group_column="group", stratify_column="stratum")],
+        assignment=dict(path=assignment, sha256=pin(assignment)), splits=dict(train=.8, val=.2, holdout=0))
+    for arm in ("full", "nested", "excluded"):
+        spec = FixedImportSpec(**common, selection=dict(path=arms, sha256=pin(arms), arm=arm))
+        out = tmp_path / arm
+        compose_fixed(spec, out, tmp_path)
+        ids = json.loads((out / "split_ids.json").read_text())
+        assert ids["val"] == ["5"]
+        assert ids["train"] == (["1", "2", "3", "4"] if arm == "full" else ["4"])
+        assert all(r["id"] == r["row_id"] for r in map(json.loads, (out / "curated.jsonl").read_text().splitlines()))
+
+
+@pytest.mark.parametrize("mutation", ["deleted", "changed", "swapped"])
+def test_frozen_split_weights_cannot_drift(setup, tmp_path, mutation):
+    from parapet_runner.runner import ManifestSplitResolver
+    from parapet_runner.manifest import CurationManifest
+    spec, rows = setup
+    source = Path(spec["inputs"][0]["path"])
+    for i, row in enumerate(rows):
+        row["sample_weight"] = i + .125
+    source.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    spec["inputs"][0].update(sha256=pin(source), weight_column="sample_weight")
+    out = tmp_path / "out"
+    compose_fixed(FixedImportSpec.model_validate(spec), out, tmp_path)
+    receipt = CurationManifest.model_validate_json((out / "manifest.json").read_text())
+    assert receipt.split_ids is not None
+    resolver = ManifestSplitResolver(root_dir=out)
+    resolver.resolve(receipt)
+    train = out / "train.jsonl"
+    entries = list(map(json.loads, train.read_text().splitlines()))
+    if mutation == "deleted":
+        del entries[0]["sample_weight"]
+    elif mutation == "changed":
+        entries[0]["sample_weight"] = 99
+    else:
+        entries[0]["sample_weight"], entries[1]["sample_weight"] = entries[1]["sample_weight"], entries[0]["sample_weight"]
+    train.write_text("".join(json.dumps(r) + "\n" for r in entries))
+    with pytest.raises(ValueError, match="byte hash"):
+        resolver.resolve(receipt)
+
+
+def test_canonical_id_conflict_refused(setup, tmp_path):
+    spec, rows = setup
+    for row in rows:
+        row["row_id"] = "different-" + row["id"]
+    source = Path(spec["inputs"][0]["path"])
+    source.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    spec["selection"] = None
+    spec["inputs"][0].update(sha256=pin(source), id_column="row_id")
+    with pytest.raises(ValueError, match="id column conflicts"):
+        compose_fixed(FixedImportSpec.model_validate(spec), tmp_path / "out", tmp_path)
+
+
+def test_arm_calibration_requires_pinned_population_assignment(setup, tmp_path):
+    spec, _ = setup
+    spec["splits"] = dict(train=.8, val=.2, holdout=0.)
+    with pytest.raises(ValueError, match="full-population assignment"):
+        compose_fixed(FixedImportSpec.model_validate(spec), tmp_path / "out", tmp_path)

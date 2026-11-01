@@ -34,6 +34,12 @@ class InputSpec(BaseModel):
         return self
 
 
+class AssignmentSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    path: Path
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class SelectionSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
     path: Path
@@ -47,6 +53,7 @@ class FixedImportSpec(BaseModel):
     mode: Literal["fixed_import"]
     name: str
     inputs: list[InputSpec] = Field(min_length=1)
+    assignment: AssignmentSpec | None = None
     selection: SelectionSpec | None = None
     expected_counts: dict[Literal["benign", "malicious"], int] | None = None
     seed: int = 42
@@ -87,10 +94,18 @@ def compose_fixed(spec: FixedImportSpec, output: Path, base: Path) -> CurationMa
                 raise ValueError("selection ids must be lists of strings")
             if len(ids) != len(set(ids)):
                 raise ValueError("duplicate selected id")
+    assignment = None
+    if spec.assignment:
+        assignment = json.loads(_pinned(spec.assignment.path, spec.assignment.sha256, base))
+        if not isinstance(assignment, dict) or any(v not in ("train", "calibration") for v in assignment.values()):
+            raise ValueError("assignment must map ids to train or calibration")
+    if spec.selection and spec.splits["train"] < 1 and assignment is None:
+        raise ValueError("arm selection with calibration/holdout requires pinned full-population assignment")
     rows = []
     seen = set()
     split_rows = {k: [] for k in ("train", "val", "holdout")}
     grouped = {}
+    full_group_assignments = {}
     row_ids = {}
     for source in spec.inputs:
         wanted = set(selection[source.name]) if selection is not None else None
@@ -113,13 +128,29 @@ def compose_fixed(spec: FixedImportSpec, output: Path, base: Path) -> CurationMa
             text = row[source.text_column]
             if not isinstance(text, str) or not text.strip():
                 raise ValueError("text must be a nonempty string")
-            if wanted is not None and identifier not in wanted:
+            if assignment is not None and identifier not in assignment:
+                raise ValueError("assignment missing population id")
+            group = row.get(source.group_column) if source.group_column else identifier
+            if group is None:
+                group = ["row", identifier]
+            elif not isinstance(group, str) or not group:
+                raise ValueError("group must be a nonempty string")
+            group_key = json.dumps(group, sort_keys=True)
+            if assignment is not None:
+                value = assignment[identifier]
+                if group_key in full_group_assignments and full_group_assignments[group_key] != value:
+                    raise ValueError("assignment splits a group")
+                full_group_assignments[group_key] = value
+            if wanted is not None and identifier in wanted:
+                found.add(identifier)
+            if wanted is not None and identifier not in wanted and (assignment is None or assignment[identifier] != "calibration"):
                 continue
-            found.add(identifier)
             # Preserve all original fields, including any noncanonical content field.
             if "content" in row and row["content"] != text:
                 raise ValueError("content column conflicts with text column")
-            item = dict(row, content=text, label=label)
+            if "id" in row and row["id"] != identifier:
+                raise ValueError("id column conflicts with canonical id")
+            item = dict(row, id=identifier, content=text, label=label)
             if source.weight_column:
                 weight = row[source.weight_column]
                 if isinstance(weight, bool) or not isinstance(weight, (int, float)) or not math.isfinite(weight) or weight <= 0:
@@ -127,12 +158,6 @@ def compose_fixed(spec: FixedImportSpec, output: Path, base: Path) -> CurationMa
                 if "sample_weight" in row and row["sample_weight"] != weight:
                     raise ValueError("sample_weight conflicts with weight column")
                 item["sample_weight"] = weight
-            group = row.get(source.group_column) if source.group_column else identifier
-            if group is None:
-                # Tag row identities so they cannot collide with real group strings.
-                group = ["row", identifier]
-            elif not isinstance(group, str) or not group:
-                raise ValueError("group must be a nonempty string")
             row_ids[id(item)] = identifier
             group_key = json.dumps(group, sort_keys=True)
             stratum = row[source.stratify_column] if source.stratify_column else None
@@ -156,7 +181,13 @@ def compose_fixed(spec: FixedImportSpec, output: Path, base: Path) -> CurationMa
     counts = Counter(r["label"] for r in rows)
     if spec.expected_counts is not None and any(counts[k] != v for k, v in spec.expected_counts.items()):
         raise ValueError(f"count mismatch: {dict(counts)}")
-    if any(source.stratify_column for source in spec.inputs):
+    if assignment is not None:
+        if set(assignment) != seen:
+            raise ValueError("assignment must match full population ids")
+        split_rows = {"train": [], "val": [], "holdout": []}
+        for row in rows:
+            split_rows["val" if assignment[row["id"]] == "calibration" else "train"].append(row)
+    elif any(source.stratify_column for source in spec.inputs):
         # Allocate whole groups within each stratum, ordered by seeded hashes.
         split_rows = {k: [] for k in split_rows}
         strata = {}
@@ -177,8 +208,8 @@ def compose_fixed(spec: FixedImportSpec, output: Path, base: Path) -> CurationMa
     hashes = lambda entries: sorted(hashlib.sha256(r["content"].strip().encode()).hexdigest() for r in entries)
     splits = {}
     for name, entries in split_rows.items():
-        write(name, entries)
-        splits[name] = SplitManifest(name=name, sample_count=len(entries), content_hashes=hashes(entries), artifact_path=Path(f"{name}.jsonl"))
+        digest = write(name, entries)
+        splits[name] = SplitManifest(sha256=digest, name=name, sample_count=len(entries), content_hashes=hashes(entries), artifact_path=Path(f"{name}.jsonl"))
     manifest = CurationManifest(
         spec_name=spec.name, spec_version="fixed-import-v1", spec_hash=hashlib.sha256(_json_bytes(spec.model_dump(mode="json"))).hexdigest(),
         seed=spec.seed, timestamp="1970-01-01T00:00:00+00:00", source_hashes={s.name: s.sha256 for s in spec.inputs},
@@ -186,11 +217,12 @@ def compose_fixed(spec: FixedImportSpec, output: Path, base: Path) -> CurationMa
         total_samples=len(rows), attack_samples=counts["malicious"], benign_samples=counts["benign"],
         splits=splits, cell_fills={}, gaps=[], cross_contamination_dropped=0, output_path=Path("curated.jsonl"),
     )
-    receipt = manifest.model_dump(mode="json")
     split_ids = _json_bytes({name: sorted(row_ids[id(r)] for r in entries) for name, entries in split_rows.items()})
     (output / "split_ids.json").write_bytes(split_ids)
-    receipt["split_ids"] = {"path": "split_ids.json", "sha256": hashlib.sha256(split_ids).hexdigest()}
-    receipt["fixed_import"] = spec.model_dump(mode="json")
+    from .models import ArtifactReceipt
+    manifest.split_ids = ArtifactReceipt(path=Path("split_ids.json"), sha256=hashlib.sha256(split_ids).hexdigest())
+    manifest.fixed_import = spec.model_dump(mode="json")
+    receipt = manifest.model_dump(mode="json")
     (output / "manifest.json").write_bytes(_json_bytes(receipt))
     (output / "composition.json").write_bytes(_json_bytes({"counts": dict(counts)}))
     return manifest

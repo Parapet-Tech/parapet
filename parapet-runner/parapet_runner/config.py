@@ -20,6 +20,7 @@ class ThresholdPolicy(str, Enum):
 class TrainConfig(BaseModel):
     """Config for one training run."""
 
+    pre_split: bool = False
     specialist: str = "generalist"
     analyzer: str = "char_wb"
     ngram_min: int = 3
@@ -39,6 +40,8 @@ class TrainConfig(BaseModel):
     threshold_policy: ThresholdPolicy = ThresholdPolicy.FIXED
     calibration_scores: Path | None = None
     calibration_scores_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    generalist_weights: Path | None = None
+    generalist_weights_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     retention_floor: float = Field(default=0.99, ge=0, le=1)
     generalist_threshold: float = 0.0
     generalist_block_alone: float = 3.0
@@ -73,6 +76,10 @@ class TrainConfig(BaseModel):
         if self.threshold_policy == ThresholdPolicy.CONSTRAINED_RETENTION:
             if self.calibration_scores is None or self.calibration_scores_sha256 is None:
                 raise ValueError("constrained_retention requires pinned calibration scores")
+            if self.generalist_weights is None or self.generalist_weights_sha256 is None:
+                raise ValueError("constrained_retention requires pinned generalist weights")
+            if self.specialist == "generalist":
+                raise ValueError("constrained_retention requires an explicit specialist")
             if self.generalist_block_alone < self.generalist_threshold:
                 raise ValueError("block-alone cutoff must be >= generalist threshold")
         if self.threshold_policy == ThresholdPolicy.FIXED:

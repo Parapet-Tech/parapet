@@ -57,17 +57,79 @@ def constrained_retention(
     return best
 
 
-def calibrate_pinned_scores(config: Any, validation_rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    """Verify frozen row alignment and score bytes before selecting a threshold."""
+def weights_identity(path: Path) -> str:
+    """Stable generated-table identity, omitting only the timestamp line."""
+    return hashlib.sha256(b"".join(line for line in path.read_bytes().splitlines(keepends=True)
+                                  if not line.startswith(b"// Trained:"))).hexdigest()
+
+
+def score_candidate(path: Path, rows: Sequence[Mapping[str, Any]], config: Any) -> list[float]:
+    """Score the actual pruned Rust artifact, with runtime binary raw/squash features.
+
+    This calibration path supports char_wb, the runtime specialist contract.
+    L0 uses the same transform as the trainer, before both scoring passes.
+    """
+    import importlib.util
+    import re
+    if config.analyzer != "char_wb":
+        raise ValueError("retention calibration requires char_wb")
+    module_spec = importlib.util.spec_from_file_location("l1_calibration_transform",
+        Path(__file__).resolve().parents[2] / "scripts" / "train_l1_specialist.py")
+    module = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(module)
+    text = path.read_text(encoding="utf-8")
+    bias_match = re.search(r"pub const BIAS: f64 = ([-+0-9.eE]+)_f64;", text)
+    if bias_match is None:
+        raise ValueError("candidate artifact has no bias")
+    weights = {}
+    for match in re.finditer(r'    "((?:[^"\\]|\\.)*)" => ([-+0-9.eE]+)_f64,', text):
+        key = re.sub(r'\\([\\"])', lambda m: m[1], match[1])
+        weights[key] = float(match[2])
+    if not weights:
+        raise ValueError("candidate artifact has no weights")
+    bias = float(bias_match[1])
+    def score(value):
+        features = set()
+        for word in value.lower().split():
+            padded = " " + word + " "
+            for n in range(config.ngram_min, config.ngram_max + 1):
+                if len(padded) < n:
+                    features.add(padded)
+                else:
+                    features.update(padded[i:i+n] for i in range(len(padded)-n+1))
+        return bias + math.fsum(weights.get(f, 0.) for f in sorted(features))
+    results = []
+    for row in rows:
+        value = row["content"]
+        if config.apply_l0_transform:
+            value = module.apply_l0_transform(value)
+        results.append(max(score(value), score("".join(c for c in value.lower() if c.isalnum()))))
+    return results
+
+
+def calibrate_pinned_scores(config: Any, validation_rows: Sequence[Mapping[str, Any]], *,
+                            model_artifact: Path) -> dict[str, Any]:
+    """Bind frozen generalist scores to content, then score the trained candidate."""
+    if weights_identity(Path(config.generalist_weights)) != config.generalist_weights_sha256:
+        raise ValueError("generalist weights identity mismatch")
     path = Path(config.calibration_scores)
     data = path.read_bytes()
     if hashlib.sha256(data).hexdigest() != config.calibration_scores_sha256:
         raise ValueError("calibration score sha256 mismatch")
     scores = [json.loads(line) for line in data.splitlines() if line.strip()]
-    expected = {r["id"]: r["label"] for r in validation_rows}
-    actual = {r["id"]: r["label"] for r in scores}
+    expected = {r["id"]: (r["label"], hashlib.sha256(r["content"].encode()).hexdigest()) for r in validation_rows}
+    actual = {r["id"]: (r["label"], r.get("content_sha256")) for r in scores}
     if len(expected) != len(validation_rows) or len(actual) != len(scores) or actual != expected:
-        raise ValueError("calibration scores must match validation ids and labels exactly")
-    result = constrained_retention(scores, retention_floor=config.retention_floor,
+        raise ValueError("calibration scores must match validation ids, labels and content hashes exactly")
+    if any(r.get("generalist_weights_sha256") != config.generalist_weights_sha256 for r in scores):
+        raise ValueError("generalist score identity mismatch")
+    if any("specialist_score" in r for r in scores):
+        raise ValueError("externally supplied specialist scores are forbidden")
+    by_id = {r["id"]: r for r in scores}
+    candidate_scores = score_candidate(model_artifact, validation_rows, config)
+    joined = [dict(by_id[r["id"]], specialist_score=s) for r, s in zip(validation_rows, candidate_scores)]
+    result = constrained_retention(joined, retention_floor=config.retention_floor,
         generalist_threshold=config.generalist_threshold, generalist_block_alone=config.generalist_block_alone)
-    return dict(result, scores_sha256=config.calibration_scores_sha256)
+    return dict(result, scores_sha256=config.calibration_scores_sha256,
+                candidate_weights_sha256=weights_identity(model_artifact),
+                generalist_weights_sha256=config.generalist_weights_sha256)

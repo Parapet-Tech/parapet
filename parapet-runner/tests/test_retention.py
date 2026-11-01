@@ -53,17 +53,50 @@ def test_empty_deciding_band_reports_undefined_interval():
     assert result["deciding_band"] == dict(kept=0, total=0, retention=None, wilson95=None)
 
 
-def test_pinned_scores_require_exact_validation_population(tmp_path):
+def calibration_fixture(tmp_path):
+    from parapet_runner.retention import weights_identity
+    generalist = tmp_path / "generalist.rs"
+    generalist.write_text("// Trained: yesterday\nfrozen table")
+    candidate = tmp_path / "candidate.rs"
+    candidate.write_text('pub const BIAS: f64 = 1_f64;\n    " a " => 1_f64,\n')
     scores = tmp_path / "scores.jsonl"
-    scores.write_text(json.dumps(dict(row("malicious", 0, 1), id="a")) + "\n")
-    config = TrainConfig(threshold_policy="constrained_retention", calibration_scores=scores,
-                         calibration_scores_sha256=hashlib.sha256(scores.read_bytes()).hexdigest())
-    assert calibrate_pinned_scores(config, [dict(id="a", label="malicious")])["threshold"] == 1
-    with pytest.raises(ValueError, match="match validation"):
-        calibrate_pinned_scores(config, [dict(id="b", label="malicious")])
-    scores.write_text("[]")
-    with pytest.raises(ValueError, match="sha256"):
-        calibrate_pinned_scores(config, [])
+    identity = weights_identity(generalist)
+    score_row = dict(id="a", label="malicious", generalist_score=0,
+        generalist_weights_sha256=identity, content_sha256=hashlib.sha256(b"a").hexdigest())
+    scores.write_text(json.dumps(score_row) + "\n")
+    config = TrainConfig(specialist="example", threshold_policy="constrained_retention", calibration_scores=scores,
+        calibration_scores_sha256=hashlib.sha256(scores.read_bytes()).hexdigest(),
+        generalist_weights=generalist, generalist_weights_sha256=identity)
+    return config, candidate, [dict(id="a", content="a", label="malicious")]
+
+
+def test_candidate_scores_come_from_actual_model(tmp_path):
+    config, model, rows = calibration_fixture(tmp_path)
+    assert calibrate_pinned_scores(config, rows, model_artifact=model)["threshold"] == 2
+    model.write_text('pub const BIAS: f64 = 4_f64;\n    " a " => 1_f64,\n')
+    assert calibrate_pinned_scores(config, rows, model_artifact=model)["threshold"] == 5
+
+
+@pytest.mark.parametrize("failure", ["id", "content", "generalist", "score_identity", "external_specialist", "bytes"])
+def test_pinned_scores_reject_mismatches(tmp_path, failure):
+    config, model, rows = calibration_fixture(tmp_path)
+    if failure == "id":
+        rows[0]["id"] = "b"
+    elif failure == "content":
+        rows[0]["content"] = "changed"
+    elif failure == "generalist":
+        config.generalist_weights.write_text("wrong table")
+    else:
+        score = json.loads(config.calibration_scores.read_text())
+        if failure == "score_identity":
+            score["generalist_weights_sha256"] = "0" * 64
+        elif failure == "external_specialist":
+            score["specialist_score"] = 99
+        config.calibration_scores.write_text(json.dumps(score) + " ")
+        if failure != "bytes":
+            config.calibration_scores_sha256 = hashlib.sha256(config.calibration_scores.read_bytes()).hexdigest()
+    with pytest.raises(ValueError):
+        calibrate_pinned_scores(config, rows, model_artifact=model)
 
 
 def test_no_cap_and_min_df_are_expressible():
@@ -85,7 +118,7 @@ def test_specialist_cannot_overwrite_shipped_weights(tmp_path):
         def run(self, args, **kwargs):
             return type("Result", (), {"returncode": 0})()
     kwargs = dict(model_artifact=specialist, rust_crate_dir=tmp_path, last_installed_hash=None,
-                  executor=Executor(), build_features=["eval"])
+                  executor=Executor(), build_features=["eval"], model_role="example")
     with pytest.raises(ValueError, match="separate"):
         _install_weights_and_rebuild(weights_install_target="l1_weights.rs", **kwargs)
     _install_weights_and_rebuild(weights_install_target="l1_weights_example.rs", **kwargs)
@@ -106,7 +139,8 @@ def test_environment_freeze_uses_configured_python(tmp_path):
     assert calls == [["configured-python", "-m", "pip", "freeze", "--all"]]
 
 
-def test_runner_preserves_weights_and_uses_frozen_split(tmp_path):
+@pytest.mark.parametrize("pre_split", [False, True])
+def test_runner_preserves_weights_and_uses_frozen_split(tmp_path, pre_split):
     import yaml
     from parapet_runner.runner import TrainScriptTrainer
     split = tmp_path / "train.jsonl"
@@ -122,11 +156,86 @@ def test_runner_preserves_weights_and_uses_frozen_split(tmp_path):
             return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
     trainer = TrainScriptTrainer(trainer_script=Path("trainer"), workspace_root=tmp_path,
         command_executor=Executor(), python_bin="configured-python")
-    trainer.train(train_split=split, config=TrainConfig(), output_dir=tmp_path)
+    trainer.train(train_split=split, config=TrainConfig(pre_split=pre_split), output_dir=tmp_path)
     args = calls[0]
     assert args[0] == "configured-python"
-    assert "--pre-split" in args
+    assert ("--pre-split" in args) == pre_split
     attacks = yaml.safe_load(Path(args[args.index("--attack-files") + 1]).read_text())
     benign = yaml.safe_load(Path(args[args.index("--benign-files") + 1]).read_text())
     assert attacks[0]["sample_weight"] == .25
     assert benign[0]["sample_weight"] == 2
+
+
+@pytest.mark.parametrize("alias", ["symlink", "case", "hardlink"])
+def test_install_refuses_generalist_aliases_before_copy_or_build(tmp_path, alias):
+    import os
+    layers = tmp_path / "src" / "layers"
+    layers.mkdir(parents=True)
+    protected = layers / "l1_weights.rs"
+    protected.write_text("frozen")
+    target = layers / ("L1_WEIGHTS.RS" if alias == "case" else "alias.rs")
+    if alias == "symlink":
+        target.symlink_to(protected)
+    elif alias == "hardlink":
+        os.link(protected, target)
+    model = tmp_path / "arbitrary.rs"
+    model.write_text("candidate")
+    class Executor:
+        def run(self, *args, **kwargs):
+            pytest.fail("must refuse before build")
+    with pytest.raises(ValueError):
+        _install_weights_and_rebuild(model_artifact=model, rust_crate_dir=tmp_path,
+            weights_install_target=target.name, last_installed_hash=None,
+            executor=Executor(), model_role="example")
+    assert protected.read_text() == "frozen"
+
+
+def test_threshold_yaml_roundtrip_targets_rust_specialist_fields(tmp_path):
+    import yaml
+    from parapet_runner.runner import _set_l1_threshold
+    policy, _, _ = calibration_fixture(tmp_path)
+    source = {"layers": {"L1": {"mode": "block", "threshold": 0.,
+        "generalist_solo_threshold": 3., "specialists": {"example": {"threshold": 0.}}}}}
+    path = tmp_path / "eval.yaml"
+    path.write_text(yaml.safe_dump(_set_l1_threshold(source, 2., policy=policy)))
+    # These are precisely RawL1Config/RawL1SpecialistConfig's YAML fields.
+    l1 = yaml.safe_load(path.read_text())["layers"]["L1"]
+    assert l1["threshold"] == 0.
+    assert l1["generalist_solo_threshold"] == 3.
+    assert l1["specialists"] == {"example": {"threshold": 2.}}
+    assert not (1. >= l1["specialists"]["example"]["threshold"])
+    assert source["layers"]["L1"]["specialists"]["example"]["threshold"] == 0.
+    for field, value in [("threshold", -1.), ("generalist_solo_threshold", 4.)]:
+        changed = yaml.safe_load(yaml.safe_dump(source))
+        changed["layers"]["L1"][field] = value
+        with pytest.raises(ValueError, match="disagree"):
+            _set_l1_threshold(changed, 2., policy=policy)
+    source["layers"]["L1"]["specialists"]["other"] = {"threshold": 0.}
+    with pytest.raises(ValueError, match="exactly"):
+        _set_l1_threshold(source, 2., policy=policy)
+
+
+def test_evaluator_writes_selected_specialist_threshold(tmp_path):
+    import yaml
+    from parapet_runner.runner import ParapetEvalEvaluator
+    config, model, rows = calibration_fixture(tmp_path)
+    split = tmp_path / "holdout.jsonl"
+    split.write_text(json.dumps(rows[0]) + "\n")
+    source = tmp_path / "eval.yaml"
+    source.write_text(yaml.safe_dump({"layers": {"L1": {"mode": "block", "threshold": 0.,
+        "generalist_solo_threshold": 3., "specialists": {"example": {"threshold": 0.}}}}}))
+    class Executor:
+        def run(self, args, **kwargs):
+            generated = yaml.safe_load(Path(args[args.index("--config") + 1]).read_text())
+            l1 = generated["layers"]["L1"]
+            assert l1["threshold"] == 0.
+            assert l1["generalist_solo_threshold"] == 3.
+            assert l1["specialists"]["example"]["threshold"] == 2.
+            Path(args[args.index("--output") + 1]).write_text(json.dumps({"layers": [dict(
+                layer="l1", tp=0, fp=0, fn_count=1, tn=0, precision=0., recall=0., f1=0., total=1)]}))
+            return type("Result", (), {"returncode": 0})()
+    evaluator = ParapetEvalEvaluator(parapet_eval_bin=Path("eval"), eval_config=source,
+        workspace_root=tmp_path, command_executor=Executor(), model_role="example")
+    result = evaluator.evaluate(model_artifact=model, split_path=split, threshold=2.,
+        split_name="holdout", output_dir=tmp_path / "run", calibration_policy=config)
+    assert result.threshold == 2.

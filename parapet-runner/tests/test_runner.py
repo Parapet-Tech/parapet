@@ -59,6 +59,7 @@ class FakeEvaluator:
         threshold: float,
         split_name: str,
         output_dir: Path,  # noqa: ARG002
+        calibration_policy=None,
     ) -> EvalResult:
         self._calls.append(f"eval:{split_name}:{threshold}")
         if split_name == "val":
@@ -366,6 +367,7 @@ def test_install_weights_copies_and_rebuilds() -> None:
     target = "l1_weights_test.rs"
 
     h1 = _install_weights_and_rebuild(
+        model_role="generalist",
         model_artifact=weights,
         rust_crate_dir=rust_crate,
         weights_install_target=target,
@@ -394,6 +396,7 @@ def test_install_weights_skips_rebuild_when_hash_matches() -> None:
     executor = _RecordingExecutor()
 
     h1 = _install_weights_and_rebuild(
+        model_role="generalist",
         model_artifact=weights,
         rust_crate_dir=rust_crate,
         weights_install_target="test.rs",
@@ -404,6 +407,7 @@ def test_install_weights_skips_rebuild_when_hash_matches() -> None:
 
     executor.commands.clear()
     h2 = _install_weights_and_rebuild(
+        model_role="generalist",
         model_artifact=weights,
         rust_crate_dir=rust_crate,
         weights_install_target="test.rs",
@@ -429,6 +433,7 @@ def test_install_weights_rebuilds_on_new_weights() -> None:
     target = "test.rs"
 
     h1 = _install_weights_and_rebuild(
+        model_role="generalist",
         model_artifact=weights,
         rust_crate_dir=rust_crate,
         weights_install_target=target,
@@ -441,6 +446,7 @@ def test_install_weights_rebuilds_on_new_weights() -> None:
     executor.commands.clear()
 
     h2 = _install_weights_and_rebuild(
+        model_role="generalist",
         model_artifact=weights,
         rust_crate_dir=rust_crate,
         weights_install_target=target,
@@ -473,6 +479,7 @@ def test_install_weights_raises_on_cargo_failure() -> None:
 
     with pytest.raises(RuntimeError, match="Cargo build failed"):
         _install_weights_and_rebuild(
+        model_role="generalist",
             model_artifact=weights,
             rust_crate_dir=rust_crate,
             weights_install_target="test.rs",
@@ -510,6 +517,7 @@ def test_install_weights_can_rebuild_with_eval_and_l2a() -> None:
     executor = _RecordingExecutor()
 
     _install_weights_and_rebuild(
+        model_role="generalist",
         model_artifact=weights,
         rust_crate_dir=rust_crate,
         weights_install_target="test.rs",
@@ -600,12 +608,17 @@ def test_random_baseline_provider_trains_and_evaluates() -> None:
 
 
 def test_constrained_calibration_reaches_manifest_and_evaluator(tmp_path):
+    from parapet_runner.retention import weights_identity
     import hashlib
     calls = []
     validation = tmp_path / "val.jsonl"
     validation.write_text(json.dumps(dict(id="a", content="synthetic", label="malicious")) + "\n")
     scores = tmp_path / "scores.jsonl"
-    scores.write_text(json.dumps(dict(id="a", label="malicious", generalist_score=1, specialist_score=2)) + "\n")
+    generalist = tmp_path / "generalist.rs"
+    generalist.write_text("frozen generalist")
+    identity = weights_identity(generalist)
+    scores.write_text(json.dumps(dict(id="a", label="malicious", generalist_score=1,
+        generalist_weights_sha256=identity, content_sha256=hashlib.sha256(b"synthetic").hexdigest())) + "\n")
     class Resolver(FakeSplitResolver):
         def resolve(self, curation):
             result = super().resolve(curation)
@@ -613,12 +626,18 @@ def test_constrained_calibration_reaches_manifest_and_evaluator(tmp_path):
                 holdout_path=result.holdout_path, holdout_source=result.holdout_source,
                 dataset_dir=result.dataset_dir, content_hashes=result.content_hashes,
                 per_cell_counts=result.per_cell_counts)
-    deps = ExperimentDependencies(split_resolver=Resolver(), trainer=FakeTrainer(calls),
+    class CandidateTrainer(FakeTrainer):
+        def train(self, **kwargs):
+            path = super().train(**kwargs)
+            path.write_text('pub const BIAS: f64 = 2_f64;\n    " syn" => 0_f64,\n')
+            return path
+    deps = ExperimentDependencies(split_resolver=Resolver(), trainer=CandidateTrainer(calls),
         evaluator=FakeEvaluator(calls), baseline_provider=FakeBaseline(calls),
         error_analyzer=FakeErrorAnalyzer(), runtime_identity_provider=FakeRuntimeIdentityProvider())
     manifest = ExperimentRunner(deps).run_experiment(curation_manifest=_make_manifest(),
-        train_config=TrainConfig(threshold_policy="constrained_retention", calibration_scores=scores,
+        train_config=TrainConfig(specialist="example", generalist_weights=generalist, generalist_weights_sha256=identity,
+            threshold_policy="constrained_retention", calibration_scores=scores,
             calibration_scores_sha256=hashlib.sha256(scores.read_bytes()).hexdigest()), output_dir=tmp_path / "run")
     assert manifest.calibration["threshold"] == 2
     assert manifest.calibration["total"]["retention"] == 1
-    assert "eval:holdout:2" in calls
+    assert "eval:holdout:2.0" in calls

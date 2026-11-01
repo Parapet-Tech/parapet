@@ -105,3 +105,15 @@ class SampleWeightTests(unittest.TestCase):
             path = Path(directory) / "rows.yaml"
             path.write_text(yaml.safe_dump([dict(content=texts[0], label="benign", sample_weight=.125)]))
             self.assertEqual(trainer.load_yaml_entries([str(path)])[0]["sample_weight"], .125)
+
+
+class FrozenPopulationTests(unittest.TestCase):
+    def test_main_rejects_squash_augmentation_before_loading(self):
+        from unittest.mock import patch
+        argv = ["trainer", "--specialist", "example", "--attack-files", "absent-attack.yaml",
+                "--benign-files", "absent-benign.yaml", "--pre-split", "--squash-augment"]
+        with patch.object(sys, "argv", argv), patch.object(trainer, "load_yaml_entries") as load:
+            with self.assertRaises(SystemExit) as raised:
+                trainer.main()
+            self.assertEqual(raised.exception.code, 2)
+            load.assert_not_called()

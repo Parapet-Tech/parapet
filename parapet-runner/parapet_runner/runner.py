@@ -8,6 +8,7 @@ import json
 import random as _random
 import shutil
 import sys
+import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -88,6 +89,7 @@ class Evaluator(Protocol):
         threshold: float,
         split_name: str,
         output_dir: Path,
+        calibration_policy: TrainConfig | None = None,
     ) -> EvalResult:
         ...
 
@@ -315,6 +317,13 @@ class ManifestSplitResolver:
         elif self._root_dir is not None:
             output_parent = (self._root_dir / output_path).resolve().parent
 
+        if curation.fixed_import is not None:
+            if curation.split_ids is None or output_parent is None:
+                raise ValueError("fixed-import requires split receipt")
+            receipt_path = output_parent / curation.split_ids.path
+            if _sha256_file(receipt_path) != curation.split_ids.sha256:
+                raise ValueError("split receipt sha256 mismatch")
+
         resolved_paths: dict[str, Path] = {}
         for split_name in required:
             split_manifest = curation.splits[split_name]
@@ -338,6 +347,11 @@ class ManifestSplitResolver:
                     f"Split artifact for '{split_name}' not found: {path} "
                     f"(manifest path={raw_path})"
                 )
+
+            if split_manifest.sha256 is not None and _sha256_file(path) != split_manifest.sha256:
+                raise ValueError(f"Split byte hash mismatch: {split_name}")
+            if curation.fixed_import is not None and split_manifest.sha256 is None:
+                raise ValueError("fixed-import requires split byte hashes")
 
             if self._verify_content_hashes:
                 expected = sorted(str(h) for h in split_manifest.content_hashes)
@@ -413,7 +427,8 @@ class TrainScriptTrainer:
                 holdout_path=holdout_artifact,
             ),
         ]
-        args.append("--pre-split")
+        if config.pre_split:
+            args.append("--pre-split")
         result = self._executor.run(args, cwd=self._workspace_root)
 
         # Persist training output for reproducibility
@@ -456,7 +471,7 @@ def _build_eval_cases(entries: Sequence[Mapping[str, Any]], *, split_name: str) 
     return cases
 
 
-def _set_l1_threshold(config: Mapping[str, Any], threshold: float) -> dict[str, Any]:
+def _set_l1_threshold(config: Mapping[str, Any], threshold: float, *, policy: TrainConfig | None = None) -> dict[str, Any]:
     payload = dict(config)
     layers_raw = payload.get("layers")
     if not isinstance(layers_raw, Mapping):
@@ -471,7 +486,15 @@ def _set_l1_threshold(config: Mapping[str, Any], threshold: float) -> dict[str, 
     if not isinstance(l1_raw, Mapping):
         raise ValueError("Eval config L1 entry must be a mapping")
     l1 = dict(l1_raw)
-    l1["threshold"] = float(threshold)
+    if policy is not None:
+        if l1.get("threshold", 0.0) != policy.generalist_threshold or l1.get("generalist_solo_threshold") != policy.generalist_block_alone:
+            raise ValueError("eval generalist thresholds disagree with calibration policy")
+        specialists = l1.get("specialists")
+        if not isinstance(specialists, Mapping) or set(specialists) != {policy.specialist}:
+            raise ValueError("eval config must select exactly the calibrated specialist")
+        l1["specialists"] = {policy.specialist: dict(specialists[policy.specialist], threshold=float(threshold))}
+    else:
+        l1["threshold"] = float(threshold)
     layers[l1_key] = l1
     payload["layers"] = layers
     return payload
@@ -485,6 +508,7 @@ def _install_weights_and_rebuild(
     last_installed_hash: str | None,
     executor: CommandExecutor,
     build_features: Sequence[str] = ("eval",),
+    model_role: str,
 ) -> str:
     """Copy trained weights to Rust source tree and rebuild if changed.
 
@@ -493,14 +517,27 @@ def _install_weights_and_rebuild(
     """
     if Path(weights_install_target).name != weights_install_target:
         raise ValueError("weights install target must be a filename")
-    if model_artifact.name.startswith("l1_weights_") and model_artifact.name != "l1_weights_generalist.rs" and weights_install_target == "l1_weights.rs":
+    install_path = rust_crate_dir / "src" / "layers" / weights_install_target
+    protected = rust_crate_dir / "src" / "layers" / "l1_weights.rs"
+    if install_path.is_symlink():
+        raise ValueError("weights install destination must not be a symlink")
+    if model_role != "generalist" and (
+        install_path.name.casefold() == protected.name.casefold()
+        or install_path.resolve() == protected.resolve()
+        or (install_path.exists() and protected.exists() and install_path.samefile(protected))
+    ):
         raise ValueError("specialist weights require a separate install target")
     current_hash = _sha256_file(model_artifact)
     if current_hash == last_installed_hash:
         return current_hash
-
-    install_path = rust_crate_dir / "src" / "layers" / weights_install_target
-    shutil.copy2(model_artifact, install_path)
+    # Replace a directory entry atomically, never follow a destination link.
+    with tempfile.NamedTemporaryFile(dir=install_path.parent, delete=False) as temporary:
+        staging_path = Path(temporary.name)
+    try:
+        shutil.copy2(model_artifact, staging_path)
+        staging_path.replace(install_path)
+    finally:
+        staging_path.unlink(missing_ok=True)
 
     features = [feature.strip() for feature in build_features if str(feature).strip()]
     if not features:
@@ -533,6 +570,7 @@ class ParapetEvalEvaluator:
         rust_crate_dir: Path | None = None,
         weights_install_target: str = "l1_weights.rs",
         build_features: Sequence[str] = ("eval",),
+        model_role: str = "generalist",
     ) -> None:
         self._parapet_eval_bin = parapet_eval_bin
         self._eval_config = eval_config
@@ -541,6 +579,7 @@ class ParapetEvalEvaluator:
         self._accepted_returncodes = set(accepted_returncodes)
         self._rust_crate_dir = rust_crate_dir
         self._weights_install_target = weights_install_target
+        self._model_role = model_role
         self._build_features = tuple(build_features)
         self._last_installed_weights_hash: str | None = None
 
@@ -552,9 +591,15 @@ class ParapetEvalEvaluator:
         threshold: float,
         split_name: str,
         output_dir: Path,
+        calibration_policy: TrainConfig | None = None,
     ) -> EvalResult:
         if not model_artifact.exists():
             raise FileNotFoundError(f"Model artifact not found: {model_artifact}")
+
+        base_config = yaml.safe_load(self._eval_config.read_text(encoding="utf-8"))
+        if not isinstance(base_config, Mapping):
+            raise ValueError(f"Invalid eval config format: {self._eval_config}")
+        threshold_config = _set_l1_threshold(base_config, threshold, policy=calibration_policy)
 
         if self._rust_crate_dir is not None:
             self._last_installed_weights_hash = _install_weights_and_rebuild(
@@ -564,6 +609,7 @@ class ParapetEvalEvaluator:
                 last_installed_hash=self._last_installed_weights_hash,
                 executor=self._executor,
                 build_features=self._build_features,
+                model_role=calibration_policy.specialist if calibration_policy is not None else self._model_role,
             )
 
         run_dir = output_dir / f"_eval_{split_name}_{str(threshold).replace('.', 'p').replace('-', 'm')}"
@@ -575,10 +621,6 @@ class ParapetEvalEvaluator:
         eval_cases = _build_eval_cases(split_entries, split_name=split_name)
         _write_yaml_entries(eval_cases_path, eval_cases)
 
-        base_config = yaml.safe_load(self._eval_config.read_text(encoding="utf-8"))
-        if not isinstance(base_config, Mapping):
-            raise ValueError(f"Invalid eval config format: {self._eval_config}")
-        threshold_config = _set_l1_threshold(base_config, threshold)
         config_path = run_dir / "eval_config_l1_threshold.yaml"
         config_path.parent.mkdir(parents=True, exist_ok=True)
         config_path.write_text(
@@ -1184,6 +1226,9 @@ class ExperimentRunner:
             self._deps.artifact_verifier.verify(curation_manifest)
 
         splits = self._deps.split_resolver.resolve(curation_manifest)
+        if train_config.pre_split and curation_manifest.fixed_import is None:
+            raise ValueError("pre-split requires a fixed-import manifest")
+        train_config = train_config.model_copy(update={"pre_split": curation_manifest.fixed_import is not None})
         model_artifact = self._deps.trainer.train(
             train_split=splits.train_path,
             config=train_config,
@@ -1203,7 +1248,7 @@ class ExperimentRunner:
             )
 
         if train_config.threshold_policy == ThresholdPolicy.CONSTRAINED_RETENTION:
-            calibration = calibrate_pinned_scores(train_config, _load_labeled_entries(splits.val_path))
+            calibration = calibrate_pinned_scores(train_config, _load_labeled_entries(splits.val_path), model_artifact=model_artifact)
             threshold = calibration["threshold"]
 
         eval_result = self._deps.evaluator.evaluate(
@@ -1212,6 +1257,7 @@ class ExperimentRunner:
             threshold=threshold,
             split_name="holdout",
             output_dir=output_dir,
+            **({"calibration_policy": train_config} if calibration is not None else {}),
         )
         baseline_run = self._deps.baseline_provider.run(
             holdout=splits,
@@ -1351,7 +1397,7 @@ def _cli_run(args: argparse.Namespace) -> int:
         train_config_raw = _load_structured_file(train_config_path)
         curation_manifest = CurationManifest.model_validate(curation_raw)
         train_config = TrainConfig.model_validate(train_config_raw)
-        if train_config.specialist != "generalist" and args.weights_install_target == "l1_weights.rs":
+        if train_config.specialist != "generalist" and args.weights_install_target.casefold() == "l1_weights.rs":
             raise ValueError("specialist runs require --weights-install-target with a separate filename")
 
         thresholds = _parse_thresholds(args.calibration_thresholds)
@@ -1372,6 +1418,7 @@ def _cli_run(args: argparse.Namespace) -> int:
             command_executor=executor,
             rust_crate_dir=rust_crate_dir,
             weights_install_target=args.weights_install_target,
+            model_role=train_config.specialist,
             build_features=build_features,
         )
         threshold_calibrator = F1GridSearchCalibrator(thresholds=thresholds)

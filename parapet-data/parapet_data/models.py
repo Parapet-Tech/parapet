@@ -690,6 +690,7 @@ class SplitManifest(BaseModel):
     sample_count: int
     content_hashes: list[str]  # SHA256 of each sample's content, sorted
     artifact_path: Path
+    sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
 
 class VerifiedSyncManifest(BaseModel):
@@ -706,6 +707,11 @@ class VerifiedSyncManifest(BaseModel):
     relabeled: int
 
 
+class ArtifactReceipt(BaseModel):
+    path: Path
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class CurationManifest(BaseModel):
     """Immutable receipt of a curation run.
 
@@ -714,6 +720,8 @@ class CurationManifest(BaseModel):
     was produced, and where the mirror fell short.
     """
 
+    split_ids: ArtifactReceipt | None = None
+    fixed_import: dict | None = None
     spec_name: str
     spec_version: str
     spec_hash: str

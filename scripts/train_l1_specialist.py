@@ -47,9 +47,6 @@ from pathlib import Path
 
 import numpy as np
 import yaml
-from sklearn.feature_extraction.text import CountVectorizer
-from sklearn.model_selection import cross_val_score, train_test_split
-from sklearn.svm import LinearSVC
 
 try:
     YAML_LOADER = yaml.CSafeLoader
@@ -599,6 +596,9 @@ def train_model(
     sample_weight=None,
 ):
     """Train binary n-gram + LinearSVC and return vectorizer + model."""
+    from sklearn.feature_extraction.text import CountVectorizer
+    from sklearn.model_selection import cross_val_score
+    from sklearn.svm import LinearSVC
     cw = class_weight if class_weight is not None else "None"
     print(
         f"\nTraining: CountVectorizer(analyzer={analyzer!r}, ngram_range={ngram_range}, "
@@ -987,6 +987,7 @@ def save_holdout(holdout_entries, out_path, specialist, seed, holdout_pct):
 # ---------------------------------------------------------------------------
 
 def main():
+    from sklearn.model_selection import train_test_split
     parser = argparse.ArgumentParser(
         description="Train one L1 specialist classifier and codegen Rust weights"
     )
@@ -1089,7 +1090,7 @@ def main():
     if args.min_df < 1:
         parser.error("--min-df must be >= 1")
 
-    if args.pre_split and (args.max_per_file > 0 or args.split_by_source or args.split_by_source_stress):
+    if args.pre_split and (args.max_per_file > 0 or args.split_by_source or args.split_by_source_stress or args.squash_augment):
         parser.error("--pre-split cannot be combined with resampling or splitting")
     import random
     rng = random.Random(args.seed)
