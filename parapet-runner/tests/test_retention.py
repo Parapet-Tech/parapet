@@ -145,6 +145,9 @@ def test_specialist_cannot_overwrite_shipped_weights(tmp_path):
 
 def test_environment_freeze_uses_configured_python(tmp_path):
     calls = []
+    binary = tmp_path / "custom-target" / "parapet-eval"
+    binary.parent.mkdir()
+    binary.write_bytes(b"built evaluator")
     class Executor:
         def run(self, args, **kwargs):
             calls.append(args)
@@ -164,6 +167,9 @@ def test_runner_preserves_weights_and_uses_frozen_split(tmp_path, pre_split):
     split.write_text("\n".join(json.dumps(dict(id=str(i), content=f"synthetic {i}",
         label=label, sample_weight=weight)) for i, (label, weight) in enumerate([("malicious", .25), ("benign", 2)])))
     calls = []
+    binary = tmp_path / "custom-target" / "parapet-eval"
+    binary.parent.mkdir()
+    binary.write_bytes(b"built evaluator")
     class Executor:
         def run(self, args, **kwargs):
             calls.append(args)
@@ -261,7 +267,8 @@ def test_evaluator_writes_selected_specialist_threshold(tmp_path):
     assert result.threshold == 2.
 
 
-def test_runtime_adapter_installs_pair_and_measures_generalist_runs(tmp_path):
+@pytest.mark.parametrize("scenario", ["happy", "mismatch", "changed", "no_report", "old_dirs", "stale"])
+def test_runtime_adapter_installs_pair_and_measures_generalist_runs(tmp_path, scenario):
     import yaml
     from parapet_runner.retention import weights_identity
     from parapet_runner.runner import ParapetEvalEvaluator
@@ -280,12 +287,28 @@ def test_runtime_adapter_installs_pair_and_measures_generalist_runs(tmp_path):
         "mode": "block", "specialists": {"generalist": {"threshold": 0.}, "pilot": {"threshold": 9.}},
         "generalist_solo_threshold": 3.}}}))
     calls = []
+    binary = tmp_path / "custom-target" / "parapet-eval"
+    binary.parent.mkdir()
+    binary.write_bytes(b"built evaluator")
     class Executor:
         def run(self, args, **kwargs):
             if args[0] == "cargo":
                 assert (layers / "l1_weights_pilot.rs").read_bytes() == model.read_bytes()
                 calls.append("build")
+                assert "--message-format=json" in args
+                return type("Result", (), {"returncode": 0, "stdout": json.dumps({
+                    "reason": "compiler-artifact", "target": {"name": "parapet-eval", "kind": ["bin"]},
+                    "executable": str(binary)})})()
             else:
+                assert Path(args[0]) == binary.resolve()
+                output = Path(args[args.index("--output") + 1])
+                if scenario in ("no_report", "stale"):
+                    return type("Result", (), {"returncode": 1, "args": args, "stdout": "", "stderr": ""})()
+                if scenario == "old_dirs":
+                    for name in ("_eval_aaa", "_eval_zzz"):
+                        stale = output.parent.parent / name
+                        stale.mkdir()
+                        (stale / "eval.json").write_text("{}")
                 payload = yaml.safe_load(Path(args[args.index("--config") + 1]).read_text())
                 assert payload["layers"]["L0"] == {"mode": "sanitize"}
                 l1 = payload["layers"]["L1"]
@@ -305,14 +328,36 @@ def test_runtime_adapter_installs_pair_and_measures_generalist_runs(tmp_path):
                     "results": [{"case_id": "a", "actual": "blocked" if blocked else "allowed"}],
                     "layers": [dict(layer="l1", tp=int(blocked), fp=0, fn_count=int(not blocked), tn=0,
                                     precision=1., recall=float(blocked), f1=float(blocked), total=1)]}))
-            return type("Result", (), {"returncode": 0})()
-    evaluator = ParapetEvalEvaluator(parapet_eval_bin=Path("eval"), eval_config=source,
+            if scenario == "changed":
+                binary.write_bytes(b"replaced after first invocation")
+            return type("Result", (), {"returncode": 1})()
+    evaluator = ParapetEvalEvaluator(parapet_eval_bin=(tmp_path / "wrong" if scenario == "mismatch" else binary), eval_config=source,
         workspace_root=tmp_path, command_executor=Executor(), rust_crate_dir=tmp_path / "crate",
         weights_install_target="l1_weights_pilot.rs", model_role="specialist")
+    if scenario == "stale":
+        stale = tmp_path / "run" / "_calibration" / "1_generalist_0.0" / "_eval_calibration_0p0" / "eval.json"
+        stale.parent.mkdir(parents=True)
+        stale.write_text(json.dumps({"results": [{"case_id": "a", "actual": "blocked"}],
+            "layers": [dict(layer="l1", tp=1, fp=0, fn_count=0, tn=0,
+                precision=1., recall=1., f1=1., total=1)]}))
+        with pytest.raises(FileExistsError):
+            evaluator.calibrate(model_artifact=model, split_path=split, config=config, output_dir=tmp_path / "run")
+        assert calls == ["build"]
+        return
+    if scenario in ("mismatch", "changed", "no_report"):
+        error = FileNotFoundError if scenario == "no_report" else ValueError
+        pattern = {"mismatch": "does not match Cargo", "changed": "artifact changed", "no_report": "did not produce"}[scenario]
+        with pytest.raises(error, match=pattern):
+            evaluator.calibrate(model_artifact=model, split_path=split, config=config, output_dir=tmp_path / "run")
+        return
     result = evaluator.calibrate(model_artifact=model, split_path=split, config=config, output_dir=tmp_path / "run")
+    assert result["parapet_eval_sha256"] == hashlib.sha256(binary.read_bytes()).hexdigest()
     assert result["total"]["retention"] == 1
     assert result["deciding_band"]["total"] == 1
     assert calls == ["build", {"generalist"}, {"generalist"}, {"generalist", "pilot"}]
+    evaluator.evaluate(model_artifact=model, split_path=split, threshold=0., split_name="holdout",
+        output_dir=tmp_path / "holdout-run", calibration_policy=config)
+    assert calls.count("build") == 1
     generalist.write_text("drift")
     with pytest.raises(ValueError, match="generalist.*(identity|pinned)"):
         evaluator.calibrate(model_artifact=model, split_path=split, config=config, output_dir=tmp_path / "other")
@@ -327,3 +372,25 @@ def test_calibration_refuses_nonblocking_engine_config(tmp_path, mode):
         l1["mode"] = mode
     with pytest.raises(ValueError, match="block mode"):
         _set_l1_threshold({"layers": {"L1": l1}}, 1., policy=policy)
+
+
+@pytest.mark.parametrize("returncode", [0, 1])
+def test_evaluator_refuses_existing_report_before_command(tmp_path, returncode):
+    from parapet_runner.runner import ParapetEvalEvaluator
+    config, model, rows = calibration_fixture(tmp_path)
+    split = tmp_path / "split.jsonl"
+    split.write_text(json.dumps(rows[0]) + "\n")
+    source = tmp_path / "source.yaml"
+    source.write_text("layers: {L1: {mode: block}}")
+    stale = tmp_path / "run" / "_eval_calibration_0p0" / "eval.json"
+    stale.parent.mkdir(parents=True)
+    stale.write_text(json.dumps({"results": [{"case_id": rows[0]["id"], "actual": "blocked"}],
+        "layers": [dict(layer="l1", tp=1, fp=0, fn_count=0, tn=0, precision=1., recall=1., f1=1., total=1)]}))
+    class Executor:
+        def run(self, args, **kwargs):
+            return type("Result", (), {"returncode": returncode, "args": args, "stdout": "", "stderr": ""})()
+    evaluator = ParapetEvalEvaluator(parapet_eval_bin=Path("eval"), eval_config=source,
+        workspace_root=tmp_path, command_executor=Executor())
+    with pytest.raises(FileExistsError):
+        evaluator.evaluate(model_artifact=model, split_path=split, threshold=0.,
+            split_name="calibration", output_dir=tmp_path / "run")

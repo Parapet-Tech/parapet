@@ -627,7 +627,8 @@ def test_constrained_calibration_reaches_manifest_and_evaluator(tmp_path):
             return path
     class RuntimeEvaluator(FakeEvaluator):
         def calibrate(self, **kwargs):
-            return dict(threshold=2., total={"retention": 1})
+            return dict(threshold=2., total={"retention": 1},
+                candidate_weights_sha256="a" * 64, parapet_eval_sha256="b" * 64)
     deps = ExperimentDependencies(split_resolver=Resolver(), trainer=CandidateTrainer(calls),
         evaluator=RuntimeEvaluator(calls), baseline_provider=FakeBaseline(calls),
         error_analyzer=FakeErrorAnalyzer(), runtime_identity_provider=FakeRuntimeIdentityProvider())
@@ -636,4 +637,10 @@ def test_constrained_calibration_reaches_manifest_and_evaluator(tmp_path):
             threshold_policy="constrained_retention"), output_dir=tmp_path / "run")
     assert manifest.calibration["threshold"] == 2
     assert manifest.calibration["total"]["retention"] == 1
+    assert manifest.calibration["candidate_weights_sha256"] == "a" * 64
+    assert manifest.calibration["parapet_eval_sha256"] == "b" * 64
+    from parapet_runner.runner import write_run_manifest
+    write_run_manifest(tmp_path / "run" / "manifest.json", manifest)
+    saved = json.loads((tmp_path / "run" / "manifest.json").read_text())
+    assert saved["calibration"]["parapet_eval_sha256"] == "b" * 64
     assert "eval:holdout:2.0" in calls

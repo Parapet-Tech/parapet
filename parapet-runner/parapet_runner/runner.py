@@ -13,7 +13,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import Any, Callable, Literal, Protocol
 
 import yaml
 from pydantic import BaseModel, Field
@@ -518,6 +518,7 @@ def _install_weights_and_rebuild(
     executor: CommandExecutor,
     build_features: Sequence[str] = ("eval",),
     model_role: str,
+    artifact_consumer: Callable[[Path], None] | None = None,
 ) -> str:
     """Copy trained weights to Rust source tree and rebuild if changed.
 
@@ -553,7 +554,7 @@ def _install_weights_and_rebuild(
         raise ValueError("build_features cannot be empty")
 
     result = executor.run(
-        ["cargo", "build", "--features", ",".join(features), "--release"],
+        ["cargo", "build", "--features", ",".join(features), "--release", "--message-format=json"],
         cwd=rust_crate_dir,
     )
     if result.returncode != 0:
@@ -562,6 +563,21 @@ def _install_weights_and_rebuild(
             f"stdout={result.stdout}\n"
             f"stderr={result.stderr}"
         )
+    if artifact_consumer is not None:
+        artifacts = set()
+        for line in result.stdout.splitlines():
+            record = json.loads(line)
+            if (record.get("reason") == "compiler-artifact"
+                    and record.get("target", {}).get("name") == "parapet-eval"
+                    and "bin" in record.get("target", {}).get("kind", [])
+                    and record.get("executable")):
+                artifact = Path(record["executable"])
+                if not artifact.is_absolute():
+                    artifact = rust_crate_dir / artifact
+                artifacts.add(artifact.resolve(strict=True))
+        if len(artifacts) != 1:
+            raise ValueError("Cargo must report exactly one parapet-eval executable")
+        artifact_consumer(artifacts.pop())
     return current_hash
 
 
@@ -591,6 +607,20 @@ class ParapetEvalEvaluator:
         self._model_role = model_role
         self._build_features = tuple(build_features)
         self._last_installed_weights_hash: str | None = None
+        self._built_executable_sha256: str | None = None
+        self._last_report_path: Path | None = None
+
+    def _bind_build_artifact(self, artifact: Path) -> None:
+        digest = _sha256_file(artifact)
+        if self._parapet_eval_bin.resolve() != artifact:
+            raise ValueError("configured parapet-eval executable does not match Cargo artifact")
+        self._parapet_eval_bin = artifact
+        self._built_executable_sha256 = digest
+
+    def _verify_executable(self) -> None:
+        if (self._built_executable_sha256 is not None
+                and _sha256_file(self._parapet_eval_bin) != self._built_executable_sha256):
+            raise ValueError("Cargo evaluator artifact changed before invocation")
 
     def calibrate(self, *, model_artifact: Path, split_path: Path, config: TrainConfig,
                   output_dir: Path) -> dict[str, Any]:
@@ -609,9 +639,14 @@ class ParapetEvalEvaluator:
             model_artifact=model_artifact, rust_crate_dir=self._rust_crate_dir,
             weights_install_target=self._weights_install_target,
             last_installed_hash=self._last_installed_weights_hash, executor=self._executor,
-            build_features=self._build_features, model_role="specialist")
+            build_features=self._build_features, model_role="specialist",
+            artifact_consumer=self._bind_build_artifact)
+
+        sequence = 0
 
         def runtime(threshold, generalist_only=False):
+            nonlocal sequence
+            sequence += 1
             import copy
             payload = copy.deepcopy(pair)
             l1 = next(v for k, v in payload["layers"].items() if str(k).lower() == "l1")
@@ -624,17 +659,17 @@ class ParapetEvalEvaluator:
             else:
                 l1["specialists"]["pilot"]["threshold"] = threshold
             name = ("generalist" if generalist_only else "pair") + "_" + str(threshold)
-            directory = output_dir / "_calibration" / name
-            directory.mkdir(parents=True, exist_ok=True)
+            directory = output_dir / "_calibration" / f"{sequence}_{name}"
+            directory.mkdir(parents=True)
             path = directory / "config.yaml"
             path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
             evaluator = ParapetEvalEvaluator(parapet_eval_bin=self._parapet_eval_bin,
                 eval_config=path, workspace_root=self._workspace_root,
                 command_executor=self._executor, accepted_returncodes=self._accepted_returncodes)
+            evaluator._built_executable_sha256 = self._built_executable_sha256
             evaluator.evaluate(model_artifact=model_artifact, split_path=split_path,
                 threshold=threshold, split_name="calibration", output_dir=directory)
-            reports = list(directory.glob("_eval_*/eval.json"))
-            report = json.loads(reports[0].read_text(encoding="utf-8"))
+            report = json.loads(evaluator._last_report_path.read_text(encoding="utf-8"))
             rows = _load_labeled_entries(split_path)
             results = report.get("results", [])
             by_id = {r["case_id"]: r for r in results}
@@ -644,8 +679,10 @@ class ParapetEvalEvaluator:
                 raise ValueError("runtime calibration returned an invalid verdict")
             return {key: value["actual"] == "blocked" for key, value in by_id.items()}
 
-        return calibrate_runtime(config, _load_labeled_entries(split_path),
+        result = calibrate_runtime(config, _load_labeled_entries(split_path),
             model_artifact=model_artifact, runtime=runtime)
+        result["parapet_eval_sha256"] = self._built_executable_sha256
+        return result
 
     def evaluate(
         self,
@@ -674,12 +711,14 @@ class ParapetEvalEvaluator:
                 executor=self._executor,
                 build_features=self._build_features,
                 model_role=calibration_policy.specialist if calibration_policy is not None else self._model_role,
+                artifact_consumer=self._bind_build_artifact,
             )
 
         run_dir = output_dir / f"_eval_{split_name}_{str(threshold).replace('.', 'p').replace('-', 'm')}"
         dataset_dir = run_dir / "dataset"
         eval_cases_path = dataset_dir / f"{split_name}.yaml"
-        dataset_dir.mkdir(parents=True, exist_ok=True)
+        run_dir.mkdir(parents=True)
+        dataset_dir.mkdir()
 
         split_entries = _load_labeled_entries(split_path)
         eval_cases = _build_eval_cases(split_entries, split_name=split_name)
@@ -707,6 +746,7 @@ class ParapetEvalEvaluator:
             "--output",
             str(output_json),
         ]
+        self._verify_executable()
         result = self._executor.run(command, cwd=self._workspace_root)
         if result.returncode not in self._accepted_returncodes:
             raise RuntimeError(
@@ -723,6 +763,7 @@ class ParapetEvalEvaluator:
                 f"stderr={result.stderr}"
             )
 
+        self._last_report_path = output_json
         payload = json.loads(output_json.read_text(encoding="utf-8"))
         return parse_eval_result_json(payload, threshold_fallback=threshold)
 
