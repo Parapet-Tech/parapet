@@ -7,64 +7,44 @@ the [README Quick Start](../README.md#quick-start).
 ## Supported environment
 
 The currently proven first-use environment is **macOS arm64 with Python 3.10 or
-newer** using a **locally built wheel** (`parapet-0.1.0-*.whl` built locally
-from `parapet-py` with Maturin). Parapet is not published to PyPI or npm. The
-protected runtime, evidence store, control socket, and file-effect lifecycle
-are POSIX-only; Windows protected-runtime support is not supported or claimed.
-Deterministic offline fixture checks do not constitute real-model validation.
+newer** using the wheel shipped in the unpacked evaluator at
+`dist/parapet-0.1.0-py3-none-macosx_11_0_arm64.whl`. Start all evaluator
+commands from the unpacked `parapet-v0.1.0-macos-arm64-evaluator` root; no
+source checkout or local build is required. Parapet is not published to PyPI
+or npm.
 
-## Build the local wheel
+The protected runtime, evidence store, control socket, and file-effect
+lifecycle are POSIX-only; Windows protected-runtime support is not supported
+or claimed. Deterministic offline fixture checks do not constitute real-model
+validation.
 
-Replace `<wheel-out-dir>` with a disposable directory outside the checkout:
+## Install the evaluator wheel
 
-```bash
-cd parapet-py
-maturin build --release --locked --out <wheel-out-dir>
-```
-
-## Ordinary first use
-
-Create a fresh disposable Python 3.10+ virtual environment outside the
-checkout, install the pinned runtime dependency `httpx==0.28.1`, then install
-the locally built wheel with `--no-deps` and activate the environment:
+Create a disposable environment, install the exact pinned runtime dependency,
+then install the reviewed wheel without resolving dependencies again:
 
 ```bash
-python3 -m venv <venv>
-<venv>/bin/python -m pip install httpx==0.28.1
-<venv>/bin/python -m pip install --no-deps <path-to-parapet-wheel>
-source <venv>/bin/activate
+python3 -m venv .venv
+.venv/bin/python -m pip install httpx==0.28.1
+.venv/bin/python -m pip install --no-deps \
+  dist/parapet-0.1.0-py3-none-macosx_11_0_arm64.whl
 ```
 
-Resolving `httpx==0.28.1` and its dependencies in this default path may use the
-network. `<path-to-parapet-wheel>` is the local wheel artifact built above; it
-is not a network package name and is not fetched from or published to PyPI.
-
-## Maintainer frozen offline verification
-
-This variant is executable only on a host with the pre-populated cache and
-pinned inputs required by the maintainer acceptance environment. Automated
-acceptance uses this offline path and does not gain network authority from the
-ordinary-user documentation:
-
-```bash
-python3 -m venv <venv>
-uv pip install --offline --python <venv>/bin/python httpx==0.28.1
-uv pip install --offline --python <venv>/bin/python --no-deps <path-to-parapet-wheel>
-source <venv>/bin/activate
-```
-
-In both installation paths, replace `<path-to-parapet-wheel>` with the local
-wheel artifact built above, never a network package name.
+The `httpx==0.28.1` command normally resolves from the configured package index
+and may use the network. For an offline install, first supply that exact
+dependency and its transitive dependencies from an approved local cache; only
+then use `--no-deps` for the Parapet wheel as shown. The wheel path is a local
+file in the evaluator, never a network package name.
 
 ## Verify `site-packages` and installed binaries
 
-Verify that `parapet` imports from the isolated environment's `site-packages`,
-never the repository checkout, and that both compiled binaries are on `PATH`:
+Verify that `parapet` imports from the isolated environment's `site-packages`
+and that both compiled programs are present:
 
 ```bash
-python -c "import parapet; print(parapet.__file__)"
-command -v parapet
-command -v parapet-engine
+.venv/bin/python -c "import parapet; print(parapet.__file__)"
+test -x .venv/bin/parapet
+test -x .venv/bin/parapet-engine
 ```
 
 The wheel installs only the Python `parapet` package plus the `parapet` and
@@ -76,8 +56,8 @@ and `parapet-eval` are intentionally absent.
 Run `info` and then a bounded `scan`:
 
 ```bash
-parapet info --json
-printf 'hello parapet' | parapet scan --stdin --json
+.venv/bin/parapet info --json
+printf 'hello parapet' | .venv/bin/parapet scan --stdin --json
 ```
 
 Default `parapet scan --json` output is bounded summary metadata: model
@@ -118,45 +98,53 @@ unchanged and keep the raw numbers.
 
 ## Protected runtime and evidence lifecycle
 
-Run the protected lifecycle in this exact order:
-
-`init` -> `run` -> `inspect` -> `restore` -> `disable` -> post-disable
-`inspect` -> optional explicit `evidence release` -> post-release `inspect`.
-
-Because `parapet run` starts a long-lived engine process, keep it running in
-one terminal and run the control and inspection commands from a second
-terminal:
+Activate the evaluator environment and define every path before starting the
+engine. Run these setup commands from the unpacked evaluator root:
 
 ```bash
-# Terminal 1: initialize disposable state and start the long-lived engine
-parapet init --state-dir <state-dir> --effect-root <new-effect-root> --json
-parapet run --state-dir <state-dir> --config <config> --effect-root <new-effect-root> --file-effect-profile v0 --max-content-bytes 4096 --json
-
-# Terminal 2: inspect, restore, disable, inspect, release, and inspect again
-parapet inspect --state-dir <state-dir> --run-id <run-id> --json
-parapet restore --state-dir <state-dir> --json
-parapet disable --state-dir <state-dir> --json
-# protected evidence: retained (use 'parapet evidence release' to release store objects)
-parapet inspect --state-dir <state-dir> --run-id <run-id> --json
-parapet evidence release --state-dir <state-dir> --run-id <run-id> --json
-parapet inspect --state-dir <state-dir> --run-id <run-id> --json
+. .venv/bin/activate
+EVALUATOR_ROOT=$(pwd -P)
+WORK="$EVALUATOR_ROOT/.parapet-evaluator-work"
+test ! -e "$WORK"
+mkdir "$WORK"
+STATE_DIR="$WORK/state"
+EFFECT_ROOT="$WORK/effects"
+CONFIG="$EVALUATOR_ROOT/parapet/demo/v0/config_demo_v0.yaml"
+RUN_JSON="$WORK/run.json"
+parapet init --state-dir "$STATE_DIR" --effect-root "$EFFECT_ROOT" --json
 ```
 
-The effect-enabled engine process is control-long-lived: it keeps serving until
-`parapet disable` stops it. Its effect runtime is one-shot: it accepts exactly
-one non-streaming request, rejects any streaming request with HTTP 400
-`effect_streaming_unsupported` (which does not consume the run), and rejects
-every request after the first non-streaming one with HTTP 409
-`effect_run_consumed`. Start a new `parapet run` with a new
-`<new-effect-root>` for each effect run.
+`STATE_DIR` is disposable engine state, `EFFECT_ROOT` is the new one-run file
+effect root, `CONFIG` is packaged in the evaluator, and `RUN_JSON` is used only
+by the JSON startup variant below. Choose either the human or JSON startup
+variant. In both variants, **Terminal 1 is the engine terminal**: the
+long-lived `parapet run` process stays there until `parapet disable` stops it.
+Use Terminal 2 for the request and lifecycle commands. From the evaluator root
+in Terminal 2, activate the same environment and recreate the same variable
+values (do not rerun `mkdir` or `init`):
 
-Run-creating commands (`parapet run`, `parapet accept`, and `parapet-engine`)
-never accept a caller-supplied run ID. The engine generates the only run
-identity; `<run-id>` above is that generated 32-character lowercase hex value.
+```bash
+. .venv/bin/activate
+EVALUATOR_ROOT=$(pwd -P)
+WORK="$EVALUATOR_ROOT/.parapet-evaluator-work"
+STATE_DIR="$WORK/state"
+EFFECT_ROOT="$WORK/effects"
+CONFIG="$EVALUATOR_ROOT/parapet/demo/v0/config_demo_v0.yaml"
+RUN_JSON="$WORK/run.json"
+```
 
-In human mode (without `--json`), `parapet run` prints a startup status to
-stdout once the engine is ready and before it starts serving, so you learn the
-port, run ID, and mode without reading files from the state directory:
+### Human startup and discovery
+
+In Terminal 1, omit `--json`. Readiness is the `status: ready` block printed
+before the engine starts serving:
+
+```bash
+parapet run --state-dir "$STATE_DIR" --config "$CONFIG" \
+  --effect-root "$EFFECT_ROOT" --file-effect-profile v0 \
+  --max-content-bytes 4096 --offline-fixture demo_benign_write_v0 --port 0
+```
+
+The ready block supplies both values needed in Terminal 2:
 
 ```text
 status: ready
@@ -166,21 +154,108 @@ mode: protected
 next: send one request, then parapet restore --state-dir <state-dir>
 ```
 
-A run without `--effect-root` prints `run_id: not_applicable` and
-`mode: proxy`. The startup status never contains the control token or any
-path. When the engine exits after `parapet disable`, human output starts with
-`status: stopped` and repeats the port and run ID. In JSON mode, stdout stays
-the single `parapet-cli-run/v0` line printed at exit (`"run_id"`, or
-`"run_id": null` without `--effect-root`). Use the reported run ID for
-`inspect` and `evidence release`.
+Here `<port>` means the decimal port printed on the `port:` line, `<run-id>`
+means the 32-character lowercase hexadecimal value printed on the `run_id:`
+line, and `<state-dir>` in the hint means the already defined `STATE_DIR`.
+Before using either value, assign the exact printed values in Terminal 2:
 
-`parapet disable` never performs `restore` itself. It is an observational
-shutdown gate that refuses to stop an owned effect-enabled engine until file
-cleanup is already `clear` (after `parapet restore`) or `not_applicable`.
-Stopping the engine retains protected receipt evidence, so post-restore and
-post-disable `parapet inspect` continue to succeed until you optionally run
-`parapet evidence release`. After release, `parapet inspect` reports
-`projection: object_released`.
+```bash
+PORT=49152  # replace 49152 with the printed port
+RUN_ID=0123456789abcdef0123456789abcdef  # replace with the printed run_id
+```
+
+The startup block never contains the control token or a path. After disable,
+Terminal 1 prints `status: stopped` and repeats the same port and run ID.
+
+### JSON startup and discovery
+
+For this alternative, use a fresh `WORK`, `STATE_DIR`, and `EFFECT_ROOT` from
+the setup block. In Terminal 1, `--ready-file ready` writes the selected port
+to `$STATE_DIR/ready`; JSON stdout is redirected and remains empty until the
+engine exits:
+
+```bash
+parapet run --state-dir "$STATE_DIR" --config "$CONFIG" \
+  --effect-root "$EFFECT_ROOT" --file-effect-profile v0 \
+  --max-content-bytes 4096 --offline-fixture demo_benign_write_v0 \
+  --port 0 --ready-file ready --json > "$RUN_JSON"
+```
+
+In Terminal 2, wait for readiness, then read the port. Obtain the run ID from
+the exact sentinel helper in
+[Neutral Working Directory, Asset Export, and Witness Helpers](../parapet/demo/v0/README.md#1-neutral-working-directory-asset-export-and-witness-helpers).
+Copy that section's `parapet_run_id` function without weakening its checks,
+then call it as shown:
+
+```bash
+until [ -s "$STATE_DIR/ready" ]; do sleep 0.1; done
+PORT=$(cat "$STATE_DIR/ready")
+RUN_ID=$(parapet_run_id "$EFFECT_ROOT")
+```
+
+The sentinel is the engine-generated identity; run-creating commands never
+accept a caller-supplied run ID. After the common lifecycle below makes
+Terminal 1 exit, `RUN_JSON` contains the sole `parapet-cli-run/v0` object.
+
+### Request, lifecycle, and cleanup
+
+Only after `PORT` and `RUN_ID` have been discovered, send the packaged
+deterministic request from Terminal 2:
+
+```bash
+curl -fsS "http://127.0.0.1:$PORT/v1/chat/completions" \
+  -H 'content-type: application/json' \
+  -H 'x-parapet-original-host: api.openai.com' \
+  --data-binary \
+  @"$EVALUATOR_ROOT/parapet/demo/v0/request_benign_write.json"
+```
+
+The effect-enabled engine is control-long-lived but its effect runtime is
+one-shot. It accepts one non-streaming request, rejects streaming with HTTP 400
+`effect_streaming_unsupported` without consuming the run, and rejects later
+requests with HTTP 409 `effect_run_consumed`.
+
+Keep the lifecycle order exact: inspect, restore, disable, post-disable
+inspect, optional evidence release, then post-release inspect.
+
+```bash
+parapet inspect --state-dir "$STATE_DIR" --run-id "$RUN_ID" --json
+parapet restore --state-dir "$STATE_DIR" --json
+parapet disable --state-dir "$STATE_DIR" --json
+parapet inspect --state-dir "$STATE_DIR" --run-id "$RUN_ID" --json
+
+# Optional pair: release retained evidence, then confirm released reader state.
+parapet evidence release --state-dir "$STATE_DIR" --run-id "$RUN_ID" --json
+parapet inspect --state-dir "$STATE_DIR" --run-id "$RUN_ID" --json || \
+  test "$?" -eq 4
+```
+
+For the JSON variant, now confirm that the terminal run ID matches the value
+discovered from the sentinel:
+
+```bash
+python3 -c 'import json,sys
+value=json.load(open(sys.argv[1]))
+assert value["schema"] == "parapet-cli-run/v0"
+assert value["run_id"] == sys.argv[2]' "$RUN_JSON" "$RUN_ID"
+```
+
+`parapet disable` never restores files itself. It refuses to stop an
+effect-enabled engine until `parapet restore` reports cleanup as `clear` or
+`not_applicable`. Protected evidence remains inspectable after disable until
+the optional release; post-release inspect exits 4 with
+`projection_code: "object_released"`.
+
+After Terminal 1 has exited, require an empty effect root and remove only the
+disposable paths created above:
+
+```bash
+test ! -e "$EFFECT_ROOT" || \
+  test -z "$(find "$EFFECT_ROOT" -mindepth 1 -print -quit)"
+rm -rf "$WORK"
+deactivate
+rm -rf .venv
+```
 
 ### Reading lifecycle output
 
@@ -211,92 +286,120 @@ Human output does not echo paths or the control token. JSON output for these
 commands is unchanged, including the `a6_booking_required` field of
 `parapet-cli-restore/v0`.
 
-## Rust CLI acceptance with the offline fixture
+## Maintainer verification from the tagged source archive
 
-This is **Rust CLI acceptance**: the installed Rust `parapet` CLI is the only
-requester, sending one request through a loopback engine/proxy to the
-deterministic offline fixture. It **does not exercise Python or TypeScript**;
-the SDKs are verified separately below.
-
-Supply a disposable `<state-dir>` and a disposable `<new-effect-root>` that
-does not exist beforehand:
-
-```bash
-parapet accept --state-dir <state-dir> --config <config> --scenario allow_verified_write --effect-root <new-effect-root> --json
-```
-
-The expected upstream is `deterministic offline fixture (no real model
-contacted)`.
-
-Both directories are disposable. The command contacts only the deterministic
-local fixture (`"real_model_contacted": false`). `<config>` must contain the
-exact bytes of `parapet/tests/fixtures/cli_v0/accept_enforced_v0.yaml`;
-`shadow_parse_error_l3_off` uses
-`parapet/tests/fixtures/cli_v0/accept_shadow_l3_off_v0.yaml`. Any other config
-exits 3 with `accept_config_mismatch` before creating state. JSON output reports
-`"requester": "rust_cli"`, the installed CLI `requester_version`, the
-engine-generated `run_id`, and the accepted `config_contract_hash`. Human
-output prints `requester: Rust CLI <version>`.
-
-For the full multi-journey deterministic offline workflow—covering `parapet
-demo export` and the complete lifecycle across benign writes, unauthorized
-blocks, injection-looking benign allows, verification mismatch, and undeclared
-residue recovery from a neutral working directory—see the
-[Deterministic Offline Demo Guide](../parapet/demo/v0/README.md).
-
-## Installed Python SDK verification
-
-This runs the Python SDK from the locally built wheel installed in
-`<ROLE>/python-installed-venv`, from the role's neutral working directory
-`<ROLE>/neutral-cwd` outside the checkout `<LANE>`, with `PYTHONPATH` unset and
-the installed `parapet-engine` and `parapet` binaries bound explicitly:
+The evaluator asset intentionally omits the full Rust, Python, and TypeScript
+test trees. Those tests are available in the
+[tagged `v0.1.0` source archive](https://github.com/Parapet-Tech/parapet/archive/refs/tags/v0.1.0.tar.gz)
+and are not part of the 15-minute evaluator journey. Download and unpack that
+archive, change to its root, and define the source and disposable verification
+paths before using the source-only commands below:
 
 ```bash
-cd <ROLE>/neutral-cwd
-env -u PYTHONPATH PARAPET_NO_REAL_MODEL=1 PARAPET_EXPECTED_ENV_ROOT=<ROLE>/python-installed-venv PARAPET_ENGINE_BIN=<ROLE>/python-installed-venv/bin/parapet-engine PARAPET_CLI_BIN=<ROLE>/python-installed-venv/bin/parapet PYTHONDONTWRITEBYTECODE=1 <ROLE>/python-installed-venv/bin/python -m pytest -q --import-mode=importlib -p no:cacheprovider <LANE>/parapet-py/tests/test_e2e.py -k installed_python_sdk_is_actual_loopback_requester_rev9
+SOURCE_ROOT=$(pwd -P)
+VERIFY_ROOT=$(mktemp -d)
+PY_ENV="$VERIFY_ROOT/python-installed-venv"
+NEUTRAL_CWD="$VERIFY_ROOT/neutral-cwd"
+TS_CONSUMER="$VERIFY_ROOT/ts-install/consumer"
+mkdir -p "$NEUTRAL_CWD" "$TS_CONSUMER"
 ```
 
-The test requires the real `Path.cwd()` to equal `<ROLE>/neutral-cwd`, records
-the installed `parapet` distribution version and `parapet.__file__`, and
-requires the module below the installed venv's `site-packages` and outside
-`<LANE>`. No checkout Python package is imported. It starts the installed
-engine on a bound loopback endpoint, records that endpoint and the engine owner
-PID, and makes an actual request through the installed SDK transport.
+### Maintainer wheel build
 
-Its substitution witness is an in-process recorder under the installed SDK's
-base HTTP transport. The request must be recorded exactly once, from the
-installed `parapet/transport.py`, with the SDK's `x-parapet-original-host`
-header, and the caller must receive that recorded response. A request made by
-Rust `reqwest` or by the TypeScript SDK never reaches the recorder and fails
-the test. Every non-loopback destination is refused, and the retained
-`PARAPET_PY_INSTALLED_REQUESTER_RECORD` reports `"real_model_contacted": false`.
-
-## Installed TypeScript SDK verification
-
-The TypeScript SDK is a separate npm package (`@parapet-tech/parapet`) in its
-own Node environment; it is not a Python-wheel payload. After building,
-packing, and installing that package into the disposable consumer
-`<ROLE>/ts-install/consumer`, run from the same neutral working directory
-against the wheel-installed engine. `<NODE>` is the Node binary; Vitest comes
-from the role's dev-dependency copy:
+Build from the tagged source tree, not from the evaluator asset:
 
 ```bash
-cd <ROLE>/neutral-cwd
-E2E=1 PARAPET_NO_REAL_MODEL=1 PARAPET_ENGINE_PATH=<ROLE>/python-installed-venv/bin/parapet-engine PARAPET_CLI_BIN=<ROLE>/python-installed-venv/bin/parapet PARAPET_TS_INSTALLED_ENTRY=<ROLE>/ts-install/consumer/node_modules/@parapet-tech/parapet/dist/index.js PARAPET_TS_CHECKOUT_ROOT=<LANE>/parapet-ts PARAPET_TS_NEUTRAL_CWD=<ROLE>/neutral-cwd <NODE> <ROLE>/tool-cache/ts-seed/node_modules/vitest/vitest.mjs run --root <LANE>/parapet-ts --config <LANE>/parapet-ts/vitest.config.ts test/e2e.test.ts -t "installed TypeScript SDK is actual loopback requester Rev9"
+mkdir "$VERIFY_ROOT/dist"
+(cd "$SOURCE_ROOT/parapet-py" && \
+  maturin build --release --locked --out "$VERIFY_ROOT/dist")
+WHEEL="$VERIFY_ROOT/dist/parapet-0.1.0-py3-none-macosx_11_0_arm64.whl"
+test -f "$WHEEL"
+python3 -m venv "$PY_ENV"
+"$PY_ENV/bin/python" -m pip install httpx==0.28.1 pytest
+"$PY_ENV/bin/python" -m pip install --no-deps "$WHEEL"
 ```
 
-The test requires `process.cwd()` to equal `<ROLE>/neutral-cwd`, records the
-installed package name, version, and resolved entry (inside the consumer and
-outside `<LANE>/parapet-ts`), records the bound loopback engine endpoint and
-the actual request/response, and retains the
-`PARAPET_TS_INSTALLED_REQUESTER_RECORD` substitution witness proving the
-installed entry—not Rust `reqwest` or Python—made the request with
-`"real_model_contacted": false`.
+### Rust CLI acceptance with the offline fixture
 
-The same command with
-`PARAPET_TS_INSTALLED_ENTRY=<LANE>/parapet-ts/src/index.ts` must exit nonzero
-with `installed_entry_inside_checkout` before starting the engine.
+This is Rust CLI acceptance, not Python or TypeScript SDK verification. Both
+configuration files named here live only in the tagged source archive:
 
-A missing runtime, package, binary, or other installed input is a hard error in
-every SDK verification command. There is no client fallback to Rust, the other
-SDK, or a checkout source tree.
+```bash
+ACCEPT_STATE="$VERIFY_ROOT/accept-state"
+ACCEPT_EFFECT="$VERIFY_ROOT/accept-effect"
+ACCEPT_CONFIG="$SOURCE_ROOT/parapet/tests/fixtures/cli_v0/accept_enforced_v0.yaml"
+"$PY_ENV/bin/parapet" accept --state-dir "$ACCEPT_STATE" \
+  --config "$ACCEPT_CONFIG" --scenario allow_verified_write \
+  --effect-root "$ACCEPT_EFFECT" --json
+```
+
+The `shadow_parse_error_l3_off` scenario instead uses
+`$SOURCE_ROOT/parapet/tests/fixtures/cli_v0/accept_shadow_l3_off_v0.yaml`.
+The expected upstream is the deterministic offline fixture, with
+`"real_model_contacted": false`. Any other config exits 3 with
+`accept_config_mismatch` before creating state.
+
+The evaluator does include the complete multi-journey
+[Deterministic Offline Demo Guide](../parapet/demo/v0/README.md), which uses
+packaged assets and requires no source tree.
+
+### Installed Python SDK verification
+
+Run the installed SDK from the neutral directory, with the tagged source test
+path supplied explicitly and `PYTHONPATH` unset:
+
+```bash
+cd "$NEUTRAL_CWD"
+env -u PYTHONPATH \
+  PARAPET_NO_REAL_MODEL=1 \
+  PARAPET_EXPECTED_ENV_ROOT="$PY_ENV" \
+  PARAPET_ENGINE_BIN="$PY_ENV/bin/parapet-engine" \
+  PARAPET_CLI_BIN="$PY_ENV/bin/parapet" \
+  PYTHONDONTWRITEBYTECODE=1 \
+  "$PY_ENV/bin/python" -m pytest -q --import-mode=importlib \
+  -p no:cacheprovider "$SOURCE_ROOT/parapet-py/tests/test_e2e.py" \
+  -k installed_python_sdk_is_actual_loopback_requester_rev9
+```
+
+The test requires imports from the installed environment's `site-packages`,
+outside `SOURCE_ROOT`; it starts the installed engine, makes one actual
+loopback request through the installed SDK transport, refuses non-loopback
+destinations, and records `"real_model_contacted": false`.
+
+### Installed TypeScript SDK verification
+
+The TypeScript SDK is a separate npm package, not a Python-wheel payload. Build,
+pack, and install `@parapet-tech/parapet` from `$SOURCE_ROOT/parapet-ts` into
+`TS_CONSUMER`. Then define its installed entry and the tagged source test tools:
+
+```bash
+NODE=$(command -v node)
+VITEST="$SOURCE_ROOT/parapet-ts/node_modules/vitest/vitest.mjs"
+TS_ENTRY="$TS_CONSUMER/node_modules/@parapet-tech/parapet/dist/index.js"
+test -f "$NODE"
+test -f "$VITEST"
+test -f "$TS_ENTRY"
+cd "$NEUTRAL_CWD"
+E2E=1 \
+PARAPET_NO_REAL_MODEL=1 \
+PARAPET_ENGINE_PATH="$PY_ENV/bin/parapet-engine" \
+PARAPET_CLI_BIN="$PY_ENV/bin/parapet" \
+PARAPET_TS_INSTALLED_ENTRY="$TS_ENTRY" \
+PARAPET_TS_CHECKOUT_ROOT="$SOURCE_ROOT/parapet-ts" \
+PARAPET_TS_NEUTRAL_CWD="$NEUTRAL_CWD" \
+"$NODE" "$VITEST" run --root "$SOURCE_ROOT/parapet-ts" \
+  --config "$SOURCE_ROOT/parapet-ts/vitest.config.ts" test/e2e.test.ts \
+  -t "installed TypeScript SDK is actual loopback requester Rev9"
+```
+
+The test requires the resolved package entry inside `TS_CONSUMER` and outside
+the tagged source tree, then proves that installed TypeScript—not Rust or
+Python—made the loopback request with `"real_model_contacted": false`. A
+missing runtime, package, binary, or test input is a hard error; there is no
+fallback to another client.
+
+After maintainer verification, remove only its disposable root:
+
+```bash
+rm -rf "$VERIFY_ROOT"
+```

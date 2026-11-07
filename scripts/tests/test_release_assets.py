@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -266,6 +267,110 @@ class ReleaseAssetTests(unittest.TestCase):
             "Cleanup result",
         ):
             self.assertIn(field, result)
+
+    def test_evaluator_docs_are_artifact_first_and_link_closed(self) -> None:
+        evaluator, _ = self._build()
+        readme_path = evaluator / "README.md"
+        guide_path = evaluator / "docs/local-first-use.md"
+        readme = readme_path.read_text()
+        guide = guide_path.read_text()
+
+        exact_wheel = f"dist/{builder.WHEEL_NAME}"
+        source_archive = (
+            "https://github.com/Parapet-Tech/parapet/"
+            "archive/refs/tags/v0.1.0.tar.gz"
+        )
+        for text in (readme, guide):
+            self.assertIn("macOS arm64", text)
+            self.assertIn("Python 3.10", text)
+            self.assertIn(exact_wheel, text)
+            self.assertIn("httpx==0.28.1", text)
+            self.assertIn("--no-deps", text)
+            self.assertIn(".venv/bin/parapet", text)
+            self.assertIn(".venv/bin/parapet-engine", text)
+            self.assertIn(source_archive, text)
+
+        quick_start = readme.split("### 2. Write a policy", 1)[0]
+        self.assertNotIn("maturin build", quick_start)
+        self.assertNotIn("cd parapet-py", quick_start)
+        self.assertIn("### 5. Clean up", readme)
+        self.assertIn("rm -rf .venv", readme)
+
+        readme_evaluator = readme.split("## Maintainer Source Build", 1)[0]
+        guide_evaluator = guide.split(
+            "## Maintainer verification from the tagged source archive", 1
+        )[0]
+        for text in (readme_evaluator, guide_evaluator):
+            for source_only in (
+                "cd parapet-py",
+                "cd parapet-ts",
+                "parapet/tests/fixtures/",
+                "parapet-py/tests/",
+                "parapet-ts/vitest.config.ts",
+            ):
+                self.assertNotIn(source_only, text)
+        self.assertIn('$SOURCE_ROOT/parapet-py/tests/test_e2e.py', guide)
+        self.assertIn('$SOURCE_ROOT/parapet-ts/vitest.config.ts', guide)
+
+        link_pattern = re.compile(r"\[[^]]+\]\(([^)]+)\)")
+        for document in (readme_path, guide_path):
+            for raw_target in link_pattern.findall(document.read_text()):
+                target = raw_target.split("#", 1)[0]
+                if not target or target.startswith(("https://", "http://", "mailto:")):
+                    continue
+                resolved = document.parent / target
+                self.assertTrue(
+                    resolved.exists(),
+                    f"{document.relative_to(evaluator)} has broken asset link "
+                    f"{raw_target}",
+                )
+
+    def test_lifecycle_discovers_values_before_use_and_preserves_order(self) -> None:
+        guide = (ROOT / "docs/local-first-use.md").read_text()
+        sentinel_link = (
+            "../parapet/demo/v0/README.md#1-neutral-working-directory-"
+            "asset-export-and-witness-helpers"
+        )
+        self.assertIn(sentinel_link, guide)
+        self.assertIn("Terminal 1 is the engine terminal", guide)
+        self.assertIn("status: ready", guide)
+        self.assertIn("PORT=$(cat \"$STATE_DIR/ready\")", guide)
+        self.assertIn("RUN_ID=$(parapet_run_id \"$EFFECT_ROOT\")", guide)
+        self.assertIn(
+            "stdout is redirected and remains empty until the\nengine exits", guide
+        )
+        self.assertIn('assert value["run_id"] == sys.argv[2]', guide)
+
+        setup = guide.index('STATE_DIR="$WORK/state"')
+        human_discovery = guide.index("PORT=49152")
+        json_discovery = guide.index('RUN_ID=$(parapet_run_id "$EFFECT_ROOT")')
+        request = guide.index('curl -fsS "http://127.0.0.1:$PORT')
+        lifecycle = guide.index(
+            'parapet inspect --state-dir "$STATE_DIR" --run-id "$RUN_ID" --json'
+        )
+        self.assertLess(setup, human_discovery)
+        self.assertLess(human_discovery, request)
+        self.assertLess(json_discovery, request)
+        self.assertLess(request, lifecycle)
+
+        ordered_commands = (
+            'parapet inspect --state-dir "$STATE_DIR" --run-id "$RUN_ID" --json',
+            'parapet restore --state-dir "$STATE_DIR" --json',
+            'parapet disable --state-dir "$STATE_DIR" --json',
+            'parapet inspect --state-dir "$STATE_DIR" --run-id "$RUN_ID" --json',
+            'parapet evidence release --state-dir "$STATE_DIR" '
+            '--run-id "$RUN_ID" --json',
+            'parapet inspect --state-dir "$STATE_DIR" --run-id "$RUN_ID" --json',
+        )
+        position = lifecycle
+        for command in ordered_commands:
+            position = guide.index(command, position)
+            position += len(command)
+
+        self.assertIn(
+            'test -z "$(find "$EFFECT_ROOT" -mindepth 1 -print -quit)"', guide
+        )
+        self.assertIn('rm -rf "$WORK"', guide)
 
 
 if __name__ == "__main__":

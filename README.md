@@ -32,35 +32,53 @@ L0 normalize
 ```
 
 Implementation names are still in transition. For the canonical target taxonomy
-and current implementation mapping, see [strategy/layers.md](strategy/layers.md).
+and current implementation mapping, see the
+[tagged `v0.1.0` layer guide](https://github.com/Parapet-Tech/parapet/blob/v0.1.0/strategy/layers.md).
 
 ## Quick Start
 
-### 1. Install and check the CLI
+### 1. Install the reviewed wheel and check the CLI
 
-The currently proven first-use environment is macOS arm64 with Python 3.10 or
-newer. Parapet is not yet published to PyPI or npm, so build and install the
-wheel locally:
+Start in the unpacked `parapet-v0.1.0-macos-arm64-evaluator` directory on
+macOS arm64 with Python 3.10 or newer. The evaluator contains the exact wheel
+at `dist/parapet-0.1.0-py3-none-macosx_11_0_arm64.whl`; no source checkout or
+local build is part of this path.
 
-```bash
-cd parapet-py
-maturin build --release --locked --out <wheel-out-dir>
-python3 -m venv <venv>
-<venv>/bin/python -m pip install httpx==0.28.1
-<venv>/bin/python -m pip install --no-deps <path-to-parapet-wheel>
-source <venv>/bin/activate
-```
-
-Confirm the installed CLI and run a bounded local scan:
+Create a disposable virtual environment, install the pinned runtime dependency,
+then install the reviewed wheel without resolving dependencies a second time:
 
 ```bash
-parapet info --json
-printf 'hello parapet' | parapet scan --stdin --json
+python3 -m venv .venv
+.venv/bin/python -m pip install httpx==0.28.1
+.venv/bin/python -m pip install --no-deps \
+  dist/parapet-0.1.0-py3-none-macosx_11_0_arm64.whl
 ```
 
-For offline installation, protected runtime and evidence lifecycle commands,
-the deterministic acceptance fixture, and installed Python/TypeScript SDK
-verification, see the [Local First-Use and Verification Guide](docs/local-first-use.md).
+Installing `httpx==0.28.1` normally may contact the configured package index.
+For an offline install, first supply that exact dependency and its transitive
+dependencies from an approved local cache, then keep the `--no-deps` wheel
+install shown above.
+
+Confirm both installed programs, query their identity, and run a bounded local
+scan directly from the disposable environment:
+
+```bash
+test -x .venv/bin/parapet
+test -x .venv/bin/parapet-engine
+.venv/bin/parapet info --json
+printf 'hello parapet' | .venv/bin/parapet scan --stdin --json
+```
+
+The clean scan checks the installation; it is not a security benchmark or a
+real-model evaluation. Keep `.venv` until the Quick Start is complete, then use
+the cleanup step below.
+
+For protected runtime and evidence lifecycle commands and the deterministic
+offline fixture, see the
+[Local First-Use and Verification Guide](docs/local-first-use.md). Full Python
+and TypeScript SDK verification and source builds use the separate
+[tagged `v0.1.0` source archive](https://github.com/Parapet-Tech/parapet/archive/refs/tags/v0.1.0.tar.gz),
+not the evaluator quick start.
 
 ### 2. Write a policy
 
@@ -109,7 +127,7 @@ with parapet.session(user_id="u_1", role="admin"):
 Proxy-only mode:
 
 ```bash
-parapet-engine --config parapet.yaml --port 9800
+.venv/bin/parapet-engine --config parapet.yaml --port 9800
 ```
 
 Then point your OpenAI-compatible client at `http://127.0.0.1:9800`.
@@ -117,6 +135,16 @@ Then point your OpenAI-compatible client at `http://127.0.0.1:9800`.
 ### 4. Verify behavior
 
 Prompt injection attempts should block. Ordinary traffic should pass through.
+
+### 5. Clean up
+
+Stop any foreground `parapet-engine` process with `Ctrl-C`, verify that no
+listener or engine process remains, and remove only the disposable environment
+and any state/effect roots you created:
+
+```bash
+rm -rf .venv
+```
 
 ## What It Catches
 
@@ -173,20 +201,20 @@ If you are evaluating Parapet seriously, read the engine and SDK behavior before
 
 The repository has a few distinct parts:
 
-- [parapet/](parapet) - Rust engine and eval binary
-- [parapet-py/](parapet-py) - Python SDK
-- [parapet-ts/](parapet-ts) - TypeScript SDK
-- [parapet-data/](parapet-data) - corpus staging and curation
-- [parapet-runner/](parapet-runner) - experiment orchestration
-- [strategy/](strategy) - layer docs and research direction
+- [parapet/](https://github.com/Parapet-Tech/parapet/tree/v0.1.0/parapet) - Rust engine and eval binary
+- [parapet-py/](https://github.com/Parapet-Tech/parapet/tree/v0.1.0/parapet-py) - Python SDK
+- [parapet-ts/](https://github.com/Parapet-Tech/parapet/tree/v0.1.0/parapet-ts) - TypeScript SDK
+- [parapet-data/](https://github.com/Parapet-Tech/parapet/tree/v0.1.0/parapet-data) - corpus staging and curation
+- [parapet-runner/](https://github.com/Parapet-Tech/parapet/tree/v0.1.0/parapet-runner) - experiment orchestration
+- [strategy/](https://github.com/Parapet-Tech/parapet/tree/v0.1.0/strategy) - layer docs and research direction
 
 ## Data And Experiments
 
 Use these entry points:
 
-- [parapet-data/README.md](parapet-data/README.md) - how source data is staged and curated into train, val, and holdout splits
-- [parapet-runner/README.md](parapet-runner/README.md) - how training and evaluation runs are orchestrated from curated manifests
-- [schema/README.md](schema/README.md) - schema layout, staged artifacts, and dataset contract notes
+- [parapet-data/README.md](https://github.com/Parapet-Tech/parapet/blob/v0.1.0/parapet-data/README.md) - how source data is staged and curated into train, val, and holdout splits
+- [parapet-runner/README.md](https://github.com/Parapet-Tech/parapet/blob/v0.1.0/parapet-runner/README.md) - how training and evaluation runs are orchestrated from curated manifests
+- [schema/README.md](https://github.com/Parapet-Tech/parapet/blob/v0.1.0/schema/README.md) - schema layout, staged artifacts, and dataset contract notes
 
 In short:
 
@@ -195,7 +223,8 @@ In short:
 
 ## Integrations
 
-LiteLLM chaining is documented separately in [use/litellm.md](use/litellm.md).
+LiteLLM chaining is documented in the
+[tagged `v0.1.0` source guide](https://github.com/Parapet-Tech/parapet/blob/v0.1.0/use/litellm.md).
 
 ## Research Notes
 
@@ -204,17 +233,22 @@ classifiers, and deterministic orthogonal sensors.
 
 Current public papers:
 
-- [Amplify, Don't Create: Temporal Accumulation for Slow-Burn Prompt Injection](docs/publications/amplify/paper.pdf)
-- [Peak + Accumulation: A Proxy-Level Scoring Formula for Multi-Turn LLM Attack Detection](docs/publications/multiturn/paper.pdf)
-- [The Mirror Design Pattern: Strict Data Geometry over Model Scale for Prompt Injection Detection](docs/publications/mirror/paper.pdf)
+- [Amplify, Don't Create: Temporal Accumulation for Slow-Burn Prompt Injection](https://github.com/Parapet-Tech/parapet/blob/v0.1.0/docs/publications/amplify/paper.pdf)
+- [Peak + Accumulation: A Proxy-Level Scoring Formula for Multi-Turn LLM Attack Detection](https://github.com/Parapet-Tech/parapet/blob/v0.1.0/docs/publications/multiturn/paper.pdf)
+- [The Mirror Design Pattern: Strict Data Geometry over Model Scale for Prompt Injection Detection](https://github.com/Parapet-Tech/parapet/blob/v0.1.0/docs/publications/mirror/paper.pdf)
 
-The broader research and layer notes live under [strategy/](strategy).
+The broader research and layer notes live in the
+[tagged strategy directory](https://github.com/Parapet-Tech/parapet/tree/v0.1.0/strategy).
 
 For the current detection direction, including the closure of the inline
 semantic-transformer hot-path slot, see
-[strategy/current_direction.md](strategy/current_direction.md).
+[the tagged current-direction note](https://github.com/Parapet-Tech/parapet/blob/v0.1.0/strategy/current_direction.md).
 
-## Building From Source
+## Maintainer Source Build
+
+This is separate from the evaluator quick start. Download and unpack the
+[tagged `v0.1.0` source archive](https://github.com/Parapet-Tech/parapet/archive/refs/tags/v0.1.0.tar.gz),
+then run these commands from that source root:
 
 ```bash
 # Rust engine
