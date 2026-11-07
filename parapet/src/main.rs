@@ -124,6 +124,18 @@ async fn main() {
         (None, None)
     };
 
+    #[cfg(not(windows))]
+    if let Some(state_dir) = cli.state_dir.as_deref() {
+        if parapet::cli::control::preflight_control_socket_path(state_dir).is_err() {
+            tracing::error!(
+                error_code = "control_socket_path_too_long",
+                "{}",
+                parapet::cli::control::CONTROL_SOCKET_PATH_TOO_LONG_MESSAGE
+            );
+            std::process::exit(2);
+        }
+    }
+
     let addr = SocketAddr::from(([127, 0, 0, 1], cli.port));
     tracing::info!(%addr, "parapet starting");
 

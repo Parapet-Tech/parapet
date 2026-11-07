@@ -19,9 +19,10 @@ use std::path::PathBuf;
 
 #[cfg(not(windows))]
 use crate::cli::control::{
-    check_state_dir_ownership, remove_owned_transient_files, send_control_request,
-    verify_private_state_dir, wait_for_owned_shutdown, write_private_file, ControlStateMetadataV0,
-    EngineControlPlane, OwnershipCheck, CONTROL_STATE_SCHEMA, CONTROL_TIMEOUT,
+    check_state_dir_ownership, preflight_control_socket_path, remove_owned_transient_files,
+    send_control_request, verify_private_state_dir, wait_for_owned_shutdown, write_private_file,
+    ControlStateMetadataV0, EngineControlPlane, OwnershipCheck,
+    CONTROL_SOCKET_PATH_TOO_LONG_MESSAGE, CONTROL_STATE_SCHEMA, CONTROL_TIMEOUT,
 };
 #[cfg(not(windows))]
 use crate::cli::render::{
@@ -914,6 +915,16 @@ fn run_init(args: InitArgs, json_mode: bool) -> i32 {
         );
     }
 
+    if preflight_control_socket_path(&args.state_dir).is_err() {
+        return emit_cli_error(
+            "init",
+            "control_socket_path_too_long",
+            2,
+            CONTROL_SOCKET_PATH_TOO_LONG_MESSAGE,
+            json_mode,
+        );
+    }
+
     if let Some(ref er) = args.effect_root {
         if std::fs::symlink_metadata(er).is_ok() {
             return emit_cli_error(
@@ -1031,6 +1042,16 @@ fn run_engine_cmd(args: RunArgs, json_mode: bool) -> i32 {
             "invalid_path",
             2,
             "path arguments must not contain parent directory traversal",
+            json_mode,
+        );
+    }
+
+    if preflight_control_socket_path(&args.state_dir).is_err() {
+        return emit_cli_error(
+            "run",
+            "control_socket_path_too_long",
+            2,
+            CONTROL_SOCKET_PATH_TOO_LONG_MESSAGE,
             json_mode,
         );
     }
@@ -1443,6 +1464,16 @@ fn run_accept(args: AcceptArgs, json_mode: bool) -> i32 {
             "invalid_accept_combination",
             2,
             "path arguments must not contain parent directory traversal",
+            json_mode,
+        );
+    }
+
+    if preflight_control_socket_path(&state_dir).is_err() {
+        return emit_cli_error(
+            "accept",
+            "control_socket_path_too_long",
+            2,
+            CONTROL_SOCKET_PATH_TOO_LONG_MESSAGE,
             json_mode,
         );
     }

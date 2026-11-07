@@ -12,7 +12,7 @@ use serde_json::Value;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{SocketAddr as UnixSocketAddr, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -27,6 +27,9 @@ pub const ENGINE_OWNER_SCHEMA: &str = "parapet-engine-owner/v0";
 pub const MAX_CONTROL_LINE_BYTES: usize = 4096;
 /// Control request/response timeout (`5,000 ms`).
 pub const CONTROL_TIMEOUT: Duration = Duration::from_millis(5000);
+/// Actionable public diagnostic for an unrepresentable derived control socket.
+pub const CONTROL_SOCKET_PATH_TOO_LONG_MESSAGE: &str =
+    "derived control socket path exceeds this platform's Unix-domain socket pathname limit; choose a shorter --state-dir";
 
 /// Persistent state metadata written by `parapet init` to `<state-dir>/control.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,6 +98,7 @@ struct ControlDisableResponseV0<'a> {
 pub enum ControlError {
     InvalidStateDir,
     UnsafePermissions,
+    ControlSocketPathUnrepresentable,
     IoFailed,
     EngineUnavailable,
     AuthFailed,
@@ -106,12 +110,21 @@ impl ControlError {
         match self {
             Self::InvalidStateDir => "invalid_state_dir",
             Self::UnsafePermissions => "unsafe_state_dir_permissions",
+            Self::ControlSocketPathUnrepresentable => "control_socket_path_too_long",
             Self::IoFailed => "control_io_failed",
             Self::EngineUnavailable => "engine_unavailable",
             Self::AuthFailed => "control_auth_failed",
             Self::ProtocolError => "control_protocol_error",
         }
     }
+}
+
+/// Verify that the derived `<state_dir>/control.sock` pathname is representable
+/// by this platform's Unix-domain socket address type. This performs no I/O.
+pub fn preflight_control_socket_path(state_dir: &Path) -> Result<(), ControlError> {
+    UnixSocketAddr::from_pathname(state_dir.join("control.sock"))
+        .map(|_| ())
+        .map_err(|_| ControlError::ControlSocketPathUnrepresentable)
 }
 
 /// Tracked in-memory file-cleanup state inside the live owning engine.
@@ -355,6 +368,7 @@ impl EngineControlPlane {
         F: FnOnce() -> std::io::Result<R>,
         R: Read,
     {
+        preflight_control_socket_path(state_dir)?;
         let expected_uid = verify_private_state_dir(state_dir)?;
         let token = control_token_from_source(token_source)?;
         write_private_file(state_dir, "control.token", token.as_bytes())?;

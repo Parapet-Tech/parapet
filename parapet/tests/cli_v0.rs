@@ -1115,8 +1115,8 @@ mod story2_r1b {
     pub(super) fn cli_redaction_and_target_text_path_preservation() {
         let golden = golden_outputs();
         let dir = tempfile::tempdir().expect("create tempdir");
-        let state_marker = "CLI_STATE_ABS_PATH_SECRET_MARKER_7712";
-        let effect_marker = "CLI_EFFECT_ROOT_ABS_PATH_SECRET_MARKER_8823";
+        let state_marker = "STATE_SECRET_7712";
+        let effect_marker = "EFFECT_SECRET_8823";
         let payload_secret = "PROTECTED_STORE_PAYLOAD_SECRET_BYTES_991122";
         let model_target_abs_path = "/abs/path/model_proposed_target_file.txt";
 
@@ -3571,7 +3571,7 @@ mod story3_r2a {
 
         // 1. Verify all 4 scenarios in both `--json` and human modes match golden outputs
         //    and satisfy all Rev 8 Section 5.2.5 / AC-1D-14 / AC-1D-20 invariants.
-        for (scenario, needs_er, json_golden_key, human_golden_key) in [
+        for (case_index, (scenario, needs_er, json_golden_key, human_golden_key)) in [
             (
                 "allow_no_executor",
                 false,
@@ -3596,15 +3596,18 @@ mod story3_r2a {
                 "accept_shadow_parse_error_l3_off_json_stdout",
                 "accept_shadow_parse_error_l3_off_human_stdout",
             ),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let scenario_cfg = if scenario == "shadow_parse_error_l3_off" {
                 &shadow_cfg_path
             } else {
                 &cfg_path
             };
             // JSON mode
-            let state_j = dir.path().join(format!("state_{scenario}_json"));
-            let er_j = dir.path().join(format!("er_{scenario}_json"));
+            let state_j = dir.path().join(format!("s{case_index}j"));
+            let er_j = dir.path().join(format!("e{case_index}j"));
             let mut args_j = vec![
                 "accept",
                 "--state-dir",
@@ -3655,8 +3658,8 @@ mod story3_r2a {
             }
 
             // Human mode
-            let state_h = dir.path().join(format!("state_{scenario}_human"));
-            let er_h = dir.path().join(format!("er_{scenario}_human"));
+            let state_h = dir.path().join(format!("s{case_index}h"));
+            let er_h = dir.path().join(format!("e{case_index}h"));
             let mut args_h = vec![
                 "accept",
                 "--state-dir",
@@ -5999,10 +6002,10 @@ mod rev9_r4 {
     use super::*;
     use parapet::cli::control::{
         control_token_from_reader, control_token_from_source, open_control_token_source,
-        peer_credential_authorized, read_bounded_control_line, read_bounded_control_line_sync,
-        write_private_file, ControlError, ControlLineError, EngineControlPlane,
-        EngineOwnerRecordV0, CONTROL_TOKEN_BYTES, CONTROL_TOKEN_SOURCE, ENGINE_OWNER_SCHEMA,
-        MAX_CONTROL_LINE_BYTES,
+        peer_credential_authorized, preflight_control_socket_path, read_bounded_control_line,
+        read_bounded_control_line_sync, write_private_file, ControlError, ControlLineError,
+        EngineControlPlane, EngineOwnerRecordV0, CONTROL_SOCKET_PATH_TOO_LONG_MESSAGE,
+        CONTROL_TOKEN_BYTES, CONTROL_TOKEN_SOURCE, ENGINE_OWNER_SCHEMA, MAX_CONTROL_LINE_BYTES,
     };
     use parapet::cli::render::{verification_error_code, verification_reason_code};
     use parapet::receipt::{
@@ -6096,12 +6099,14 @@ mod rev9_r4 {
         let version = installed_cli_version();
         assert_eq!(version, env!("CARGO_PKG_VERSION"));
 
-        for (scenario, needs_er, cfg_bytes, cfg_hash) in SCENARIOS {
+        for (case_index, (scenario, needs_er, cfg_bytes, cfg_hash)) in
+            SCENARIOS.into_iter().enumerate()
+        {
             let cfg = write_cfg(dir.path(), &format!("{scenario}.yaml"), cfg_bytes);
 
             // JSON: Rust requester, generated envelope run id, exact contract hash, no `sdk`.
-            let state = dir.path().join(format!("state_{scenario}"));
-            let er = dir.path().join(format!("er_{scenario}"));
+            let state = dir.path().join(format!("s{case_index}j"));
+            let er = dir.path().join(format!("e{case_index}j"));
             let out = run_parapet(
                 &accept_args(
                     &state,
@@ -6148,8 +6153,8 @@ mod rev9_r4 {
             );
 
             // Human: `requester: Rust CLI <version>`, exact hash, and no `sdk:` line.
-            let state_h = dir.path().join(format!("state_{scenario}_h"));
-            let er_h = dir.path().join(format!("er_{scenario}_h"));
+            let state_h = dir.path().join(format!("s{case_index}h"));
+            let er_h = dir.path().join(format!("e{case_index}h"));
             let out_h = run_parapet(
                 &accept_args(
                     &state_h,
@@ -6467,6 +6472,217 @@ mod rev9_r4 {
         );
     }
 
+    fn control_socket_boundary(root: &Path) -> (PathBuf, PathBuf) {
+        let mut last_accepted = None;
+        for component_len in 1..=255 {
+            let candidate = root.join("s".repeat(component_len));
+            match preflight_control_socket_path(&candidate) {
+                Ok(()) => last_accepted = Some(candidate),
+                Err(ControlError::ControlSocketPathUnrepresentable) => {
+                    return (
+                        last_accepted.expect("temp root leaves a representable socket path"),
+                        candidate,
+                    );
+                }
+                Err(other) => panic!("unexpected preflight result: {other:?}"),
+            }
+        }
+        panic!("platform socket boundary exceeds one filesystem component")
+    }
+
+    fn assert_control_socket_path_error(out: Output, command: &str, json_mode: bool) {
+        assert_eq!(out.status.code(), Some(2), "{command} exit");
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert_eq!(
+            stderr,
+            format!("parapet {command}: error: {CONTROL_SOCKET_PATH_TOO_LONG_MESSAGE}\n")
+        );
+        if json_mode {
+            assert_eq!(
+                stdout,
+                format!(
+                    "{{\"schema\":\"parapet-cli-error/v0\",\"command\":\"{command}\",\"error_code\":\"control_socket_path_too_long\",\"exit_code\":2}}\n"
+                )
+            );
+        } else {
+            assert!(stdout.is_empty());
+        }
+        assert!(!stderr.contains("failed to bind control channel"));
+    }
+
+    pub(super) fn control_socket_path_preflight_boundary_and_zero_residue() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let (last_accepted, first_rejected) = control_socket_boundary(dir.path());
+        assert_eq!(
+            first_rejected.to_str().unwrap().len(),
+            last_accepted.to_str().unwrap().len() + 1,
+            "boundary candidates differ by exactly one pathname byte"
+        );
+        assert_eq!(preflight_control_socket_path(&last_accepted), Ok(()));
+        assert_eq!(
+            preflight_control_socket_path(&first_rejected),
+            Err(ControlError::ControlSocketPathUnrepresentable)
+        );
+        assert_eq!(
+            ControlError::ControlSocketPathUnrepresentable.as_str(),
+            "control_socket_path_too_long"
+        );
+
+        // The final representable derived pathname initializes successfully.
+        let accepted = run_parapet(
+            &["init", "--state-dir", last_accepted.to_str().unwrap()],
+            None,
+        );
+        assert_eq!(
+            accepted.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&accepted.stderr)
+        );
+        assert!(last_accepted.join("control.json").is_file());
+        assert!(last_accepted.join("receipt-evidence").is_dir());
+
+        // The first unrepresentable pathname is rejected in human and JSON
+        // modes without creating an absent state root.
+        let rejected_path = first_rejected.to_str().unwrap();
+        let human = run_parapet(&["init", "--state-dir", rejected_path], None);
+        assert_control_socket_path_error(human, "init", false);
+        assert!(!first_rejected.exists());
+        let json = run_parapet(&["init", "--state-dir", rejected_path, "--json"], None);
+        assert_control_socket_path_error(json, "init", true);
+        assert!(!first_rejected.exists());
+
+        // A caller-owned directory and marker remain byte/entry identical.
+        std::fs::create_dir(&first_rejected).unwrap();
+        std::fs::set_permissions(&first_rejected, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let marker = first_rejected.join("caller.marker");
+        let marker_bytes = b"caller-owned marker\n";
+        std::fs::write(&marker, marker_bytes).unwrap();
+        let listing = |path: &Path| {
+            let mut names: Vec<_> = std::fs::read_dir(path)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            names.sort();
+            names
+        };
+        let before = listing(&first_rejected);
+        let existing = run_parapet(&["init", "--state-dir", rejected_path], None);
+        assert_control_socket_path_error(existing, "init", false);
+        assert_eq!(listing(&first_rejected), before);
+        assert_eq!(std::fs::read(&marker).unwrap(), marker_bytes);
+
+        // Defense in depth: bind checks representability before verifying the
+        // directory, opening the token source, or writing any control entry.
+        let bind = EngineControlPlane::bind_with_token_source(
+            &first_rejected,
+            0,
+            ENFORCED_HASH,
+            None,
+            || -> std::io::Result<std::io::Cursor<Vec<u8>>> {
+                panic!("token source must not be opened for a rejected path")
+            },
+        );
+        assert!(matches!(
+            bind,
+            Err(ControlError::ControlSocketPathUnrepresentable)
+        ));
+        assert_eq!(listing(&first_rejected), before);
+
+        let cfg = write_cfg(dir.path(), "boundary.yaml", ENFORCED_YAML);
+        let run_effect = dir.path().join("run_effect");
+        let run = run_parapet(
+            &[
+                "run",
+                "--state-dir",
+                rejected_path,
+                "--config",
+                cfg.to_str().unwrap(),
+                "--port",
+                "0",
+                "--effect-root",
+                run_effect.to_str().unwrap(),
+                "--file-effect-profile",
+                "v0",
+                "--max-content-bytes",
+                "4096",
+                "--offline-fixture",
+                "v0",
+                "--json",
+            ],
+            None,
+        );
+        assert_control_socket_path_error(run, "run", true);
+        assert!(!run_effect.exists());
+        assert_eq!(listing(&first_rejected), before);
+
+        let accept_effect = dir.path().join("accept_effect");
+        let accept = run_parapet(
+            &accept_args(
+                &first_rejected,
+                &cfg,
+                "allow_verified_write",
+                Some(&accept_effect),
+                true,
+            ),
+            None,
+        );
+        assert_control_socket_path_error(accept, "accept", true);
+        assert!(!accept_effect.exists());
+        assert_eq!(listing(&first_rejected), before);
+
+        let engine_effect = dir.path().join("engine_effect");
+        let engine = Command::new(env!("CARGO_BIN_EXE_parapet-engine"))
+            .args([
+                "--config",
+                cfg.to_str().unwrap(),
+                "--port",
+                "0",
+                "--state-dir",
+                rejected_path,
+                "--effect-root",
+                engine_effect.to_str().unwrap(),
+                "--file-effect-profile",
+                "v0",
+                "--max-content-bytes",
+                "4096",
+                "--offline-fixture",
+                "v0",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("spawn parapet-engine");
+        assert_eq!(engine.status.code(), Some(2));
+        assert!(engine.stdout.is_empty());
+        let engine_stderr = String::from_utf8(engine.stderr).unwrap();
+        let structured: Value = engine_stderr
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("structured engine diagnostic"))
+            .find(|value: &Value| {
+                value["fields"]["error_code"].as_str() == Some("control_socket_path_too_long")
+            })
+            .expect("path constraint error record");
+        assert_eq!(
+            structured["fields"]["message"].as_str(),
+            Some(CONTROL_SOCKET_PATH_TOO_LONG_MESSAGE)
+        );
+        assert!(!engine_stderr.contains(rejected_path));
+        assert!(!engine_stderr.contains("failed to bind control channel"));
+        assert!(!engine_effect.exists());
+        assert_eq!(listing(&first_rejected), before);
+        assert_eq!(std::fs::read(&marker).unwrap(), marker_bytes);
+        for name in [
+            "control.sock",
+            "control.token",
+            "engine.owner.json",
+            "receipt-evidence",
+        ] {
+            assert!(!first_rejected.join(name).exists(), "no {name} residue");
+        }
+    }
+
     struct CountingReader {
         next: u8,
         delivered: usize,
@@ -6774,6 +6990,12 @@ fn cli_accept_requires_exact_immutable_scenario_config_rev9() {
 #[test]
 fn cli_accept_verification_error_code_mapping_rev9() {
     rev9_r4::cli_accept_verification_error_code_mapping_rev9();
+}
+
+#[cfg(not(windows))]
+#[test]
+fn control_socket_path_preflight_boundary_and_zero_residue() {
+    rev9_r4::control_socket_path_preflight_boundary_and_zero_residue();
 }
 
 #[cfg(not(windows))]
