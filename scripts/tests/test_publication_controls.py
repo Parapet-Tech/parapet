@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -186,6 +187,14 @@ class ReleaseWorkflowTests(unittest.TestCase):
                 f"Wheel-Version: 1.0\nTag: py3-none-{platform_tag}\n",
             )
 
+    def wheel_set_sha256(self, paths: list[Path]) -> str:
+        digest_lines = [
+            f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}"
+            for path in paths
+        ]
+        payload = "\n".join(sorted(digest_lines)) + "\n"
+        return hashlib.sha256(payload.encode()).hexdigest()
+
     def test_tag_workflow_builds_only_and_cannot_publish(self):
         workflow = self.workflow("py-sdk-wheels.yml")
         self.assertIn('tags: ["v*"]', workflow)
@@ -197,6 +206,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertNotIn("gh release", workflow)
         self.assertNotIn("--draft=false", workflow)
         self.assertNotIn("environment:", workflow)
+        self.assertIn("permissions:\n  contents: read", workflow)
 
     def test_pypi_publish_is_manual_protected_and_bound_to_tag_build(self):
         workflow = self.workflow("py-sdk-publish.yml")
@@ -207,6 +217,8 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("name: pypi", workflow)
         self.assertIn('test "$GITHUB_REF" = "refs/heads/main"', workflow)
         self.assertIn("PUBLISH PYPI v0.1.0", workflow)
+        self.assertIn("expected_commit:", workflow)
+        self.assertIn("wheel_set_sha256:", workflow)
         self.assertIn("actions/workflows/py-sdk-wheels.yml", workflow)
         self.assertIn(".workflow_id", workflow)
         self.assertIn(".head_sha", workflow)
@@ -217,7 +229,14 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("expected 5 wheels", workflow)
         self.assertIn("wheel metadata identity mismatch", workflow)
         self.assertIn("unexpected non-wheel artifact entry", workflow)
+        self.assertIn("id-token: write", workflow)
+        self.assertIn("ACTIONS_ID_TOKEN_REQUEST_TOKEN", workflow)
+        self.assertIn("ACTIONS_ID_TOKEN_REQUEST_URL", workflow)
+        self.assertIn("--non-interactive", workflow)
+        self.assertIn("maturin-version: v1.15.0", workflow)
         self.assertIn("command: upload", workflow)
+        self.assertNotIn("PYPI_API_TOKEN", workflow)
+        self.assertNotIn("secrets.", workflow)
         self.assertNotIn("--skip-existing", workflow)
         self.assertNotIn("npm", workflow.lower())
         self.assertNotIn("contents: write", workflow)
@@ -231,6 +250,9 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("name: github-release", workflow)
         self.assertIn('test "$GITHUB_REF" = "refs/heads/main"', workflow)
         self.assertIn("PUBLISH GITHUB RELEASE v0.1.0", workflow)
+        self.assertIn("expected_commit:", workflow)
+        self.assertIn("wheel_set_sha256:", workflow)
+        self.assertIn("release_manifest_sha256:", workflow)
         self.assertIn("contents: write", workflow)
         self.assertIn(".targetCommitish", workflow)
         self.assertIn(".isDraft", workflow)
@@ -245,6 +267,24 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn('test "$published_assets" = "$expected_assets"', workflow)
         self.assertIn("--draft=false --latest=false --verify-tag", workflow)
         self.assertNotIn("npm", workflow.lower())
+
+    def test_publish_workflow_actions_are_sha_pinned(self):
+        for name in ("py-sdk-publish.yml", "github-release-publish.yml"):
+            with self.subTest(workflow=name):
+                uses = re.findall(r"^\s*uses:\s*(\S+)", self.workflow(name), re.MULTILINE)
+                self.assertTrue(uses)
+                for action in uses:
+                    self.assertRegex(action, r"^[^@]+@[0-9a-f]{40}$")
+
+    def test_only_github_release_publish_requests_contents_write(self):
+        workflows = ROOT / ".github" / "workflows"
+        offenders = []
+        for path in sorted([*workflows.glob("*.yml"), *workflows.glob("*.yaml")]):
+            if path.name == "github-release-publish.yml":
+                continue
+            if re.search(r"^\s*contents:\s*write\s*$", path.read_text(), re.MULTILINE):
+                offenders.append(path.name)
+        self.assertEqual(offenders, [])
 
     def test_pypi_artifact_and_wheel_validators_fail_closed(self):
         blocks = self.python_blocks(self.workflow("py-sdk-publish.yml"))
@@ -262,15 +302,33 @@ class ReleaseWorkflowTests(unittest.TestCase):
                 for name in artifact_names
             ]
         }
+        commit_env = {
+            "TAG_COMMIT": "a" * 40,
+            "EXPECTED_COMMIT": "a" * 40,
+        }
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             good = self.run_python_block(
-                blocks[0], cwd=root, env={"ARTIFACTS_JSON": json.dumps(payload)}
+                blocks[0],
+                cwd=root,
+                env={**commit_env, "ARTIFACTS_JSON": json.dumps(payload)},
             )
             self.assertEqual(good.returncode, 0, good.stdout + good.stderr)
-            payload["artifacts"].pop()
+            wrong_commit = self.run_python_block(
+                blocks[0],
+                cwd=root,
+                env={
+                    **commit_env,
+                    "EXPECTED_COMMIT": "b" * 40,
+                    "ARTIFACTS_JSON": json.dumps(payload),
+                },
+            )
+            self.assertNotEqual(wrong_commit.returncode, 0)
+            missing_payload = {"artifacts": payload["artifacts"][:-1]}
             missing = self.run_python_block(
-                blocks[0], cwd=root, env={"ARTIFACTS_JSON": json.dumps(payload)}
+                blocks[0],
+                cwd=root,
+                env={**commit_env, "ARTIFACTS_JSON": json.dumps(missing_payload)},
             )
             self.assertNotEqual(missing.returncode, 0)
 
@@ -286,26 +344,35 @@ class ReleaseWorkflowTests(unittest.TestCase):
             for platform_tag in platform_tags:
                 wheel = dist / f"parapet-0.1.0-py3-none-{platform_tag}.whl"
                 self.write_wheel(wheel, platform_tag)
-            valid_wheels = self.run_python_block(blocks[1], cwd=root)
+            wheel_paths = sorted(dist.glob("*.whl"))
+            wheel_set_sha256 = self.wheel_set_sha256(wheel_paths)
+            wheel_env = {"EXPECTED_WHEEL_SET_SHA256": wheel_set_sha256}
+            valid_wheels = self.run_python_block(blocks[1], cwd=root, env=wheel_env)
             self.assertEqual(
                 valid_wheels.returncode,
                 0,
                 valid_wheels.stdout + valid_wheels.stderr,
             )
+            wrong_wheel_set = self.run_python_block(
+                blocks[1],
+                cwd=root,
+                env={"EXPECTED_WHEEL_SET_SHA256": "0" * 64},
+            )
+            self.assertNotEqual(wrong_wheel_set.returncode, 0)
             unexpected_file = dist / "unexpected.txt"
             unexpected_file.write_text("unexpected")
-            unexpected = self.run_python_block(blocks[1], cwd=root)
+            unexpected = self.run_python_block(blocks[1], cwd=root, env=wheel_env)
             self.assertNotEqual(unexpected.returncode, 0)
             unexpected_file.unlink()
             unexpected_dir = dist / "unexpected"
             unexpected_dir.mkdir()
-            unexpected = self.run_python_block(blocks[1], cwd=root)
+            unexpected = self.run_python_block(blocks[1], cwd=root, env=wheel_env)
             self.assertNotEqual(unexpected.returncode, 0)
             unexpected_dir.rmdir()
             (dist / "parapet-0.1.0-py3-none-win_amd64.whl").rename(
                 dist / "parapet-0.2.0-py3-none-win_amd64.whl"
             )
-            wrong_version = self.run_python_block(blocks[1], cwd=root)
+            wrong_version = self.run_python_block(blocks[1], cwd=root, env=wheel_env)
             self.assertNotEqual(wrong_version.returncode, 0)
 
     def test_github_release_asset_validators_fail_closed(self):
@@ -315,18 +382,33 @@ class ReleaseWorkflowTests(unittest.TestCase):
             {"name": "one", "size": 1},
             {"name": "two", "size": 2},
         ]
+        commit_env = {
+            "TAG_COMMIT": "a" * 40,
+            "EXPECTED_COMMIT": "a" * 40,
+        }
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             metadata = self.run_python_block(
                 blocks[0],
                 cwd=root,
-                env={"RELEASE_JSON": json.dumps({"assets": base_assets})},
+                env={**commit_env, "RELEASE_JSON": json.dumps({"assets": base_assets})},
             )
             self.assertEqual(metadata.returncode, 0, metadata.stdout + metadata.stderr)
+            wrong_commit = self.run_python_block(
+                blocks[0],
+                cwd=root,
+                env={
+                    **commit_env,
+                    "EXPECTED_COMMIT": "b" * 40,
+                    "RELEASE_JSON": json.dumps({"assets": base_assets}),
+                },
+            )
+            self.assertNotEqual(wrong_commit.returncode, 0)
             duplicate = self.run_python_block(
                 blocks[0],
                 cwd=root,
                 env={
+                    **commit_env,
                     "RELEASE_JSON": json.dumps(
                         {"assets": [base_assets[0], base_assets[0]]}
                     )
@@ -375,12 +457,29 @@ class ReleaseWorkflowTests(unittest.TestCase):
 
             write_manifest(names)
             current_release_assets = release_assets()
+            reviewed_wheel_set = self.wheel_set_sha256(
+                [assets_dir / name for name in wheel_names]
+            )
+            validator_env = {
+                "EXPECTED_RELEASE_MANIFEST_SHA256": hashlib.sha256(
+                    manifest.read_bytes()
+                ).hexdigest(),
+                "EXPECTED_WHEEL_SET_SHA256": reviewed_wheel_set,
+                "RELEASE_JSON": json.dumps({"assets": current_release_assets}),
+            }
             valid = self.run_python_block(
                 blocks[1],
                 cwd=root,
-                env={"RELEASE_JSON": json.dumps({"assets": current_release_assets})},
+                env=validator_env,
             )
             self.assertEqual(valid.returncode, 0, valid.stdout + valid.stderr)
+
+            wrong_manifest = self.run_python_block(
+                blocks[1],
+                cwd=root,
+                env={**validator_env, "EXPECTED_RELEASE_MANIFEST_SHA256": "0" * 64},
+            )
+            self.assertNotEqual(wrong_manifest.returncode, 0)
 
             extra_name = "unreviewed-debug.tar.gz"
             (assets_dir / extra_name).write_bytes(b"unexpected")
@@ -388,10 +487,35 @@ class ReleaseWorkflowTests(unittest.TestCase):
             unexpected = self.run_python_block(
                 blocks[1],
                 cwd=root,
-                env={"RELEASE_JSON": json.dumps({"assets": release_assets()})},
+                env={
+                    "EXPECTED_RELEASE_MANIFEST_SHA256": hashlib.sha256(
+                        manifest.read_bytes()
+                    ).hexdigest(),
+                    "EXPECTED_WHEEL_SET_SHA256": reviewed_wheel_set,
+                    "RELEASE_JSON": json.dumps({"assets": release_assets()}),
+                },
             )
             self.assertNotEqual(unexpected.returncode, 0)
             (assets_dir / extra_name).unlink()
+            write_manifest(names)
+            current_release_assets = release_assets()
+
+            with zipfile.ZipFile(assets_dir / wheel_names[0], "a") as archive:
+                archive.writestr("review-drift", "different reviewed bytes")
+            write_manifest(names)
+            changed_release_wheel = self.run_python_block(
+                blocks[1],
+                cwd=root,
+                env={
+                    "EXPECTED_RELEASE_MANIFEST_SHA256": hashlib.sha256(
+                        manifest.read_bytes()
+                    ).hexdigest(),
+                    "EXPECTED_WHEEL_SET_SHA256": reviewed_wheel_set,
+                    "RELEASE_JSON": json.dumps({"assets": release_assets()}),
+                },
+            )
+            self.assertNotEqual(changed_release_wheel.returncode, 0)
+            self.write_wheel(assets_dir / wheel_names[0], platform_tags[0])
             write_manifest(names)
             current_release_assets = release_assets()
 
@@ -399,7 +523,13 @@ class ReleaseWorkflowTests(unittest.TestCase):
             tampered = self.run_python_block(
                 blocks[1],
                 cwd=root,
-                env={"RELEASE_JSON": json.dumps({"assets": current_release_assets})},
+                env={
+                    "EXPECTED_RELEASE_MANIFEST_SHA256": hashlib.sha256(
+                        manifest.read_bytes()
+                    ).hexdigest(),
+                    "EXPECTED_WHEEL_SET_SHA256": reviewed_wheel_set,
+                    "RELEASE_JSON": json.dumps({"assets": current_release_assets}),
+                },
             )
             self.assertNotEqual(tampered.returncode, 0)
 

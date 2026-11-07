@@ -14,6 +14,9 @@ on:
       - "parapet/**"
       - ".github/workflows/py-sdk-wheels.yml"
 
+permissions:
+  contents: read
+
 jobs:
   build:
     name: Build ${{ matrix.platform }}
