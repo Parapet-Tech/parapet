@@ -275,7 +275,7 @@ jobs:
             <<<"$before_publish")
           test "$observed_assets" = "$expected_assets"
 
-          gh release edit "$RELEASE_TAG" --draft=false --latest=false --verify-tag
+          gh release edit "$RELEASE_TAG" --draft=false --latest --verify-tag
           published=$(gh release view "$RELEASE_TAG" \
             --json tagName,targetCommitish,isDraft,isPrerelease,publishedAt,assets)
           test "$(jq -r .tagName <<<"$published")" = "$RELEASE_TAG"

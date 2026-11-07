@@ -265,7 +265,8 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("wheel metadata identity mismatch", workflow)
         self.assertIn('sort_by(.name)', workflow)
         self.assertIn('test "$published_assets" = "$expected_assets"', workflow)
-        self.assertIn("--draft=false --latest=false --verify-tag", workflow)
+        self.assertIn("--draft=false --latest --verify-tag", workflow)
+        self.assertNotIn("--latest=false", workflow)
         self.assertNotIn("npm", workflow.lower())
 
     def test_publish_workflow_actions_are_sha_pinned(self):
