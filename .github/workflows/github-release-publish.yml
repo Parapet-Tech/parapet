@@ -85,11 +85,13 @@ jobs:
           set -euo pipefail
           release_json=$(gh release view "$RELEASE_TAG" --json assets)
           RELEASE_JSON="$release_json" python3 - <<'PY'
+          from email.parser import BytesParser
           import hashlib
           import json
           import os
           import re
           from pathlib import Path, PurePosixPath
+          from zipfile import ZipFile
 
           root = Path("release-assets")
           manifest_name = "parapet-v0.1.0-RELEASE_SHA256SUMS"
@@ -115,6 +117,9 @@ jobs:
           api_sizes = {item.get("name"): item.get("size") for item in api_assets}
           if len(api_sizes) != len(api_assets):
               raise SystemExit("duplicate release asset names")
+          for name, size in api_sizes.items():
+              if not isinstance(name, str) or not isinstance(size, int) or size <= 0:
+                  raise SystemExit(f"invalid release asset metadata: {name!r}")
 
           files = {}
           for path in root.iterdir():
@@ -125,35 +130,115 @@ jobs:
               raise SystemExit("downloaded asset set does not match draft release metadata")
           if set(entries) != set(files) - {manifest_name}:
               raise SystemExit("checksum manifest does not cover the exact downloadable asset set")
+          for name, path in files.items():
+              if path.stat().st_size != api_sizes[name]:
+                  raise SystemExit(f"release asset size mismatch: {name}")
 
           required = {
               "parapet-v0.1.0-macos-arm64-evaluator.tar.gz",
               "parapet-v0.1.0-release-evidence.tar.gz",
           }
-          if not required <= set(entries):
-              raise SystemExit(f"missing required reviewed assets: {sorted(required - set(entries))!r}")
-          wheels = [name for name in entries if re.fullmatch(r"parapet-0\.1\.0-.*\.whl", name)]
+          wheels = sorted(name for name in entries if name.endswith(".whl"))
           if len(wheels) != 5:
               raise SystemExit(f"expected 5 release wheels, found {len(wheels)}")
+          expected_assets = required | set(wheels)
+          if set(entries) != expected_assets:
+              raise SystemExit(
+                  "release asset set mismatch: "
+                  f"expected={sorted(expected_assets)!r} observed={sorted(entries)!r}"
+              )
+
+          platform_classes = {
+              "manylinux_2_17_x86_64": "manylinux-x86_64",
+              "manylinux_2_17_x86_64.manylinux2014_x86_64": "manylinux-x86_64",
+              "manylinux_2_17_aarch64": "manylinux-aarch64",
+              "manylinux_2_17_aarch64.manylinux2014_aarch64": "manylinux-aarch64",
+              "macosx_11_0_arm64": "macos-arm64",
+              "macosx_10_12_x86_64": "macos-x86_64",
+              "win_amd64": "windows-amd64",
+          }
+          expected_classes = {
+              "manylinux-x86_64",
+              "manylinux-aarch64",
+              "macos-arm64",
+              "macos-x86_64",
+              "windows-amd64",
+          }
+          observed_classes = set()
+          for name in wheels:
+              path = files[name]
+              parts = path.stem.split("-")
+              if len(parts) != 5:
+                  raise SystemExit(f"unexpected wheel filename: {name}")
+              distribution, version, python_tag, abi_tag, platform_tag = parts
+              if (distribution, version, python_tag, abi_tag) != (
+                  "parapet", "0.1.0", "py3", "none"
+              ):
+                  raise SystemExit(f"unexpected wheel identity: {name}")
+              platform_class = platform_classes.get(platform_tag)
+              if platform_class is None or platform_class in observed_classes:
+                  raise SystemExit(f"unexpected or duplicate wheel platform: {name}")
+              observed_classes.add(platform_class)
+              with ZipFile(path) as archive:
+                  metadata_paths = [
+                      member for member in archive.namelist()
+                      if member.endswith(".dist-info/METADATA")
+                  ]
+                  wheel_paths = [
+                      member for member in archive.namelist()
+                      if member.endswith(".dist-info/WHEEL")
+                  ]
+                  if len(metadata_paths) != 1 or len(wheel_paths) != 1:
+                      raise SystemExit(f"invalid wheel metadata layout: {name}")
+                  metadata = BytesParser().parsebytes(archive.read(metadata_paths[0]))
+                  if metadata.get("Name") != "parapet" or metadata.get("Version") != "0.1.0":
+                      raise SystemExit(f"wheel metadata identity mismatch: {name}")
+                  wheel_text = archive.read(wheel_paths[0]).decode("utf-8")
+                  if f"Tag: py3-none-{platform_tag}" not in wheel_text.splitlines():
+                      raise SystemExit(f"wheel tag mismatch: {name}")
+          if observed_classes != expected_classes:
+              raise SystemExit(
+                  "wheel platform set mismatch: "
+                  f"expected={sorted(expected_classes)!r} observed={sorted(observed_classes)!r}"
+              )
 
           for name, digest in entries.items():
               path = files[name]
-              if path.stat().st_size != api_sizes[name]:
-                  raise SystemExit(f"release asset size mismatch: {name}")
               observed = hashlib.sha256(path.read_bytes()).hexdigest()
               if observed != digest:
                   raise SystemExit(f"release asset digest mismatch: {name}")
               print(f"{digest}  {name}")
           PY
+          jq -cS '[.assets[] | {id,name,size,updatedAt,digest}] | sort_by(.name)' \
+            <<<"$release_json" > "$RUNNER_TEMP/release-assets.json"
 
       - name: Make the reviewed draft release public
         shell: bash
         run: |
           set -euo pipefail
+          tag_commit=$(git rev-list -n 1 "$RELEASE_TAG")
+          before_publish=$(gh release view "$RELEASE_TAG" \
+            --json tagName,targetCommitish,isDraft,isPrerelease,isImmutable,assets)
+          test "$(jq -r .tagName <<<"$before_publish")" = "$RELEASE_TAG"
+          test "$(jq -r .targetCommitish <<<"$before_publish")" = "$tag_commit"
+          test "$(jq -r .isDraft <<<"$before_publish")" = "true"
+          test "$(jq -r .isPrerelease <<<"$before_publish")" = "false"
+          test "$(jq -r .isImmutable <<<"$before_publish")" = "false"
+          expected_assets=$(cat "$RUNNER_TEMP/release-assets.json")
+          observed_assets=$(jq -cS \
+            '[.assets[] | {id,name,size,updatedAt,digest}] | sort_by(.name)' \
+            <<<"$before_publish")
+          test "$observed_assets" = "$expected_assets"
+
           gh release edit "$RELEASE_TAG" --draft=false --latest=false --verify-tag
           published=$(gh release view "$RELEASE_TAG" \
-            --json tagName,isDraft,isPrerelease,publishedAt)
+            --json tagName,targetCommitish,isDraft,isPrerelease,publishedAt,assets)
           test "$(jq -r .tagName <<<"$published")" = "$RELEASE_TAG"
+          test "$(jq -r .targetCommitish <<<"$published")" = "$tag_commit"
           test "$(jq -r .isDraft <<<"$published")" = "false"
           test "$(jq -r .isPrerelease <<<"$published")" = "false"
           test "$(jq -r .publishedAt <<<"$published")" != "null"
+          published_assets=$(jq -cS \
+            '[.assets[] | {id,name,size,updatedAt,digest}] | sort_by(.name)' \
+            <<<"$published")
+          test "$published_assets" = "$expected_assets"

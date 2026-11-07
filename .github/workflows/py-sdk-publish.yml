@@ -135,7 +135,17 @@ jobs:
               "macos-x86_64",
               "windows-amd64",
           }
-          wheels = sorted(Path("dist").glob("*.whl"))
+          root = Path("dist")
+          if not root.is_dir() or root.is_symlink():
+              raise SystemExit("missing regular wheel download directory")
+          wheels = []
+          for path in root.iterdir():
+              if path.is_symlink() or not path.is_file():
+                  raise SystemExit(f"unexpected non-regular wheel artifact entry: {path.name!r}")
+              if path.suffix != ".whl":
+                  raise SystemExit(f"unexpected non-wheel artifact entry: {path.name!r}")
+              wheels.append(path)
+          wheels.sort()
           if len(wheels) != 5:
               raise SystemExit(f"expected 5 wheels, found {len(wheels)}")
           observed = set()

@@ -175,6 +175,17 @@ class ReleaseWorkflowTests(unittest.TestCase):
             check=False,
         )
 
+    def write_wheel(self, path: Path, platform_tag: str) -> None:
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr(
+                "parapet-0.1.0.dist-info/METADATA",
+                "Metadata-Version: 2.1\nName: parapet\nVersion: 0.1.0\n",
+            )
+            archive.writestr(
+                "parapet-0.1.0.dist-info/WHEEL",
+                f"Wheel-Version: 1.0\nTag: py3-none-{platform_tag}\n",
+            )
+
     def test_tag_workflow_builds_only_and_cannot_publish(self):
         workflow = self.workflow("py-sdk-wheels.yml")
         self.assertIn('tags: ["v*"]', workflow)
@@ -205,6 +216,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("github-token: ${{ github.token }}", workflow)
         self.assertIn("expected 5 wheels", workflow)
         self.assertIn("wheel metadata identity mismatch", workflow)
+        self.assertIn("unexpected non-wheel artifact entry", workflow)
         self.assertIn("command: upload", workflow)
         self.assertNotIn("--skip-existing", workflow)
         self.assertNotIn("npm", workflow.lower())
@@ -227,6 +239,10 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("parapet-v0.1.0-macos-arm64-evaluator.tar.gz", workflow)
         self.assertIn("parapet-v0.1.0-release-evidence.tar.gz", workflow)
         self.assertIn("checksum manifest does not cover the exact downloadable asset set", workflow)
+        self.assertIn("release asset set mismatch", workflow)
+        self.assertIn("wheel metadata identity mismatch", workflow)
+        self.assertIn('sort_by(.name)', workflow)
+        self.assertIn('test "$published_assets" = "$expected_assets"', workflow)
         self.assertIn("--draft=false --latest=false --verify-tag", workflow)
         self.assertNotIn("npm", workflow.lower())
 
@@ -269,21 +285,23 @@ class ReleaseWorkflowTests(unittest.TestCase):
             ]
             for platform_tag in platform_tags:
                 wheel = dist / f"parapet-0.1.0-py3-none-{platform_tag}.whl"
-                with zipfile.ZipFile(wheel, "w") as archive:
-                    archive.writestr(
-                        "parapet-0.1.0.dist-info/METADATA",
-                        "Metadata-Version: 2.1\nName: parapet\nVersion: 0.1.0\n",
-                    )
-                    archive.writestr(
-                        "parapet-0.1.0.dist-info/WHEEL",
-                        f"Wheel-Version: 1.0\nTag: py3-none-{platform_tag}\n",
-                    )
+                self.write_wheel(wheel, platform_tag)
             valid_wheels = self.run_python_block(blocks[1], cwd=root)
             self.assertEqual(
                 valid_wheels.returncode,
                 0,
                 valid_wheels.stdout + valid_wheels.stderr,
             )
+            unexpected_file = dist / "unexpected.txt"
+            unexpected_file.write_text("unexpected")
+            unexpected = self.run_python_block(blocks[1], cwd=root)
+            self.assertNotEqual(unexpected.returncode, 0)
+            unexpected_file.unlink()
+            unexpected_dir = dist / "unexpected"
+            unexpected_dir.mkdir()
+            unexpected = self.run_python_block(blocks[1], cwd=root)
+            self.assertNotEqual(unexpected.returncode, 0)
+            unexpected_dir.rmdir()
             (dist / "parapet-0.1.0-py3-none-win_amd64.whl").rename(
                 dist / "parapet-0.2.0-py3-none-win_amd64.whl"
             )
@@ -318,36 +336,70 @@ class ReleaseWorkflowTests(unittest.TestCase):
 
             assets_dir = root / "release-assets"
             assets_dir.mkdir()
-            names = [
+            required_names = [
                 "parapet-v0.1.0-macos-arm64-evaluator.tar.gz",
                 "parapet-v0.1.0-release-evidence.tar.gz",
-                *[f"parapet-0.1.0-py3-none-platform-{index}.whl" for index in range(5)],
             ]
-            for index, name in enumerate(names):
+            for index, name in enumerate(required_names):
                 (assets_dir / name).write_bytes(f"asset-{index}".encode())
+            platform_tags = [
+                "manylinux_2_17_x86_64",
+                "manylinux_2_17_aarch64",
+                "macosx_11_0_arm64",
+                "macosx_10_12_x86_64",
+                "win_amd64",
+            ]
+            wheel_names = [
+                f"parapet-0.1.0-py3-none-{platform_tag}.whl"
+                for platform_tag in platform_tags
+            ]
+            for name, platform_tag in zip(wheel_names, platform_tags):
+                self.write_wheel(assets_dir / name, platform_tag)
+            names = required_names + wheel_names
             manifest_name = "parapet-v0.1.0-RELEASE_SHA256SUMS"
             manifest = assets_dir / manifest_name
-            manifest.write_text(
-                "".join(
-                    f"{hashlib.sha256((assets_dir / name).read_bytes()).hexdigest()}  {name}\n"
-                    for name in names
+
+            def write_manifest(asset_names: list[str]) -> None:
+                manifest.write_text(
+                    "".join(
+                        f"{hashlib.sha256((assets_dir / name).read_bytes()).hexdigest()}  {name}\n"
+                        for name in asset_names
+                    )
                 )
-            )
-            release_assets = [
-                {"name": path.name, "size": path.stat().st_size}
-                for path in sorted(assets_dir.iterdir())
-            ]
+
+            def release_assets() -> list[dict[str, object]]:
+                return [
+                    {"name": path.name, "size": path.stat().st_size}
+                    for path in sorted(assets_dir.iterdir())
+                ]
+
+            write_manifest(names)
+            current_release_assets = release_assets()
             valid = self.run_python_block(
                 blocks[1],
                 cwd=root,
-                env={"RELEASE_JSON": json.dumps({"assets": release_assets})},
+                env={"RELEASE_JSON": json.dumps({"assets": current_release_assets})},
             )
             self.assertEqual(valid.returncode, 0, valid.stdout + valid.stderr)
+
+            extra_name = "unreviewed-debug.tar.gz"
+            (assets_dir / extra_name).write_bytes(b"unexpected")
+            write_manifest(names + [extra_name])
+            unexpected = self.run_python_block(
+                blocks[1],
+                cwd=root,
+                env={"RELEASE_JSON": json.dumps({"assets": release_assets()})},
+            )
+            self.assertNotEqual(unexpected.returncode, 0)
+            (assets_dir / extra_name).unlink()
+            write_manifest(names)
+            current_release_assets = release_assets()
+
             (assets_dir / names[0]).write_bytes(b"tampered")
             tampered = self.run_python_block(
                 blocks[1],
                 cwd=root,
-                env={"RELEASE_JSON": json.dumps({"assets": release_assets})},
+                env={"RELEASE_JSON": json.dumps({"assets": current_release_assets})},
             )
             self.assertNotEqual(tampered.returncode, 0)
 
