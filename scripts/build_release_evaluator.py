@@ -22,6 +22,11 @@ EVALUATOR_NAME = "parapet-v0.1.0-macos-arm64-evaluator"
 ARCHIVE_NAME = f"{EVALUATOR_NAME}.tar.gz"
 WHEEL_NAME = "parapet-0.1.0-py3-none-macosx_11_0_arm64.whl"
 CHECKSUM_NAME = "EVALUATOR_SHA256SUMS"
+WHEEL_TAG = "py3-none-macosx_11_0_arm64"
+WHEEL_SCRIPTS = (
+    "parapet-0.1.0.data/scripts/parapet",
+    "parapet-0.1.0.data/scripts/parapet-engine",
+)
 DEMO_FILES = (
     "README.md",
     "config_demo_v0.yaml",
@@ -117,12 +122,19 @@ def validate_wheel(path: Path) -> None:
             raise BuildError("wheel is missing v0.1.0 dist-info metadata")
         metadata = archive.read(metadata_name).decode("utf-8", "strict")
         wheel_metadata = archive.read(wheel_name).decode("utf-8", "strict")
+        for script_name in WHEEL_SCRIPTS:
+            if script_name not in names:
+                raise BuildError(f"wheel is missing required script: {script_name}")
+            script = archive.getinfo(script_name)
+            if script.is_dir() or script.file_size == 0:
+                raise BuildError(f"wheel has an invalid required script: {script_name}")
     if not re.search(r"(?m)^Name: parapet$", metadata):
         raise BuildError("wheel metadata has the wrong distribution name")
     if not re.search(r"(?m)^Version: 0\.1\.0$", metadata):
         raise BuildError("wheel metadata has the wrong version")
-    if not re.search(r"(?m)^Tag: py3-none-macosx_11_0_arm64$", wheel_metadata):
-        raise BuildError("wheel metadata has the wrong platform tag")
+    tags = re.findall(r"(?m)^Tag:\s*(\S+)\s*$", wheel_metadata)
+    if tags != [WHEEL_TAG]:
+        raise BuildError(f"wheel metadata must contain only Tag: {WHEEL_TAG}")
 
 
 def source_file_map(source_root: Path, wheel: Path) -> dict[PurePosixPath, Path]:

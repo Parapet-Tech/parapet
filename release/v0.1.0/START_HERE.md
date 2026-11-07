@@ -5,6 +5,10 @@ macOS arm64 with Python 3.10 or newer. It is a deterministic local fixture: it
 does not contact a model provider, exercise a real model, or establish
 production readiness. It is not an independent usability validation.
 
+Full Python and TypeScript SDK verification is available from the tagged
+`v0.1.0` source archive; those suites are not part of this 15-minute evaluator
+journey.
+
 ## 1. Verify the package
 
 From the unpacked evaluator root, verify every packaged file before running it:

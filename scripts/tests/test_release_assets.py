@@ -49,6 +49,8 @@ class ReleaseAssetTests(unittest.TestCase):
         distribution: str = "parapet",
         version: str = "0.1.0",
         tag: str = "py3-none-macosx_11_0_arm64",
+        extra_tags: tuple[str, ...] = (),
+        include_scripts: bool = True,
     ) -> None:
         dist_info = "parapet-0.1.0.dist-info"
         with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as archive:
@@ -59,8 +61,12 @@ class ReleaseAssetTests(unittest.TestCase):
             )
             archive.writestr(
                 f"{dist_info}/WHEEL",
-                f"Wheel-Version: 1.0\nRoot-Is-Purelib: false\nTag: {tag}\n",
+                "Wheel-Version: 1.0\nRoot-Is-Purelib: false\n"
+                + "".join(f"Tag: {item}\n" for item in (tag, *extra_tags)),
             )
+            if include_scripts:
+                for script_name in builder.WHEEL_SCRIPTS:
+                    archive.writestr(script_name, b"fixture-binary\n")
 
     def _build(self, name: str = "out") -> tuple[Path, Path]:
         return builder.build_release_evaluator(
@@ -149,13 +155,24 @@ class ReleaseAssetTests(unittest.TestCase):
 
         self.wheel.unlink()
         self._write_wheel(self.wheel, tag="py3-none-macosx_10_9_x86_64")
-        with self.assertRaisesRegex(builder.BuildError, "wrong platform tag"):
+        with self.assertRaisesRegex(builder.BuildError, "must contain only Tag"):
             self._build("bad-tag")
 
         self.wheel.unlink()
         self._write_wheel(self.wheel, version="0.1.1")
         with self.assertRaisesRegex(builder.BuildError, "wrong version"):
             self._build("bad-version")
+
+    def test_extra_wheel_tag_and_missing_scripts_fail_closed(self) -> None:
+        self.wheel.unlink()
+        self._write_wheel(self.wheel, extra_tags=("py3-none-win_amd64",))
+        with self.assertRaisesRegex(builder.BuildError, "must contain only Tag"):
+            self._build("extra-tag")
+
+        self.wheel.unlink()
+        self._write_wheel(self.wheel, include_scripts=False)
+        with self.assertRaisesRegex(builder.BuildError, "missing required script"):
+            self._build("missing-scripts")
 
     def test_changed_byte_and_stale_checksum_fail_closed(self) -> None:
         evaluator, _ = self._build()
@@ -236,6 +253,8 @@ class ReleaseAssetTests(unittest.TestCase):
         self.assertIn(builder.WHEEL_NAME, start)
         self.assertIn("no real model", start.lower())
         self.assertIn("not an independent usability validation", start)
+        self.assertIn("tagged\n`v0.1.0` source archive", start)
+        self.assertIn("not part of this 15-minute evaluator\njourney", start)
         self.assertIn("not stable or\nproduction-ready", notes)
         self.assertIn(builder.ARCHIVE_NAME, notes)
         self.assertIn("Known issues and limitations", notes)
