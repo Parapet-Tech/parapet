@@ -1468,16 +1468,6 @@ fn run_accept(args: AcceptArgs, json_mode: bool) -> i32 {
         );
     }
 
-    if preflight_control_socket_path(&state_dir).is_err() {
-        return emit_cli_error(
-            "accept",
-            "control_socket_path_too_long",
-            2,
-            CONTROL_SOCKET_PATH_TOO_LONG_MESSAGE,
-            json_mode,
-        );
-    }
-
     let (fixture, (required_config, required_hash)) = match scenario.as_str() {
         "allow_no_executor" => (
             OfflineUpstreamFixtureV0::AllowNoExecutor,

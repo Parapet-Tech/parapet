@@ -6003,9 +6003,10 @@ mod rev9_r4 {
     use parapet::cli::control::{
         control_token_from_reader, control_token_from_source, open_control_token_source,
         peer_credential_authorized, preflight_control_socket_path, read_bounded_control_line,
-        read_bounded_control_line_sync, write_private_file, ControlError, ControlLineError,
-        EngineControlPlane, EngineOwnerRecordV0, CONTROL_SOCKET_PATH_TOO_LONG_MESSAGE,
-        CONTROL_TOKEN_BYTES, CONTROL_TOKEN_SOURCE, ENGINE_OWNER_SCHEMA, MAX_CONTROL_LINE_BYTES,
+        read_bounded_control_line_sync, remove_owned_transient_files, write_private_file,
+        ControlError, ControlLineError, EngineControlPlane, EngineOwnerRecordV0,
+        CONTROL_SOCKET_PATH_TOO_LONG_MESSAGE, CONTROL_TOKEN_BYTES, CONTROL_TOKEN_SOURCE,
+        ENGINE_OWNER_SCHEMA, MAX_CONTROL_LINE_BYTES,
     };
     use parapet::cli::render::{verification_error_code, verification_reason_code};
     use parapet::receipt::{
@@ -6490,6 +6491,15 @@ mod rev9_r4 {
         panic!("platform socket boundary exceeds one filesystem component")
     }
 
+    fn directory_listing(path: &Path) -> Vec<std::ffi::OsString> {
+        let mut names: Vec<_> = std::fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    }
+
     fn assert_control_socket_path_error(out: Output, command: &str, json_mode: bool) {
         assert_eq!(out.status.code(), Some(2), "{command} exit");
         let stdout = String::from_utf8(out.stdout).unwrap();
@@ -6543,15 +6553,32 @@ mod rev9_r4 {
         assert!(last_accepted.join("control.json").is_file());
         assert!(last_accepted.join("receipt-evidence").is_dir());
 
+        // The final representable derived pathname reaches a real socket bind.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (_plane, listener, _shutdown_rx) =
+                EngineControlPlane::bind(&last_accepted, 0, ENFORCED_HASH, None)
+                    .expect("last accepted control socket path binds");
+            assert!(last_accepted.join("control.sock").exists());
+            drop(listener);
+        });
+        remove_owned_transient_files(&last_accepted);
+
         // The first unrepresentable pathname is rejected in human and JSON
         // modes without creating an absent state root.
         let rejected_path = first_rejected.to_str().unwrap();
+        let parent_before_init = directory_listing(dir.path());
         let human = run_parapet(&["init", "--state-dir", rejected_path], None);
         assert_control_socket_path_error(human, "init", false);
         assert!(!first_rejected.exists());
+        assert_eq!(directory_listing(dir.path()), parent_before_init);
         let json = run_parapet(&["init", "--state-dir", rejected_path, "--json"], None);
         assert_control_socket_path_error(json, "init", true);
         assert!(!first_rejected.exists());
+        assert_eq!(directory_listing(dir.path()), parent_before_init);
 
         // A caller-owned directory and marker remain byte/entry identical.
         std::fs::create_dir(&first_rejected).unwrap();
@@ -6559,18 +6586,10 @@ mod rev9_r4 {
         let marker = first_rejected.join("caller.marker");
         let marker_bytes = b"caller-owned marker\n";
         std::fs::write(&marker, marker_bytes).unwrap();
-        let listing = |path: &Path| {
-            let mut names: Vec<_> = std::fs::read_dir(path)
-                .unwrap()
-                .map(|entry| entry.unwrap().file_name())
-                .collect();
-            names.sort();
-            names
-        };
-        let before = listing(&first_rejected);
+        let before = directory_listing(&first_rejected);
         let existing = run_parapet(&["init", "--state-dir", rejected_path], None);
         assert_control_socket_path_error(existing, "init", false);
-        assert_eq!(listing(&first_rejected), before);
+        assert_eq!(directory_listing(&first_rejected), before);
         assert_eq!(std::fs::read(&marker).unwrap(), marker_bytes);
 
         // Defense in depth: bind checks representability before verifying the
@@ -6588,15 +6607,22 @@ mod rev9_r4 {
             bind,
             Err(ControlError::ControlSocketPathUnrepresentable)
         ));
-        assert_eq!(listing(&first_rejected), before);
+        assert_eq!(directory_listing(&first_rejected), before);
 
         let cfg = write_cfg(dir.path(), "boundary.yaml", ENFORCED_YAML);
+        let rejected_component_len = first_rejected.file_name().unwrap().len();
+        let run_state = dir.path().join("r".repeat(rejected_component_len));
+        assert_eq!(
+            preflight_control_socket_path(&run_state),
+            Err(ControlError::ControlSocketPathUnrepresentable)
+        );
         let run_effect = dir.path().join("run_effect");
+        let parent_before_run = directory_listing(dir.path());
         let run = run_parapet(
             &[
                 "run",
                 "--state-dir",
-                rejected_path,
+                run_state.to_str().unwrap(),
                 "--config",
                 cfg.to_str().unwrap(),
                 "--port",
@@ -6614,25 +6640,17 @@ mod rev9_r4 {
             None,
         );
         assert_control_socket_path_error(run, "run", true);
+        assert!(!run_state.exists());
         assert!(!run_effect.exists());
-        assert_eq!(listing(&first_rejected), before);
+        assert_eq!(directory_listing(dir.path()), parent_before_run);
 
-        let accept_effect = dir.path().join("accept_effect");
-        let accept = run_parapet(
-            &accept_args(
-                &first_rejected,
-                &cfg,
-                "allow_verified_write",
-                Some(&accept_effect),
-                true,
-            ),
-            None,
+        let engine_state = dir.path().join("e".repeat(rejected_component_len));
+        assert_eq!(
+            preflight_control_socket_path(&engine_state),
+            Err(ControlError::ControlSocketPathUnrepresentable)
         );
-        assert_control_socket_path_error(accept, "accept", true);
-        assert!(!accept_effect.exists());
-        assert_eq!(listing(&first_rejected), before);
-
         let engine_effect = dir.path().join("engine_effect");
+        let parent_before_engine = directory_listing(dir.path());
         let engine = Command::new(env!("CARGO_BIN_EXE_parapet-engine"))
             .args([
                 "--config",
@@ -6640,7 +6658,7 @@ mod rev9_r4 {
                 "--port",
                 "0",
                 "--state-dir",
-                rejected_path,
+                engine_state.to_str().unwrap(),
                 "--effect-root",
                 engine_effect.to_str().unwrap(),
                 "--file-effect-profile",
@@ -6668,10 +6686,12 @@ mod rev9_r4 {
             structured["fields"]["message"].as_str(),
             Some(CONTROL_SOCKET_PATH_TOO_LONG_MESSAGE)
         );
-        assert!(!engine_stderr.contains(rejected_path));
+        assert!(!engine_stderr.contains(engine_state.to_str().unwrap()));
         assert!(!engine_stderr.contains("failed to bind control channel"));
+        assert!(!engine_state.exists());
         assert!(!engine_effect.exists());
-        assert_eq!(listing(&first_rejected), before);
+        assert_eq!(directory_listing(dir.path()), parent_before_engine);
+        assert_eq!(directory_listing(&first_rejected), before);
         assert_eq!(std::fs::read(&marker).unwrap(), marker_bytes);
         for name in [
             "control.sock",
@@ -6681,6 +6701,31 @@ mod rev9_r4 {
         ] {
             assert!(!first_rejected.join(name).exists(), "no {name} residue");
         }
+
+        // `accept` does not create a protected control channel, so a state-dir
+        // beyond the socket boundary remains valid for its offline workflow.
+        let accept_state = dir.path().join("a".repeat(rejected_component_len));
+        assert_eq!(
+            preflight_control_socket_path(&accept_state),
+            Err(ControlError::ControlSocketPathUnrepresentable)
+        );
+        let accept = run_parapet(
+            &accept_args(&accept_state, &cfg, "allow_no_executor", None, true),
+            None,
+        );
+        assert_eq!(
+            accept.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&accept.stderr)
+        );
+        for name in ["control.sock", "control.token", "engine.owner.json"] {
+            assert!(
+                !accept_state.join(name).exists(),
+                "accept creates no {name}"
+            );
+        }
+        assert!(accept_state.join("receipt-evidence").is_dir());
     }
 
     struct CountingReader {
