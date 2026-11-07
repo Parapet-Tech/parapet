@@ -195,6 +195,31 @@ class ReleaseWorkflowTests(unittest.TestCase):
         payload = "\n".join(sorted(digest_lines)) + "\n"
         return hashlib.sha256(payload.encode()).hexdigest()
 
+    def write_permission_findings(self, workflow: str) -> list[str]:
+        findings = []
+        scalar_pattern = r"(?:['\"]?write-all['\"]?)"
+        if re.search(
+            rf"^\s*permissions\s*:\s*{scalar_pattern}\s*(?:#.*)?$",
+            workflow,
+            re.MULTILINE,
+        ):
+            findings.append("permissions-write-all")
+        if re.search(
+            r"^\s*contents\s*:\s*['\"]?write['\"]?\s*(?:#.*)?$",
+            workflow,
+            re.MULTILINE,
+        ):
+            findings.append("contents-write")
+        for match in re.finditer(
+            r"^\s*permissions\s*:\s*\{([^}\n]*)\}", workflow, re.MULTILINE
+        ):
+            if re.search(
+                r"(?:^|,)\s*['\"]?contents['\"]?\s*:\s*['\"]?write['\"]?\s*(?:,|$)",
+                match.group(1),
+            ):
+                findings.append("flow-contents-write")
+        return findings
+
     def test_tag_workflow_builds_only_and_cannot_publish(self):
         workflow = self.workflow("py-sdk-wheels.yml")
         self.assertIn('tags: ["v*"]', workflow)
@@ -279,13 +304,44 @@ class ReleaseWorkflowTests(unittest.TestCase):
 
     def test_only_github_release_publish_requests_contents_write(self):
         workflows = ROOT / ".github" / "workflows"
-        offenders = []
+        findings = {}
         for path in sorted([*workflows.glob("*.yml"), *workflows.glob("*.yaml")]):
-            if path.name == "github-release-publish.yml":
-                continue
-            if re.search(r"^\s*contents:\s*write\s*$", path.read_text(), re.MULTILINE):
-                offenders.append(path.name)
-        self.assertEqual(offenders, [])
+            observed = self.write_permission_findings(path.read_text())
+            if observed:
+                findings[path.name] = observed
+        self.assertEqual(
+            findings,
+            {"github-release-publish.yml": ["contents-write"]},
+        )
+
+    def test_write_permission_scanner_rejects_alternate_yaml_syntaxes(self):
+        unsafe = {
+            "workflow block": "permissions:\n  contents: write\n",
+            "job block": "jobs:\n  publish:\n    permissions:\n      contents: write\n",
+            "workflow write-all": "permissions: write-all\n",
+            "job write-all": "jobs:\n  publish:\n    permissions: write-all\n",
+            "workflow flow": "permissions: {contents: write, actions: read}\n",
+            "job flow": (
+                "jobs:\n  publish:\n"
+                "    permissions: { actions: read, contents: write }\n"
+            ),
+        }
+        for name, fixture in unsafe.items():
+            with self.subTest(name=name):
+                self.assertTrue(self.write_permission_findings(fixture))
+
+        safe = {
+            "empty mapping": "permissions: {}\n",
+            "read-all": "permissions: read-all\n",
+            "workflow block read": "permissions:\n  contents: read\n",
+            "job flow read": (
+                "jobs:\n  build:\n"
+                "    permissions: { contents: read, actions: read }\n"
+            ),
+        }
+        for name, fixture in safe.items():
+            with self.subTest(name=name):
+                self.assertEqual(self.write_permission_findings(fixture), [])
 
     def test_pypi_artifact_and_wheel_validators_fail_closed(self):
         blocks = self.python_blocks(self.workflow("py-sdk-publish.yml"))
