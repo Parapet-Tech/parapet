@@ -1,0 +1,185 @@
+name: Publish Python wheels to PyPI
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Exact existing release tag (v0.1.0)
+        required: true
+        type: string
+      build_run_id:
+        description: Successful Python SDK Wheels tag-build run ID
+        required: true
+        type: string
+      authorization:
+        description: Type exactly PUBLISH PYPI v0.1.0
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: publish-pypi-v0.1.0
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish reviewed v0.1.0 wheels
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      BUILD_RUN_ID: ${{ inputs.build_run_id }}
+      NAMED_AUTHORIZATION: ${{ inputs.authorization }}
+      PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+    steps:
+      - name: Validate named authorization and inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$RELEASE_TAG" = "v0.1.0"
+          test "$NAMED_AUTHORIZATION" = "PUBLISH PYPI v0.1.0"
+          [[ "$BUILD_RUN_ID" =~ ^[0-9]+$ ]]
+          test -n "$PYPI_API_TOKEN"
+
+      - name: Check out the exact tag
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+
+      - name: Bind the successful wheel workflow run to the tag commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag_commit=$(git rev-list -n 1 "$RELEASE_TAG")
+          workflow_id=$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/py-sdk-wheels.yml" \
+            --jq .id)
+          run_json=$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$BUILD_RUN_ID")
+          test "$(jq -r .workflow_id <<<"$run_json")" = "$workflow_id"
+          test "$(jq -r .event <<<"$run_json")" = "push"
+          test "$(jq -r .status <<<"$run_json")" = "completed"
+          test "$(jq -r .conclusion <<<"$run_json")" = "success"
+          test "$(jq -r .head_sha <<<"$run_json")" = "$tag_commit"
+
+          artifacts_json=$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$BUILD_RUN_ID/artifacts?per_page=100")
+          ARTIFACTS_JSON="$artifacts_json" python3 - <<'PY'
+          import json
+          import os
+
+          expected = {
+              "parapet-manylinux_2_17_x86_64-wheels",
+              "parapet-manylinux_2_17_aarch64-wheels",
+              "parapet-macosx_11_0_arm64-wheels",
+              "parapet-macosx_10_12_x86_64-wheels",
+              "parapet-win_amd64-wheels",
+          }
+          payload = json.loads(os.environ["ARTIFACTS_JSON"])
+          artifacts = payload.get("artifacts")
+          if not isinstance(artifacts, list):
+              raise SystemExit("artifact response is missing artifacts")
+          names = [item.get("name") for item in artifacts]
+          if len(names) != len(set(names)):
+              raise SystemExit("duplicate artifact names")
+          if set(names) != expected:
+              raise SystemExit(
+                  f"wheel artifact set mismatch: expected={sorted(expected)!r} observed={sorted(names)!r}"
+              )
+          for item in artifacts:
+              if item.get("expired") is not False or not isinstance(item.get("size_in_bytes"), int) or item["size_in_bytes"] <= 0:
+                  raise SystemExit(f"invalid or expired artifact: {item.get('name')!r}")
+          PY
+
+      - name: Download wheels from the bound workflow run
+        uses: actions/download-artifact@v4
+        with:
+          pattern: parapet-*-wheels
+          path: dist
+          merge-multiple: true
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.build_run_id }}
+
+      - name: Validate the exact wheel set
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from email.parser import BytesParser
+          from hashlib import sha256
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          platform_classes = {
+              "manylinux_2_17_x86_64": "manylinux-x86_64",
+              "manylinux_2_17_x86_64.manylinux2014_x86_64": "manylinux-x86_64",
+              "manylinux_2_17_aarch64": "manylinux-aarch64",
+              "manylinux_2_17_aarch64.manylinux2014_aarch64": "manylinux-aarch64",
+              "macosx_11_0_arm64": "macos-arm64",
+              "macosx_10_12_x86_64": "macos-x86_64",
+              "win_amd64": "windows-amd64",
+          }
+          expected_classes = {
+              "manylinux-x86_64",
+              "manylinux-aarch64",
+              "macos-arm64",
+              "macos-x86_64",
+              "windows-amd64",
+          }
+          wheels = sorted(Path("dist").glob("*.whl"))
+          if len(wheels) != 5:
+              raise SystemExit(f"expected 5 wheels, found {len(wheels)}")
+          observed = set()
+          for wheel in wheels:
+              parts = wheel.stem.split("-")
+              if len(parts) != 5:
+                  raise SystemExit(f"unexpected wheel filename: {wheel.name}")
+              distribution, version, python_tag, abi_tag, platform_tag = parts
+              if (distribution, version, python_tag, abi_tag) != (
+                  "parapet", "0.1.0", "py3", "none"
+              ):
+                  raise SystemExit(f"unexpected wheel identity: {wheel.name}")
+              platform_class = platform_classes.get(platform_tag)
+              if platform_class is None or platform_class in observed:
+                  raise SystemExit(f"unexpected or duplicate wheel platform: {wheel.name}")
+              observed.add(platform_class)
+              with ZipFile(wheel) as archive:
+                  metadata_paths = [
+                      name for name in archive.namelist()
+                      if name.endswith(".dist-info/METADATA")
+                  ]
+                  wheel_paths = [
+                      name for name in archive.namelist()
+                      if name.endswith(".dist-info/WHEEL")
+                  ]
+                  if len(metadata_paths) != 1 or len(wheel_paths) != 1:
+                      raise SystemExit(f"invalid wheel metadata layout: {wheel.name}")
+                  metadata = BytesParser().parsebytes(archive.read(metadata_paths[0]))
+                  if metadata.get("Name") != "parapet" or metadata.get("Version") != "0.1.0":
+                      raise SystemExit(f"wheel metadata identity mismatch: {wheel.name}")
+                  wheel_text = archive.read(wheel_paths[0]).decode("utf-8")
+                  if f"Tag: py3-none-{platform_tag}" not in wheel_text.splitlines():
+                      raise SystemExit(f"wheel tag mismatch: {wheel.name}")
+              print(f"{sha256(wheel.read_bytes()).hexdigest()}  {wheel.name}")
+          if observed != expected_classes:
+              raise SystemExit(
+                  f"wheel platform set mismatch: expected={sorted(expected_classes)!r} observed={sorted(observed)!r}"
+              )
+          PY
+
+      - name: Publish the reviewed wheels
+        uses: PyO3/maturin-action@v1
+        env:
+          MATURIN_PYPI_TOKEN: ${{ env.PYPI_API_TOKEN }}
+        with:
+          command: upload
+          args: dist/*.whl

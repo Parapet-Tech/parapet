@@ -1,0 +1,159 @@
+name: Publish GitHub release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Exact existing release tag (v0.1.0)
+        required: true
+        type: string
+      authorization:
+        description: Type exactly PUBLISH GITHUB RELEASE v0.1.0
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-github-release-v0.1.0
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish the complete reviewed draft release
+    runs-on: ubuntu-latest
+    environment:
+      name: github-release
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      NAMED_AUTHORIZATION: ${{ inputs.authorization }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Validate named authorization
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$RELEASE_TAG" = "v0.1.0"
+          test "$NAMED_AUTHORIZATION" = "PUBLISH GITHUB RELEASE v0.1.0"
+
+      - name: Check out the exact tag
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+
+      - name: Verify the draft release and tag binding
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag_commit=$(git rev-list -n 1 "$RELEASE_TAG")
+          release_json=$(gh release view "$RELEASE_TAG" \
+            --json tagName,targetCommitish,isDraft,isPrerelease,isImmutable,assets)
+          test "$(jq -r .tagName <<<"$release_json")" = "$RELEASE_TAG"
+          test "$(jq -r .targetCommitish <<<"$release_json")" = "$tag_commit"
+          test "$(jq -r .isDraft <<<"$release_json")" = "true"
+          test "$(jq -r .isPrerelease <<<"$release_json")" = "false"
+          test "$(jq -r .isImmutable <<<"$release_json")" = "false"
+          RELEASE_JSON="$release_json" python3 - <<'PY'
+          import json
+          import os
+
+          payload = json.loads(os.environ["RELEASE_JSON"])
+          assets = payload.get("assets")
+          if not isinstance(assets, list):
+              raise SystemExit("release response is missing assets")
+          names = [item.get("name") for item in assets]
+          if len(names) != len(set(names)):
+              raise SystemExit("duplicate release asset names")
+          for item in assets:
+              if not isinstance(item.get("size"), int) or item["size"] <= 0:
+                  raise SystemExit(f"empty release asset: {item.get('name')!r}")
+          PY
+
+      - name: Download every draft release asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir release-assets
+          gh release download "$RELEASE_TAG" --dir release-assets
+
+      - name: Verify the detached manifest and complete asset set
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_json=$(gh release view "$RELEASE_TAG" --json assets)
+          RELEASE_JSON="$release_json" python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          from pathlib import Path, PurePosixPath
+
+          root = Path("release-assets")
+          manifest_name = "parapet-v0.1.0-RELEASE_SHA256SUMS"
+          manifest = root / manifest_name
+          if not manifest.is_file() or manifest.is_symlink():
+              raise SystemExit("missing regular detached release checksum manifest")
+
+          entries = {}
+          line_re = re.compile(r"^([0-9a-f]{64})  ([^/]+)$")
+          for line in manifest.read_text(encoding="utf-8").splitlines():
+              match = line_re.fullmatch(line)
+              if match is None:
+                  raise SystemExit(f"invalid checksum line: {line!r}")
+              digest, name = match.groups()
+              if PurePosixPath(name).name != name or name == manifest_name or name in entries:
+                  raise SystemExit(f"invalid checksum entry: {name!r}")
+              entries[name] = digest
+
+          release = json.loads(os.environ["RELEASE_JSON"])
+          api_assets = release.get("assets")
+          if not isinstance(api_assets, list):
+              raise SystemExit("release response is missing assets")
+          api_sizes = {item.get("name"): item.get("size") for item in api_assets}
+          if len(api_sizes) != len(api_assets):
+              raise SystemExit("duplicate release asset names")
+
+          files = {}
+          for path in root.iterdir():
+              if path.is_symlink() or not path.is_file():
+                  raise SystemExit(f"unexpected non-regular release asset: {path.name!r}")
+              files[path.name] = path
+          if set(files) != set(api_sizes):
+              raise SystemExit("downloaded asset set does not match draft release metadata")
+          if set(entries) != set(files) - {manifest_name}:
+              raise SystemExit("checksum manifest does not cover the exact downloadable asset set")
+
+          required = {
+              "parapet-v0.1.0-macos-arm64-evaluator.tar.gz",
+              "parapet-v0.1.0-release-evidence.tar.gz",
+          }
+          if not required <= set(entries):
+              raise SystemExit(f"missing required reviewed assets: {sorted(required - set(entries))!r}")
+          wheels = [name for name in entries if re.fullmatch(r"parapet-0\.1\.0-.*\.whl", name)]
+          if len(wheels) != 5:
+              raise SystemExit(f"expected 5 release wheels, found {len(wheels)}")
+
+          for name, digest in entries.items():
+              path = files[name]
+              if path.stat().st_size != api_sizes[name]:
+                  raise SystemExit(f"release asset size mismatch: {name}")
+              observed = hashlib.sha256(path.read_bytes()).hexdigest()
+              if observed != digest:
+                  raise SystemExit(f"release asset digest mismatch: {name}")
+              print(f"{digest}  {name}")
+          PY
+
+      - name: Make the reviewed draft release public
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release edit "$RELEASE_TAG" --draft=false --latest=false --verify-tag
+          published=$(gh release view "$RELEASE_TAG" \
+            --json tagName,isDraft,isPrerelease,publishedAt)
+          test "$(jq -r .tagName <<<"$published")" = "$RELEASE_TAG"
+          test "$(jq -r .isDraft <<<"$published")" = "false"
+          test "$(jq -r .isPrerelease <<<"$published")" = "false"
+          test "$(jq -r .publishedAt <<<"$published")" != "null"

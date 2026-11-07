@@ -76,7 +76,7 @@ jobs:
           manylinux: ${{ matrix.manylinux }}
           container: ${{ matrix.container }}
           before-script-linux: yum install -y openssl-devel perl-IPC-Cmd pkgconfig
-          args: --release --out dist
+          args: --release --locked --out dist
           working-directory: parapet-py
 
       - name: Build macOS wheel
@@ -87,7 +87,7 @@ jobs:
         with:
           command: build
           target: ${{ matrix.target }}
-          args: --release --out dist
+          args: --release --locked --out dist
           working-directory: parapet-py
 
       - name: Build Windows wheel
@@ -96,7 +96,7 @@ jobs:
         with:
           command: build
           target: ${{ matrix.target }}
-          args: --release --out dist
+          args: --release --locked --out dist
           working-directory: parapet-py
 
       - name: Upload wheel artifact
@@ -105,29 +105,3 @@ jobs:
           name: parapet-${{ matrix.platform }}-wheels
           path: parapet-py/dist/*.whl
           if-no-files-found: error
-
-  publish:
-    name: Publish wheels to PyPI
-    runs-on: ubuntu-latest
-    needs: build
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    env:
-      PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
-
-      - name: Skip publish when PYPI_API_TOKEN is unavailable
-        if: env.PYPI_API_TOKEN == ''
-        run: echo "PYPI_API_TOKEN is not configured; skipping PyPI publish."
-
-      - name: Publish wheels
-        if: env.PYPI_API_TOKEN != ''
-        uses: PyO3/maturin-action@v1
-        env:
-          MATURIN_PYPI_TOKEN: ${{ env.PYPI_API_TOKEN }}
-        with:
-          command: upload
-          args: --skip-existing dist/*.whl
