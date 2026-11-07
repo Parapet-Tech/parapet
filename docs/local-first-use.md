@@ -104,9 +104,8 @@ engine. Run these setup commands from the unpacked evaluator root:
 ```bash
 . .venv/bin/activate
 EVALUATOR_ROOT=$(pwd -P)
-WORK="$EVALUATOR_ROOT/.parapet-evaluator-work"
-test ! -e "$WORK"
-mkdir "$WORK"
+WORK=$(mktemp -d /tmp/parapet.XXXXXX)
+printf 'WORK=%s\n' "$WORK"
 STATE_DIR="$WORK/state"
 EFFECT_ROOT="$WORK/effects"
 CONFIG="$EVALUATOR_ROOT/parapet/demo/v0/config_demo_v0.yaml"
@@ -114,19 +113,23 @@ RUN_JSON="$WORK/run.json"
 parapet init --state-dir "$STATE_DIR" --effect-root "$EFFECT_ROOT" --json
 ```
 
-`STATE_DIR` is disposable engine state, `EFFECT_ROOT` is the new one-run file
-effect root, `CONFIG` is packaged in the evaluator, and `RUN_JSON` is used only
-by the JSON startup variant below. Choose either the human or JSON startup
+`WORK` is a short disposable root under `/tmp`, so the derived
+`$STATE_DIR/control.sock` pathname does not grow with the evaluator's unpack
+path. `STATE_DIR` is disposable engine state, `EFFECT_ROOT` is the new one-run
+file effect root, `CONFIG` is packaged in the evaluator, and `RUN_JSON` is used
+only by the JSON startup variant below. Choose either the human or JSON startup
 variant. In both variants, **Terminal 1 is the engine terminal**: the
 long-lived `parapet run` process stays there until `parapet disable` stops it.
+
 Use Terminal 2 for the request and lifecycle commands. From the evaluator root
-in Terminal 2, activate the same environment and recreate the same variable
-values (do not rerun `mkdir` or `init`):
+in Terminal 2, activate the same environment, copy the exact `WORK=/tmp/...`
+value printed by Terminal 1, and recreate the derived values. Do not run
+`mktemp` or `init` again in Terminal 2:
 
 ```bash
 . .venv/bin/activate
 EVALUATOR_ROOT=$(pwd -P)
-WORK="$EVALUATOR_ROOT/.parapet-evaluator-work"
+WORK=/tmp/parapet.ABC123  # replace with Terminal 1's exact printed WORK value
 STATE_DIR="$WORK/state"
 EFFECT_ROOT="$WORK/effects"
 CONFIG="$EVALUATOR_ROOT/parapet/demo/v0/config_demo_v0.yaml"
@@ -181,11 +184,11 @@ parapet run --state-dir "$STATE_DIR" --config "$CONFIG" \
   --port 0 --ready-file ready --json > "$RUN_JSON"
 ```
 
-In Terminal 2, wait for readiness, then read the port. Obtain the run ID from
-the exact sentinel helper in
+In Terminal 2, wait for readiness, then read the port. Obtain the run ID and
+validate the later released-reader state with the exact helpers in
 [Neutral Working Directory, Asset Export, and Witness Helpers](../parapet/demo/v0/README.md#1-neutral-working-directory-asset-export-and-witness-helpers).
-Copy that section's `parapet_run_id` function without weakening its checks,
-then call it as shown:
+Copy that section's `parapet_run_id` and `parapet_released` functions without
+weakening their checks, then discover the run ID as shown:
 
 ```bash
 until [ -s "$STATE_DIR/ready" ]; do sleep 0.1; done
@@ -226,8 +229,10 @@ parapet inspect --state-dir "$STATE_DIR" --run-id "$RUN_ID" --json
 
 # Optional pair: release retained evidence, then confirm released reader state.
 parapet evidence release --state-dir "$STATE_DIR" --run-id "$RUN_ID" --json
-parapet inspect --state-dir "$STATE_DIR" --run-id "$RUN_ID" --json || \
-  test "$?" -eq 4
+POST_RELEASE_CODE=0
+parapet inspect --state-dir "$STATE_DIR" --run-id "$RUN_ID" --json \
+  > "$WORK/post-release.json" || POST_RELEASE_CODE=$?
+parapet_released evaluator "$POST_RELEASE_CODE" "$WORK/post-release.json"
 ```
 
 For the JSON variant, now confirm that the terminal run ID matches the value

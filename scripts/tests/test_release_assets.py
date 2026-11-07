@@ -334,6 +334,10 @@ class ReleaseAssetTests(unittest.TestCase):
         self.assertIn(sentinel_link, guide)
         self.assertIn("Terminal 1 is the engine terminal", guide)
         self.assertIn("status: ready", guide)
+        self.assertIn("WORK=$(mktemp -d /tmp/parapet.XXXXXX)", guide)
+        self.assertNotIn('WORK="$EVALUATOR_ROOT/.parapet-evaluator-work"', guide)
+        documented_socket = "/tmp/parapet.XXXXXX/state/control.sock"
+        self.assertLessEqual(len(documented_socket.encode("utf-8")), 103)
         self.assertIn("PORT=$(cat \"$STATE_DIR/ready\")", guide)
         self.assertIn("RUN_ID=$(parapet_run_id \"$EFFECT_ROOT\")", guide)
         self.assertIn(
@@ -360,7 +364,10 @@ class ReleaseAssetTests(unittest.TestCase):
             'parapet inspect --state-dir "$STATE_DIR" --run-id "$RUN_ID" --json',
             'parapet evidence release --state-dir "$STATE_DIR" '
             '--run-id "$RUN_ID" --json',
+            "POST_RELEASE_CODE=0",
             'parapet inspect --state-dir "$STATE_DIR" --run-id "$RUN_ID" --json',
+            'parapet_released evaluator "$POST_RELEASE_CODE" '
+            '"$WORK/post-release.json"',
         )
         position = lifecycle
         for command in ordered_commands:
@@ -371,6 +378,8 @@ class ReleaseAssetTests(unittest.TestCase):
             'test -z "$(find "$EFFECT_ROOT" -mindepth 1 -print -quit)"', guide
         )
         self.assertIn('rm -rf "$WORK"', guide)
+        self.assertIn('|| POST_RELEASE_CODE=$?', guide)
+        self.assertNotIn('|| test "$?" -eq 4', guide)
 
 
 if __name__ == "__main__":
