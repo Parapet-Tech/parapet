@@ -136,6 +136,12 @@ CONFIG="$EVALUATOR_ROOT/parapet/demo/v0/config_demo_v0.yaml"
 RUN_JSON="$WORK/run.json"
 ```
 
+Both startup variants use the packaged witness helpers during the shared
+lifecycle below. From
+[Neutral Working Directory, Asset Export, and Witness Helpers](../parapet/demo/v0/README.md#1-neutral-working-directory-asset-export-and-witness-helpers),
+copy the `parapet_run_id` and `parapet_released` functions into Terminal 2
+without weakening their checks before choosing either startup variant.
+
 ### Human startup and discovery
 
 In Terminal 1, omit `--json`. Readiness is the `status: ready` block printed
@@ -184,11 +190,8 @@ parapet run --state-dir "$STATE_DIR" --config "$CONFIG" \
   --port 0 --ready-file ready --json > "$RUN_JSON"
 ```
 
-In Terminal 2, wait for readiness, then read the port. Obtain the run ID and
-validate the later released-reader state with the exact helpers in
-[Neutral Working Directory, Asset Export, and Witness Helpers](../parapet/demo/v0/README.md#1-neutral-working-directory-asset-export-and-witness-helpers).
-Copy that section's `parapet_run_id` and `parapet_released` functions without
-weakening their checks, then discover the run ID as shown:
+In Terminal 2, wait for readiness, then read the port. Discover the run ID with
+the copied `parapet_run_id` helper as shown:
 
 ```bash
 until [ -s "$STATE_DIR/ready" ]; do sleep 0.1; done

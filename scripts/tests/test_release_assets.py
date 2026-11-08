@@ -346,6 +346,11 @@ class ReleaseAssetTests(unittest.TestCase):
         self.assertIn('assert value["run_id"] == sys.argv[2]', guide)
 
         setup = guide.index('STATE_DIR="$WORK/state"')
+        helper_instruction = guide.index(
+            "copy the `parapet_run_id` and `parapet_released` functions"
+        )
+        human_heading = guide.index("### Human startup and discovery")
+        json_heading = guide.index("### JSON startup and discovery")
         human_discovery = guide.index("PORT=49152")
         json_discovery = guide.index('RUN_ID=$(parapet_run_id "$EFFECT_ROOT")')
         request = guide.index('curl -fsS "http://127.0.0.1:$PORT')
@@ -353,6 +358,8 @@ class ReleaseAssetTests(unittest.TestCase):
             'parapet inspect --state-dir "$STATE_DIR" --run-id "$RUN_ID" --json'
         )
         self.assertLess(setup, human_discovery)
+        self.assertLess(helper_instruction, human_heading)
+        self.assertLess(human_heading, json_heading)
         self.assertLess(human_discovery, request)
         self.assertLess(json_discovery, request)
         self.assertLess(request, lifecycle)
@@ -373,6 +380,11 @@ class ReleaseAssetTests(unittest.TestCase):
         for command in ordered_commands:
             position = guide.index(command, position)
             position += len(command)
+        released_call = guide.index(
+            'parapet_released evaluator "$POST_RELEASE_CODE" '
+            '"$WORK/post-release.json"'
+        )
+        self.assertLess(helper_instruction, released_call)
 
         self.assertIn(
             'test -z "$(find "$EFFECT_ROOT" -mindepth 1 -print -quit)"', guide
