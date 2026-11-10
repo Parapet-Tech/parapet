@@ -127,6 +127,68 @@ class LandingScriptTests(unittest.TestCase):
         self.assertIn("Test publication controls", workflow)
 
 
+class MacosArm64RecoveryWorkflowTests(unittest.TestCase):
+    def setUp(self):
+        self.workflow = (
+            ROOT
+            / ".github"
+            / "workflows"
+            / "v0.1.0-macos-arm64-recovery.yml"
+        ).read_text()
+
+    def test_recovery_is_manual_single_platform_and_read_only(self):
+        self.assertIn("workflow_dispatch:", self.workflow)
+        self.assertNotIn("\n  push:", self.workflow)
+        self.assertNotIn("\n  pull_request:", self.workflow)
+        self.assertEqual(self.workflow.count("runs-on:"), 1)
+        self.assertIn("runs-on: macos-15", self.workflow)
+        self.assertIn("contents: read", self.workflow)
+        self.assertNotIn("contents: write", self.workflow)
+        self.assertNotIn("secrets.", self.workflow)
+        self.assertNotIn("maturin upload", self.workflow)
+        self.assertNotIn("gh release", self.workflow)
+
+    def test_recovery_binds_the_exact_immutable_source(self):
+        for value in (
+            "5d1e2b2c0dfa07deaf38818a98a901401a5f5993",
+            "602738d7fabfe05a167cc010fd18975df3f32026",
+            "e201b80ed27d3b539bcb47ff2f548f87e16b039f",
+            "0e5529d84e707f440372721394d977eda374a7a18010d2170a45036d5035d1ec",
+            "refs/tags/$RELEASE_TAG^{tag}",
+            "refs/tags/$RELEASE_TAG^{}",
+            "git archive --format=tar",
+        ):
+            self.assertIn(value, self.workflow)
+
+    def test_recovery_preserves_the_reviewed_build_contract(self):
+        for value in (
+            "BUILD MACOS ARM64 v0.1.0",
+            "aarch64-apple-darwin",
+            'MACOSX_DEPLOYMENT_TARGET: "11.0"',
+            "maturin-version: v1.16.0",
+            '"maturin": "maturin 1.16.0"',
+            "--release --locked --out dist",
+            "parapet-0.1.0-py3-none-macosx_11_0_arm64.whl",
+            "parapet-v0.1.0-macos-arm64-recovery-wheel",
+            "parapet-v0.1.0-macos-arm64-recovery-provenance",
+            '"workflow_run_id": "42813653184"',
+            '"cancelled_job_id": "129821127293"',
+        ):
+            self.assertIn(value, self.workflow)
+        self.assertNotIn('["maturin", "--version"]', self.workflow)
+
+    def test_recovery_actions_are_pinned_to_observed_commits(self):
+        action_pins = (
+            "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+            "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065",
+            "dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec",
+            "PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b",
+            "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+        )
+        for pin in action_pins:
+            self.assertIn(pin, self.workflow)
+
+
 class LanderHarnessTests(unittest.TestCase):
     def write_executable(self, path: Path, body: str) -> None:
         path.write_text(f"#!{sys.executable}\n{body}")

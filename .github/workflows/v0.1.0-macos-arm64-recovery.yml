@@ -1,0 +1,209 @@
+name: v0.1.0 macOS arm64 recovery
+
+on:
+  workflow_dispatch:
+    inputs:
+      authorization:
+        description: Type exactly BUILD MACOS ARM64 v0.1.0
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: v0.1.0-macos-arm64-recovery
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build immutable v0.1.0 macOS arm64 wheel
+    runs-on: macos-15
+    env:
+      RELEASE_TAG: v0.1.0
+      EXPECTED_TAG_OBJECT: 5d1e2b2c0dfa07deaf38818a98a901401a5f5993
+      EXPECTED_COMMIT: 602738d7fabfe05a167cc010fd18975df3f32026
+      EXPECTED_TREE: e201b80ed27d3b539bcb47ff2f548f87e16b039f
+      EXPECTED_ARCHIVE_SHA256: 0e5529d84e707f440372721394d977eda374a7a18010d2170a45036d5035d1ec
+      NAMED_AUTHORIZATION: ${{ inputs.authorization }}
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - name: Validate manual recovery authority
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_EVENT_NAME" = "workflow_dispatch"
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$NAMED_AUTHORIZATION" = "BUILD MACOS ARM64 v0.1.0"
+
+      - name: Check out the exact reviewed commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 observed in run 42813653184
+        with:
+          ref: 602738d7fabfe05a167cc010fd18975df3f32026
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Verify immutable tag and source identities
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --force --no-tags origin \
+            "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          test "$(git cat-file -t "refs/tags/$RELEASE_TAG")" = "tag"
+          test "$(git rev-parse "refs/tags/$RELEASE_TAG^{tag}")" = \
+            "$EXPECTED_TAG_OBJECT"
+          test "$(git rev-parse "refs/tags/$RELEASE_TAG^{}")" = \
+            "$EXPECTED_COMMIT"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_COMMIT"
+          test "$(git rev-parse "$EXPECTED_COMMIT^{tree}")" = "$EXPECTED_TREE"
+          observed_archive_sha256=$( \
+            git archive --format=tar "$EXPECTED_COMMIT" | shasum -a 256 | awk '{print $1}' \
+          )
+          test "$observed_archive_sha256" = "$EXPECTED_ARCHIVE_SHA256"
+          test -z "$(git status --porcelain)"
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5 observed in run 42813653184
+        with:
+          python-version: "3.13"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable observed in run 42813653184
+        with:
+          toolchain: 1.99.1
+          targets: aarch64-apple-darwin
+
+      - name: Build the missing macOS arm64 wheel
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1 observed in run 42813653184
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+        with:
+          command: build
+          maturin-version: v1.16.0
+          target: aarch64-apple-darwin
+          args: --release --locked --out dist
+          working-directory: parapet-py
+
+      - name: Validate wheel and write provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from email.parser import BytesParser
+          from hashlib import sha256
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          from zipfile import ZipFile
+
+          wheel_dir = Path("parapet-py/dist")
+          wheels = sorted(wheel_dir.glob("*.whl"))
+          if len(wheels) != 1:
+              raise SystemExit(f"expected exactly one wheel, found {len(wheels)}")
+          wheel = wheels[0]
+          expected_name = "parapet-0.1.0-py3-none-macosx_11_0_arm64.whl"
+          if wheel.name != expected_name:
+              raise SystemExit(
+                  f"unexpected wheel filename: expected={expected_name!r} observed={wheel.name!r}"
+              )
+
+          with ZipFile(wheel) as archive:
+              metadata_paths = [
+                  name for name in archive.namelist()
+                  if name.endswith(".dist-info/METADATA")
+              ]
+              wheel_paths = [
+                  name for name in archive.namelist()
+                  if name.endswith(".dist-info/WHEEL")
+              ]
+              if len(metadata_paths) != 1 or len(wheel_paths) != 1:
+                  raise SystemExit("invalid wheel metadata layout")
+              metadata = BytesParser().parsebytes(archive.read(metadata_paths[0]))
+              if metadata.get("Name") != "parapet" or metadata.get("Version") != "0.1.0":
+                  raise SystemExit("wheel metadata identity mismatch")
+              wheel_lines = archive.read(wheel_paths[0]).decode("utf-8").splitlines()
+              if "Tag: py3-none-macosx_11_0_arm64" not in wheel_lines:
+                  raise SystemExit("wheel platform tag mismatch")
+
+          wheel_sha256 = sha256(wheel.read_bytes()).hexdigest()
+          receipt_dir = Path("recovery-provenance")
+          receipt_dir.mkdir()
+          rustc = subprocess.run(
+              ["rustc", "--version", "--verbose"],
+              check=True,
+              capture_output=True,
+              text=True,
+          ).stdout
+          receipt = {
+              "schema": "parapet-v0.1.0-macos-arm64-recovery-v1",
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "workflow": os.environ["GITHUB_WORKFLOW"],
+              "workflow_ref": os.environ["GITHUB_WORKFLOW_REF"],
+              "workflow_sha": os.environ["GITHUB_SHA"],
+              "run_id": os.environ["GITHUB_RUN_ID"],
+              "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "job": os.environ["GITHUB_JOB"],
+              "runner_os": os.environ["RUNNER_OS"],
+              "runner_arch": os.environ["RUNNER_ARCH"],
+              "runner_image_os": os.environ.get("ImageOS", ""),
+              "runner_image_version": os.environ.get("ImageVersion", ""),
+              "recovery_of": {
+                  "workflow_run_id": "42813653184",
+                  "cancelled_job_id": "129821127293",
+                  "reason": "macos-14-arm64-us-default runner configuration retired",
+              },
+              "source": {
+                  "tag": os.environ["RELEASE_TAG"],
+                  "tag_object": os.environ["EXPECTED_TAG_OBJECT"],
+                  "commit": os.environ["EXPECTED_COMMIT"],
+                  "tree": os.environ["EXPECTED_TREE"],
+                  "archive_sha256": os.environ["EXPECTED_ARCHIVE_SHA256"],
+              },
+              "build": {
+                  "target": "aarch64-apple-darwin",
+                  "macosx_deployment_target": os.environ["MACOSX_DEPLOYMENT_TARGET"],
+                  "rustc": rustc,
+                  "maturin": "maturin 1.16.0",
+              },
+              "wheel": {
+                  "filename": wheel.name,
+                  "bytes": wheel.stat().st_size,
+                  "sha256": wheel_sha256,
+                  "tag": "py3-none-macosx_11_0_arm64",
+              },
+              "action_pins": {
+                  "checkout": "11d5960a326750d5838078e36cf38b85af677262",
+                  "setup_python": "a26af69be951a213d495a4c3e4e4022e16d87065",
+                  "rust_toolchain": "b725eda525362e7cf34af9a7243cac1e3f01a7ec",
+                  "maturin_action": "e83996d129638aa358a18fbd1dfb82f0b0fb5d3b",
+                  "upload_artifact": "ea165f8d65b6e75b540449e92b4886f43607fa02",
+              },
+          }
+          receipt_path = receipt_dir / "RECOVERY_PROVENANCE.json"
+          receipt_path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
+          (receipt_dir / "SHA256SUMS").write_text(
+              f"{wheel_sha256}  {wheel.name}\n"
+              f"{sha256(receipt_path.read_bytes()).hexdigest()}  {receipt_path.name}\n"
+          )
+          print(f"{wheel_sha256}  {wheel}")
+          print(f"{wheel.stat().st_size} bytes")
+          PY
+
+      - name: Upload recovered wheel
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 observed in run 42813653184
+        with:
+          name: parapet-v0.1.0-macos-arm64-recovery-wheel
+          path: parapet-py/dist/parapet-0.1.0-py3-none-macosx_11_0_arm64.whl
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 90
+
+      - name: Upload recovery provenance
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 observed in run 42813653184
+        with:
+          name: parapet-v0.1.0-macos-arm64-recovery-provenance
+          path: recovery-provenance/
+          if-no-files-found: error
+          retention-days: 90
