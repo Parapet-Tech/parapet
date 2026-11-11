@@ -215,8 +215,8 @@ jobs:
           if len(files) != len(list(root.iterdir())):
               raise SystemExit("non-regular release asset")
           expected_wheels = {
-              "parapet-0.2.0-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
-              "parapet-0.2.0-py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
+              "parapet-0.2.0-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+              "parapet-0.2.0-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl",
               "parapet-0.2.0-py3-none-macosx_11_0_arm64.whl",
               "parapet-0.2.0-py3-none-macosx_10_12_x86_64.whl",
               "parapet-0.2.0-py3-none-win_amd64.whl",
@@ -242,6 +242,18 @@ jobs:
                       parsed = BytesParser().parsebytes(archive.read(meta[0]))
                       if parsed.get("Name") != "parapet" or parsed.get("Version") != "0.2.0":
                           raise SystemExit("wheel metadata identity mismatch")
+                      wheel_meta = [n for n in archive.namelist() if n.endswith(".dist-info/WHEEL")]
+                      if len(wheel_meta) != 1:
+                          raise SystemExit("invalid wheel metadata layout")
+                      platform_tags = Path(name).stem.split("-")[4].split(".")
+                      wheel_tags = [
+                          line.removeprefix("Tag: ")
+                          for line in archive.read(wheel_meta[0]).decode().splitlines()
+                          if line.startswith("Tag: ")
+                      ]
+                      expected_wheel_tags = {f"py3-none-{tag}" for tag in platform_tags}
+                      if len(wheel_tags) != len(set(wheel_tags)) or set(wheel_tags) != expected_wheel_tags:
+                          raise SystemExit(f"wheel tag mismatch: {name}")
                   wheel_lines.append(f"{observed}  {name}")
           wheel_set = sha256(("\n".join(sorted(wheel_lines)) + "\n").encode()).hexdigest()
           if not compare_digest(wheel_set, os.environ["EXPECTED_WHEEL_SET_SHA256"]):

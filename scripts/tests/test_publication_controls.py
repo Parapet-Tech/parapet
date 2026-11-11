@@ -181,6 +181,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
         )
 
     def write_wheel(self, path: Path, platform_tag: str) -> None:
+        tags = platform_tag.split(".")
         with zipfile.ZipFile(path, "w") as archive:
             archive.writestr(
                 "parapet-0.2.0.dist-info/METADATA",
@@ -188,8 +189,23 @@ class ReleaseWorkflowTests(unittest.TestCase):
             )
             archive.writestr(
                 "parapet-0.2.0.dist-info/WHEEL",
-                f"Wheel-Version: 1.0\nTag: py3-none-{platform_tag}\n",
+                "Wheel-Version: 1.0\n"
+                + "".join(f"Tag: py3-none-{tag}\n" for tag in reversed(tags)),
             )
+
+    def wheel_platforms(self, *, alias_first: bool) -> list[str]:
+        linux_tags = (
+            ["manylinux_2_17_x86_64", "manylinux2014_x86_64"],
+            ["manylinux_2_17_aarch64", "manylinux2014_aarch64"],
+        )
+        platforms = [
+            ".".join(reversed(tags) if alias_first else tags)
+            for tags in linux_tags
+        ]
+        platforms.extend(
+            ["macosx_11_0_arm64", "macosx_10_12_x86_64", "win_amd64"]
+        )
+        return platforms
 
     def wheel_set_sha256(self, paths: list[Path]) -> str:
         lines = [
@@ -505,6 +521,55 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("windows-2025", workflow)
         self.assertIn("image_version=${ImageVersion:-unavailable}", workflow)
 
+    def test_wheel_build_validators_accept_expanded_manylinux_tag_sets(self):
+        blocks = self.python_blocks(self.workflow("py-sdk-wheels.yml"))
+        self.assertEqual(len(blocks), 2)
+        for alias_first in (False, True):
+            for arch in ("x86_64", "aarch64"):
+                with self.subTest(
+                    alias_first=alias_first, validator="per-wheel", arch=arch
+                ):
+                    with tempfile.TemporaryDirectory() as temp_dir:
+                        root = Path(temp_dir)
+                        dist = root / "parapet-py" / "dist"
+                        dist.mkdir(parents=True)
+                        tags = [f"manylinux_2_17_{arch}", f"manylinux2014_{arch}"]
+                        if alias_first:
+                            tags.reverse()
+                        tag = ".".join(tags)
+                        self.write_wheel(
+                            dist / f"parapet-0.2.0-py3-none-{tag}.whl", tag
+                        )
+                        result = self.run_python_block(
+                            blocks[0],
+                            cwd=root,
+                            env={
+                                "EXPECTED_VERSION": "0.2.0",
+                                "EXPECTED_PLATFORM": f"manylinux_2_17_{arch}",
+                            },
+                        )
+                        self.assertEqual(
+                            result.returncode, 0, result.stdout + result.stderr
+                        )
+
+            with self.subTest(alias_first=alias_first, validator="aggregate"):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    root = Path(temp_dir)
+                    dist = root / "dist"
+                    dist.mkdir()
+                    for tag in self.wheel_platforms(alias_first=alias_first):
+                        self.write_wheel(
+                            dist / f"parapet-0.2.0-py3-none-{tag}.whl", tag
+                        )
+                    result = self.run_python_block(
+                        blocks[1],
+                        cwd=root,
+                        env={"EXPECTED_VERSION": "0.2.0"},
+                    )
+                    self.assertEqual(
+                        result.returncode, 0, result.stdout + result.stderr
+                    )
+
     def test_publishers_bind_control_numeric_actors_and_config(self):
         pypi = self.workflow("py-sdk-publish.yml")
         github = self.workflow("github-release-publish.yml")
@@ -575,28 +640,31 @@ class ReleaseWorkflowTests(unittest.TestCase):
                 env={"ARTIFACTS_JSON": json.dumps({"artifacts": payload["artifacts"][:-1]})},
             )
             self.assertNotEqual(missing.returncode, 0)
-            dist = root / "dist"
-            dist.mkdir()
-            tags = [
-                "manylinux_2_17_x86_64",
-                "manylinux_2_17_aarch64",
-                "macosx_11_0_arm64",
-                "macosx_10_12_x86_64",
-                "win_amd64",
-            ]
-            wheels = []
-            for tag in tags:
-                wheel = dist / f"parapet-0.2.0-py3-none-{tag}.whl"
-                self.write_wheel(wheel, tag)
-                wheels.append(wheel)
-            env = {"EXPECTED_WHEEL_SET_SHA256": self.wheel_set_sha256(wheels)}
-            valid_wheels = self.run_python_block(blocks[1], cwd=root, env=env)
-            self.assertEqual(
-                valid_wheels.returncode, 0, valid_wheels.stdout + valid_wheels.stderr
-            )
-            (dist / "unexpected.txt").write_text("x")
-            invalid = self.run_python_block(blocks[1], cwd=root, env=env)
-            self.assertNotEqual(invalid.returncode, 0)
+        for alias_first in (False, True):
+            with (
+                self.subTest(alias_first=alias_first),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                dist = root / "dist"
+                dist.mkdir()
+                wheels = []
+                for tag in self.wheel_platforms(alias_first=alias_first):
+                    wheel = dist / f"parapet-0.2.0-py3-none-{tag}.whl"
+                    self.write_wheel(wheel, tag)
+                    wheels.append(wheel)
+                env = {
+                    "EXPECTED_WHEEL_SET_SHA256": self.wheel_set_sha256(wheels)
+                }
+                valid_wheels = self.run_python_block(blocks[1], cwd=root, env=env)
+                self.assertEqual(
+                    valid_wheels.returncode,
+                    0,
+                    valid_wheels.stdout + valid_wheels.stderr,
+                )
+                (dist / "unexpected.txt").write_text("x")
+                invalid = self.run_python_block(blocks[1], cwd=root, env=env)
+                self.assertNotEqual(invalid.returncode, 0)
 
     def test_github_asset_validator_accepts_exact_manifest(self):
         blocks = self.python_blocks(self.workflow("github-release-publish.yml"))
@@ -609,15 +677,8 @@ class ReleaseWorkflowTests(unittest.TestCase):
                 "parapet-v0.2.0-macos-arm64-evaluator.tar.gz",
                 "parapet-v0.2.0-release-evidence.tar.gz",
             ]
-            tags = [
-                "manylinux_2_17_x86_64.manylinux2014_x86_64",
-                "manylinux_2_17_aarch64.manylinux2014_aarch64",
-                "macosx_11_0_arm64",
-                "macosx_10_12_x86_64",
-                "win_amd64",
-            ]
             wheels = []
-            for tag in tags:
+            for tag in self.wheel_platforms(alias_first=True):
                 wheel = assets / f"parapet-0.2.0-py3-none-{tag}.whl"
                 self.write_wheel(wheel, tag)
                 wheels.append(wheel)
