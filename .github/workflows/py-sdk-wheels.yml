@@ -3,7 +3,7 @@ name: Python SDK Wheels
 on:
   push:
     branches: [main]
-    tags: ["v*"]
+    tags: ["v0.2.0"]
     paths:
       - "parapet-py/**"
       - "parapet/**"
@@ -13,27 +13,134 @@ on:
       - "parapet-py/**"
       - "parapet/**"
       - ".github/workflows/py-sdk-wheels.yml"
+  workflow_dispatch:
+    inputs:
+      authorization:
+        description: Type exactly BUILD PRETAG v0.2.0
+        required: true
+        type: string
+      candidate_commit:
+        description: Reviewed release/v0.2.0 commit
+        required: true
+        type: string
+      candidate_tree:
+        description: Reviewed candidate tree
+        required: true
+        type: string
+      candidate_archive_sha256:
+        description: SHA-256 of canonical git archive tar
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: py-sdk-wheels-${{ github.run_id }}
+  cancel-in-progress: false
 
 jobs:
+  identity:
+    name: Bind source and dispatch identity
+    runs-on: ubuntu-24.04
+    outputs:
+      checkout_ref: ${{ steps.bind.outputs.checkout_ref }}
+      expected_version: ${{ steps.bind.outputs.expected_version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - id: bind
+        name: Validate source identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          ACTOR: ${{ github.actor }}
+          ACTOR_ID: ${{ github.actor_id }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          SENDER_LOGIN: ${{ github.event.sender.login }}
+          SENDER_ID: ${{ github.event.sender.id }}
+          AUTHORIZATION: ${{ inputs.authorization }}
+          CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
+          CANDIDATE_TREE: ${{ inputs.candidate_tree }}
+          CANDIDATE_ARCHIVE_SHA256: ${{ inputs.candidate_archive_sha256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$RUN_ATTEMPT" = "1"
+          case "$EVENT_NAME" in
+            workflow_dispatch)
+              test "$GITHUB_REF" = "refs/heads/main"
+              test "$AUTHORIZATION" = "BUILD PRETAG v0.2.0"
+              test "$ACTOR" = "parapet-worker"
+              test "$ACTOR_ID" = "319884068"
+              test "$TRIGGERING_ACTOR" = "parapet-worker"
+              test "$SENDER_LOGIN" = "parapet-worker"
+              test "$SENDER_ID" = "319884068"
+              test "$GITHUB_WORKFLOW_SHA" = "$GITHUB_SHA"
+              [[ "$CANDIDATE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+              [[ "$CANDIDATE_TREE" =~ ^[0-9a-f]{40}$ ]]
+              [[ "$CANDIDATE_ARCHIVE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+              test "$(gh api users/parapet-worker --jq '.login+":"+(.id|tostring)+":"+.type')" = "parapet-worker:319884068:User"
+              test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)" = "$GITHUB_SHA"
+              release_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/release/v0.2.0" --jq .object.sha)
+              test "$release_sha" = "$CANDIDATE_COMMIT"
+              test "$(gh api "repos/$GITHUB_REPOSITORY/git/commits/$CANDIDATE_COMMIT" --jq .tree.sha)" = "$CANDIDATE_TREE"
+              git fetch --no-tags origin "+refs/heads/release/v0.2.0:refs/remotes/origin/release/v0.2.0"
+              test "$(git rev-parse refs/remotes/origin/release/v0.2.0)" = "$CANDIDATE_COMMIT"
+              test "$(git rev-parse "$CANDIDATE_COMMIT^{tree}")" = "$CANDIDATE_TREE"
+              test "$(git archive --format=tar "$CANDIDATE_COMMIT" | sha256sum | awk '{print $1}')" = "$CANDIDATE_ARCHIVE_SHA256"
+              echo "checkout_ref=$CANDIDATE_COMMIT" >> "$GITHUB_OUTPUT"
+              echo "expected_version=0.2.0" >> "$GITHUB_OUTPUT"
+              ;;
+            push)
+              if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+                test "$GITHUB_REF" = "refs/tags/v0.2.0"
+                test "$ACTOR" = "parapet-worker"
+                test "$ACTOR_ID" = "319884068"
+                test "$TRIGGERING_ACTOR" = "parapet-worker"
+                test "$SENDER_LOGIN" = "parapet-worker"
+                test "$SENDER_ID" = "319884068"
+                test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+                test "$(git rev-parse "refs/tags/v0.2.0^{}")" = "$GITHUB_SHA"
+                echo "expected_version=0.2.0" >> "$GITHUB_OUTPUT"
+              else
+                version=$(python3 -c 'import tomllib; print(tomllib.load(open("parapet-py/pyproject.toml","rb"))["project"]["version"])')
+                echo "expected_version=$version" >> "$GITHUB_OUTPUT"
+              fi
+              echo "checkout_ref=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+              ;;
+            pull_request)
+              version=$(python3 -c 'import tomllib; print(tomllib.load(open("parapet-py/pyproject.toml","rb"))["project"]["version"])')
+              echo "checkout_ref=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+              echo "expected_version=$version" >> "$GITHUB_OUTPUT"
+              ;;
+            *) exit 1 ;;
+          esac
+
   build:
     name: Build ${{ matrix.platform }}
+    needs: identity
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - platform: manylinux_2_17_x86_64
-            os: ubuntu-latest
+            os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             manylinux: "2_17"
-            container: quay.io/pypa/manylinux2014_x86_64:latest
+            container: quay.io/pypa/manylinux2014_x86_64@sha256:62eeff30ef134a85ec0f97109e008a319b0315ca5e8a6d754ee771556c02622a
           - platform: manylinux_2_17_aarch64
             os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             manylinux: "2_17"
-            container: quay.io/pypa/manylinux2014_aarch64:latest
+            container: quay.io/pypa/manylinux2014_aarch64@sha256:101d2292840109c9d329fcfcd7b89b46f59e19ca23cbfdcf059fb389994665fc
           - platform: macosx_11_0_arm64
-            os: macos-14
+            os: macos-15
             target: aarch64-apple-darwin
             macosx_deployment_target: "11.0"
           - platform: macosx_10_12_x86_64
@@ -41,93 +148,204 @@ jobs:
             target: x86_64-apple-darwin
             macosx_deployment_target: "10.12"
           - platform: win_amd64
-            os: windows-latest
+            os: windows-2025
             target: x86_64-pc-windows-msvc
-
     steps:
-      - uses: actions/checkout@v4
+      - name: Record runner image identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "platform=${{ matrix.platform }}"
+            echo "runner_os=$RUNNER_OS runner_arch=$RUNNER_ARCH"
+            echo "image_os=${ImageOS:-unavailable} image_version=${ImageVersion:-unavailable}"
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.identity.outputs.checkout_ref }}
+          fetch-depth: 0
+
+      - name: Prove checked-out source and version
+        env:
+          EXPECTED_VERSION: ${{ needs.identity.outputs.expected_version }}
+          EXPECTED_COMMIT: ${{ needs.identity.outputs.checkout_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_COMMIT"
+          test -z "$(git status --porcelain)"
+          test "$(python3 -c 'import tomllib; print(tomllib.load(open("parapet-py/pyproject.toml","rb"))["project"]["version"])')" = "$EXPECTED_VERSION"
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.13"
 
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Set up Rust 1.99.1
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
         with:
+          toolchain: 1.99.1
           targets: ${{ matrix.target }}
 
-      - name: Pre-pull manylinux image
-        if: startsWith(matrix.platform, 'manylinux')
+      - name: Record frozen Rust toolchain
         shell: bash
-        run: |
-          for attempt in 1 2 3; do
-            docker pull "${{ matrix.container }}" && exit 0
-            sleep $((attempt * 20))
-          done
-          docker pull "${{ matrix.container }}"
+        run: rustc -V
 
       - name: Build manylinux wheel
         if: startsWith(matrix.platform, 'manylinux')
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b
         with:
           command: build
+          maturin-version: v1.16.0
+          rust-toolchain: 1.99.1
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
           container: ${{ matrix.container }}
           before-script-linux: yum install -y openssl-devel perl-IPC-Cmd pkgconfig
-          args: --release --out dist
+          args: --release --locked --out dist
           working-directory: parapet-py
 
       - name: Build macOS wheel
         if: startsWith(matrix.platform, 'macosx')
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b
         env:
           MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macosx_deployment_target }}
         with:
           command: build
+          maturin-version: v1.16.0
+          rust-toolchain: 1.99.1
           target: ${{ matrix.target }}
-          args: --release --out dist
+          args: --release --locked --out dist
           working-directory: parapet-py
 
       - name: Build Windows wheel
         if: matrix.platform == 'win_amd64'
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b
         with:
           command: build
+          maturin-version: v1.16.0
+          rust-toolchain: 1.99.1
           target: ${{ matrix.target }}
-          args: --release --out dist
+          args: --release --locked --out dist
           working-directory: parapet-py
 
+      - name: Validate the single platform wheel
+        env:
+          EXPECTED_VERSION: ${{ needs.identity.outputs.expected_version }}
+          EXPECTED_PLATFORM: ${{ matrix.platform }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from email.parser import BytesParser
+          import os
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          root = Path("parapet-py/dist")
+          wheels = list(root.iterdir()) if root.is_dir() and not root.is_symlink() else []
+          if len(wheels) != 1 or wheels[0].is_symlink() or not wheels[0].is_file():
+              raise SystemExit(f"expected exactly one regular wheel, observed {wheels!r}")
+          wheel = wheels[0]
+          parts = wheel.stem.split("-")
+          if len(parts) != 5:
+              raise SystemExit(f"unexpected wheel filename: {wheel.name}")
+          distribution, version, python_tag, abi_tag, platform_tag = parts
+          expected_platform = os.environ["EXPECTED_PLATFORM"]
+          allowed = {expected_platform}
+          if expected_platform == "manylinux_2_17_x86_64":
+              allowed.add("manylinux_2_17_x86_64.manylinux2014_x86_64")
+          if expected_platform == "manylinux_2_17_aarch64":
+              allowed.add("manylinux_2_17_aarch64.manylinux2014_aarch64")
+          if (distribution, version, python_tag, abi_tag) != (
+              "parapet", os.environ["EXPECTED_VERSION"], "py3", "none"
+          ) or platform_tag not in allowed:
+              raise SystemExit(f"unexpected wheel identity: {wheel.name}")
+          if wheel.stat().st_size <= 0:
+              raise SystemExit("empty wheel")
+          with ZipFile(wheel) as archive:
+              bad = archive.testzip()
+              if bad is not None:
+                  raise SystemExit(f"wheel CRC failure: {bad}")
+              metadata = [n for n in archive.namelist() if n.endswith(".dist-info/METADATA")]
+              wheel_meta = [n for n in archive.namelist() if n.endswith(".dist-info/WHEEL")]
+              if len(metadata) != 1 or len(wheel_meta) != 1:
+                  raise SystemExit("invalid wheel metadata layout")
+              parsed = BytesParser().parsebytes(archive.read(metadata[0]))
+              if parsed.get("Name") != "parapet" or parsed.get("Version") != version:
+                  raise SystemExit("wheel metadata identity mismatch")
+              if f"Tag: py3-none-{platform_tag}" not in archive.read(wheel_meta[0]).decode().splitlines():
+                  raise SystemExit("wheel tag mismatch")
+          PY
+
       - name: Upload wheel artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: parapet-${{ matrix.platform }}-wheels
           path: parapet-py/dist/*.whl
           if-no-files-found: error
+          retention-days: 30
 
-  publish:
-    name: Publish wheels to PyPI
-    runs-on: ubuntu-latest
-    needs: build
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    env:
-      PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+  aggregate:
+    name: Verify complete five-wheel set
+    needs: [identity, build]
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
+          pattern: parapet-*-wheels
           path: dist
           merge-multiple: true
 
-      - name: Skip publish when PYPI_API_TOKEN is unavailable
-        if: env.PYPI_API_TOKEN == ''
-        run: echo "PYPI_API_TOKEN is not configured; skipping PyPI publish."
-
-      - name: Publish wheels
-        if: env.PYPI_API_TOKEN != ''
-        uses: PyO3/maturin-action@v1
+      - name: Validate exact aggregate without uploading another artifact
         env:
-          MATURIN_PYPI_TOKEN: ${{ env.PYPI_API_TOKEN }}
-        with:
-          command: upload
-          args: --skip-existing dist/*.whl
+          EXPECTED_VERSION: ${{ needs.identity.outputs.expected_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from email.parser import BytesParser
+          import os
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          platforms = {
+              "manylinux_2_17_x86_64": "linux-x86_64",
+              "manylinux_2_17_x86_64.manylinux2014_x86_64": "linux-x86_64",
+              "manylinux_2_17_aarch64": "linux-aarch64",
+              "manylinux_2_17_aarch64.manylinux2014_aarch64": "linux-aarch64",
+              "macosx_11_0_arm64": "macos-arm64",
+              "macosx_10_12_x86_64": "macos-x86_64",
+              "win_amd64": "windows-amd64",
+          }
+          expected = set(platforms.values())
+          root = Path("dist")
+          entries = list(root.iterdir()) if root.is_dir() and not root.is_symlink() else []
+          if any(p.is_symlink() or not p.is_file() or p.suffix != ".whl" for p in entries):
+              raise SystemExit("aggregate contains a non-regular or non-wheel entry")
+          if len(entries) != 5:
+              raise SystemExit(f"expected 5 wheels, found {len(entries)}")
+          observed = set()
+          for wheel in entries:
+              parts = wheel.stem.split("-")
+              if len(parts) != 5 or tuple(parts[:4]) != (
+                  "parapet", os.environ["EXPECTED_VERSION"], "py3", "none"
+              ):
+                  raise SystemExit(f"unexpected wheel identity: {wheel.name}")
+              platform = platforms.get(parts[4])
+              if platform is None or platform in observed:
+                  raise SystemExit(f"unexpected or duplicate platform: {wheel.name}")
+              observed.add(platform)
+              with ZipFile(wheel) as archive:
+                  if archive.testzip() is not None:
+                      raise SystemExit(f"wheel CRC failure: {wheel.name}")
+                  metadata = [n for n in archive.namelist() if n.endswith(".dist-info/METADATA")]
+                  if len(metadata) != 1:
+                      raise SystemExit(f"invalid wheel metadata layout: {wheel.name}")
+                  parsed = BytesParser().parsebytes(archive.read(metadata[0]))
+                  if parsed.get("Name") != "parapet" or parsed.get("Version") != parts[1]:
+                      raise SystemExit(f"wheel metadata identity mismatch: {wheel.name}")
+          if observed != expected:
+              raise SystemExit(f"wheel platform set mismatch: {sorted(observed)!r}")
+          PY
