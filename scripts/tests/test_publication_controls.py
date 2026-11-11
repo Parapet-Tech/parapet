@@ -392,7 +392,7 @@ class V020PublicationControlTests(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def test_publishers_use_reader_independent_config_projections(self):
+    def test_publishers_do_not_use_unavailable_environment_admin_api(self):
         for name in ("py-sdk-publish.yml", "github-release-publish.yml"):
             with self.subTest(workflow=name):
                 workflow = self.workflow(name)
@@ -400,61 +400,12 @@ class V020PublicationControlTests(unittest.TestCase):
                     "{id,name,target,enforcement,conditions,rules,updated_at}",
                     workflow,
                 )
-                self.assertIn("reviewer_id:.reviewer.id", workflow)
-                self.assertIn("prevent_self_review", workflow)
-                self.assertIn("deployment_branch_policy", workflow)
+                self.assertIn("protected environment before publication", workflow)
+                self.assertNotIn("/environments/", workflow)
+                self.assertNotIn("environment_sha()", workflow)
                 self.assertNotIn("current_user_can_bypass", workflow)
                 self.assertNotIn("bypass_actors", workflow)
                 self.assertNotIn("/secrets", workflow)
-
-                expressions = re.findall(
-                    r"jq -S -c '([^']+)' \| sha256sum",
-                    workflow,
-                )
-                environment_expression = next(
-                    expression
-                    for expression in expressions
-                    if "protection_rules" in expression
-                )
-                admin_view = {
-                    "name": "pypi",
-                    "can_admins_bypass": False,
-                    "protection_rules": [
-                        {
-                            "id": 1,
-                            "type": "required_reviewers",
-                            "reviewers": [
-                                {
-                                    "type": "User",
-                                    "reviewer": {"id": 4242, "login": "independent-reviewer"},
-                                }
-                            ],
-                            "prevent_self_review": True,
-                        }
-                    ],
-                    "deployment_branch_policy": {
-                        "protected_branches": False,
-                        "custom_branch_policies": True,
-                    },
-                    "url": "admin-relative-url",
-                }
-                token_view = {
-                    **admin_view,
-                    "url": "token-relative-url",
-                    "html_url": "reader-only-field",
-                }
-                outputs = []
-                for payload in (admin_view, token_view):
-                    result = subprocess.run(
-                        ["jq", "-S", "-c", environment_expression],
-                        input=json.dumps(payload),
-                        capture_output=True,
-                        text=True,
-                        check=False,
-                    )
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    outputs.append(result.stdout)
-                self.assertEqual(outputs[0], outputs[1])
 
     def test_all_workflow_jq_filters_compile(self):
         token = r"(?:'[^']*'|\"[^\"\n]*\"|[^\s|;&<>\)]+)"
@@ -495,7 +446,7 @@ class V020PublicationControlTests(unittest.TestCase):
                             0,
                             f"{name}:{line_number}: {result.stderr}",
                         )
-        self.assertEqual(single_quoted, 23)
+        self.assertEqual(single_quoted, 19)
 
     def test_all_workflow_run_blocks_parse_as_bash(self):
         expression = re.compile(r"\$\{\{.*?\}\}")
@@ -580,7 +531,7 @@ class V020PublicationControlTests(unittest.TestCase):
                     re.MULTILINE,
                 )
             ),
-            18,
+            16,
         )
 
     def test_wheel_workflow_has_one_five_runner_contract(self):

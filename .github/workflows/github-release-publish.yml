@@ -17,8 +17,6 @@ on:
       main_ruleset_sha256: {description: Reviewed reader-independent main-freeze projection SHA-256, required: true, type: string}
       release_ruleset_id: {description: Reviewed release-freeze ruleset ID, required: true, type: string}
       release_ruleset_sha256: {description: Reviewed reader-independent release-freeze projection SHA-256, required: true, type: string}
-      pypi_environment_sha256: {description: Reviewed reader-independent pypi environment projection SHA-256, required: true, type: string}
-      github_environment_sha256: {description: Reviewed reader-independent github-release environment projection SHA-256, required: true, type: string}
       release_text_sha256: {description: Reviewed canonical draft name and body SHA-256, required: true, type: string}
       authorization: {description: Type exactly PUBLISH GITHUB RELEASE v0.2.0, required: true, type: string}
 
@@ -51,8 +49,6 @@ jobs:
           MAIN_RULESET_SHA256: ${{ inputs.main_ruleset_sha256 }}
           RELEASE_RULESET_ID: ${{ inputs.release_ruleset_id }}
           RELEASE_RULESET_SHA256: ${{ inputs.release_ruleset_sha256 }}
-          PYPI_ENVIRONMENT_SHA256: ${{ inputs.pypi_environment_sha256 }}
-          GITHUB_ENVIRONMENT_SHA256: ${{ inputs.github_environment_sha256 }}
           RELEASE_COMMIT: ${{ inputs.expected_commit }}
           TAG: ${{ inputs.tag }}
           NAMED_AUTHORIZATION: ${{ inputs.authorization }}
@@ -94,16 +90,11 @@ jobs:
           ruleset_sha() {
             jq -S -c '{id,name,target,enforcement,conditions,rules,updated_at}' | sha256sum | awk '{print $1}'
           }
-          environment_sha() {
-            jq -S -c '{name,can_admins_bypass,protection_rules:([.protection_rules[]? | {id,type,reviewers:([.reviewers[]? | {type,reviewer_id:.reviewer.id}] | sort_by(.type,.reviewer_id)),prevent_self_review,wait_timer}] | sort_by(.type,.id)),deployment_branch_policy}' | sha256sum | awk '{print $1}'
-          }
-          # Independent operator review binds secret inventories and
-          # /deployment-branch-policies entries; GITHUB_TOKEN binds only the
-          # reader-independent projections below.
+          # GitHub enforces the protected environment before publication.
+          # Environment administration endpoints are intentionally unavailable
+          # to this restricted workflow token and are verified externally.
           test "$(gh api "repos/$GITHUB_REPOSITORY/rulesets/$MAIN_RULESET_ID" | ruleset_sha)" = "$MAIN_RULESET_SHA256"
           test "$(gh api "repos/$GITHUB_REPOSITORY/rulesets/$RELEASE_RULESET_ID" | ruleset_sha)" = "$RELEASE_RULESET_SHA256"
-          test "$(gh api "repos/$GITHUB_REPOSITORY/environments/pypi" | environment_sha)" = "$PYPI_ENVIRONMENT_SHA256"
-          test "$(gh api "repos/$GITHUB_REPOSITORY/environments/github-release" | environment_sha)" = "$GITHUB_ENVIRONMENT_SHA256"
           {
             echo "control_commit=$CONTROL_COMMIT control_tree=$CONTROL_TREE"
             echo "workflow_id=$EXPECTED_WORKFLOW_ID workflow_sha256=$EXPECTED_WORKFLOW_SHA256"
@@ -134,8 +125,6 @@ jobs:
       MAIN_RULESET_SHA256: ${{ inputs.main_ruleset_sha256 }}
       RELEASE_RULESET_ID: ${{ inputs.release_ruleset_id }}
       RELEASE_RULESET_SHA256: ${{ inputs.release_ruleset_sha256 }}
-      PYPI_ENVIRONMENT_SHA256: ${{ inputs.pypi_environment_sha256 }}
-      GITHUB_ENVIRONMENT_SHA256: ${{ inputs.github_environment_sha256 }}
       EXPECTED_RELEASE_TEXT_SHA256: ${{ inputs.release_text_sha256 }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -154,15 +143,8 @@ jobs:
           ruleset_sha() {
             jq -S -c '{id,name,target,enforcement,conditions,rules,updated_at}' | sha256sum | awk '{print $1}'
           }
-          environment_sha() {
-            jq -S -c '{name,can_admins_bypass,protection_rules:([.protection_rules[]? | {id,type,reviewers:([.reviewers[]? | {type,reviewer_id:.reviewer.id}] | sort_by(.type,.reviewer_id)),prevent_self_review,wait_timer}] | sort_by(.type,.id)),deployment_branch_policy}' | sha256sum | awk '{print $1}'
-          }
-          # Independent operator review re-reads secret inventories and
-          # /deployment-branch-policies entries after approval.
           test "$(gh api "repos/$GITHUB_REPOSITORY/rulesets/$MAIN_RULESET_ID" | ruleset_sha)" = "$MAIN_RULESET_SHA256"
           test "$(gh api "repos/$GITHUB_REPOSITORY/rulesets/$RELEASE_RULESET_ID" | ruleset_sha)" = "$RELEASE_RULESET_SHA256"
-          test "$(gh api "repos/$GITHUB_REPOSITORY/environments/pypi" | environment_sha)" = "$PYPI_ENVIRONMENT_SHA256"
-          test "$(gh api "repos/$GITHUB_REPOSITORY/environments/github-release" | environment_sha)" = "$GITHUB_ENVIRONMENT_SHA256"
           test "$(git cat-file -t "refs/tags/$RELEASE_TAG")" = "tag"
           test "$(git rev-parse "refs/tags/$RELEASE_TAG^{}")" = "$EXPECTED_COMMIT"
           test "$(git rev-parse "$EXPECTED_COMMIT^{tree}")" = "$EXPECTED_TREE"
