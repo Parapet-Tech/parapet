@@ -9,6 +9,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import textwrap
 import tomllib
 import unittest
 import zipfile
@@ -204,6 +205,75 @@ class V020PublicationControlTests(unittest.TestCase):
 
     def workflow(self, name: str) -> str:
         return (ROOT / ".github" / "workflows" / name).read_text()
+
+    def workflow_python(self, name: str, step: str) -> str:
+        workflow = self.workflow(name)
+        marker = f"      - name: {step}\n"
+        start = workflow.index(marker)
+        end = workflow.find("\n      - ", start + len(marker))
+        segment = workflow[start:] if end == -1 else workflow[start:end]
+        match = re.search(
+            r"^          python3 - <<'PY'\n(?P<body>.*?)^          PY$",
+            segment,
+            re.MULTILINE | re.DOTALL,
+        )
+        self.assertIsNotNone(match, f"missing Python heredoc in {name}: {step}")
+        assert match is not None
+        return textwrap.dedent(match.group("body"))
+
+    def write_synthetic_wheel(
+        self, root: Path, version: str, platform_tag: str
+    ) -> Path:
+        root.mkdir(parents=True, exist_ok=True)
+        wheel = root / f"parapet-{version}-py3-none-{platform_tag}.whl"
+        dist_info = f"parapet-{version}.dist-info"
+        tags = platform_tag.split(".")
+        with zipfile.ZipFile(wheel, "w") as archive:
+            archive.writestr(
+                f"{dist_info}/METADATA",
+                f"Metadata-Version: 2.1\nName: parapet\nVersion: {version}\n",
+            )
+            archive.writestr(
+                f"{dist_info}/WHEEL",
+                "Wheel-Version: 1.0\n"
+                + "".join(f"Tag: py3-none-{tag}\n" for tag in reversed(tags)),
+            )
+        return wheel
+
+    def write_five_wheels(
+        self, root: Path, version: str, *, alias_first: bool
+    ) -> list[Path]:
+        linux_tags = {
+            "x86_64": ["manylinux_2_17_x86_64", "manylinux2014_x86_64"],
+            "aarch64": ["manylinux_2_17_aarch64", "manylinux2014_aarch64"],
+        }
+        platforms = []
+        for tags in linux_tags.values():
+            ordered = list(reversed(tags)) if alias_first else tags
+            platforms.append(".".join(ordered))
+        platforms.extend(
+            ["macosx_11_0_arm64", "macosx_10_12_x86_64", "win_amd64"]
+        )
+        return [
+            self.write_synthetic_wheel(root, version, platform)
+            for platform in platforms
+        ]
+
+    def run_workflow_python(
+        self,
+        code: str,
+        *,
+        cwd: Path,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=cwd,
+            env={**os.environ, **(env or {})},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
 
     def test_main_versions_are_one_coherent_development_identity(self):
         pyproject = tomllib.loads(
@@ -534,6 +604,144 @@ class V020PublicationControlTests(unittest.TestCase):
         self.assertIn("ubuntu-24.04", workflow)
         self.assertIn("windows-2025", workflow)
         self.assertIn("image_version=${ImageVersion:-unavailable}", workflow)
+
+    def test_wheel_validators_accept_exact_expanded_manylinux_tag_sets(self):
+        per_wheel = self.workflow_python(
+            "py-sdk-wheels.yml", "Validate the single platform wheel"
+        )
+        aggregate = self.workflow_python(
+            "py-sdk-wheels.yml",
+            "Validate exact aggregate without uploading another artifact",
+        )
+        publish = self.workflow_python(
+            "py-sdk-publish.yml", "Validate exact wheel bytes"
+        )
+
+        for alias_first in (False, True):
+            for arch in ("x86_64", "aarch64"):
+                with self.subTest(
+                    alias_first=alias_first, validator="per-wheel", arch=arch
+                ):
+                    with tempfile.TemporaryDirectory() as temp_dir:
+                        root = Path(temp_dir)
+                        tags = [f"manylinux_2_17_{arch}", f"manylinux2014_{arch}"]
+                        if alias_first:
+                            tags.reverse()
+                        self.write_synthetic_wheel(
+                            root / "parapet-py" / "dist",
+                            "0.3.0.dev0",
+                            ".".join(tags),
+                        )
+                        result = self.run_workflow_python(
+                            per_wheel,
+                            cwd=root,
+                            env={
+                                "EXPECTED_VERSION": "0.3.0.dev0",
+                                "EXPECTED_PLATFORM": f"manylinux_2_17_{arch}",
+                            },
+                        )
+                        self.assertEqual(
+                            result.returncode, 0, result.stdout + result.stderr
+                        )
+
+            with self.subTest(alias_first=alias_first, validator="aggregate"):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    root = Path(temp_dir)
+                    self.write_five_wheels(
+                        root / "dist", "0.3.0.dev0", alias_first=alias_first
+                    )
+                    result = self.run_workflow_python(
+                        aggregate,
+                        cwd=root,
+                        env={"EXPECTED_VERSION": "0.3.0.dev0"},
+                    )
+                    self.assertEqual(
+                        result.returncode, 0, result.stdout + result.stderr
+                    )
+
+            with self.subTest(alias_first=alias_first, validator="publish"):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    root = Path(temp_dir)
+                    wheels = self.write_five_wheels(
+                        root / "dist", "0.2.0", alias_first=alias_first
+                    )
+                    lines = [
+                        f"{hashlib.sha256(wheel.read_bytes()).hexdigest()}  {wheel.name}"
+                        for wheel in wheels
+                    ]
+                    wheel_set = hashlib.sha256(
+                        ("\n".join(sorted(lines)) + "\n").encode()
+                    ).hexdigest()
+                    result = self.run_workflow_python(
+                        publish,
+                        cwd=root,
+                        env={"EXPECTED_WHEEL_SET_SHA256": wheel_set},
+                    )
+                    self.assertEqual(
+                        result.returncode, 0, result.stdout + result.stderr
+                    )
+
+    def test_github_release_validator_uses_observed_alias_first_filenames(self):
+        workflow = self.workflow("github-release-publish.yml")
+        self.assertIn(
+            "parapet-0.2.0-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+            workflow,
+        )
+        self.assertIn(
+            "parapet-0.2.0-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl",
+            workflow,
+        )
+        self.assertNotIn(
+            "parapet-0.2.0-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+            workflow,
+        )
+        self.assertNotIn(
+            "parapet-0.2.0-py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
+            workflow,
+        )
+
+        validator = self.workflow_python(
+            "github-release-publish.yml",
+            "Verify exact detached manifest and asset bytes",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            assets = root / "release-assets"
+            wheels = self.write_five_wheels(
+                assets, "0.2.0", alias_first=True
+            )
+            payloads = [
+                assets / "parapet-v0.2.0-macos-arm64-evaluator.tar.gz",
+                assets / "parapet-v0.2.0-release-evidence.tar.gz",
+            ]
+            for index, payload in enumerate(payloads):
+                payload.write_bytes(f"asset-{index}".encode())
+            manifest = assets / "parapet-v0.2.0-RELEASE_SHA256SUMS"
+            manifest.write_text(
+                "".join(
+                    f"{hashlib.sha256(item.read_bytes()).hexdigest()}  {item.name}\n"
+                    for item in wheels + payloads
+                )
+            )
+            wheel_lines = [
+                f"{hashlib.sha256(wheel.read_bytes()).hexdigest()}  {wheel.name}"
+                for wheel in wheels
+            ]
+            result = self.run_workflow_python(
+                validator,
+                cwd=root,
+                env={
+                    "EXPECTED_RELEASE_MANIFEST_SHA256": hashlib.sha256(
+                        manifest.read_bytes()
+                    ).hexdigest(),
+                    "EXPECTED_WHEEL_SET_SHA256": hashlib.sha256(
+                        ("\n".join(sorted(wheel_lines)) + "\n").encode()
+                    ).hexdigest(),
+                },
+            )
+            self.assertEqual(
+                result.returncode, 0, result.stdout + result.stderr
+            )
 
     def test_publication_workflows_bind_control_actor_and_environments(self):
         pypi = self.workflow("py-sdk-publish.yml")

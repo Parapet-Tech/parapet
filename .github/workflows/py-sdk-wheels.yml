@@ -253,14 +253,15 @@ jobs:
               raise SystemExit(f"unexpected wheel filename: {wheel.name}")
           distribution, version, python_tag, abi_tag, platform_tag = parts
           expected_platform = os.environ["EXPECTED_PLATFORM"]
-          allowed = {expected_platform}
+          expected_platform_tags = {expected_platform}
           if expected_platform == "manylinux_2_17_x86_64":
-              allowed.add("manylinux_2_17_x86_64.manylinux2014_x86_64")
+              expected_platform_tags.add("manylinux2014_x86_64")
           if expected_platform == "manylinux_2_17_aarch64":
-              allowed.add("manylinux_2_17_aarch64.manylinux2014_aarch64")
+              expected_platform_tags.add("manylinux2014_aarch64")
+          platform_tags = platform_tag.split(".")
           if (distribution, version, python_tag, abi_tag) != (
               "parapet", os.environ["EXPECTED_VERSION"], "py3", "none"
-          ) or platform_tag not in allowed:
+          ) or len(platform_tags) != len(set(platform_tags)) or set(platform_tags) != expected_platform_tags:
               raise SystemExit(f"unexpected wheel identity: {wheel.name}")
           if wheel.stat().st_size <= 0:
               raise SystemExit("empty wheel")
@@ -275,7 +276,13 @@ jobs:
               parsed = BytesParser().parsebytes(archive.read(metadata[0]))
               if parsed.get("Name") != "parapet" or parsed.get("Version") != version:
                   raise SystemExit("wheel metadata identity mismatch")
-              if f"Tag: py3-none-{platform_tag}" not in archive.read(wheel_meta[0]).decode().splitlines():
+              wheel_tags = [
+                  line.removeprefix("Tag: ")
+                  for line in archive.read(wheel_meta[0]).decode().splitlines()
+                  if line.startswith("Tag: ")
+              ]
+              expected_wheel_tags = {f"py3-none-{tag}" for tag in platform_tags}
+              if len(wheel_tags) != len(set(wheel_tags)) or set(wheel_tags) != expected_wheel_tags:
                   raise SystemExit("wheel tag mismatch")
           PY
 
@@ -311,13 +318,11 @@ jobs:
           from zipfile import ZipFile
 
           platforms = {
-              "manylinux_2_17_x86_64": "linux-x86_64",
-              "manylinux_2_17_x86_64.manylinux2014_x86_64": "linux-x86_64",
-              "manylinux_2_17_aarch64": "linux-aarch64",
-              "manylinux_2_17_aarch64.manylinux2014_aarch64": "linux-aarch64",
-              "macosx_11_0_arm64": "macos-arm64",
-              "macosx_10_12_x86_64": "macos-x86_64",
-              "win_amd64": "windows-amd64",
+              frozenset({"manylinux_2_17_x86_64", "manylinux2014_x86_64"}): "linux-x86_64",
+              frozenset({"manylinux_2_17_aarch64", "manylinux2014_aarch64"}): "linux-aarch64",
+              frozenset({"macosx_11_0_arm64"}): "macos-arm64",
+              frozenset({"macosx_10_12_x86_64"}): "macos-x86_64",
+              frozenset({"win_amd64"}): "windows-amd64",
           }
           expected = set(platforms.values())
           root = Path("dist")
@@ -333,7 +338,10 @@ jobs:
                   "parapet", os.environ["EXPECTED_VERSION"], "py3", "none"
               ):
                   raise SystemExit(f"unexpected wheel identity: {wheel.name}")
-              platform = platforms.get(parts[4])
+              platform_tags = parts[4].split(".")
+              platform = platforms.get(frozenset(platform_tags))
+              if len(platform_tags) != len(set(platform_tags)):
+                  raise SystemExit(f"duplicate platform tag: {wheel.name}")
               if platform is None or platform in observed:
                   raise SystemExit(f"unexpected or duplicate platform: {wheel.name}")
               observed.add(platform)
@@ -341,11 +349,20 @@ jobs:
                   if archive.testzip() is not None:
                       raise SystemExit(f"wheel CRC failure: {wheel.name}")
                   metadata = [n for n in archive.namelist() if n.endswith(".dist-info/METADATA")]
-                  if len(metadata) != 1:
+                  wheel_meta = [n for n in archive.namelist() if n.endswith(".dist-info/WHEEL")]
+                  if len(metadata) != 1 or len(wheel_meta) != 1:
                       raise SystemExit(f"invalid wheel metadata layout: {wheel.name}")
                   parsed = BytesParser().parsebytes(archive.read(metadata[0]))
                   if parsed.get("Name") != "parapet" or parsed.get("Version") != parts[1]:
                       raise SystemExit(f"wheel metadata identity mismatch: {wheel.name}")
+                  wheel_tags = [
+                      line.removeprefix("Tag: ")
+                      for line in archive.read(wheel_meta[0]).decode().splitlines()
+                      if line.startswith("Tag: ")
+                  ]
+                  expected_wheel_tags = {f"py3-none-{tag}" for tag in platform_tags}
+                  if len(wheel_tags) != len(set(wheel_tags)) or set(wheel_tags) != expected_wheel_tags:
+                      raise SystemExit(f"wheel tag mismatch: {wheel.name}")
           if observed != expected:
               raise SystemExit(f"wheel platform set mismatch: {sorted(observed)!r}")
           PY
