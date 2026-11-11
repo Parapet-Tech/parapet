@@ -392,17 +392,15 @@ class V020PublicationControlTests(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def test_publishers_do_not_use_unavailable_environment_admin_api(self):
+    def test_publishers_do_not_use_unavailable_admin_apis(self):
         for name in ("py-sdk-publish.yml", "github-release-publish.yml"):
             with self.subTest(workflow=name):
                 workflow = self.workflow(name)
-                self.assertIn(
-                    "{id,name,target,enforcement,conditions,rules,updated_at}",
-                    workflow,
-                )
                 self.assertIn("protected environment before publication", workflow)
                 self.assertNotIn("/environments/", workflow)
                 self.assertNotIn("environment_sha()", workflow)
+                self.assertNotIn("/rulesets/", workflow)
+                self.assertNotIn("ruleset_sha()", workflow)
                 self.assertNotIn("current_user_can_bypass", workflow)
                 self.assertNotIn("bypass_actors", workflow)
                 self.assertNotIn("/secrets", workflow)
@@ -446,7 +444,7 @@ class V020PublicationControlTests(unittest.TestCase):
                             0,
                             f"{name}:{line_number}: {result.stderr}",
                         )
-        self.assertEqual(single_quoted, 19)
+        self.assertEqual(single_quoted, 15)
 
     def test_all_workflow_run_blocks_parse_as_bash(self):
         expression = re.compile(r"\$\{\{.*?\}\}")
@@ -531,7 +529,7 @@ class V020PublicationControlTests(unittest.TestCase):
                     re.MULTILINE,
                 )
             ),
-            16,
+            12,
         )
 
     def test_wheel_workflow_has_one_five_runner_contract(self):
@@ -706,8 +704,6 @@ class V020PublicationControlTests(unittest.TestCase):
             self.assertIn("GITHUB_WORKFLOW_SHA", workflow)
             self.assertIn("control_commit", workflow)
             self.assertIn("workflow_sha256", workflow)
-            self.assertIn("main_ruleset_sha256", workflow)
-            self.assertIn("release_ruleset_sha256", workflow)
             self.assertIn(f"name: {environment}", workflow)
             self.assertNotIn("/secrets", workflow)
             self.assertNotIn(

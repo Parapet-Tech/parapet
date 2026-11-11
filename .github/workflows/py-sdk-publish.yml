@@ -43,22 +43,6 @@ on:
         description: Independently reviewed workflow blob SHA-256
         required: true
         type: string
-      main_ruleset_id:
-        description: Reviewed main-freeze ruleset ID
-        required: true
-        type: string
-      main_ruleset_sha256:
-        description: SHA-256 of reviewed reader-independent main-freeze projection
-        required: true
-        type: string
-      release_ruleset_id:
-        description: Reviewed release-source-freeze ruleset ID
-        required: true
-        type: string
-      release_ruleset_sha256:
-        description: SHA-256 of reviewed reader-independent release-freeze projection
-        required: true
-        type: string
       authorization:
         description: Type exactly PUBLISH PYPI v0.2.0
         required: true
@@ -90,10 +74,6 @@ jobs:
           CONTROL_TREE: ${{ inputs.control_tree }}
           EXPECTED_WORKFLOW_ID: ${{ inputs.workflow_id }}
           EXPECTED_WORKFLOW_SHA256: ${{ inputs.workflow_sha256 }}
-          MAIN_RULESET_ID: ${{ inputs.main_ruleset_id }}
-          MAIN_RULESET_SHA256: ${{ inputs.main_ruleset_sha256 }}
-          RELEASE_RULESET_ID: ${{ inputs.release_ruleset_id }}
-          RELEASE_RULESET_SHA256: ${{ inputs.release_ruleset_sha256 }}
           RELEASE_COMMIT: ${{ inputs.expected_commit }}
           NAMED_AUTHORIZATION: ${{ inputs.authorization }}
           TAG: ${{ inputs.tag }}
@@ -135,14 +115,9 @@ jobs:
           test "$(jq -r .run_attempt <<<"$run_json")" = "1"
           test "$(jq -r '.actor.login+":"+(.actor.id|tostring)' <<<"$run_json")" = "parapet-worker:319884068"
           test "$(jq -r '.triggering_actor.login+":"+(.triggering_actor.id|tostring)' <<<"$run_json")" = "parapet-worker:319884068"
-          ruleset_sha() {
-            jq -S -c '{id,name,target,enforcement,conditions,rules,updated_at}' | sha256sum | awk '{print $1}'
-          }
           # GitHub enforces the protected environment before publication.
-          # Environment administration endpoints are intentionally unavailable
-          # to this restricted workflow token and are verified externally.
-          test "$(gh api "repos/$GITHUB_REPOSITORY/rulesets/$MAIN_RULESET_ID" | ruleset_sha)" = "$MAIN_RULESET_SHA256"
-          test "$(gh api "repos/$GITHUB_REPOSITORY/rulesets/$RELEASE_RULESET_ID" | ruleset_sha)" = "$RELEASE_RULESET_SHA256"
+          # Repository and environment administration endpoints are intentionally
+          # unavailable to this restricted workflow token and are enforced externally.
           {
             echo "control_commit=$CONTROL_COMMIT"
             echo "control_tree=$CONTROL_TREE"
@@ -172,10 +147,6 @@ jobs:
       EXPECTED_WHEEL_SET_SHA256: ${{ inputs.wheel_set_sha256 }}
       CONTROL_COMMIT: ${{ inputs.control_commit }}
       EXPECTED_WORKFLOW_SHA256: ${{ inputs.workflow_sha256 }}
-      MAIN_RULESET_ID: ${{ inputs.main_ruleset_id }}
-      MAIN_RULESET_SHA256: ${{ inputs.main_ruleset_sha256 }}
-      RELEASE_RULESET_ID: ${{ inputs.release_ruleset_id }}
-      RELEASE_RULESET_SHA256: ${{ inputs.release_ruleset_sha256 }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -190,11 +161,6 @@ jobs:
           test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)" = "$CONTROL_COMMIT"
           test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/release/v0.2.0" --jq .object.sha)" = "$EXPECTED_COMMIT"
           test "$(sha256sum <(gh api "repos/$GITHUB_REPOSITORY/contents/.github/workflows/py-sdk-publish.yml?ref=$CONTROL_COMMIT" --jq .content | tr -d '\n' | base64 --decode) | awk '{print $1}')" = "$EXPECTED_WORKFLOW_SHA256"
-          ruleset_sha() {
-            jq -S -c '{id,name,target,enforcement,conditions,rules,updated_at}' | sha256sum | awk '{print $1}'
-          }
-          test "$(gh api "repos/$GITHUB_REPOSITORY/rulesets/$MAIN_RULESET_ID" | ruleset_sha)" = "$MAIN_RULESET_SHA256"
-          test "$(gh api "repos/$GITHUB_REPOSITORY/rulesets/$RELEASE_RULESET_ID" | ruleset_sha)" = "$RELEASE_RULESET_SHA256"
           test "$(git cat-file -t "refs/tags/$RELEASE_TAG")" = "tag"
           test "$(git rev-parse "refs/tags/$RELEASE_TAG^{}")" = "$EXPECTED_COMMIT"
           test "$(git rev-parse "$EXPECTED_COMMIT^{tree}")" = "$EXPECTED_TREE"
