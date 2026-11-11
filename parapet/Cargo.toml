@@ -1,6 +1,6 @@
 [package]
 name = "parapet"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "LLM proxy firewall — protective wall at the edge of a fortification"

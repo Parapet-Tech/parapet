@@ -48,14 +48,14 @@ class ReleaseAssetTests(unittest.TestCase):
         path: Path,
         *,
         distribution: str = "parapet",
-        version: str = "0.1.0",
+        version: str = "0.2.0",
         tag: str = "py3-none-macosx_11_0_arm64",
         extra_tags: tuple[str, ...] = (),
         include_scripts: bool = True,
     ) -> None:
-        dist_info = "parapet-0.1.0.dist-info"
+        dist_info = "parapet-0.2.0.dist-info"
         with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as archive:
-            archive.writestr("parapet/__init__.py", "__version__ = '0.1.0'\n")
+            archive.writestr("parapet/__init__.py", "__version__ = '0.2.0'\n")
             archive.writestr(
                 f"{dist_info}/METADATA",
                 f"Metadata-Version: 2.1\nName: {distribution}\nVersion: {version}\n",
@@ -147,7 +147,7 @@ class ReleaseAssetTests(unittest.TestCase):
             self._build()
 
     def test_wrong_wheel_filename_and_internal_tag_fail_closed(self) -> None:
-        wrong_name = self.base / "parapet-0.1.0-py3-none-win_amd64.whl"
+        wrong_name = self.base / "parapet-0.2.0-py3-none-win_amd64.whl"
         self._write_wheel(wrong_name)
         with self.assertRaisesRegex(builder.BuildError, "named exactly"):
             builder.build_release_evaluator(
@@ -248,13 +248,13 @@ class ReleaseAssetTests(unittest.TestCase):
         self.assertEqual([entry.name for entry in output.iterdir()], ["caller.marker"])
 
     def test_public_docs_name_scope_and_limitations(self) -> None:
-        start = (ROOT / "release/v0.1.0/START_HERE.md").read_text()
-        result = (ROOT / "release/v0.1.0/RESULT_TEMPLATE.md").read_text()
-        notes = (ROOT / "release/v0.1.0/RELEASE_NOTES.md").read_text()
+        start = (ROOT / "release/v0.2.0/START_HERE.md").read_text()
+        result = (ROOT / "release/v0.2.0/RESULT_TEMPLATE.md").read_text()
+        notes = (ROOT / "release/v0.2.0/RELEASE_NOTES.md").read_text()
         self.assertIn(builder.WHEEL_NAME, start)
         self.assertIn("no real model", start.lower())
         self.assertIn("not an independent usability validation", start)
-        self.assertIn("tagged\n`v0.1.0` source archive", start)
+        self.assertIn("tagged\n`v0.2.0` source archive", start)
         self.assertIn("not part of this 15-minute evaluator\njourney", start)
         self.assertIn("not stable or\nproduction-ready", notes)
         self.assertIn(builder.ARCHIVE_NAME, notes)
@@ -278,7 +278,7 @@ class ReleaseAssetTests(unittest.TestCase):
         exact_wheel = f"dist/{builder.WHEEL_NAME}"
         source_archive = (
             "https://github.com/Parapet-Tech/parapet/"
-            "archive/refs/tags/v0.1.0.tar.gz"
+            "archive/refs/tags/v0.2.0.tar.gz"
         )
         for text in (readme, guide):
             self.assertIn("macOS arm64", text)

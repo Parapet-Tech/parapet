@@ -8,10 +8,12 @@ the [README Quick Start](../README.md#quick-start).
 
 The currently proven first-use environment is **macOS arm64 with Python 3.10 or
 newer** using the wheel shipped in the unpacked evaluator at
-`dist/parapet-0.1.0-py3-none-macosx_11_0_arm64.whl`. Start all evaluator
-commands from the unpacked `parapet-v0.1.0-macos-arm64-evaluator` root; no
-source checkout or local build is required. Parapet is not published to PyPI
-or npm.
+`dist/parapet-0.2.0-py3-none-macosx_11_0_arm64.whl`. Start all evaluator
+commands from the unpacked `parapet-v0.2.0-macos-arm64-evaluator` root; no
+source checkout or local build is required. PyPI installation after release
+must use the compatible release-line constraint `parapet>=0.2.0,<0.3` (or the
+exact reproducibility pin `parapet==0.2.0`). The TypeScript metadata is aligned
+to v0.2.0, but `@parapet-tech/parapet@0.2.0` is not published to npm.
 
 The protected runtime, evidence store, control socket, and file-effect
 lifecycle are POSIX-only; Windows protected-runtime support is not supported
@@ -27,7 +29,7 @@ then install the reviewed wheel without resolving dependencies again:
 python3 -m venv .venv
 .venv/bin/python -m pip install httpx==0.28.1
 .venv/bin/python -m pip install --no-deps \
-  dist/parapet-0.1.0-py3-none-macosx_11_0_arm64.whl
+  dist/parapet-0.2.0-py3-none-macosx_11_0_arm64.whl
 ```
 
 The `httpx==0.28.1` command normally resolves from the configured package index
@@ -56,9 +58,16 @@ and `parapet-eval` are intentionally absent.
 Run `info` and then a bounded `scan`:
 
 ```bash
+.venv/bin/parapet --version
 .venv/bin/parapet info --json
 printf 'hello parapet' | .venv/bin/parapet scan --stdin --json
 ```
+
+`parapet --version` and the `engine_version` reported by `parapet info --json`
+must both be `0.2.0`. The bundled `parapet-engine` executable does not expose a
+`--version` flag in this release; the evaluator binds that exact executable
+through its wheel RECORD digest and records the lack of an independent
+engine-side version surface as an accepted residual.
 
 Default `parapet scan --json` output is bounded summary metadata: model
 identity, digests, score, and detection outcome without raw input or matched
@@ -298,7 +307,7 @@ commands is unchanged, including the `a6_booking_required` field of
 
 The evaluator asset intentionally omits the full Rust, Python, and TypeScript
 test trees. Those tests are available in the
-[tagged `v0.1.0` source archive](https://github.com/Parapet-Tech/parapet/archive/refs/tags/v0.1.0.tar.gz)
+[tagged `v0.2.0` source archive](https://github.com/Parapet-Tech/parapet/archive/refs/tags/v0.2.0.tar.gz)
 and are not part of the 15-minute evaluator journey. Download and unpack that
 archive, change to its root, and define the source and disposable verification
 paths before using the source-only commands below:
@@ -320,7 +329,7 @@ Build from the tagged source tree, not from the evaluator asset:
 mkdir "$VERIFY_ROOT/dist"
 (cd "$SOURCE_ROOT/parapet-py" && \
   maturin build --release --locked --out "$VERIFY_ROOT/dist")
-WHEEL="$VERIFY_ROOT/dist/parapet-0.1.0-py3-none-macosx_11_0_arm64.whl"
+WHEEL="$VERIFY_ROOT/dist/parapet-0.2.0-py3-none-macosx_11_0_arm64.whl"
 test -f "$WHEEL"
 python3 -m venv "$PY_ENV"
 "$PY_ENV/bin/python" -m pip install httpx==0.28.1 pytest

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and verify the deterministic Parapet v0.1.0 evaluator archive."""
+"""Build and verify the deterministic Parapet v0.2.0 evaluator archive."""
 
 from __future__ import annotations
 
@@ -18,14 +18,14 @@ import tempfile
 import zipfile
 
 
-EVALUATOR_NAME = "parapet-v0.1.0-macos-arm64-evaluator"
+EVALUATOR_NAME = "parapet-v0.2.0-macos-arm64-evaluator"
 ARCHIVE_NAME = f"{EVALUATOR_NAME}.tar.gz"
-WHEEL_NAME = "parapet-0.1.0-py3-none-macosx_11_0_arm64.whl"
+WHEEL_NAME = "parapet-0.2.0-py3-none-macosx_11_0_arm64.whl"
 CHECKSUM_NAME = "EVALUATOR_SHA256SUMS"
 WHEEL_TAG = "py3-none-macosx_11_0_arm64"
 WHEEL_SCRIPTS = (
-    "parapet-0.1.0.data/scripts/parapet",
-    "parapet-0.1.0.data/scripts/parapet-engine",
+    "parapet-0.2.0.data/scripts/parapet",
+    "parapet-0.2.0.data/scripts/parapet-engine",
 )
 DEMO_FILES = (
     "README.md",
@@ -41,10 +41,10 @@ DEMO_FILES = (
     "request_unauthorized.json",
 )
 STATIC_FILES = (
-    ("release/v0.1.0/START_HERE.md", "START_HERE.md"),
+    ("release/v0.2.0/START_HERE.md", "START_HERE.md"),
     ("README.md", "README.md"),
     ("docs/local-first-use.md", "docs/local-first-use.md"),
-    ("release/v0.1.0/RESULT_TEMPLATE.md", "RESULT_TEMPLATE.md"),
+    ("release/v0.2.0/RESULT_TEMPLATE.md", "RESULT_TEMPLATE.md"),
 )
 EXPECTED_DIRS = (
     "dist",
@@ -103,8 +103,8 @@ def validate_wheel(path: Path) -> None:
     if not zipfile.is_zipfile(path):
         raise BuildError("wheel is not a valid ZIP archive")
 
-    metadata_name = "parapet-0.1.0.dist-info/METADATA"
-    wheel_name = "parapet-0.1.0.dist-info/WHEEL"
+    metadata_name = "parapet-0.2.0.dist-info/METADATA"
+    wheel_name = "parapet-0.2.0.dist-info/WHEEL"
     with zipfile.ZipFile(path) as archive:
         infos = archive.infolist()
         names = [info.filename for info in infos]
@@ -119,7 +119,7 @@ def validate_wheel(path: Path) -> None:
             if unix_type == stat.S_IFLNK:
                 raise BuildError(f"wheel contains a symlink: {name!r}")
         if metadata_name not in names or wheel_name not in names:
-            raise BuildError("wheel is missing v0.1.0 dist-info metadata")
+            raise BuildError("wheel is missing v0.2.0 dist-info metadata")
         metadata = archive.read(metadata_name).decode("utf-8", "strict")
         wheel_metadata = archive.read(wheel_name).decode("utf-8", "strict")
         for script_name in WHEEL_SCRIPTS:
@@ -130,7 +130,7 @@ def validate_wheel(path: Path) -> None:
                 raise BuildError(f"wheel has an invalid required script: {script_name}")
     if not re.search(r"(?m)^Name: parapet$", metadata):
         raise BuildError("wheel metadata has the wrong distribution name")
-    if not re.search(r"(?m)^Version: 0\.1\.0$", metadata):
+    if not re.search(r"(?m)^Version: 0\.2\.0$", metadata):
         raise BuildError("wheel metadata has the wrong version")
     tags = re.findall(r"(?m)^Tag:\s*(\S+)\s*$", wheel_metadata)
     if tags != [WHEEL_TAG]:

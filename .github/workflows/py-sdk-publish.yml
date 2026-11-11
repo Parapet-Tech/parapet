@@ -4,97 +4,245 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Exact existing release tag (v0.1.0)
+        description: Exact existing release tag (v0.2.0)
         required: true
         type: string
       build_run_id:
-        description: Successful Python SDK Wheels tag-build run ID
+        description: Successful attempt-1 Python SDK Wheels tag run
         required: true
         type: string
       expected_commit:
-        description: Reviewed 40-character commit SHA
+        description: Reviewed release commit
+        required: true
+        type: string
+      expected_tree:
+        description: Reviewed release tree
+        required: true
+        type: string
+      expected_archive_sha256:
+        description: Reviewed canonical source archive SHA-256
         required: true
         type: string
       wheel_set_sha256:
-        description: SHA-256 of the reviewed sorted wheel digest list
+        description: SHA-256 of reviewed sorted wheel digest list
+        required: true
+        type: string
+      control_commit:
+        description: Independently reviewed main control commit
+        required: true
+        type: string
+      control_tree:
+        description: Independently reviewed main control tree
+        required: true
+        type: string
+      workflow_id:
+        description: Independently reviewed workflow numeric ID
+        required: true
+        type: string
+      workflow_sha256:
+        description: Independently reviewed workflow blob SHA-256
+        required: true
+        type: string
+      main_ruleset_id:
+        description: Reviewed main-freeze ruleset ID
+        required: true
+        type: string
+      main_ruleset_sha256:
+        description: SHA-256 of reviewed reader-independent main-freeze projection
+        required: true
+        type: string
+      release_ruleset_id:
+        description: Reviewed release-source-freeze ruleset ID
+        required: true
+        type: string
+      release_ruleset_sha256:
+        description: SHA-256 of reviewed reader-independent release-freeze projection
+        required: true
+        type: string
+      pypi_environment_sha256:
+        description: SHA-256 of reviewed reader-independent pypi environment projection
+        required: true
+        type: string
+      github_environment_sha256:
+        description: SHA-256 of reviewed reader-independent github-release environment projection
         required: true
         type: string
       authorization:
-        description: Type exactly PUBLISH PYPI v0.1.0
+        description: Type exactly PUBLISH PYPI v0.2.0
         required: true
         type: string
 
-permissions:
-  actions: read
-  contents: read
-  id-token: write
+permissions: {}
 
 concurrency:
-  group: publish-pypi-v0.1.0
+  group: publish-pypi-v0.2.0
   cancel-in-progress: false
 
 jobs:
-  publish:
-    name: Publish reviewed v0.1.0 wheels
-    runs-on: ubuntu-latest
-    environment:
-      name: pypi
-    env:
-      RELEASE_TAG: ${{ inputs.tag }}
-      BUILD_RUN_ID: ${{ inputs.build_run_id }}
-      EXPECTED_COMMIT: ${{ inputs.expected_commit }}
-      EXPECTED_WHEEL_SET_SHA256: ${{ inputs.wheel_set_sha256 }}
-      NAMED_AUTHORIZATION: ${{ inputs.authorization }}
+  identity:
+    name: Bind reviewed control and deployment identity
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
     steps:
-      - name: Validate named authorization and inputs
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.control_commit }}
+          fetch-depth: 0
+
+      - name: Independently reproducible control checks
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CONTROL_COMMIT: ${{ inputs.control_commit }}
+          CONTROL_TREE: ${{ inputs.control_tree }}
+          EXPECTED_WORKFLOW_ID: ${{ inputs.workflow_id }}
+          EXPECTED_WORKFLOW_SHA256: ${{ inputs.workflow_sha256 }}
+          MAIN_RULESET_ID: ${{ inputs.main_ruleset_id }}
+          MAIN_RULESET_SHA256: ${{ inputs.main_ruleset_sha256 }}
+          RELEASE_RULESET_ID: ${{ inputs.release_ruleset_id }}
+          RELEASE_RULESET_SHA256: ${{ inputs.release_ruleset_sha256 }}
+          PYPI_ENVIRONMENT_SHA256: ${{ inputs.pypi_environment_sha256 }}
+          GITHUB_ENVIRONMENT_SHA256: ${{ inputs.github_environment_sha256 }}
+          RELEASE_COMMIT: ${{ inputs.expected_commit }}
+          NAMED_AUTHORIZATION: ${{ inputs.authorization }}
+          TAG: ${{ inputs.tag }}
+          SENDER_LOGIN: ${{ github.event.sender.login }}
+          SENDER_ID: ${{ github.event.sender.id }}
         shell: bash
         run: |
           set -euo pipefail
           test "$GITHUB_REF" = "refs/heads/main"
-          test "$RELEASE_TAG" = "v0.1.0"
-          test "$NAMED_AUTHORIZATION" = "PUBLISH PYPI v0.1.0"
-          [[ "$BUILD_RUN_ID" =~ ^[0-9]+$ ]]
-          [[ "$EXPECTED_COMMIT" =~ ^[0-9a-f]{40}$ ]]
-          [[ "$EXPECTED_WHEEL_SET_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          test "$GITHUB_SHA" = "$CONTROL_COMMIT"
+          test "$GITHUB_WORKFLOW_SHA" = "$CONTROL_COMMIT"
+          test "$GITHUB_RUN_ATTEMPT" = "1"
+          test "$GITHUB_ACTOR" = "parapet-worker"
+          test "$GITHUB_ACTOR_ID" = "319884068"
+          test "$GITHUB_TRIGGERING_ACTOR" = "parapet-worker"
+          test "$SENDER_LOGIN" = "parapet-worker"
+          test "$SENDER_ID" = "319884068"
+          test "$TAG" = "v0.2.0"
+          test "$NAMED_AUTHORIZATION" = "PUBLISH PYPI v0.2.0"
+          [[ "$CONTROL_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$CONTROL_TREE" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$CONTROL_COMMIT"
+          test "$(git rev-parse HEAD^{tree})" = "$CONTROL_TREE"
+          test -z "$(git status --porcelain)"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)" = "$CONTROL_COMMIT"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/release/v0.2.0" --jq .object.sha)" = "$RELEASE_COMMIT"
+          test "$(gh api users/parapet-worker --jq '.login+":"+(.id|tostring)+":"+.type')" = "parapet-worker:319884068:User"
+          workflow_json=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/py-sdk-publish.yml")
+          test "$(jq -r .id <<<"$workflow_json")" = "$EXPECTED_WORKFLOW_ID"
+          test "$(jq -r .path <<<"$workflow_json")" = ".github/workflows/py-sdk-publish.yml"
+          test "$(sha256sum .github/workflows/py-sdk-publish.yml | awk '{print $1}')" = "$EXPECTED_WORKFLOW_SHA256"
+          run_json=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID")
+          test "$(jq -r .id <<<"$run_json")" = "$GITHUB_RUN_ID"
+          test "$(jq -r .workflow_id <<<"$run_json")" = "$EXPECTED_WORKFLOW_ID"
+          test "$(jq -r .path <<<"$run_json")" = ".github/workflows/py-sdk-publish.yml"
+          test "$(jq -r .event <<<"$run_json")" = "workflow_dispatch"
+          test "$(jq -r .head_branch <<<"$run_json")" = "main"
+          test "$(jq -r .head_sha <<<"$run_json")" = "$CONTROL_COMMIT"
+          test "$(jq -r .run_attempt <<<"$run_json")" = "1"
+          test "$(jq -r '.actor.login+":"+(.actor.id|tostring)' <<<"$run_json")" = "parapet-worker:319884068"
+          test "$(jq -r '.triggering_actor.login+":"+(.triggering_actor.id|tostring)' <<<"$run_json")" = "parapet-worker:319884068"
+          ruleset_sha() {
+            jq -S -c '{id,name,target,enforcement,conditions,rules,updated_at}' | sha256sum | awk '{print $1}'
+          }
+          environment_sha() {
+            jq -S -c '{name,can_admins_bypass,protection_rules:([.protection_rules[]? | {id,type,reviewers:([.reviewers[]? | {type,reviewer_id:.reviewer.id}] | sort_by(.type,.reviewer_id)),prevent_self_review,wait_timer}] | sort_by(.type,.id)),deployment_branch_policy}' | sha256sum | awk '{print $1}'
+          }
+          # Independent operator review binds secret inventories and
+          # /deployment-branch-policies entries; GITHUB_TOKEN binds only the
+          # reader-independent projections below.
+          test "$(gh api "repos/$GITHUB_REPOSITORY/rulesets/$MAIN_RULESET_ID" | ruleset_sha)" = "$MAIN_RULESET_SHA256"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/rulesets/$RELEASE_RULESET_ID" | ruleset_sha)" = "$RELEASE_RULESET_SHA256"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/environments/pypi" | environment_sha)" = "$PYPI_ENVIRONMENT_SHA256"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/environments/github-release" | environment_sha)" = "$GITHUB_ENVIRONMENT_SHA256"
+          {
+            echo "control_commit=$CONTROL_COMMIT"
+            echo "control_tree=$CONTROL_TREE"
+            echo "workflow_id=$EXPECTED_WORKFLOW_ID"
+            echo "workflow_sha256=$EXPECTED_WORKFLOW_SHA256"
+            echo "run_id=$GITHUB_RUN_ID attempt=$GITHUB_RUN_ATTEMPT"
+            echo "actor=parapet-worker:319884068 reviewer=protected-environment"
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Check out the exact tag
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+  publish:
+    name: Publish reviewed v0.2.0 wheels
+    needs: identity
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    environment:
+      name: pypi
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.tag }}
+      BUILD_RUN_ID: ${{ inputs.build_run_id }}
+      EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+      EXPECTED_TREE: ${{ inputs.expected_tree }}
+      EXPECTED_ARCHIVE_SHA256: ${{ inputs.expected_archive_sha256 }}
+      EXPECTED_WHEEL_SET_SHA256: ${{ inputs.wheel_set_sha256 }}
+      CONTROL_COMMIT: ${{ inputs.control_commit }}
+      EXPECTED_WORKFLOW_SHA256: ${{ inputs.workflow_sha256 }}
+      MAIN_RULESET_ID: ${{ inputs.main_ruleset_id }}
+      MAIN_RULESET_SHA256: ${{ inputs.main_ruleset_sha256 }}
+      RELEASE_RULESET_ID: ${{ inputs.release_ruleset_id }}
+      RELEASE_RULESET_SHA256: ${{ inputs.release_ruleset_sha256 }}
+      PYPI_ENVIRONMENT_SHA256: ${{ inputs.pypi_environment_sha256 }}
+      GITHUB_ENVIRONMENT_SHA256: ${{ inputs.github_environment_sha256 }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ inputs.tag }}
           fetch-depth: 0
 
-      - name: Bind the successful wheel workflow run to the tag commit
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Re-read immutable bindings after approval
         shell: bash
         run: |
           set -euo pipefail
-          tag_commit=$(git rev-list -n 1 "$RELEASE_TAG")
-          workflow_id=$(gh api \
-            "repos/$GITHUB_REPOSITORY/actions/workflows/py-sdk-wheels.yml" \
-            --jq .id)
-          run_json=$(gh api \
-            "repos/$GITHUB_REPOSITORY/actions/runs/$BUILD_RUN_ID")
+          test "$GITHUB_RUN_ATTEMPT" = "1"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)" = "$CONTROL_COMMIT"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/release/v0.2.0" --jq .object.sha)" = "$EXPECTED_COMMIT"
+          test "$(sha256sum <(gh api "repos/$GITHUB_REPOSITORY/contents/.github/workflows/py-sdk-publish.yml?ref=$CONTROL_COMMIT" --jq .content | tr -d '\n' | base64 --decode) | awk '{print $1}')" = "$EXPECTED_WORKFLOW_SHA256"
+          ruleset_sha() {
+            jq -S -c '{id,name,target,enforcement,conditions,rules,updated_at}' | sha256sum | awk '{print $1}'
+          }
+          environment_sha() {
+            jq -S -c '{name,can_admins_bypass,protection_rules:([.protection_rules[]? | {id,type,reviewers:([.reviewers[]? | {type,reviewer_id:.reviewer.id}] | sort_by(.type,.reviewer_id)),prevent_self_review,wait_timer}] | sort_by(.type,.id)),deployment_branch_policy}' | sha256sum | awk '{print $1}'
+          }
+          # Independent operator review re-reads secret inventories and
+          # /deployment-branch-policies entries after approval.
+          test "$(gh api "repos/$GITHUB_REPOSITORY/rulesets/$MAIN_RULESET_ID" | ruleset_sha)" = "$MAIN_RULESET_SHA256"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/rulesets/$RELEASE_RULESET_ID" | ruleset_sha)" = "$RELEASE_RULESET_SHA256"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/environments/pypi" | environment_sha)" = "$PYPI_ENVIRONMENT_SHA256"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/environments/github-release" | environment_sha)" = "$GITHUB_ENVIRONMENT_SHA256"
+          test "$(git cat-file -t "refs/tags/$RELEASE_TAG")" = "tag"
+          test "$(git rev-parse "refs/tags/$RELEASE_TAG^{}")" = "$EXPECTED_COMMIT"
+          test "$(git rev-parse "$EXPECTED_COMMIT^{tree}")" = "$EXPECTED_TREE"
+          test "$(git archive --format=tar "$EXPECTED_COMMIT" | sha256sum | awk '{print $1}')" = "$EXPECTED_ARCHIVE_SHA256"
+
+      - name: Bind attempt-1 successful wheel run and artifact set
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$BUILD_RUN_ID" =~ ^[0-9]+$ ]]
+          run_json=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BUILD_RUN_ID")
+          workflow_id=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/py-sdk-wheels.yml" --jq .id)
           test "$(jq -r .workflow_id <<<"$run_json")" = "$workflow_id"
           test "$(jq -r .event <<<"$run_json")" = "push"
           test "$(jq -r .status <<<"$run_json")" = "completed"
           test "$(jq -r .conclusion <<<"$run_json")" = "success"
-          test "$(jq -r .head_sha <<<"$run_json")" = "$tag_commit"
-
-          artifacts_json=$(gh api \
-            "repos/$GITHUB_REPOSITORY/actions/runs/$BUILD_RUN_ID/artifacts?per_page=100")
-          ARTIFACTS_JSON="$artifacts_json" TAG_COMMIT="$tag_commit" python3 - <<'PY'
-          from hmac import compare_digest
-          import json
-          import os
-
-          tag_commit = os.environ["TAG_COMMIT"]
-          expected_commit = os.environ["EXPECTED_COMMIT"]
-          if not compare_digest(tag_commit, expected_commit):
-              raise SystemExit(
-                  f"tag commit does not match reviewed commit: tag={tag_commit} reviewed={expected_commit}"
-              )
-
+          test "$(jq -r .head_branch <<<"$run_json")" = "v0.2.0"
+          test "$(jq -r .head_sha <<<"$run_json")" = "$EXPECTED_COMMIT"
+          test "$(jq -r .run_attempt <<<"$run_json")" = "1"
+          test "$(jq -r '.actor.login+":"+(.actor.id|tostring)' <<<"$run_json")" = "parapet-worker:319884068"
+          test "$(jq -r '.triggering_actor.login+":"+(.triggering_actor.id|tostring)' <<<"$run_json")" = "parapet-worker:319884068"
+          artifacts=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BUILD_RUN_ID/artifacts?per_page=100")
+          ARTIFACTS_JSON="$artifacts" python3 - <<'PY'
+          import json, os
           expected = {
               "parapet-manylinux_2_17_x86_64-wheels",
               "parapet-manylinux_2_17_aarch64-wheels",
@@ -102,24 +250,17 @@ jobs:
               "parapet-macosx_10_12_x86_64-wheels",
               "parapet-win_amd64-wheels",
           }
-          payload = json.loads(os.environ["ARTIFACTS_JSON"])
-          artifacts = payload.get("artifacts")
-          if not isinstance(artifacts, list):
-              raise SystemExit("artifact response is missing artifacts")
-          names = [item.get("name") for item in artifacts]
-          if len(names) != len(set(names)):
-              raise SystemExit("duplicate artifact names")
-          if set(names) != expected:
-              raise SystemExit(
-                  f"wheel artifact set mismatch: expected={sorted(expected)!r} observed={sorted(names)!r}"
-              )
-          for item in artifacts:
-              if item.get("expired") is not False or not isinstance(item.get("size_in_bytes"), int) or item["size_in_bytes"] <= 0:
-                  raise SystemExit(f"invalid or expired artifact: {item.get('name')!r}")
+          artifacts = json.loads(os.environ["ARTIFACTS_JSON"]).get("artifacts")
+          if not isinstance(artifacts, list) or len(artifacts) != 5:
+              raise SystemExit("expected exactly five artifacts")
+          names = [a.get("name") for a in artifacts]
+          if set(names) != expected or len(names) != len(set(names)):
+              raise SystemExit("wheel artifact set mismatch")
+          if any(a.get("expired") is not False or a.get("size_in_bytes", 0) <= 0 for a in artifacts):
+              raise SystemExit("expired or empty artifact")
           PY
 
-      - name: Download wheels from the bound workflow run
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: parapet-*-wheels
           path: dist
@@ -128,111 +269,78 @@ jobs:
           repository: ${{ github.repository }}
           run-id: ${{ inputs.build_run_id }}
 
-      - name: Validate the exact wheel set
+      - name: Validate exact wheel bytes
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
           from email.parser import BytesParser
-          from hmac import compare_digest
           from hashlib import sha256
+          from hmac import compare_digest
           import os
           from pathlib import Path
           from zipfile import ZipFile
-
-          platform_classes = {
-              "manylinux_2_17_x86_64": "manylinux-x86_64",
-              "manylinux_2_17_x86_64.manylinux2014_x86_64": "manylinux-x86_64",
-              "manylinux_2_17_aarch64": "manylinux-aarch64",
-              "manylinux_2_17_aarch64.manylinux2014_aarch64": "manylinux-aarch64",
+          classes = {
+              "manylinux_2_17_x86_64": "linux-x86_64",
+              "manylinux_2_17_x86_64.manylinux2014_x86_64": "linux-x86_64",
+              "manylinux_2_17_aarch64": "linux-aarch64",
+              "manylinux_2_17_aarch64.manylinux2014_aarch64": "linux-aarch64",
               "macosx_11_0_arm64": "macos-arm64",
               "macosx_10_12_x86_64": "macos-x86_64",
               "win_amd64": "windows-amd64",
           }
-          expected_classes = {
-              "manylinux-x86_64",
-              "manylinux-aarch64",
-              "macos-arm64",
-              "macos-x86_64",
-              "windows-amd64",
-          }
           root = Path("dist")
-          if not root.is_dir() or root.is_symlink():
-              raise SystemExit("missing regular wheel download directory")
-          wheels = []
-          for path in root.iterdir():
-              if path.is_symlink() or not path.is_file():
-                  raise SystemExit(f"unexpected non-regular wheel artifact entry: {path.name!r}")
-              if path.suffix != ".whl":
-                  raise SystemExit(f"unexpected non-wheel artifact entry: {path.name!r}")
-              wheels.append(path)
-          wheels.sort()
-          if len(wheels) != 5:
-              raise SystemExit(f"expected 5 wheels, found {len(wheels)}")
-          observed = set()
-          digest_lines = []
+          wheels = sorted(root.iterdir()) if root.is_dir() and not root.is_symlink() else []
+          if len(wheels) != 5 or any(p.is_symlink() or not p.is_file() or p.suffix != ".whl" for p in wheels):
+              raise SystemExit("expected 5 regular wheels and no other entries")
+          observed, lines = set(), []
           for wheel in wheels:
               parts = wheel.stem.split("-")
-              if len(parts) != 5:
-                  raise SystemExit(f"unexpected wheel filename: {wheel.name}")
-              distribution, version, python_tag, abi_tag, platform_tag = parts
-              if (distribution, version, python_tag, abi_tag) != (
-                  "parapet", "0.1.0", "py3", "none"
-              ):
+              if len(parts) != 5 or tuple(parts[:4]) != ("parapet", "0.2.0", "py3", "none"):
                   raise SystemExit(f"unexpected wheel identity: {wheel.name}")
-              platform_class = platform_classes.get(platform_tag)
-              if platform_class is None or platform_class in observed:
-                  raise SystemExit(f"unexpected or duplicate wheel platform: {wheel.name}")
-              observed.add(platform_class)
+              kind = classes.get(parts[4])
+              if kind is None or kind in observed:
+                  raise SystemExit(f"unexpected or duplicate platform: {wheel.name}")
+              observed.add(kind)
               with ZipFile(wheel) as archive:
-                  metadata_paths = [
-                      name for name in archive.namelist()
-                      if name.endswith(".dist-info/METADATA")
-                  ]
-                  wheel_paths = [
-                      name for name in archive.namelist()
-                      if name.endswith(".dist-info/WHEEL")
-                  ]
-                  if len(metadata_paths) != 1 or len(wheel_paths) != 1:
-                      raise SystemExit(f"invalid wheel metadata layout: {wheel.name}")
-                  metadata = BytesParser().parsebytes(archive.read(metadata_paths[0]))
-                  if metadata.get("Name") != "parapet" or metadata.get("Version") != "0.1.0":
-                      raise SystemExit(f"wheel metadata identity mismatch: {wheel.name}")
-                  wheel_text = archive.read(wheel_paths[0]).decode("utf-8")
-                  if f"Tag: py3-none-{platform_tag}" not in wheel_text.splitlines():
-                      raise SystemExit(f"wheel tag mismatch: {wheel.name}")
-              digest_line = f"{sha256(wheel.read_bytes()).hexdigest()}  {wheel.name}"
-              digest_lines.append(digest_line)
-              print(digest_line)
-          if observed != expected_classes:
-              raise SystemExit(
-                  f"wheel platform set mismatch: expected={sorted(expected_classes)!r} observed={sorted(observed)!r}"
-              )
-          observed_wheel_set = sha256(
-              ("\n".join(sorted(digest_lines)) + "\n").encode("utf-8")
-          ).hexdigest()
-          expected_wheel_set = os.environ["EXPECTED_WHEEL_SET_SHA256"]
-          if not compare_digest(observed_wheel_set, expected_wheel_set):
-              raise SystemExit(
-                  "wheel set does not match reviewed bytes: "
-                  f"observed={observed_wheel_set} reviewed={expected_wheel_set}"
-              )
+                  if archive.testzip() is not None:
+                      raise SystemExit(f"wheel CRC failure: {wheel.name}")
+                  meta = [n for n in archive.namelist() if n.endswith(".dist-info/METADATA")]
+                  if len(meta) != 1:
+                      raise SystemExit("invalid wheel metadata layout")
+                  parsed = BytesParser().parsebytes(archive.read(meta[0]))
+                  if parsed.get("Name") != "parapet" or parsed.get("Version") != "0.2.0":
+                      raise SystemExit("wheel metadata identity mismatch")
+              lines.append(f"{sha256(wheel.read_bytes()).hexdigest()}  {wheel.name}")
+          if observed != set(classes.values()):
+              raise SystemExit("wheel platform set mismatch")
+          digest = sha256(("\n".join(sorted(lines)) + "\n").encode()).hexdigest()
+          if not compare_digest(digest, os.environ["EXPECTED_WHEEL_SET_SHA256"]):
+              raise SystemExit("wheel set does not match reviewed bytes")
           PY
 
-      - name: Require PyPI Trusted Publishing credentials only
+      - name: Stop if PyPI already has 0.2.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          code=$(curl --silent --show-error --output /tmp/pypi-v0.2.0.json --write-out '%{http_code}' https://pypi.org/pypi/parapet/0.2.0/json)
+          test "$code" = "404"
+
+      - name: Require Trusted Publishing only
         shell: bash
         run: |
           set -euo pipefail
           test -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}"
           test -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}"
+          test -z "${PYPI_API_TOKEN:-}"
           test -z "${MATURIN_PYPI_TOKEN:-}"
           test -z "${MATURIN_USERNAME:-}"
           test -z "${MATURIN_PASSWORD:-}"
           test ! -e "$HOME/.pypirc"
 
-      - name: Publish the reviewed wheels
-        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+      - name: Publish reviewed wheels once
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b
         with:
           command: upload
-          maturin-version: v1.15.0
+          maturin-version: v1.16.0
           args: --non-interactive dist/*.whl

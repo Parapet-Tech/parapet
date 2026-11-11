@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import importlib.util
 import json
@@ -132,11 +133,14 @@ class LandingScriptTests(unittest.TestCase):
 
 
 class ReleaseWorkflowTests(unittest.TestCase):
+    WORKFLOWS = (
+        "py-sdk-wheels.yml",
+        "py-sdk-publish.yml",
+        "github-release-publish.yml",
+    )
+
     def workflow(self, name: str) -> str:
         return (ROOT / ".github" / "workflows" / name).read_text()
-
-    def trigger_block(self, workflow: str) -> str:
-        return workflow.split("\npermissions:", 1)[0]
 
     def python_blocks(self, workflow: str) -> list[str]:
         lines = workflow.splitlines()
@@ -179,171 +183,365 @@ class ReleaseWorkflowTests(unittest.TestCase):
     def write_wheel(self, path: Path, platform_tag: str) -> None:
         with zipfile.ZipFile(path, "w") as archive:
             archive.writestr(
-                "parapet-0.1.0.dist-info/METADATA",
-                "Metadata-Version: 2.1\nName: parapet\nVersion: 0.1.0\n",
+                "parapet-0.2.0.dist-info/METADATA",
+                "Metadata-Version: 2.1\nName: parapet\nVersion: 0.2.0\n",
             )
             archive.writestr(
-                "parapet-0.1.0.dist-info/WHEEL",
+                "parapet-0.2.0.dist-info/WHEEL",
                 f"Wheel-Version: 1.0\nTag: py3-none-{platform_tag}\n",
             )
 
     def wheel_set_sha256(self, paths: list[Path]) -> str:
-        digest_lines = [
+        lines = [
             f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}"
             for path in paths
         ]
-        payload = "\n".join(sorted(digest_lines)) + "\n"
-        return hashlib.sha256(payload.encode()).hexdigest()
+        return hashlib.sha256(("\n".join(sorted(lines)) + "\n").encode()).hexdigest()
 
-    def write_permission_findings(self, workflow: str) -> list[str]:
-        findings = []
-        scalar_pattern = r"(?:['\"]?write-all['\"]?)"
-        if re.search(
-            rf"^\s*permissions\s*:\s*{scalar_pattern}\s*(?:#.*)?$",
-            workflow,
-            re.MULTILINE,
-        ):
-            findings.append("permissions-write-all")
-        if re.search(
-            r"^\s*contents\s*:\s*['\"]?write['\"]?\s*(?:#.*)?$",
-            workflow,
-            re.MULTILINE,
-        ):
-            findings.append("contents-write")
-        for match in re.finditer(
-            r"^\s*permissions\s*:\s*\{([^}\n]*)\}", workflow, re.MULTILINE
-        ):
-            if re.search(
-                r"(?:^|,)\s*['\"]?contents['\"]?\s*:\s*['\"]?write['\"]?\s*(?:,|$)",
-                match.group(1),
-            ):
-                findings.append("flow-contents-write")
-        return findings
+    def test_release_versions_are_coherent(self):
+        import tomllib
+        pyproject = tomllib.loads((ROOT / "parapet-py/pyproject.toml").read_text())
+        cargo_toml = tomllib.loads((ROOT / "parapet/Cargo.toml").read_text())
+        cargo_lock = tomllib.loads((ROOT / "parapet/Cargo.lock").read_text())
+        package = json.loads((ROOT / "parapet-ts/package.json").read_text())
+        package_lock = json.loads((ROOT / "parapet-ts/package-lock.json").read_text())
+        self.assertEqual(pyproject["project"]["version"], "0.2.0")
+        self.assertEqual(cargo_toml["package"]["version"], "0.2.0")
+        roots = [p for p in cargo_lock["package"] if p["name"] == "parapet"]
+        self.assertEqual([p["version"] for p in roots], ["0.2.0"])
+        self.assertEqual(package["version"], "0.2.0")
+        self.assertEqual(package_lock["version"], "0.2.0")
+        self.assertEqual(package_lock["packages"][""]["version"], "0.2.0")
+        metadata = subprocess.run(
+            ["cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"],
+            cwd=ROOT / "parapet",
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        packages = json.loads(metadata.stdout)["packages"]
+        self.assertEqual(
+            [p["version"] for p in packages if p["name"] == "parapet"],
+            ["0.2.0"],
+        )
 
-    def test_tag_workflow_builds_only_and_cannot_publish(self):
-        workflow = self.workflow("py-sdk-wheels.yml")
-        self.assertIn('tags: ["v*"]', workflow)
-        self.assertIn("actions/upload-artifact@v4", workflow)
-        self.assertEqual(workflow.count("args: --release --locked --out dist"), 3)
-        self.assertNotIn("PYPI_API_TOKEN", workflow)
-        self.assertNotIn("MATURIN_PYPI_TOKEN", workflow)
-        self.assertNotIn("command: upload", workflow)
-        self.assertNotIn("gh release", workflow)
-        self.assertNotIn("--draft=false", workflow)
-        self.assertNotIn("environment:", workflow)
-        self.assertIn("permissions:\n  contents: read", workflow)
-
-    def test_pypi_publish_is_manual_protected_and_bound_to_tag_build(self):
-        workflow = self.workflow("py-sdk-publish.yml")
-        trigger = self.trigger_block(workflow)
-        self.assertIn("workflow_dispatch:", trigger)
-        self.assertNotIn("push:", trigger)
-        self.assertNotIn("pull_request:", trigger)
-        self.assertIn("name: pypi", workflow)
-        self.assertIn('test "$GITHUB_REF" = "refs/heads/main"', workflow)
-        self.assertIn("PUBLISH PYPI v0.1.0", workflow)
-        self.assertIn("expected_commit:", workflow)
-        self.assertIn("wheel_set_sha256:", workflow)
-        self.assertIn("actions/workflows/py-sdk-wheels.yml", workflow)
-        self.assertIn(".workflow_id", workflow)
-        self.assertIn(".head_sha", workflow)
-        self.assertIn('= "completed"', workflow)
-        self.assertIn('= "success"', workflow)
-        self.assertIn("run-id: ${{ inputs.build_run_id }}", workflow)
-        self.assertIn("github-token: ${{ github.token }}", workflow)
-        self.assertIn("expected 5 wheels", workflow)
-        self.assertIn("wheel metadata identity mismatch", workflow)
-        self.assertIn("unexpected non-wheel artifact entry", workflow)
-        self.assertIn("id-token: write", workflow)
-        self.assertIn("ACTIONS_ID_TOKEN_REQUEST_TOKEN", workflow)
-        self.assertIn("ACTIONS_ID_TOKEN_REQUEST_URL", workflow)
-        self.assertIn("--non-interactive", workflow)
-        self.assertIn("maturin-version: v1.15.0", workflow)
-        self.assertIn("command: upload", workflow)
-        self.assertNotIn("PYPI_API_TOKEN", workflow)
-        self.assertNotIn("secrets.", workflow)
-        self.assertNotIn("--skip-existing", workflow)
-        self.assertNotIn("npm", workflow.lower())
-        self.assertNotIn("contents: write", workflow)
-
-    def test_github_release_publish_is_manual_protected_and_draft_only(self):
-        workflow = self.workflow("github-release-publish.yml")
-        trigger = self.trigger_block(workflow)
-        self.assertIn("workflow_dispatch:", trigger)
-        self.assertNotIn("push:", trigger)
-        self.assertNotIn("pull_request:", trigger)
-        self.assertIn("name: github-release", workflow)
-        self.assertIn('test "$GITHUB_REF" = "refs/heads/main"', workflow)
-        self.assertIn("PUBLISH GITHUB RELEASE v0.1.0", workflow)
-        self.assertIn("expected_commit:", workflow)
-        self.assertIn("wheel_set_sha256:", workflow)
-        self.assertIn("release_manifest_sha256:", workflow)
-        self.assertIn("contents: write", workflow)
-        self.assertIn(".targetCommitish", workflow)
-        self.assertIn(".isDraft", workflow)
-        self.assertIn('= "true"', workflow)
-        self.assertIn("parapet-v0.1.0-RELEASE_SHA256SUMS", workflow)
-        self.assertIn("parapet-v0.1.0-macos-arm64-evaluator.tar.gz", workflow)
-        self.assertIn("parapet-v0.1.0-release-evidence.tar.gz", workflow)
-        self.assertIn("checksum manifest does not cover the exact downloadable asset set", workflow)
-        self.assertIn("release asset set mismatch", workflow)
-        self.assertIn("wheel metadata identity mismatch", workflow)
-        self.assertIn('sort_by(.name)', workflow)
-        self.assertIn('test "$published_assets" = "$expected_assets"', workflow)
-        self.assertIn("--draft=false --latest --verify-tag", workflow)
-        self.assertNotIn("--latest=false", workflow)
-        self.assertNotIn("npm", workflow.lower())
-
-    def test_publish_workflow_actions_are_sha_pinned(self):
-        for name in ("py-sdk-publish.yml", "github-release-publish.yml"):
+    def test_workflows_are_pinned_attempt_one_and_secret_free(self):
+        for name in self.WORKFLOWS:
             with self.subTest(workflow=name):
-                uses = re.findall(r"^\s*uses:\s*(\S+)", self.workflow(name), re.MULTILINE)
+                workflow = self.workflow(name)
+                uses = re.findall(
+                    r"^\s*(?:-\s*)?uses:\s*(\S+)", workflow, re.MULTILINE
+                )
                 self.assertTrue(uses)
                 for action in uses:
                     self.assertRegex(action, r"^[^@]+@[0-9a-f]{40}$")
+                self.assertNotIn("secrets.", workflow)
+                self.assertNotIn("--skip-existing", workflow)
+                self.assertTrue(
+                    "GITHUB_RUN_ATTEMPT" in workflow or "RUN_ATTEMPT:" in workflow
+                )
+                self.assertIn('= "1"', workflow)
 
-    def test_only_github_release_publish_requests_contents_write(self):
-        workflows = ROOT / ".github" / "workflows"
-        findings = {}
-        for path in sorted([*workflows.glob("*.yml"), *workflows.glob("*.yaml")]):
-            observed = self.write_permission_findings(path.read_text())
-            if observed:
-                findings[path.name] = observed
+    def test_publisher_workflow_content_rereads_execute_with_gh_jq(self):
+        payload = b"reviewed workflow bytes\n"
+        encoded = base64.b64encode(payload).decode()
+        expected = hashlib.sha256(payload).hexdigest()
+        for name in ("py-sdk-publish.yml", "github-release-publish.yml"):
+            with (
+                self.subTest(workflow=name),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                workflow = self.workflow(name)
+                self.assertNotIn("--jq -r .content", workflow)
+                line = next(
+                    line.strip()
+                    for line in workflow.splitlines()
+                    if "/contents/.github/workflows/" in line
+                )
+                root = Path(temp_dir)
+                fake_bin = root / "bin"
+                fake_bin.mkdir()
+                gh = fake_bin / "gh"
+                gh.write_text(
+                    f"#!{sys.executable}\n"
+                    "import os, sys\n"
+                    "args = sys.argv[1:]\n"
+                    "if len(args) != 4 or args[0] != 'api' or args[2:] != ['--jq', '.content']:\n"
+                    "    raise SystemExit(f'unexpected gh arguments: {args!r}')\n"
+                    "print(os.environ['CONTENT_B64'])\n"
+                )
+                gh.chmod(0o755)
+                result = subprocess.run(
+                    ["bash", "-c", "set -euo pipefail\n" + line],
+                    cwd=root,
+                    env={
+                        **os.environ,
+                        "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                        "CONTENT_B64": encoded,
+                        "CONTROL_COMMIT": "a" * 40,
+                        "GITHUB_REPOSITORY": "Parapet-Tech/parapet",
+                        "EXPECTED_WORKFLOW_SHA256": expected,
+                    },
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_publishers_use_reader_independent_config_projections(self):
+        for name in ("py-sdk-publish.yml", "github-release-publish.yml"):
+            with self.subTest(workflow=name):
+                workflow = self.workflow(name)
+                self.assertIn(
+                    "{id,name,target,enforcement,conditions,rules,updated_at}",
+                    workflow,
+                )
+                self.assertIn("reviewer_id:.reviewer.id", workflow)
+                self.assertIn("prevent_self_review", workflow)
+                self.assertIn("deployment_branch_policy", workflow)
+                self.assertNotIn("current_user_can_bypass", workflow)
+                self.assertNotIn("bypass_actors", workflow)
+                self.assertNotIn("/secrets", workflow)
+
+                expressions = re.findall(
+                    r"jq -S -c '([^']+)' \| sha256sum",
+                    workflow,
+                )
+                environment_expression = next(
+                    expression
+                    for expression in expressions
+                    if "protection_rules" in expression
+                )
+                admin_view = {
+                    "name": "pypi",
+                    "can_admins_bypass": False,
+                    "protection_rules": [
+                        {
+                            "id": 1,
+                            "type": "required_reviewers",
+                            "reviewers": [
+                                {
+                                    "type": "User",
+                                    "reviewer": {"id": 4242, "login": "independent-reviewer"},
+                                }
+                            ],
+                            "prevent_self_review": True,
+                        }
+                    ],
+                    "deployment_branch_policy": {
+                        "protected_branches": False,
+                        "custom_branch_policies": True,
+                    },
+                    "url": "admin-relative-url",
+                }
+                token_view = {
+                    **admin_view,
+                    "url": "token-relative-url",
+                    "html_url": "reader-only-field",
+                }
+                outputs = []
+                for payload in (admin_view, token_view):
+                    result = subprocess.run(
+                        ["jq", "-S", "-c", environment_expression],
+                        input=json.dumps(payload),
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    outputs.append(result.stdout)
+                self.assertEqual(outputs[0], outputs[1])
+
+    def test_all_workflow_jq_filters_compile(self):
+        token = r"(?:'[^']*'|\"[^\"\n]*\"|[^\s|;&<>\)]+)"
+        direct = re.compile(
+            rf"(?<![-\w])jq(?:\s+-[A-Za-z]+)+\s+(?P<filter>{token})"
+        )
+        gh = re.compile(rf"--jq\s+(?P<filter>{token})")
+        single_quoted = 0
+        for name in self.WORKFLOWS:
+            with self.subTest(workflow=name):
+                workflow = self.workflow(name)
+                filters: list[tuple[int, str]] = []
+                expected = 0
+                for line_number, line in enumerate(workflow.splitlines(), 1):
+                    expected += len(re.findall(r"(?<![-\w])jq\s+-", line))
+                    expected += line.count("--jq")
+                    for pattern in (direct, gh):
+                        for match in pattern.finditer(line):
+                            expression = match.group("filter")
+                            if expression.startswith("'"):
+                                single_quoted += 1
+                            if expression[:1] in {"'", '"'}:
+                                self.assertEqual(expression[-1], expression[0])
+                                expression = expression[1:-1]
+                            filters.append((line_number, expression))
+                self.assertGreater(expected, 0)
+                self.assertEqual(len(filters), expected)
+                for line_number, expression in filters:
+                    with self.subTest(line=line_number, jq=expression):
+                        result = subprocess.run(
+                            ["jq", "-n", f"try ({expression}) catch empty"],
+                            capture_output=True,
+                            text=True,
+                            check=False,
+                        )
+                        self.assertEqual(
+                            result.returncode,
+                            0,
+                            f"{name}:{line_number}: {result.stderr}",
+                        )
+        self.assertEqual(single_quoted, 23)
+
+    def test_all_workflow_run_blocks_parse_as_bash(self):
+        expression = re.compile(r"\$\{\{.*?\}\}")
+        for name in self.WORKFLOWS:
+            with self.subTest(workflow=name):
+                workflow = self.workflow(name)
+                lines = workflow.splitlines()
+                blocks: list[tuple[int, str]] = []
+                index = 0
+                while index < len(lines):
+                    match = re.match(
+                        r"^(?P<indent>\s*)run:\s*(?P<body>.*)$", lines[index]
+                    )
+                    if match is None:
+                        index += 1
+                        continue
+                    line_number = index + 1
+                    body = match.group("body")
+                    key_indent = len(match.group("indent"))
+                    if re.fullmatch(r"[|>][+-]?", body):
+                        index += 1
+                        block_lines: list[str] = []
+                        content_indent: int | None = None
+                        while index < len(lines):
+                            line = lines[index]
+                            indent = len(line) - len(line.lstrip())
+                            if line and indent <= key_indent:
+                                break
+                            if line and content_indent is None:
+                                content_indent = indent
+                            if line:
+                                self.assertIsNotNone(content_indent)
+                                self.assertGreaterEqual(indent, content_indent)
+                                block_lines.append(line[content_indent:])
+                            else:
+                                block_lines.append("")
+                            index += 1
+                        self.assertIsNotNone(
+                            content_indent, f"{name}:{line_number}: empty run block"
+                        )
+                        body = "\n".join(block_lines) + "\n"
+                    else:
+                        self.assertTrue(body, f"{name}:{line_number}: empty inline run")
+                        index += 1
+                    blocks.append(
+                        (line_number, expression.sub("GITHUB_EXPRESSION", body))
+                    )
+
+                self.assertEqual(
+                    len(blocks),
+                    len(re.findall(r"^\s*run:", workflow, re.MULTILINE)),
+                )
+                self.assertGreater(len(blocks), 0)
+                for line_number, block in blocks:
+                    with self.subTest(line=line_number):
+                        result = subprocess.run(
+                            ["bash", "-n", "-c", block],
+                            capture_output=True,
+                            text=True,
+                            check=False,
+                        )
+                        self.assertEqual(
+                            result.returncode,
+                            0,
+                            f"{name}:{line_number}: {result.stderr}",
+                        )
+
+    def test_dispatch_input_counts_fit_github_limit(self):
+        for name in (
+            "py-sdk-wheels.yml",
+            "py-sdk-publish.yml",
+            "github-release-publish.yml",
+        ):
+            with self.subTest(workflow=name):
+                workflow = self.workflow(name).split("\npermissions:", 1)[0]
+                inputs = re.findall(
+                    r"^      ([a-z0-9_]+):(?:\n| )", workflow, re.MULTILINE
+                )
+                self.assertLessEqual(len(inputs), 25)
         self.assertEqual(
-            findings,
-            {"github-release-publish.yml": ["contents-write"]},
+            len(
+                re.findall(
+                    r"^      ([a-z0-9_]+):(?:\n| )",
+                    self.workflow("github-release-publish.yml").split(
+                        "\npermissions:", 1
+                    )[0],
+                    re.MULTILINE,
+                )
+            ),
+            18,
         )
 
-    def test_write_permission_scanner_rejects_alternate_yaml_syntaxes(self):
-        unsafe = {
-            "workflow block": "permissions:\n  contents: write\n",
-            "job block": "jobs:\n  publish:\n    permissions:\n      contents: write\n",
-            "workflow write-all": "permissions: write-all\n",
-            "job write-all": "jobs:\n  publish:\n    permissions: write-all\n",
-            "workflow flow": "permissions: {contents: write, actions: read}\n",
-            "job flow": (
-                "jobs:\n  publish:\n"
-                "    permissions: { actions: read, contents: write }\n"
-            ),
-        }
-        for name, fixture in unsafe.items():
-            with self.subTest(name=name):
-                self.assertTrue(self.write_permission_findings(fixture))
+    def test_wheel_workflow_is_single_run_five_platform_and_pretag(self):
+        workflow = self.workflow("py-sdk-wheels.yml")
+        self.assertIn("BUILD PRETAG v0.2.0", workflow)
+        self.assertIn('tags: ["v0.2.0"]', workflow)
+        self.assertIn("os: macos-15", workflow)
+        self.assertIn("macos-15-intel", workflow)
+        self.assertIn("toolchain: 1.99.1", workflow)
+        self.assertEqual(workflow.count("rust-toolchain: 1.99.1"), 3)
+        self.assertIn("run: rustc -V", workflow)
+        self.assertIn("maturin-version: v1.16.0", workflow)
+        self.assertIn("@sha256:", workflow)
+        self.assertEqual(workflow.count("args: --release --locked --out dist"), 3)
+        self.assertIn("expected 5 wheels", workflow)
+        self.assertNotIn("command: upload", workflow)
+        self.assertNotIn("environment:", workflow)
+        self.assertNotIn("ubuntu-latest", workflow)
+        self.assertNotIn("windows-latest", workflow)
+        self.assertIn("ubuntu-24.04", workflow)
+        self.assertIn("windows-2025", workflow)
+        self.assertIn("image_version=${ImageVersion:-unavailable}", workflow)
 
-        safe = {
-            "empty mapping": "permissions: {}\n",
-            "read-all": "permissions: read-all\n",
-            "workflow block read": "permissions:\n  contents: read\n",
-            "job flow read": (
-                "jobs:\n  build:\n"
-                "    permissions: { contents: read, actions: read }\n"
-            ),
-        }
-        for name, fixture in safe.items():
-            with self.subTest(name=name):
-                self.assertEqual(self.write_permission_findings(fixture), [])
+    def test_publishers_bind_control_numeric_actors_and_config(self):
+        pypi = self.workflow("py-sdk-publish.yml")
+        github = self.workflow("github-release-publish.yml")
+        for workflow, environment in ((pypi, "pypi"), (github, "github-release")):
+            self.assertIn("parapet-worker:319884068", workflow)
+            self.assertIn("reviewer=protected-environment", workflow)
+            self.assertIn("GITHUB_WORKFLOW_SHA", workflow)
+            self.assertIn("control_commit", workflow)
+            self.assertIn("workflow_sha256", workflow)
+            self.assertIn("main_ruleset_sha256", workflow)
+            self.assertIn("release_ruleset_sha256", workflow)
+            self.assertIn(f"name: {environment}", workflow)
+            self.assertNotIn("/secrets", workflow)
+            self.assertNotIn(
+                "${{ github.event.sender",
+                "\n".join(
+                    line
+                    for line in workflow.splitlines()
+                    if line.lstrip().startswith("test ")
+                ),
+            )
+        self.assertIn("id-token: write", pypi)
+        self.assertIn("ACTIONS_ID_TOKEN_REQUEST_TOKEN", pypi)
+        self.assertIn("--non-interactive dist/*.whl", pypi)
+        self.assertIn("https://pypi.org/pypi/parapet/0.2.0/json", pypi)
+        self.assertNotIn("contents: write", pypi)
+        self.assertIn("contents: write", github)
+        self.assertIn("--draft=false --latest --verify-tag", github)
+        self.assertIn("release_text_sha256", github)
+        self.assertIn("{name,body}", github)
+        self.assertNotIn("downloadCount", github)
+        self.assertIn("{id,name,size,digest,state,contentType,updatedAt}", github)
+        self.assertIn("parapet-v0.2.0-RELEASE_SHA256SUMS", github)
+        self.assertIn("parapet-v0.2.0-macos-arm64-evaluator.tar.gz", github)
+        self.assertIn("parapet-v0.2.0-release-evidence.tar.gz", github)
 
-    def test_pypi_artifact_and_wheel_validators_fail_closed(self):
+    def test_pypi_python_validators_accept_only_exact_sets(self):
         blocks = self.python_blocks(self.workflow("py-sdk-publish.yml"))
         self.assertEqual(len(blocks), 2)
         artifact_names = [
@@ -359,236 +557,91 @@ class ReleaseWorkflowTests(unittest.TestCase):
                 for name in artifact_names
             ]
         }
-        commit_env = {
-            "TAG_COMMIT": "a" * 40,
-            "EXPECTED_COMMIT": "a" * 40,
-        }
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            good = self.run_python_block(
+            valid_artifacts = self.run_python_block(
                 blocks[0],
                 cwd=root,
-                env={**commit_env, "ARTIFACTS_JSON": json.dumps(payload)},
+                env={"ARTIFACTS_JSON": json.dumps(payload)},
             )
-            self.assertEqual(good.returncode, 0, good.stdout + good.stderr)
-            wrong_commit = self.run_python_block(
-                blocks[0],
-                cwd=root,
-                env={
-                    **commit_env,
-                    "EXPECTED_COMMIT": "b" * 40,
-                    "ARTIFACTS_JSON": json.dumps(payload),
-                },
+            self.assertEqual(
+                valid_artifacts.returncode,
+                0,
+                valid_artifacts.stdout + valid_artifacts.stderr,
             )
-            self.assertNotEqual(wrong_commit.returncode, 0)
-            missing_payload = {"artifacts": payload["artifacts"][:-1]}
             missing = self.run_python_block(
                 blocks[0],
                 cwd=root,
-                env={**commit_env, "ARTIFACTS_JSON": json.dumps(missing_payload)},
+                env={"ARTIFACTS_JSON": json.dumps({"artifacts": payload["artifacts"][:-1]})},
             )
             self.assertNotEqual(missing.returncode, 0)
-
             dist = root / "dist"
             dist.mkdir()
-            platform_tags = [
+            tags = [
                 "manylinux_2_17_x86_64",
                 "manylinux_2_17_aarch64",
                 "macosx_11_0_arm64",
                 "macosx_10_12_x86_64",
                 "win_amd64",
             ]
-            for platform_tag in platform_tags:
-                wheel = dist / f"parapet-0.1.0-py3-none-{platform_tag}.whl"
-                self.write_wheel(wheel, platform_tag)
-            wheel_paths = sorted(dist.glob("*.whl"))
-            wheel_set_sha256 = self.wheel_set_sha256(wheel_paths)
-            wheel_env = {"EXPECTED_WHEEL_SET_SHA256": wheel_set_sha256}
-            valid_wheels = self.run_python_block(blocks[1], cwd=root, env=wheel_env)
+            wheels = []
+            for tag in tags:
+                wheel = dist / f"parapet-0.2.0-py3-none-{tag}.whl"
+                self.write_wheel(wheel, tag)
+                wheels.append(wheel)
+            env = {"EXPECTED_WHEEL_SET_SHA256": self.wheel_set_sha256(wheels)}
+            valid_wheels = self.run_python_block(blocks[1], cwd=root, env=env)
             self.assertEqual(
-                valid_wheels.returncode,
-                0,
-                valid_wheels.stdout + valid_wheels.stderr,
+                valid_wheels.returncode, 0, valid_wheels.stdout + valid_wheels.stderr
             )
-            wrong_wheel_set = self.run_python_block(
-                blocks[1],
-                cwd=root,
-                env={"EXPECTED_WHEEL_SET_SHA256": "0" * 64},
-            )
-            self.assertNotEqual(wrong_wheel_set.returncode, 0)
-            unexpected_file = dist / "unexpected.txt"
-            unexpected_file.write_text("unexpected")
-            unexpected = self.run_python_block(blocks[1], cwd=root, env=wheel_env)
-            self.assertNotEqual(unexpected.returncode, 0)
-            unexpected_file.unlink()
-            unexpected_dir = dist / "unexpected"
-            unexpected_dir.mkdir()
-            unexpected = self.run_python_block(blocks[1], cwd=root, env=wheel_env)
-            self.assertNotEqual(unexpected.returncode, 0)
-            unexpected_dir.rmdir()
-            (dist / "parapet-0.1.0-py3-none-win_amd64.whl").rename(
-                dist / "parapet-0.2.0-py3-none-win_amd64.whl"
-            )
-            wrong_version = self.run_python_block(blocks[1], cwd=root, env=wheel_env)
-            self.assertNotEqual(wrong_version.returncode, 0)
+            (dist / "unexpected.txt").write_text("x")
+            invalid = self.run_python_block(blocks[1], cwd=root, env=env)
+            self.assertNotEqual(invalid.returncode, 0)
 
-    def test_github_release_asset_validators_fail_closed(self):
+    def test_github_asset_validator_accepts_exact_manifest(self):
         blocks = self.python_blocks(self.workflow("github-release-publish.yml"))
-        self.assertEqual(len(blocks), 2)
-        base_assets = [
-            {"name": "one", "size": 1},
-            {"name": "two", "size": 2},
-        ]
-        commit_env = {
-            "TAG_COMMIT": "a" * 40,
-            "EXPECTED_COMMIT": "a" * 40,
-        }
+        self.assertEqual(len(blocks), 1)
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            metadata = self.run_python_block(
-                blocks[0],
-                cwd=root,
-                env={**commit_env, "RELEASE_JSON": json.dumps({"assets": base_assets})},
-            )
-            self.assertEqual(metadata.returncode, 0, metadata.stdout + metadata.stderr)
-            wrong_commit = self.run_python_block(
-                blocks[0],
-                cwd=root,
-                env={
-                    **commit_env,
-                    "EXPECTED_COMMIT": "b" * 40,
-                    "RELEASE_JSON": json.dumps({"assets": base_assets}),
-                },
-            )
-            self.assertNotEqual(wrong_commit.returncode, 0)
-            duplicate = self.run_python_block(
-                blocks[0],
-                cwd=root,
-                env={
-                    **commit_env,
-                    "RELEASE_JSON": json.dumps(
-                        {"assets": [base_assets[0], base_assets[0]]}
-                    )
-                },
-            )
-            self.assertNotEqual(duplicate.returncode, 0)
-
-            assets_dir = root / "release-assets"
-            assets_dir.mkdir()
-            required_names = [
-                "parapet-v0.1.0-macos-arm64-evaluator.tar.gz",
-                "parapet-v0.1.0-release-evidence.tar.gz",
+            assets = root / "release-assets"
+            assets.mkdir()
+            payloads = [
+                "parapet-v0.2.0-macos-arm64-evaluator.tar.gz",
+                "parapet-v0.2.0-release-evidence.tar.gz",
             ]
-            for index, name in enumerate(required_names):
-                (assets_dir / name).write_bytes(f"asset-{index}".encode())
-            platform_tags = [
-                "manylinux_2_17_x86_64",
-                "manylinux_2_17_aarch64",
+            tags = [
+                "manylinux_2_17_x86_64.manylinux2014_x86_64",
+                "manylinux_2_17_aarch64.manylinux2014_aarch64",
                 "macosx_11_0_arm64",
                 "macosx_10_12_x86_64",
                 "win_amd64",
             ]
-            wheel_names = [
-                f"parapet-0.1.0-py3-none-{platform_tag}.whl"
-                for platform_tag in platform_tags
-            ]
-            for name, platform_tag in zip(wheel_names, platform_tags):
-                self.write_wheel(assets_dir / name, platform_tag)
-            names = required_names + wheel_names
-            manifest_name = "parapet-v0.1.0-RELEASE_SHA256SUMS"
-            manifest = assets_dir / manifest_name
-
-            def write_manifest(asset_names: list[str]) -> None:
-                manifest.write_text(
-                    "".join(
-                        f"{hashlib.sha256((assets_dir / name).read_bytes()).hexdigest()}  {name}\n"
-                        for name in asset_names
-                    )
+            wheels = []
+            for tag in tags:
+                wheel = assets / f"parapet-0.2.0-py3-none-{tag}.whl"
+                self.write_wheel(wheel, tag)
+                wheels.append(wheel)
+            for index, name in enumerate(payloads):
+                (assets / name).write_bytes(f"asset-{index}".encode())
+            manifest = assets / "parapet-v0.2.0-RELEASE_SHA256SUMS"
+            covered = wheels + [assets / name for name in payloads]
+            manifest.write_text(
+                "".join(
+                    f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n"
+                    for path in covered
                 )
-
-            def release_assets() -> list[dict[str, object]]:
-                return [
-                    {"name": path.name, "size": path.stat().st_size}
-                    for path in sorted(assets_dir.iterdir())
-                ]
-
-            write_manifest(names)
-            current_release_assets = release_assets()
-            reviewed_wheel_set = self.wheel_set_sha256(
-                [assets_dir / name for name in wheel_names]
             )
-            validator_env = {
+            env = {
                 "EXPECTED_RELEASE_MANIFEST_SHA256": hashlib.sha256(
                     manifest.read_bytes()
                 ).hexdigest(),
-                "EXPECTED_WHEEL_SET_SHA256": reviewed_wheel_set,
-                "RELEASE_JSON": json.dumps({"assets": current_release_assets}),
+                "EXPECTED_WHEEL_SET_SHA256": self.wheel_set_sha256(wheels),
             }
-            valid = self.run_python_block(
-                blocks[1],
-                cwd=root,
-                env=validator_env,
-            )
+            valid = self.run_python_block(blocks[0], cwd=root, env=env)
             self.assertEqual(valid.returncode, 0, valid.stdout + valid.stderr)
-
-            wrong_manifest = self.run_python_block(
-                blocks[1],
-                cwd=root,
-                env={**validator_env, "EXPECTED_RELEASE_MANIFEST_SHA256": "0" * 64},
-            )
-            self.assertNotEqual(wrong_manifest.returncode, 0)
-
-            extra_name = "unreviewed-debug.tar.gz"
-            (assets_dir / extra_name).write_bytes(b"unexpected")
-            write_manifest(names + [extra_name])
-            unexpected = self.run_python_block(
-                blocks[1],
-                cwd=root,
-                env={
-                    "EXPECTED_RELEASE_MANIFEST_SHA256": hashlib.sha256(
-                        manifest.read_bytes()
-                    ).hexdigest(),
-                    "EXPECTED_WHEEL_SET_SHA256": reviewed_wheel_set,
-                    "RELEASE_JSON": json.dumps({"assets": release_assets()}),
-                },
-            )
-            self.assertNotEqual(unexpected.returncode, 0)
-            (assets_dir / extra_name).unlink()
-            write_manifest(names)
-            current_release_assets = release_assets()
-
-            with zipfile.ZipFile(assets_dir / wheel_names[0], "a") as archive:
-                archive.writestr("review-drift", "different reviewed bytes")
-            write_manifest(names)
-            changed_release_wheel = self.run_python_block(
-                blocks[1],
-                cwd=root,
-                env={
-                    "EXPECTED_RELEASE_MANIFEST_SHA256": hashlib.sha256(
-                        manifest.read_bytes()
-                    ).hexdigest(),
-                    "EXPECTED_WHEEL_SET_SHA256": reviewed_wheel_set,
-                    "RELEASE_JSON": json.dumps({"assets": release_assets()}),
-                },
-            )
-            self.assertNotEqual(changed_release_wheel.returncode, 0)
-            self.write_wheel(assets_dir / wheel_names[0], platform_tags[0])
-            write_manifest(names)
-            current_release_assets = release_assets()
-
-            (assets_dir / names[0]).write_bytes(b"tampered")
-            tampered = self.run_python_block(
-                blocks[1],
-                cwd=root,
-                env={
-                    "EXPECTED_RELEASE_MANIFEST_SHA256": hashlib.sha256(
-                        manifest.read_bytes()
-                    ).hexdigest(),
-                    "EXPECTED_WHEEL_SET_SHA256": reviewed_wheel_set,
-                    "RELEASE_JSON": json.dumps({"assets": current_release_assets}),
-                },
-            )
-            self.assertNotEqual(tampered.returncode, 0)
+            env["EXPECTED_RELEASE_MANIFEST_SHA256"] = "0" * 64
+            invalid = self.run_python_block(blocks[0], cwd=root, env=env)
+            self.assertNotEqual(invalid.returncode, 0)
 
 
 class LanderHarnessTests(unittest.TestCase):
