@@ -204,9 +204,9 @@ classifiers, and deterministic orthogonal sensors.
 
 Current public papers:
 
-- [Amplify, Don't Create: Temporal Accumulation for Slow-Burn Prompt Injection](docs/publications/amplify/paper.pdf)
-- [Peak + Accumulation: A Proxy-Level Scoring Formula for Multi-Turn LLM Attack Detection](docs/publications/multiturn/paper.pdf)
-- [The Mirror Design Pattern: Strict Data Geometry over Model Scale for Prompt Injection Detection](docs/publications/mirror/paper.pdf)
+- Amplify, Don't Create: Temporal Accumulation for Slow-Burn Prompt Injection — [PDF](docs/publications/amplify/paper.pdf) · [arXiv](https://arxiv.org/abs/2606.20746)
+- Peak + Accumulation: A Proxy-Level Scoring Formula for Multi-Turn LLM Attack Detection — [PDF](docs/publications/multiturn/paper.pdf) · [arXiv](https://arxiv.org/abs/2602.11247)
+- The Mirror Design Pattern: Strict Data Geometry over Model Scale for Prompt Injection Detection — [PDF](docs/publications/mirror/paper.pdf) · [arXiv](https://arxiv.org/abs/2603.11875)
 
 The broader research and layer notes live under [strategy/](strategy).
 
